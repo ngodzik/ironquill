@@ -4,6 +4,7 @@ members = [
     "crates/llm",
     "crates/tools",
     "crates/agent",
+    "crates/tui",
     ".",
 ]
 resolver = "3"
@@ -22,6 +23,7 @@ ironquill-core = { path = "crates/core", version = "0.1.0" }
 ironquill-llm  = { path = "crates/llm", version = "0.1.0" }
 ironquill-tools = { path = "crates/tools", version = "0.1.0" }
 ironquill-agent = { path = "crates/agent", version = "0.1.0" }
+ironquill-tui   = { path = "crates/tui", version = "0.1.0" }
 
 thiserror  = "2.0.21"
 anyhow     = "1.0.104"
@@ -37,6 +39,14 @@ tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 proptest   = "1.11.0"
 tempfile   = "3.27.0"
+ratatui    = "0.30.2"
+# The same version ratatui drives, with the async event stream on top.
+crossterm  = { version = "0.29.0", features = ["event-stream"] }
+futures    = "0.3.34"
+regex      = "1.13.1"
+# Pure Rust regex engine instead of the default C Oniguruma: nothing to build
+# in C, the same on every platform.
+syntect    = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
 [package]
 name    = "ironquill"
@@ -55,6 +65,7 @@ ironquill-core.workspace     = true
 ironquill-llm.workspace      = true
 ironquill-tools.workspace    = true
 ironquill-agent.workspace    = true
+ironquill-tui.workspace      = true
 anyhow.workspace             = true
 clap.workspace               = true
 tokio.workspace              = true

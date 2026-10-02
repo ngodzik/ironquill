@@ -3,6 +3,7 @@
 #![deny(unsafe_code)]
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -33,8 +34,29 @@ struct Cli {
     #[arg(long, env = "IRONQUILL_API_KEY", hide_env_values = true, global = true)]
     api_key: Option<String>,
 
+    /// Model tried first in the interface. Can be set later with `:model`.
+    #[arg(long, env = "IRONQUILL_MODEL")]
+    model: Option<String>,
+
+    /// Stronger models for the interface, cheapest first.
+    #[arg(long = "escalate", value_name = "MODEL")]
+    escalate: Vec<String>,
+
+    /// Checks for the interface. Defaults as for `do`.
+    #[arg(long = "check", value_name = "COMMAND")]
+    checks: Vec<String>,
+
+    /// Continue this project's most recent conversation.
+    #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
+    continue_last: bool,
+
+    /// Pick a saved conversation of this project to continue.
+    #[arg(short = 'r', long)]
+    resume: bool,
+
+    /// Without a subcommand, ironquill opens its terminal interface.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -86,7 +108,18 @@ async fn main() -> Result<()> {
     let api_key = cli.api_key.context("no API key: set IRONQUILL_API_KEY")?;
     let provider = OpenAiCompatible::new(cli.base_url, api_key);
 
-    let command = cli.command;
+    let Some(command) = cli.command else {
+        // No log subscriber here: anything written to the terminal while the
+        // interface owns it would tear the screen.
+        let start = if cli.continue_last {
+            ironquill_tui::Start::Continue
+        } else if cli.resume {
+            ironquill_tui::Start::Pick
+        } else {
+            ironquill_tui::Start::New
+        };
+        return interface(provider, cli.model, cli.escalate, cli.checks, start).await;
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -116,6 +149,31 @@ async fn main() -> Result<()> {
             run_task(&provider, &builder.build()?, &task).await
         }
     }
+}
+
+async fn interface(
+    provider: OpenAiCompatible,
+    model: Option<String>,
+    escalate: Vec<String>,
+    checks: Vec<String>,
+    start: ironquill_tui::Start,
+) -> Result<()> {
+    let workspace = Workspace::new(".")?;
+
+    let mut tiers = Vec::new();
+    for id in model.into_iter().chain(escalate) {
+        tiers.push(ModelId::new(id)?);
+    }
+    let checks = checks_or_default(checks)?;
+
+    let settings = ironquill_tui::Settings {
+        tiers,
+        checks,
+        rounds: 2,
+        max_turns: 30,
+    };
+    ironquill_tui::run(Arc::new(provider), workspace, settings, start).await?;
+    Ok(())
 }
 
 fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {
