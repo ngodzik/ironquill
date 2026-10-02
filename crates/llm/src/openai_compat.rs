@@ -1,9 +1,11 @@
 use std::fmt;
 
 use ironquill_core::{
-    ChatModel, ChatRequest, ChatResponse, Message, ModelId, Pricing, TokenCount, Usage, Usd,
+    ChatModel, ChatRequest, ChatResponse, Message, ModelId, Pricing, TokenCount, ToolCall,
+    ToolSpec, Usage, Usd,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::error::LlmError;
 
@@ -70,10 +72,7 @@ impl ChatModel for OpenAiCompatible {
 
     async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
-        let payload = WireRequest {
-            model: request.model.as_str(),
-            messages: &request.messages,
-        };
+        let payload = wire_request(request);
         let response = self
             .http
             .post(&url)
@@ -110,10 +109,58 @@ async fn read_body(url: &str, response: reqwest::Response) -> Result<String, Llm
     Ok(body)
 }
 
-#[derive(Serialize)]
-struct WireRequest<'a> {
-    model: &'a str,
-    messages: &'a [Message],
+/// The request body. Built as JSON values rather than derived, because the
+/// core message type is protocol neutral and this is the one place that knows
+/// how OpenAI spells it.
+fn wire_request(request: &ChatRequest) -> Value {
+    let mut body = json!({
+        "model": request.model.as_str(),
+        "messages": request.messages.iter().map(wire_message).collect::<Vec<_>>(),
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = request.tools.iter().map(wire_tool).collect();
+    }
+    body
+}
+
+fn wire_message(message: &Message) -> Value {
+    match message {
+        Message::System(text) => json!({"role": "system", "content": text}),
+        Message::User(text) => json!({"role": "user", "content": text}),
+        Message::Assistant {
+            content,
+            tool_calls,
+        } => {
+            let mut m = json!({"role": "assistant", "content": content});
+            if !tool_calls.is_empty() {
+                m["tool_calls"] = tool_calls
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {"name": c.name, "arguments": c.arguments},
+                        })
+                    })
+                    .collect();
+            }
+            m
+        }
+        Message::Tool { call_id, content } => {
+            json!({"role": "tool", "tool_call_id": call_id, "content": content})
+        }
+    }
+}
+
+fn wire_tool(tool: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    })
 }
 
 #[derive(Deserialize)]
@@ -130,12 +177,29 @@ struct WireChoice {
 #[derive(Deserialize)]
 struct WireMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<WireToolCall>,
+}
+
+#[derive(Deserialize)]
+struct WireToolCall {
+    id: String,
+    function: WireFunction,
+}
+
+#[derive(Deserialize)]
+struct WireFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]
 struct WireUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// Requesty reports the cost of the call in dollars. Other endpoints
+    /// leave it out.
+    cost: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -167,13 +231,31 @@ fn parse_completion(url: &str, body: &str) -> Result<ChatResponse, LlmError> {
         .ok_or_else(|| malformed(url, "no choices in the answer"))?;
     // A missing usage block is reported as zero rather than refused: the answer
     // is still worth showing, and the status line says the cost is unknown.
-    let usage = wire.usage.map_or_else(Usage::default, |u| Usage {
-        input: TokenCount(u.prompt_tokens),
-        output: TokenCount(u.completion_tokens),
+    let (usage, cost) = wire.usage.map_or((Usage::default(), None), |u| {
+        let usage = Usage {
+            input: TokenCount(u.prompt_tokens),
+            output: TokenCount(u.completion_tokens),
+        };
+        (
+            usage,
+            u.cost.filter(|c| c.is_finite() && *c >= 0.0).map(Usd),
+        )
     });
+    let tool_calls = choice
+        .message
+        .tool_calls
+        .into_iter()
+        .map(|c| ToolCall {
+            id: c.id,
+            name: c.function.name,
+            arguments: c.function.arguments,
+        })
+        .collect();
     Ok(ChatResponse {
-        content: choice.message.content.unwrap_or_default(),
+        content: choice.message.content.filter(|c| !c.is_empty()),
+        tool_calls,
         usage,
+        cost,
     })
 }
 
@@ -205,9 +287,64 @@ mod tests {
             "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
         }"#;
         let response = parse_completion(URL, body).unwrap();
-        assert_eq!(response.content, "hello");
+        assert_eq!(response.content.as_deref(), Some("hello"));
+        assert_eq!(response.cost, None);
         assert_eq!(response.usage.input, TokenCount(12));
         assert_eq!(response.usage.output, TokenCount(3));
+    }
+
+    #[test]
+    fn reads_tool_calls_and_reported_cost() {
+        // Shape from the OpenAI chat completions spec: content is null and
+        // arguments is a JSON string, not an object.
+        let body = r#"{
+            "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}}
+            ]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 82, "completion_tokens": 18, "cost": 0.00042}
+        }"#;
+        let response = parse_completion(URL, body).unwrap();
+        assert_eq!(response.content, None);
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(response.tool_calls[0].arguments, r#"{"path": "a.rs"}"#);
+        assert_eq!(response.cost, Some(Usd(0.00042)));
+    }
+
+    #[test]
+    fn request_carries_tools_and_the_whole_tool_exchange() {
+        let request = ChatRequest {
+            model: ModelId::new("m").unwrap(),
+            messages: vec![
+                Message::user("go"),
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+                Message::Tool {
+                    call_id: "call_1".into(),
+                    content: "text".into(),
+                },
+            ],
+            tools: vec![ToolSpec {
+                name: "read_file".into(),
+                description: "d".into(),
+                parameters: json!({"type": "object"}),
+            }],
+        };
+        let body = wire_request(&request);
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(body["messages"][1]["content"], Value::Null);
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
     }
 
     #[test]

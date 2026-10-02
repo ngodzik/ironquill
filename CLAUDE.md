@@ -19,20 +19,29 @@
 Separation of concerns is **enforced by the crate dependency graph**, not by convention. The compiler refuses inverted dependencies.
 
 ```
-crates/core    ← no internal dependencies, no I/O
-    ↑
-crates/llm     (depends on core)
-    ↑
-ironquill      (bin, depends on core + llm)
+                crates/core   ← no internal dependencies, no I/O
+                ↑         ↑
+      crates/llm          crates/tools
+     (core)               (core)
+          ↑               ↑
+          |         crates/agent  (core + tools, never llm)
+          |               ↑
+          ironquill  (bin, depends on all)
 ```
 
-| Crate            | Single responsibility                                   |
-|------------------|---------------------------------------------------------|
-| `ironquill-core` | Domain types and traits, zero I/O, zero network         |
-| `ironquill-llm`  | Model providers, one `impl ChatModel` per protocol      |
-| `ironquill`      | CLI entry point                                         |
+| Crate             | Single responsibility                                                      |
+|-------------------|----------------------------------------------------------------------------|
+| `ironquill-core`  | Domain types and traits, zero I/O, zero network                            |
+| `ironquill-llm`   | Model providers, one `impl ChatModel` per protocol                         |
+| `ironquill-tools` | Deterministic tools: sandboxed workspace, file edits, checks, git          |
+| `ironquill-agent` | The loop: edit, check, retry, escalate. Generic over `ChatModel`           |
+| `ironquill`       | CLI entry point                                                            |
 
-A new crate (tools, workflows, context, TUI) is added when its first real code lands, not before, and this graph is updated in the same commit.
+`ironquill-agent` does not depend on `ironquill-llm`: it is generic over `ChatModel`, which is what lets its tests run against a scripted model with no network.
+
+The model never runs commands. It edits files through `Toolbox`; checks are run by the agent, so a model can neither skip nor fake them.
+
+A new crate (workflows, context, TUI) is added when its first real code lands, not before, and this graph is updated in the same commit.
 
 ## Idiomatic Rust patterns
 

@@ -1,0 +1,17 @@
+[package]
+name    = "ironquill-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The ironquill loop: a model edits, deterministic checks judge, a stronger model is called only on failure."
+
+[dependencies]
+ironquill-core.workspace  = true
+ironquill-tools.workspace = true
+thiserror.workspace       = true
+serde_json.workspace      = true
+
+[dev-dependencies]
+tempfile.workspace   = true
+tokio.workspace      = true

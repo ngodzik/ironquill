@@ -175,42 +175,65 @@ impl AddAssign for Usage {
     }
 }
 
-/// Who wrote a message in a conversation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    /// Standing instructions for the model.
-    System,
-    /// The person, or the tool acting on their behalf.
-    User,
-    /// The model.
-    Assistant,
+/// A tool the model may ask to call, described the way models expect.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSpec {
+    /// The name the model uses to call it.
+    pub name: String,
+    /// When and why to call it. Models choose tools from this text.
+    pub description: String,
+    /// A JSON Schema object describing the arguments.
+    pub parameters: serde_json::Value,
+}
+
+/// One call the model asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    /// The provider's identifier for this call, echoed back with the result.
+    pub id: String,
+    /// Which tool.
+    pub name: String,
+    /// The arguments, as the JSON text the model wrote. Kept as text because a
+    /// model can write invalid JSON, and that is the tool's error to report
+    /// back, not a transport failure.
+    pub arguments: String,
 }
 
 /// One message in a conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Message {
-    /// Who wrote it.
-    pub role: Role,
-    /// What it says.
-    pub content: String,
+///
+/// The variants carry exactly what each kind of message can hold, so that a
+/// tool result without a call id, say, cannot be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    /// Standing instructions for the model.
+    System(String),
+    /// The person, or ironquill speaking on their behalf.
+    User(String),
+    /// What the model said, and the tools it asked to call.
+    Assistant {
+        /// Text, if the model wrote any alongside its calls.
+        content: Option<String>,
+        /// Calls to run before the conversation continues.
+        tool_calls: Vec<ToolCall>,
+    },
+    /// The result of one tool call.
+    Tool {
+        /// The [`ToolCall::id`] this answers.
+        call_id: String,
+        /// What the tool returned, or why it failed.
+        content: String,
+    },
 }
 
 impl Message {
     /// A message from the user.
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::User,
-            content: content.into(),
-        }
+        Self::User(content.into())
     }
 
     /// A standing instruction for the model.
     pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::System,
-            content: content.into(),
-        }
+        Self::System(content.into())
     }
 }
 
@@ -221,15 +244,32 @@ pub struct ChatRequest {
     pub model: ModelId,
     /// The conversation so far, oldest first.
     pub messages: Vec<Message>,
+    /// The tools the model may call. Empty means none.
+    pub tools: Vec<ToolSpec>,
 }
 
-/// A model's answer and what it cost in tokens.
+/// A model's answer and what it cost.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatResponse {
-    /// The text of the answer.
-    pub content: String,
+    /// Text, if the model wrote any.
+    pub content: Option<String>,
+    /// Calls the model asked for. Empty means it considers itself done.
+    pub tool_calls: Vec<ToolCall>,
     /// The tokens the request consumed, as the provider reported them.
     pub usage: Usage,
+    /// The cost, when the provider reports it. Preferred over a price list
+    /// lookup, since it accounts for caching and discounts the list cannot.
+    pub cost: Option<Usd>,
+}
+
+impl ChatResponse {
+    /// The answer as a conversation message, to append before the next turn.
+    pub fn to_message(&self) -> Message {
+        Message::Assistant {
+            content: self.content.clone(),
+            tool_calls: self.tool_calls.clone(),
+        }
+    }
 }
 
 #[cfg(test)]

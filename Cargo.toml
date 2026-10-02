@@ -2,6 +2,8 @@
 members = [
     "crates/core",
     "crates/llm",
+    "crates/tools",
+    "crates/agent",
     ".",
 ]
 resolver = "3"
@@ -18,6 +20,8 @@ license     = "MIT"
 [workspace.dependencies]
 ironquill-core = { path = "crates/core", version = "0.1.0" }
 ironquill-llm  = { path = "crates/llm", version = "0.1.0" }
+ironquill-tools = { path = "crates/tools", version = "0.1.0" }
+ironquill-agent = { path = "crates/agent", version = "0.1.0" }
 
 thiserror  = "2.0.21"
 anyhow     = "1.0.104"
@@ -32,6 +36,7 @@ reqwest    = { version = "0.13.5", features = ["json"] }
 tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 proptest   = "1.11.0"
+tempfile   = "3.27.0"
 
 [package]
 name    = "ironquill"
@@ -48,6 +53,8 @@ path = "src/main.rs"
 [dependencies]
 ironquill-core.workspace     = true
 ironquill-llm.workspace      = true
+ironquill-tools.workspace    = true
+ironquill-agent.workspace    = true
 anyhow.workspace             = true
 clap.workspace               = true
 tokio.workspace              = true

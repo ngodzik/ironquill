@@ -2,11 +2,19 @@
 
 #![deny(unsafe_code)]
 
-use anyhow::{Context, Result};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use ironquill_agent::{AgentConfig, Event, Outcome, Verdict};
 use ironquill_core::{ChatModel, ChatRequest, Message, ModelId};
 use ironquill_llm::OpenAiCompatible;
+use ironquill_tools::{Check, Toolbox, Workspace};
 use tracing_subscriber::EnvFilter;
+
+/// How many tracked file names go to the model up front. Enough to orient it
+/// in a typical project, bounded so that a monorepo does not fill the context.
+const FILE_LIST_LIMIT: usize = 300;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -40,6 +48,40 @@ enum Command {
         #[arg(long, env = "IRONQUILL_MODEL")]
         model: String,
     },
+
+    /// Change the project in the current directory until its checks pass.
+    Do {
+        /// What to do, in plain words.
+        task: String,
+
+        /// The model tried first. Pick a cheap one: it is only kept if the
+        /// checks pass.
+        #[arg(long, env = "IRONQUILL_MODEL")]
+        model: String,
+
+        /// A stronger model to call if the previous one cannot make the checks
+        /// pass. Repeat to add more, cheapest first.
+        #[arg(long = "escalate", value_name = "MODEL")]
+        escalate: Vec<String>,
+
+        /// A command that must succeed, run without a shell. Repeat to add
+        /// more. Defaults to `cargo check --all-targets` then `cargo test` in a
+        /// Rust project.
+        #[arg(long = "check", value_name = "COMMAND")]
+        checks: Vec<String>,
+
+        /// How many times one model may try before the next takes over.
+        #[arg(long, default_value_t = 2)]
+        rounds: u32,
+
+        /// How many turns one try may take.
+        #[arg(long, default_value_t = 30)]
+        max_turns: u32,
+
+        /// Start even if the working tree has uncommitted changes.
+        #[arg(long)]
+        allow_dirty: bool,
+    },
 }
 
 #[tokio::main]
@@ -55,7 +97,44 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Ask { prompt, model } => ask(&provider, &prompt, &model).await,
+        Command::Do {
+            task,
+            model,
+            escalate,
+            checks,
+            rounds,
+            max_turns,
+            allow_dirty,
+        } => {
+            let mut builder = AgentConfig::builder()
+                .tier(ModelId::new(model)?)
+                .rounds_per_tier(rounds)
+                .max_turns(max_turns);
+            for model in escalate {
+                builder = builder.tier(ModelId::new(model)?);
+            }
+            for check in checks_or_default(checks)? {
+                builder = builder.check(check);
+            }
+            run_task(&provider, &builder.build()?, &task, allow_dirty).await
+        }
     }
+}
+
+fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {
+    if lines.is_empty() {
+        if Path::new("Cargo.toml").exists() {
+            return Ok(["cargo check --all-targets", "cargo test"]
+                .into_iter()
+                .filter_map(Check::parse)
+                .collect());
+        }
+        bail!("no check given and no Cargo.toml here: pass at least one --check");
+    }
+    lines
+        .iter()
+        .map(|line| Check::parse(line).with_context(|| format!("empty check: {line:?}")))
+        .collect()
 }
 
 async fn ask(provider: &OpenAiCompatible, prompt: &str, model: &str) -> Result<()> {
@@ -63,6 +142,7 @@ async fn ask(provider: &OpenAiCompatible, prompt: &str, model: &str) -> Result<(
     let request = ChatRequest {
         model: model.clone(),
         messages: vec![Message::user(prompt)],
+        tools: Vec::new(),
     };
 
     // The price list is fetched alongside the answer rather than before it, so
@@ -70,17 +150,103 @@ async fn ask(provider: &OpenAiCompatible, prompt: &str, model: &str) -> Result<(
     let (response, pricing) = tokio::join!(provider.complete(&request), provider.pricing(&model));
     let response = response.context("the request failed")?;
 
-    println!("{}", response.content);
+    println!("{}", response.content.as_deref().unwrap_or_default());
     eprintln!();
     eprintln!("Model:  {model}");
     eprintln!("Input:  {}", response.usage.input);
     eprintln!("Output: {}", response.usage.output);
-    match pricing {
-        Ok(pricing) => eprintln!("Cost:   {}", pricing.cost(&response.usage)),
-        Err(error) => {
-            tracing::debug!("no price for {model}: {error:#}");
-            eprintln!("Cost:   unknown");
-        }
+    // The provider's own figure wins: it knows about caching and discounts.
+    let cost = response
+        .cost
+        .or_else(|| pricing.as_ref().ok().map(|p| p.cost(&response.usage)));
+    match cost {
+        Some(cost) => eprintln!("Cost:   {cost}"),
+        None => eprintln!("Cost:   unknown"),
     }
     Ok(())
+}
+
+async fn run_task(
+    provider: &OpenAiCompatible,
+    config: &AgentConfig,
+    task: &str,
+    allow_dirty: bool,
+) -> Result<()> {
+    let workspace = Workspace::new(".")?;
+    let root = workspace.root().to_owned();
+
+    let clean = ironquill_tools::is_clean(&root)
+        .await
+        .context("ironquill do needs a git repository: git is how its changes are undone")?;
+    if !clean && !allow_dirty {
+        bail!(
+            "the working tree has uncommitted changes. Commit or stash them first, so that \
+             `git checkout .` can undo ironquill without undoing you, or pass --allow-dirty"
+        );
+    }
+
+    let files = ironquill_tools::tracked_files(&root, FILE_LIST_LIMIT).await?;
+    let context = format!("Files tracked by git:\n{}", files.join("\n"));
+
+    let mut toolbox = Toolbox::new(workspace);
+    let outcome =
+        ironquill_agent::run(provider, &mut toolbox, config, task, &context, show).await?;
+    summarize(&outcome)
+}
+
+fn show(event: Event) {
+    match event {
+        Event::Turn { model, usage, cost } => {
+            let cost = cost.map_or_else(|| "cost ?".to_owned(), |c| c.to_string());
+            eprintln!(
+                "· {model}  in {}  out {}  {cost}",
+                usage.input, usage.output
+            );
+        }
+        Event::Tool { name, path, error } => {
+            let path = path.unwrap_or_default();
+            match error {
+                None => eprintln!("    {name} {path}"),
+                Some(error) => eprintln!("    {name} {path}  ✗ {error}"),
+            }
+        }
+        Event::Checking => eprintln!("▸ running checks"),
+        Event::Passed => eprintln!("✓ checks passed"),
+        Event::Failed { command } => eprintln!("✗ {command} failed"),
+        Event::Escalating { from, to } => eprintln!("↑ {from} gave up, escalating to {to}"),
+    }
+}
+
+fn summarize(outcome: &Outcome) -> Result<()> {
+    eprintln!();
+    if outcome.changed.is_empty() {
+        eprintln!("Changed: nothing");
+    } else {
+        eprintln!("Changed: {}", outcome.changed.join(", "));
+    }
+    eprintln!(
+        "Tokens:  in {}  out {}",
+        outcome.usage.input, outcome.usage.output
+    );
+    let partial = if outcome.cost_complete {
+        ""
+    } else {
+        " (some turns did not report a cost)"
+    };
+    eprintln!("Cost:    {}{partial}", outcome.cost);
+
+    match &outcome.verdict {
+        Verdict::Passed { model } => {
+            eprintln!("Result:  checks pass, change by {model}");
+            eprintln!("Review with `git diff`, undo with `git checkout . && git clean -fd`.");
+            Ok(())
+        }
+        Verdict::GaveUp { failure } => {
+            if let Some(f) = failure {
+                eprintln!("\nLast failure, `{}`:\n{}", f.command, f.excerpt);
+            }
+            eprintln!("\nUndo with `git checkout . && git clean -fd`.");
+            bail!("no model made the checks pass")
+        }
+    }
 }
