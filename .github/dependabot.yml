@@ -1,0 +1,26 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "08:00"
+      timezone: Europe/Paris
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "08:00"
+      timezone: Europe/Paris
+    ignore:
+      # The branches of this action are toolchain names, not releases. The
+      # version that matters lives in rust-version in Cargo.toml.
+      - dependency-name: dtolnay/rust-toolchain

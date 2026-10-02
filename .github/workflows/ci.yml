@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push replaces the run it supersedes instead of queueing behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The workflow only reads the repository. Nothing here needs write access.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning that nobody reads is a warning that does not exist.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: Format, lints and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --all-features
+
+      # CLAUDE.md requires a doc-comment on every public item. This is what
+      # checks that the promise is kept, and it catches broken intra-doc links
+      # at the same time.
+      - name: Documentation
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux, where ironquill is developed and used. Another system is
+        # added here the day it is supported.
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --workspace --all-features
+
+  msrv:
+    name: Oldest supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The ref is the toolchain: this installs Rust 1.89. Keep it in step with
+      # rust-version in Cargo.toml, which is the value that binds. Dependabot
+      # is told to leave it alone in dependabot.yml.
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+
+      # The ref above and rust-version state the same fact in two places, and two
+      # places drift. This makes them disagree loudly instead of leaving the job
+      # quietly testing a toolchain nobody promised.
+      - name: The toolchain is the one the manifest promises
+        run: |
+          declared=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1 | cut -d. -f1,2)
+          installed=$(rustc --version | cut -d' ' -f2 | cut -d. -f1,2)
+          echo "Cargo.toml says $declared, this runner has $installed"
+          if [ -z "$declared" ]; then
+            echo "::error::no rust-version found in Cargo.toml"
+            exit 1
+          fi
+          if [ "$declared" != "$installed" ]; then
+            echo "::error::Cargo.toml promises Rust $declared but CI installed $installed"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo check --workspace --all-targets --all-features

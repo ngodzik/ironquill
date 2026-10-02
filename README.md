@@ -1,1 +1,61 @@
 # ironquill
+
+[![CI](https://github.com/ngodzik/ironquill/actions/workflows/ci.yml/badge.svg)](https://github.com/ngodzik/ironquill/actions/workflows/ci.yml) [![Security](https://github.com/ngodzik/ironquill/actions/workflows/security.yml/badge.svg)](https://github.com/ngodzik/ironquill/actions/workflows/security.yml)
+
+**An experimental terminal coding agent, built around my own way of working. It comes with no guarantee of any kind.**
+
+## Read this first
+
+This is a personal experiment, not a product. It is shaped by my habits and my needs, it changes whenever those do, and it has been tested far less than anything you should rely on.
+
+- **It changes your files without asking.** Edits are written to disk as the model makes them, with no confirmation step. Run it in a git repository, commit before you start, and read every diff it shows you.
+- **Watch it closely.** It can misread a request, edit the wrong thing, or keep going on a bad path. Stop it with Ctrl-C the moment something looks wrong.
+- **It spends money.** Every request goes to a paid API. The cost shown is the one the provider reports; when a provider reports none, the total is incomplete, and the interface says so.
+- **It has seen little real use.** Around a hundred unit tests, most of the agent loop exercised against a fake server, a handful of sessions with a real model. Linux only.
+
+**If you are looking for a coding agent to use, use one of these instead:** [OpenCode](https://opencode.ai), [Pi](https://pi.dev) or [Claude Code](https://code.claude.com/docs/en/overview). They are far more mature, far better tested, more general, and supported by people whose work it is. ironquill overlaps with them on purpose: writing one is how I learn what makes them work and try ideas of my own.
+
+## The idea
+
+Deterministic tools before models. Compilers, tests, linters and git are cheap, fast and right, so they do what they can, and a model is called for the rest. A change is kept when the project's checks pass. A cheap model goes first, and a stronger one is called only when the cheap one has failed the checks, starting from a short brief rather than the whole history. Every request shows what it cost.
+
+The interface follows my editor habits: Vim-like modes, a leader key, files opened beside the conversation and edited with Vim keys.
+
+## What it does today
+
+- A conversation in the terminal: questions get answers, requests for changes get edits shown as diffs, then the checks (`cargo check` and `cargo test` in a Rust project, any command with `/check`)
+- Escalation from a cheap model to stronger ones when the checks keep failing
+- Cost and tokens per request and for the whole conversation
+- Conversations saved locally and resumed with `ironquill -c` or `/resume`
+- A file tree, an open file coloured by language and editable with Vim keys (visual mode, registers including the system clipboard, `:s`, search)
+- A pane listing running Docker containers
+- Any OpenAI compatible endpoint, Requesty by default
+
+## What it does not do
+
+- Ask before writing a file
+- Stream answers as they are written
+- Run on anything but Linux, as far as anyone has checked
+- Sandbox the check commands: they run as you configured them
+
+## Usage
+
+```bash
+export IRONQUILL_API_KEY=...        # your provider key
+cd your-project
+ironquill --model <cheap-model> --escalate <strong-model>
+```
+
+`/help` lists the commands and keys. `IRONQUILL_BASE_URL` points it at another OpenAI compatible endpoint.
+
+## Building
+
+```bash
+cargo install --path .              # builds the ironquill binary into ~/.cargo/bin
+scripts/check.sh                    # what CI runs: formatting, lints, docs, tests, dependency audit
+git config core.hooksPath .githooks # run those checks before every commit
+```
+
+## License
+
+MIT

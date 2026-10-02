@@ -1,0 +1,24 @@
+[package]
+name    = "ironquill-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The ironquill terminal interface: Vim-like modes over the agent loop."
+
+[dependencies]
+ironquill-core.workspace  = true
+ironquill-tools.workspace = true
+ironquill-agent.workspace = true
+thiserror.workspace       = true
+ratatui.workspace         = true
+crossterm.workspace       = true
+futures.workspace         = true
+syntect.workspace         = true
+regex.workspace           = true
+serde.workspace           = true
+serde_json.workspace      = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,81 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/llm",
+    "crates/tools",
+    "crates/agent",
+    "crates/tui",
+    ".",
+]
+resolver = "3"
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2024"
+# The oldest toolchain the code is known to build on. CI holds it to this, so
+# the promise is checked rather than asserted.
+rust-version = "1.89"
+authors     = ["Nicolas Godzik"]
+license     = "MIT"
+
+[workspace.dependencies]
+ironquill-core = { path = "crates/core", version = "0.1.0" }
+ironquill-llm  = { path = "crates/llm", version = "0.1.0" }
+ironquill-tools = { path = "crates/tools", version = "0.1.0" }
+ironquill-agent = { path = "crates/agent", version = "0.1.0" }
+ironquill-tui   = { path = "crates/tui", version = "0.1.0" }
+
+thiserror  = "2.0.21"
+anyhow     = "1.0.104"
+serde      = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio      = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+clap       = { version = "4.6.7", features = ["derive", "env"] }
+# The default TLS backend verifies against the operating system trust store, so
+# a corporate proxy whose root is installed on the machine just works, where a
+# bundled root list would refuse it.
+reqwest    = { version = "0.13.5", features = ["json"] }
+tracing            = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+proptest   = "1.11.0"
+tempfile   = "3.27.0"
+ratatui    = "0.30.2"
+# The same version ratatui drives, with the async event stream on top.
+crossterm  = { version = "0.29.0", features = ["event-stream"] }
+futures    = "0.3.34"
+regex      = "1.13.1"
+# Pure Rust regex engine instead of the default C Oniguruma: nothing to build
+# in C, the same on every platform.
+syntect    = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+
+[package]
+name    = "ironquill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A terminal coding agent that lets deterministic tools do the work before any model does."
+
+[[bin]]
+name = "ironquill"
+path = "src/main.rs"
+
+[dependencies]
+ironquill-core.workspace     = true
+ironquill-llm.workspace      = true
+ironquill-tools.workspace    = true
+ironquill-agent.workspace    = true
+ironquill-tui.workspace      = true
+anyhow.workspace             = true
+clap.workspace               = true
+tokio.workspace              = true
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+# Token counts and costs are summed over a whole session. An overflow that
+# wraps silently would print a number that looks like a bill; a panic is the
+# cheaper failure.
+overflow-checks = true
