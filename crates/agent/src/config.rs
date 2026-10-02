@@ -80,16 +80,12 @@ impl AgentConfigBuilder {
     ///
     /// # Errors
     ///
-    /// [`AgentError::Config`] without a model, without a check, or with a
-    /// zero round or turn budget.
+    /// [`AgentError::Config`] without a model, or with a zero round or turn
+    /// budget. No check is allowed: changes are then kept as written, and
+    /// the verdict says they were not checked.
     pub fn build(self) -> Result<AgentConfig, AgentError> {
         if self.tiers.is_empty() {
             return Err(AgentError::Config("at least one model is needed"));
-        }
-        // Without a check nothing judges the change, and the whole point of
-        // the loop is that the model's own opinion of its work is not enough.
-        if self.checks.is_empty() {
-            return Err(AgentError::Config("at least one check is needed"));
         }
         if self.rounds_per_tier == 0 || self.max_turns == 0 {
             return Err(AgentError::Config(

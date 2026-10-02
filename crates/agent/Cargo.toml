@@ -10,6 +10,7 @@ description = "The ironquill loop: a model edits, deterministic checks judge, a 
 ironquill-core.workspace  = true
 ironquill-tools.workspace = true
 thiserror.workspace       = true
+serde.workspace           = true
 serde_json.workspace      = true
 
 [dev-dependencies]

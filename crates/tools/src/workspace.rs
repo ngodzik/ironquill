@@ -73,9 +73,20 @@ impl Workspace {
 
     pub(crate) fn read(&self, relative: &str) -> Result<String, ToolError> {
         let path = self.resolve(relative)?;
-        fs::read_to_string(&path).map_err(|source| ToolError::Io {
-            path: self.display(&path).to_owned(),
+        let shown = self.display(&path).to_owned();
+        let bytes = fs::read(&path).map_err(|source| ToolError::Io {
+            path: shown.clone(),
             source,
+        })?;
+        if is_binary(&bytes) {
+            return Err(ToolError::Binary {
+                path: shown,
+                bytes: bytes.len(),
+            });
+        }
+        String::from_utf8(bytes).map_err(|e| ToolError::Binary {
+            path: shown,
+            bytes: e.as_bytes().len(),
         })
     }
 
@@ -111,6 +122,27 @@ impl Workspace {
     }
 }
 
+/// How many leading bytes decide whether a file is binary. The heuristic git
+/// itself uses: text files do not contain a NUL byte near their start.
+const SNIFF: usize = 8000;
+
+/// Whether `bytes` look like binary data rather than text.
+pub(crate) fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(SNIFF).any(|b| *b == 0)
+}
+
+/// Whether the file at `path` looks binary, reading only its first bytes.
+/// A file that cannot be read counts as binary: there is no point offering
+/// it to the model.
+pub(crate) fn file_is_binary(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(SNIFF);
+    match fs::File::open(path) {
+        Ok(file) => file.take(SNIFF as u64).read_to_end(&mut head).is_err() || is_binary(&head),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +170,16 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
         assert!(ws.resolve("link/secret").is_err());
+    }
+
+    #[test]
+    fn a_binary_file_is_refused_clearly() {
+        let (dir, ws) = workspace();
+        std::fs::write(dir.path().join("app"), [0x7f, b'E', b'L', b'F', 0, 0, 1]).unwrap();
+        assert!(matches!(
+            ws.read("app"),
+            Err(ToolError::Binary { bytes: 7, .. })
+        ));
     }
 
     #[test]

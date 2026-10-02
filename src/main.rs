@@ -77,25 +77,23 @@ enum Command {
         /// How many turns one try may take.
         #[arg(long, default_value_t = 30)]
         max_turns: u32,
-
-        /// Start even if the working tree has uncommitted changes.
-        #[arg(long)]
-        allow_dirty: bool,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let api_key = cli.api_key.context("no API key: set IRONQUILL_API_KEY")?;
+    let provider = OpenAiCompatible::new(cli.base_url, api_key);
+
+    let command = cli.command;
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
-    let api_key = cli.api_key.context("no API key: set IRONQUILL_API_KEY")?;
-    let provider = OpenAiCompatible::new(cli.base_url, api_key);
-
-    match cli.command {
+    match command {
         Command::Ask { prompt, model } => ask(&provider, &prompt, &model).await,
         Command::Do {
             task,
@@ -104,7 +102,6 @@ async fn main() -> Result<()> {
             checks,
             rounds,
             max_turns,
-            allow_dirty,
         } => {
             let mut builder = AgentConfig::builder()
                 .tier(ModelId::new(model)?)
@@ -116,7 +113,7 @@ async fn main() -> Result<()> {
             for check in checks_or_default(checks)? {
                 builder = builder.check(check);
             }
-            run_task(&provider, &builder.build()?, &task, allow_dirty).await
+            run_task(&provider, &builder.build()?, &task).await
         }
     }
 }
@@ -129,7 +126,9 @@ fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {
                 .filter_map(Check::parse)
                 .collect());
         }
-        bail!("no check given and no Cargo.toml here: pass at least one --check");
+        // Nothing known to check this kind of project: changes are kept as
+        // written, as the verdict will say.
+        return Ok(Vec::new());
     }
     lines
         .iter()
@@ -166,27 +165,9 @@ async fn ask(provider: &OpenAiCompatible, prompt: &str, model: &str) -> Result<(
     Ok(())
 }
 
-async fn run_task(
-    provider: &OpenAiCompatible,
-    config: &AgentConfig,
-    task: &str,
-    allow_dirty: bool,
-) -> Result<()> {
+async fn run_task(provider: &OpenAiCompatible, config: &AgentConfig, task: &str) -> Result<()> {
     let workspace = Workspace::new(".")?;
-    let root = workspace.root().to_owned();
-
-    let clean = ironquill_tools::is_clean(&root)
-        .await
-        .context("ironquill do needs a git repository: git is how its changes are undone")?;
-    if !clean && !allow_dirty {
-        bail!(
-            "the working tree has uncommitted changes. Commit or stash them first, so that \
-             `git checkout .` can undo ironquill without undoing you, or pass --allow-dirty"
-        );
-    }
-
-    let files = ironquill_tools::tracked_files(&root, FILE_LIST_LIMIT).await?;
-    let context = format!("Files tracked by git:\n{}", files.join("\n"));
+    let context = ironquill_tools::project_context(workspace.root(), FILE_LIST_LIMIT).await;
 
     let mut toolbox = Toolbox::new(workspace);
     let outcome =
@@ -203,16 +184,21 @@ fn show(event: Event) {
                 usage.input, usage.output
             );
         }
-        Event::Tool { name, path, error } => {
+        Event::Said { text, .. } => eprintln!("  {text}"),
+        Event::Tool {
+            name,
+            path,
+            outcome,
+        } => {
             let path = path.unwrap_or_default();
-            match error {
-                None => eprintln!("    {name} {path}"),
-                Some(error) => eprintln!("    {name} {path}  ✗ {error}"),
+            match outcome {
+                Ok(_) => eprintln!("    {name} {path}"),
+                Err(error) => eprintln!("    {name} {path}  ✗ {error}"),
             }
         }
-        Event::Checking => eprintln!("▸ running checks"),
+        Event::Checking { commands } => eprintln!("▸ running {}", commands.join(", then ")),
         Event::Passed => eprintln!("✓ checks passed"),
-        Event::Failed { command } => eprintln!("✗ {command} failed"),
+        Event::Failed { command, .. } => eprintln!("✗ {command} failed"),
         Event::Escalating { from, to } => eprintln!("↑ {from} gave up, escalating to {to}"),
     }
 }
@@ -236,16 +222,21 @@ fn summarize(outcome: &Outcome) -> Result<()> {
     eprintln!("Cost:    {}{partial}", outcome.cost);
 
     match &outcome.verdict {
+        // `do` always runs the checks, so it never ends on a bare answer;
+        // reporting one as a pass would claim a check that did not happen.
+        Verdict::Answered => bail!("the model answered without changing anything"),
+        Verdict::Unchecked => {
+            eprintln!("Result:  changed, no check configured");
+            Ok(())
+        }
         Verdict::Passed { model } => {
             eprintln!("Result:  checks pass, change by {model}");
-            eprintln!("Review with `git diff`, undo with `git checkout . && git clean -fd`.");
             Ok(())
         }
         Verdict::GaveUp { failure } => {
             if let Some(f) = failure {
                 eprintln!("\nLast failure, `{}`:\n{}", f.command, f.excerpt);
             }
-            eprintln!("\nUndo with `git checkout . && git clean -fd`.");
             bail!("no model made the checks pass")
         }
     }

@@ -10,13 +10,15 @@
 #![warn(missing_docs)]
 
 mod check;
+mod diff;
 mod error;
 mod git;
 mod toolbox;
 mod workspace;
 
 pub use check::{Check, CheckFailure, CheckReport};
+pub use diff::DiffLine;
 pub use error::ToolError;
-pub use git::{is_clean, tracked_files};
-pub use toolbox::Toolbox;
+pub use git::{diff_stat, is_clean, project_context, project_files, tracked_files};
+pub use toolbox::{ToolOutput, ToolSummary, Toolbox};
 pub use workspace::Workspace;

@@ -39,6 +39,19 @@ pub enum ToolError {
         count: usize,
     },
 
+    /// The file holds binary data, which a model cannot read as text.
+    #[error("{path} is a binary file ({bytes} bytes), not text: it cannot be read or edited")]
+    Binary {
+        /// The file.
+        path: PathBuf,
+        /// Its size.
+        bytes: usize,
+    },
+
+    /// A directory listing was asked for a file.
+    #[error("{0} is a file, not a directory: read it with read_file")]
+    NotADirectory(PathBuf),
+
     /// The model called a tool that does not exist.
     #[error("there is no tool named {0}")]
     UnknownTool(String),

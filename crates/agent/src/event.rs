@@ -1,4 +1,5 @@
 use ironquill_core::{ModelId, Usage, Usd};
+use ironquill_tools::ToolSummary;
 
 /// Something that happened during a session, for whoever is watching.
 ///
@@ -15,23 +16,35 @@ pub enum Event {
         /// Cost for this turn alone, if the provider reported it.
         cost: Option<Usd>,
     },
+    /// A model wrote text: an explanation, or its closing summary.
+    Said {
+        /// Which model.
+        model: ModelId,
+        /// What it wrote.
+        text: String,
+    },
     /// A tool call was executed.
     Tool {
         /// The tool.
         name: String,
         /// The path it acted on, when it has one.
         path: Option<String>,
-        /// The error reported back to the model, if the call failed.
-        error: Option<String>,
+        /// What it did, or the error reported back to the model.
+        outcome: Result<ToolSummary, String>,
     },
-    /// The checks are about to run.
-    Checking,
+    /// The checks are about to run, in this order.
+    Checking {
+        /// The command lines.
+        commands: Vec<String>,
+    },
     /// The checks passed.
     Passed,
     /// A check failed.
     Failed {
         /// The command that failed.
         command: String,
+        /// The part of its output worth reading.
+        excerpt: String,
     },
     /// The next model takes over.
     Escalating {

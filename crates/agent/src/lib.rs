@@ -18,4 +18,4 @@ mod run;
 pub use config::{AgentConfig, AgentConfigBuilder};
 pub use error::AgentError;
 pub use event::Event;
-pub use run::{Outcome, Verdict, run};
+pub use run::{Outcome, Session, Verdict, run};

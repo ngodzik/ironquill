@@ -13,7 +13,7 @@ The goals, in order: reliability, cost, then speed. Every request shows what it 
 Early-stage personal project. What works today:
 
 - `ironquill do "<task>"` changes the project in the current directory until its checks pass. The model reads and edits files through a sandbox that refuses paths outside the project; it cannot run commands. When it stops, ironquill runs the checks itself (`cargo check --all-targets` and `cargo test` by default, any command with `--check`). A failure goes back to the same model, cut to the lines worth reading; after two rounds the next model given with `--escalate` takes over from a short brief, not the whole history. Every turn shows its tokens and cost
-- It refuses to start on a git tree with uncommitted changes, so that undoing it never undoes you
+- It works in any directory, git or not; without a check configured (outside a Rust project, say) changes are kept as written
 - `ironquill ask` sends one question to any OpenAI compatible endpoint (Requesty by default) and prints the answer with its token counts and its cost, priced from the provider's model list
 - TLS is verified against the operating system trust store, so a machine behind a corporate proxy works without extra setup
 
@@ -24,7 +24,6 @@ export IRONQUILL_API_KEY=...        # your provider key
 export IRONQUILL_MODEL=<model-id>        # as your provider names it
 ironquill ask "What does Rust's ? operator do?"
 
-# in a git repository with a clean working tree
 ironquill do "make the parser accept trailing commas" \
     --model <cheap-model> --escalate <strong-model>
 ```

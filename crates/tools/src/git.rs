@@ -3,6 +3,7 @@ use std::path::Path;
 use tokio::process::Command;
 
 use crate::error::ToolError;
+use crate::workspace::file_is_binary;
 
 async fn git(dir: &Path, args: &[&str]) -> Result<String, ToolError> {
     let output = Command::new("git")
@@ -52,4 +53,107 @@ pub async fn tracked_files(dir: &Path, limit: usize) -> Result<Vec<String>, Tool
         .take(limit)
         .map(str::to_owned)
         .collect())
+}
+
+/// A short account of what differs from the last commit: one line per changed
+/// or new file, then the line counts.
+///
+/// # Errors
+///
+/// [`ToolError::Git`] when `dir` is not inside a git repository.
+pub async fn diff_stat(dir: &Path) -> Result<String, ToolError> {
+    let status = git(dir, &["status", "--short"]).await?;
+    if status.trim().is_empty() {
+        return Ok("no changes since the last commit".into());
+    }
+    let stat = git(dir, &["diff", "--stat"]).await?;
+    Ok(format!("{}\n{}", status.trim_end(), stat.trim_end()))
+}
+
+/// The project's files, relative to `dir`, at most `limit` of them: the ones
+/// git tracks in a repository, otherwise every file found by walking the
+/// directory, skipping hidden directories and build output.
+///
+/// Never fails: an empty list only means the model will look for itself.
+pub async fn project_files(dir: &Path, limit: usize) -> Vec<String> {
+    // Binary files are left out: the model can do nothing with them, and
+    // seeing one by name invites it to try.
+    if let Ok(files) = tracked_files(dir, limit).await {
+        return files
+            .into_iter()
+            .filter(|f| !file_is_binary(&dir.join(f)))
+            .collect();
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, limit, &mut files);
+    files.sort();
+    files
+}
+
+/// Directories that hold what a build produced or downloaded, never sources.
+const SKIPPED: [&str; 3] = ["target", "node_modules", "__pycache__"];
+
+fn walk(root: &Path, dir: &Path, limit: usize, files: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        if files.len() >= limit {
+            return;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                if !SKIPPED.contains(&name.as_ref()) {
+                    walk(root, &path, limit, files);
+                }
+            }
+            Ok(t) if t.is_file() && !file_is_binary(&path) => {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    files.push(relative.to_string_lossy().into_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The opening context for a model: the project's text files, or a sentence
+/// saying there are none, so that it does not spend turns finding out.
+pub async fn project_context(dir: &Path, limit: usize) -> String {
+    let files = project_files(dir, limit).await;
+    if files.is_empty() {
+        "The project has no text files yet.".to_owned()
+    } else {
+        format!("Files in the project:\n{}", files.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn outside_git_the_directory_is_walked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".hidden")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        std::fs::write(dir.path().join("target/debug/app"), "").unwrap();
+        std::fs::write(dir.path().join(".hidden/x"), "").unwrap();
+        std::fs::write(dir.path().join("ironquill"), [0x7f, b'E', b'L', b'F', 0]).unwrap();
+
+        let files = project_files(dir.path(), 100).await;
+
+        assert_eq!(files, ["README.md", "src/main.rs"]);
+    }
 }

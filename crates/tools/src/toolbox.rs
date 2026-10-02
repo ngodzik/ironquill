@@ -2,12 +2,50 @@ use std::collections::BTreeSet;
 use std::fs;
 
 use ironquill_core::{ToolCall, ToolSpec};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::diff::{DiffLine, line_diff};
 use crate::error::ToolError;
 use crate::workspace::Workspace;
+
+/// What a tool call did, in a form an interface can show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolSummary {
+    /// A file was read.
+    Read {
+        /// The file.
+        path: String,
+        /// How many lines it has.
+        lines: usize,
+    },
+    /// A directory was listed.
+    Listed {
+        /// The directory.
+        path: String,
+        /// How many entries it holds.
+        entries: usize,
+    },
+    /// A file was edited, or written over an earlier version.
+    Changed {
+        /// The file.
+        path: String,
+        /// Whether the file did not exist before.
+        created: bool,
+        /// The changed lines.
+        diff: Vec<DiffLine>,
+    },
+}
+
+/// The result of a successful tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutput {
+    /// What the model is told.
+    pub for_model: String,
+    /// What the person is shown.
+    pub summary: ToolSummary,
+}
 
 /// The tools a model may call, bound to one workspace.
 ///
@@ -113,34 +151,84 @@ impl Toolbox {
     ///
     /// Any [`ToolError`]. The agent passes it back to the model as text: a
     /// failed edit is information for the next turn, not a reason to stop.
-    pub fn call(&mut self, call: &ToolCall) -> Result<String, ToolError> {
+    pub fn call(&mut self, call: &ToolCall) -> Result<ToolOutput, ToolError> {
         match call.name.as_str() {
             "read_file" => {
                 let args: PathArgs = parse(call)?;
-                self.workspace.read(&args.path)
+                let text = self.workspace.read(&args.path)?;
+                Ok(ToolOutput {
+                    summary: ToolSummary::Read {
+                        lines: text.lines().count(),
+                        path: args.path,
+                    },
+                    for_model: text,
+                })
             }
             "list_dir" => {
                 let args: PathArgs = parse(call)?;
-                self.list(&args.path)
+                let listing = self.list(&args.path)?;
+                Ok(ToolOutput {
+                    summary: ToolSummary::Listed {
+                        entries: listing.lines().count(),
+                        path: args.path,
+                    },
+                    for_model: listing,
+                })
             }
             "replace" => {
                 let args: ReplaceArgs = parse(call)?;
+                let before = self.workspace.read(&args.path)?;
                 self.workspace.replace(&args.path, &args.old, &args.new)?;
-                self.changed.insert(args.path);
-                Ok("replaced".into())
+                let after = self.workspace.read(&args.path)?;
+                Ok(self.changed_output(args.path, false, &before, &after, "replaced"))
             }
             "write_file" => {
                 let args: WriteArgs = parse(call)?;
+                let before = self.workspace.read(&args.path).ok();
                 self.workspace.write(&args.path, &args.content)?;
-                self.changed.insert(args.path);
-                Ok("written".into())
+                let created = before.is_none();
+                Ok(self.changed_output(
+                    args.path,
+                    created,
+                    before.as_deref().unwrap_or(""),
+                    &args.content,
+                    "written",
+                ))
             }
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
     }
 
+    fn changed_output(
+        &mut self,
+        path: String,
+        created: bool,
+        before: &str,
+        after: &str,
+        for_model: &str,
+    ) -> ToolOutput {
+        self.changed.insert(path.clone());
+        ToolOutput {
+            for_model: for_model.into(),
+            summary: ToolSummary::Changed {
+                path,
+                created,
+                diff: line_diff(before, after),
+            },
+        }
+    }
+
+    /// Forgets which files were changed, so that the next calls are counted
+    /// from here. A conversation does this before each request.
+    pub fn reset_changes(&mut self) {
+        self.changed.clear();
+    }
+
     fn list(&self, relative: &str) -> Result<String, ToolError> {
         let path = self.workspace.resolve(relative)?;
+        if path.is_file() {
+            return Err(ToolError::NotADirectory(relative.into()));
+        }
         let io = |source| ToolError::Io {
             path: relative.into(),
             source,
@@ -197,13 +285,52 @@ mod tests {
             .unwrap();
         let read = tools
             .call(&call("read_file", json!({"path": "src/a.rs"})))
-            .unwrap();
+            .unwrap()
+            .for_model;
 
         assert_eq!(read, "fn b() {}");
         assert_eq!(tools.changed().collect::<Vec<_>>(), ["src/a.rs"]);
         assert_eq!(
-            tools.call(&call("list_dir", json!({"path": "."}))).unwrap(),
+            tools
+                .call(&call("list_dir", json!({"path": "."})))
+                .unwrap()
+                .for_model,
             "src/"
+        );
+    }
+
+    #[test]
+    fn an_edit_reports_its_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = Toolbox::new(Workspace::new(dir.path()).unwrap());
+        let created = tools
+            .call(&call(
+                "write_file",
+                json!({"path": "a.rs", "content": "one\ntwo"}),
+            ))
+            .unwrap();
+        assert!(matches!(
+            created.summary,
+            ToolSummary::Changed { created: true, .. }
+        ));
+
+        let edited = tools
+            .call(&call(
+                "replace",
+                json!({"path": "a.rs", "old": "two", "new": "2"}),
+            ))
+            .unwrap();
+        let ToolSummary::Changed { created, diff, .. } = edited.summary else {
+            panic!("an edit should report a change");
+        };
+        assert!(!created);
+        assert_eq!(
+            diff,
+            [
+                DiffLine::Context("one".into()),
+                DiffLine::Removed("two".into()),
+                DiffLine::Added("2".into()),
+            ]
         );
     }
 

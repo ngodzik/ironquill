@@ -713,6 +713,7 @@ version = "0.1.0"
 dependencies = [
  "ironquill-core",
  "ironquill-tools",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
