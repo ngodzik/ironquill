@@ -50,9 +50,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux, where ironquill is developed and used. Another system is
-        # added here the day it is supported.
-        os: [ubuntu-latest]
+        # Linux, where ironquill is developed and used, and macOS, where it is
+        # meant to run too. Not Windows: nothing has been tried there.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
