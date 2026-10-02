@@ -88,7 +88,7 @@ impl Store {
             .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
             .filter_map(|e| serde_json::from_slice(&fs::read(e.path()).ok()?).ok())
             .collect();
-        found.sort_by(|a, b| b.updated.cmp(&a.updated));
+        found.sort_by_key(|s| std::cmp::Reverse(s.updated));
         found
     }
 
