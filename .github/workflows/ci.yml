@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push replaces the run it supersedes instead of queueing behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The workflow only reads the repository. Nothing here needs write access.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The same script a contributor runs before committing, so that local and
+  # remote checks cannot drift apart.
+  check:
+    name: Checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/check.sh
+
+  msrv:
+    name: Oldest supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Keep in step with rust-version in Cargo.toml; the next step fails if not.
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - name: The toolchain is the one the manifest promises
+        run: |
+          declared=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1 | cut -d. -f1,2)
+          installed=$(rustc --version | cut -d' ' -f2 | cut -d. -f1,2)
+          echo "Cargo.toml says $declared, this runner has $installed"
+          test -n "$declared" && test "$declared" = "$installed"
+      - run: cargo check --workspace --all-targets --all-features
