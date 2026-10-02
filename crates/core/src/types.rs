@@ -94,12 +94,16 @@ impl AddAssign for Usd {
 
 impl fmt::Display for Usd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // A real cost below a tenth of a cent would print as $0.000, which
-        // reads as free. Saying it is under the threshold is the honest form.
-        if self.0 > 0.0 && self.0 < 0.001 {
-            f.write_str("<$0.001")
-        } else {
-            write!(f, "${:.3}", self.0)
+        // Cheap models cost fractions of a cent per request: below a cent four
+        // decimals are shown, so that two requests can still be told apart.
+        // Below what four decimals can show, saying so beats printing $0.0000,
+        // which reads as free.
+        match self.0 {
+            0.0 => f.write_str("$0.00"),
+            x if x < 0.000_1 => f.write_str("<$0.0001"),
+            x if x < 0.01 => write!(f, "${x:.4}"),
+            x if x < 1.0 => write!(f, "${x:.3}"),
+            x => write!(f, "${x:.2}"),
         }
     }
 }
@@ -187,7 +191,7 @@ pub struct ToolSpec {
 }
 
 /// One call the model asked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// The provider's identifier for this call, echoed back with the result.
     pub id: String,
@@ -203,7 +207,7 @@ pub struct ToolCall {
 ///
 /// The variants carry exactly what each kind of message can hold, so that a
 /// tool result without a call id, say, cannot be built.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// Standing instructions for the model.
     System(String),
@@ -293,9 +297,11 @@ mod tests {
 
     #[test]
     fn usd_display_never_rounds_a_cost_to_free() {
-        assert_eq!(Usd(0.0).to_string(), "$0.000");
-        assert_eq!(Usd(0.000_2).to_string(), "<$0.001");
+        assert_eq!(Usd(0.0).to_string(), "$0.00");
+        assert_eq!(Usd(0.000_02).to_string(), "<$0.0001");
+        assert_eq!(Usd(0.000_23).to_string(), "$0.0002");
         assert_eq!(Usd(0.041).to_string(), "$0.041");
+        assert_eq!(Usd(12.345).to_string(), "$12.35");
     }
 
     #[test]
