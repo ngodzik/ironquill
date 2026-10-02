@@ -1,49 +1,59 @@
 # ironquill
 
-**A terminal coding agent that lets deterministic tools do the work before any model does.**
+[![CI](https://github.com/ngodzik/ironquill/actions/workflows/ci.yml/badge.svg)](https://github.com/ngodzik/ironquill/actions/workflows/ci.yml) [![Security](https://github.com/ngodzik/ironquill/actions/workflows/security.yml/badge.svg)](https://github.com/ngodzik/ironquill/actions/workflows/security.yml)
 
-## Idea
+**An experimental terminal coding agent, built around my own way of working. It comes with no guarantee of any kind.**
 
-Most coding agents are a chat with a model that can run commands. ironquill is the other way round: compilers, tests, linters, the LSP and git do everything they can, and a model is called only for what they cannot do. A patch is kept when the checks pass, and a more capable model is called only when a cheaper one has failed them.
+## Read this first
 
-The goals, in order: reliability, cost, then speed. Every request shows what it cost.
+This is a personal experiment, not a product. It is shaped by my habits and my needs, it changes whenever those do, and it has been tested far less than anything you should rely on.
 
-## Status
+- **It changes your files without asking.** Edits are written to disk as the model makes them, with no confirmation step. Run it in a git repository, commit before you start, and read every diff it shows you.
+- **Watch it closely.** It can misread a request, edit the wrong thing, or keep going on a bad path. Stop it with Ctrl-C the moment something looks wrong.
+- **It spends money.** Every request goes to a paid API. The cost shown is the one the provider reports; when a provider reports none, the total is incomplete, and the interface says so.
+- **It has seen little real use.** Around a hundred unit tests, most of the agent loop exercised against a fake server, a handful of sessions with a real model. Linux only.
 
-Early-stage personal project. What works today:
+**If you are looking for a coding agent to use, use one of these instead:** [OpenCode](https://opencode.ai), [Pi](https://pi.dev) or [Claude Code](https://code.claude.com/docs/en/overview). They are far more mature, far better tested, more general, and supported by people whose work it is. ironquill overlaps with them on purpose: writing one is how I learn what makes them work and try ideas of my own.
 
-- `ironquill` with no subcommand opens a conversation in the terminal. Ask a question and it answers; ask for a change and it edits the files, shows each edit as a diff, then runs the checks. Only a change triggers the checks, and only failing checks call the stronger models. History carries over from one message to the next until `/clear`. Commands start with `/` (`/help` lists them), or with `:` from Vim's normal mode, where `j`/`k` scroll. The status line shows the models and the session's tokens and cost as they accrue. Ctrl-C stops a request
-- Conversations are saved after every request under `~/.ironquill/sessions/<project>/` (or `$IRONQUILL_HOME`), with what the model saw, so that `ironquill -c` continues the last one and `ironquill -r` or `/resume` picks one from a list. `/name` names the current one. Each request shows its cost and tokens under it, the status line shows the conversation's total, `/cost` sums it up. Ctrl-C stops a request, Ctrl-C twice quits
-- Ctrl-G goes back to typing a message from anywhere, the open file included. Ctrl-K shows or hides a pane listing the running Docker containers, refreshed every two seconds
-- A file tree opens beside the conversation with Ctrl-B, or `,n` from normal mode. Arrows move, Enter opens a file in the middle pane with the conversation moved to the right, Tab switches panes, and the mouse clicks and scrolls. Files the agent changed are marked, and an open file follows its edits as they happen
-- An open file is coloured by its language and edited with Vim keys: insert, visual mode (`v`, `V`), delete, yank and put with registers (`"+` is the system clipboard), undo and redo, `:w`, `:q`, `:42`, `:s` with ranges, `/` search. A frame under the file shows the mode and the command being typed. Unsaved edits are never overwritten by the agent
-- `ironquill do "<task>"` changes the project in the current directory until its checks pass. The model reads and edits files through a sandbox that refuses paths outside the project; it cannot run commands. When it stops, ironquill runs the checks itself (`cargo check --all-targets` and `cargo test` by default, any command with `--check`). A failure goes back to the same model, cut to the lines worth reading; after two rounds the next model given with `--escalate` takes over from a short brief, not the whole history. Every turn shows its tokens and cost
-- `ironquill ask` sends one question to any OpenAI compatible endpoint (Requesty by default) and prints the answer with its token counts and its cost, priced from the provider's model list
-- TLS is verified against the operating system trust store, so a machine behind a corporate proxy works without extra setup
+## The idea
+
+Deterministic tools before models. Compilers, tests, linters and git are cheap, fast and right, so they do what they can, and a model is called for the rest. A change is kept when the project's checks pass. A cheap model goes first, and a stronger one is called only when the cheap one has failed the checks, starting from a short brief rather than the whole history. Every request shows what it cost.
+
+The interface follows my editor habits: Vim-like modes, a leader key, files opened beside the conversation and edited with Vim keys.
+
+## What it does today
+
+- A conversation in the terminal: questions get answers, requests for changes get edits shown as diffs, then the checks (`cargo check` and `cargo test` in a Rust project, any command with `/check`)
+- Escalation from a cheap model to stronger ones when the checks keep failing
+- Cost and tokens per request and for the whole conversation
+- Conversations saved locally and resumed with `ironquill -c` or `/resume`
+- A file tree, an open file coloured by language and editable with Vim keys (visual mode, registers including the system clipboard, `:s`, search)
+- A pane listing running Docker containers
+- Any OpenAI compatible endpoint, Requesty by default
+
+## What it does not do
+
+- Ask before writing a file
+- Stream answers as they are written
+- Run on anything but Linux, as far as anyone has checked
+- Sandbox the check commands: they run as you configured them
 
 ## Usage
 
 ```bash
 export IRONQUILL_API_KEY=...        # your provider key
-export IRONQUILL_MODEL=<model-id>        # as your provider names it
-ironquill ask "What does Rust's ? operator do?"
-
-# in a git repository: the interface
+cd your-project
 ironquill --model <cheap-model> --escalate <strong-model>
-
-# or one task, no interface
-ironquill do "make the parser accept trailing commas" \
-    --model <cheap-model> --escalate <strong-model>
 ```
 
-`IRONQUILL_BASE_URL` points it at another OpenAI compatible endpoint.
+`/help` lists the commands and keys. `IRONQUILL_BASE_URL` points it at another OpenAI compatible endpoint.
 
 ## Building
 
 ```bash
-cargo build --release               # the binary is target/release/ironquill
-scripts/check.sh                    # formatting, lints, docs, tests, dependency audit
-git config core.hooksPath .githooks # run the checks before every commit
+cargo install --path .              # builds the ironquill binary into ~/.cargo/bin
+scripts/check.sh                    # what CI runs: formatting, lints, docs, tests, dependency audit
+git config core.hooksPath .githooks # run those checks before every commit
 ```
 
 ## License
