@@ -11,6 +11,7 @@
 
 mod check;
 mod diff;
+mod docker;
 mod error;
 mod git;
 mod toolbox;
@@ -18,6 +19,7 @@ mod workspace;
 
 pub use check::{Check, CheckFailure, CheckReport};
 pub use diff::DiffLine;
+pub use docker::{Container, running_containers};
 pub use error::ToolError;
 pub use git::{diff_stat, is_clean, project_context, project_files, tracked_files};
 pub use toolbox::{ToolOutput, ToolSummary, Toolbox};
