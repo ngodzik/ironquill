@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn debug_never_shows_the_key() {
-        let provider = OpenAiCompatible::new("https://example.test/v1", "rqsty-sk-secret");
-        assert!(!format!("{provider:?}").contains("secret"));
+        let provider = OpenAiCompatible::new("https://example.test/v1", "not-a-real-key");
+        assert!(!format!("{provider:?}").contains("not-a-real-key"));
     }
 }

@@ -72,9 +72,9 @@ mod tests {
     fn reads_docker_ps_json_lines() {
         // The shape docker 29 prints, with made-up values.
         let text = concat!(
-            r#"{"Command":"\"docker-entrypoint.s…\"","CreatedAt":"2026-09-01 10:00:00 +0200 CEST","ID":"786ba3b6d691","Image":"postgres:17-alpine","Labels":"","LocalVolumes":"1","Mounts":"data","Names":"app-db","Networks":"bridge","Ports":"0.0.0.0:5432->5432/tcp","RunningFor":"2 hours ago","Size":"0B","State":"running","Status":"Up 2 hours"}"#,
+            r#"{"Command":"\"docker-entrypoint.s…\"","CreatedAt":"2026-09-01 10:00:00 +0200 CEST","ID":"0a1b2c3d4e5f","Image":"postgres:17-alpine","Labels":"","LocalVolumes":"1","Mounts":"data","Names":"app-db","Networks":"bridge","Ports":"0.0.0.0:5432->5432/tcp","RunningFor":"2 hours ago","Size":"0B","State":"running","Status":"Up 2 hours"}"#,
             "\n",
-            r#"{"ID":"23e829cc938f","Image":"web","Names":"app-web","Ports":"","State":"running","Status":"Up 5 minutes (healthy)"}"#,
+            r#"{"ID":"6a7b8c9d0e1f","Image":"web","Names":"app-web","Ports":"","State":"running","Status":"Up 5 minutes (healthy)"}"#,
             "\n"
         );
         let containers = parse(text).unwrap();
