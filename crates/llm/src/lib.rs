@@ -19,4 +19,4 @@ pub use agents::Agents;
 pub use claude_code::ClaudeCode;
 pub use codex::Codex;
 pub use error::LlmError;
-pub use openai_compat::OpenAiCompatible;
+pub use openai_compat::{Listed, OpenAiCompatible};

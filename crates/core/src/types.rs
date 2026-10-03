@@ -165,13 +165,17 @@ impl fmt::Display for Usd {
         // decimals are shown, so that two requests can still be told apart.
         // Below what four decimals can show, saying so beats printing $0.0000,
         // which reads as free.
-        match self.0 {
-            0.0 => f.write_str("$0.00"),
-            x if x < 0.000_1 => f.write_str("<$0.0001"),
-            x if x < 0.01 => write!(f, "${x:.4}"),
-            x if x < 1.0 => write!(f, "${x:.3}"),
-            x => write!(f, "${x:.2}"),
-        }
+        // Zeros past the cents say nothing: $0.10, not $0.100.
+        let text = match self.0 {
+            0.0 => return f.write_str("$0.00"),
+            x if x < 0.000_1 => return f.write_str("<$0.0001"),
+            x if x < 0.01 => format!("{x:.4}"),
+            x if x < 1.0 => format!("{x:.3}"),
+            x => return write!(f, "${x:.2}"),
+        };
+        let (units, decimals) = text.split_once('.').unwrap_or((&text, ""));
+        let decimals = decimals.trim_end_matches('0');
+        write!(f, "${units}.{decimals:0<2}")
     }
 }
 
@@ -462,6 +466,9 @@ mod tests {
 
     #[test]
     fn usd_display_never_rounds_a_cost_to_free() {
+        assert_eq!(Usd(0.10).to_string(), "$0.10");
+        assert_eq!(Usd(0.127).to_string(), "$0.127");
+        assert_eq!(Usd(0.005).to_string(), "$0.005");
         assert_eq!(Usd(0.0).to_string(), "$0.00");
         assert_eq!(Usd(0.000_02).to_string(), "<$0.0001");
         assert_eq!(Usd(0.000_23).to_string(), "$0.0002");

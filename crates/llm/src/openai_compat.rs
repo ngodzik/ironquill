@@ -60,6 +60,18 @@ impl OpenAiCompatible {
         parse_pricing(&url, &body, model)
     }
 
+    /// Every model the provider lists, with its prices and context window
+    /// when it gives them, to choose from.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pricing`], when the list cannot be fetched or read.
+    pub async fn list(&self) -> Result<Vec<Listed>, LlmError> {
+        let url = format!("{}/models", self.base_url);
+        let body = self.get(&url).await?;
+        parse_list(&url, &body)
+    }
+
     async fn get(&self, url: &str) -> Result<String, LlmError> {
         let response = self
             .http
@@ -110,6 +122,34 @@ impl ChatModel for OpenAiCompatible {
         };
         windows.get(model.as_str()).copied()
     }
+}
+
+/// A model of the provider's list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed {
+    /// Its identifier, as requests name it.
+    pub id: String,
+    /// Dollars per input token, when listed.
+    pub input_price: Option<f64>,
+    /// Dollars per output token, when listed.
+    pub output_price: Option<f64>,
+    /// The most it reads at once, in tokens, when listed.
+    pub context_window: Option<u64>,
+}
+
+fn parse_list(url: &str, body: &str) -> Result<Vec<Listed>, LlmError> {
+    let wire: WireModelList =
+        serde_json::from_str(body).map_err(|e| malformed(url, e.to_string()))?;
+    Ok(wire
+        .data
+        .into_iter()
+        .map(|m| Listed {
+            id: m.id,
+            input_price: m.input_price,
+            output_price: m.output_price,
+            context_window: m.context_window,
+        })
+        .collect())
 }
 
 fn parse_windows(body: &str) -> HashMap<String, u64> {
@@ -420,6 +460,20 @@ mod tests {
             parse_pricing(URL, body, &unpriced),
             Err(LlmError::UnknownModel(_))
         ));
+    }
+
+    #[test]
+    fn the_model_list_reads_prices_and_windows() {
+        let body = r#"{"data": [
+            {"id": "a/big", "input_price": 1.4e-7, "output_price": 2.8e-7, "context_window": 1000000},
+            {"id": "b/bare"}
+        ]}"#;
+        let list = parse_list(URL, body).unwrap();
+        assert_eq!(list[0].id, "a/big");
+        assert_eq!(list[0].input_price, Some(1.4e-7));
+        assert_eq!(list[0].context_window, Some(1_000_000));
+        assert_eq!(list[1].output_price, None);
+        assert!(parse_list(URL, "nope").is_err());
     }
 
     #[test]

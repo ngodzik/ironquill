@@ -103,15 +103,16 @@ fn render_keys(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(shown), inner);
 }
 
-/// The model picker (Ctrl-E), over everything else.
+/// The model picker (Ctrl-E), over everything else: what was typed to
+/// search, then the models, the current one marked ●, the team ✓.
 fn render_model_picker(frame: &mut Frame, app: &App) {
-    let Some(selected) = app.model_picker() else {
+    let Some(picker) = app.model_picker() else {
         return;
     };
-    let models = app.models();
+    let rows = app.model_rows();
     let screen = frame.area();
-    let width = (screen.width * 3 / 5).clamp(30, 80).min(screen.width);
-    let height = (models.len() as u16 + 2).clamp(3, screen.height.saturating_sub(4).max(3));
+    let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
+    let height = (rows.len() as u16 + 3).clamp(4, screen.height.saturating_sub(4).max(4));
     let area = Rect::new(
         screen.x + (screen.width - width) / 2,
         screen.y + screen.height.saturating_sub(height) / 3,
@@ -125,28 +126,37 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
 
     let room = usize::from(inner.width);
     let current = app.current_model();
-    let lines: Vec<Line> = models
-        .iter()
-        .enumerate()
-        .map(|(i, model)| {
-            let mark = if Some(model) == current { "● " } else { "  " };
-            let kind = match model.delegate() {
-                Some((agent, _)) => format!("{agent} · subscription"),
-                None => "API · pay per request".to_owned(),
-            };
-            let name = format!("{mark}{model}");
-            let gap = room.saturating_sub(name.chars().count() + kind.chars().count() + 1);
-            let style = if i == selected {
-                Style::new().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::new()
-            };
-            Line::from(vec![
-                Span::styled(format!("{name}{}", " ".repeat(gap)), style),
-                Span::styled(kind, style.fg(DIM)),
-            ])
-        })
-        .collect();
+    let mut lines = vec![Line::from(vec![
+        Span::styled("search ", fg(DIM)),
+        Span::raw(picker.filter.clone()),
+        Span::styled("▏", fg(ACCENT)),
+    ])];
+    let visible = usize::from(inner.height).saturating_sub(1);
+    let first = picker.selected.saturating_sub(visible.saturating_sub(1));
+    for (i, row) in rows.iter().enumerate().skip(first).take(visible) {
+        let mark = if Some(&row.model) == current {
+            "●"
+        } else {
+            " "
+        };
+        let team = if row.in_team { "✓" } else { " " };
+        let name = format!("{mark} {team} {}", row.model);
+        let gap = room.saturating_sub(name.chars().count() + row.note.chars().count() + 1);
+        let mut style = Style::new();
+        if !row.offered {
+            style = style.fg(DIM);
+        }
+        if i == picker.selected {
+            style = Style::new().add_modifier(Modifier::REVERSED);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("{name}{}", " ".repeat(gap)), style),
+            Span::styled(row.note.clone(), style.fg(DIM)),
+        ]));
+    }
+    if rows.is_empty() {
+        lines.push(Line::styled("  no model matches", fg(DIM)));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -853,6 +863,27 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 width,
             );
         }
+        Entry::Delegating { from, to, task } => {
+            out.push(action(
+                Color::Magenta,
+                "Delegate",
+                &format!("{from} → {to}"),
+            ));
+            result(&mut out, task, fg(DIM), width);
+        }
+        Entry::OverBudget { spent, budget } => {
+            push_wrapped(
+                &mut out,
+                Span::styled("✗ ", fg(Color::Yellow)),
+                "  ",
+                &format!(
+                    "Budget of {budget} for this request spent ({spent}): the work stopped. \
+                     /budget <dollars> changes it"
+                ),
+                fg(Color::Yellow),
+                width,
+            );
+        }
         Entry::GaveUp => {
             push_wrapped(
                 &mut out,
@@ -1177,6 +1208,19 @@ fn visible_window(editor: &LineEditor, prompt: &str, width: usize) -> (String, u
     (shown, cursor - start)
 }
 
+/// The size of the team and the budget, for the status line.
+fn team_and_budget(app: &App) -> String {
+    let team = match app.team_size() {
+        0 => String::new(),
+        n => format!(" · team {n}"),
+    };
+    let budget = app
+        .budget()
+        .map(|b| format!(" · budget {b}"))
+        .unwrap_or_default();
+    format!("{team}{budget}")
+}
+
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let mode = match app.mode() {
         Mode::Normal => "-- NORMAL --",
@@ -1217,14 +1261,15 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(current, fg(ACCENT)),
         Span::styled(
             format!(
-                "{rest} · {} in · {} out · {}{}{}  ",
+                "{rest}{} · {} in · {} out · {}{}{}  ",
+                team_and_budget(app),
                 usage.input,
                 usage.output,
                 cost,
                 if complete { "" } else { "+?" },
                 app.context()
                     .map(|c| format!(" · ctx {}%", c.percent()))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
             ),
             fg(DIM),
         ),

@@ -18,4 +18,9 @@ pub enum AgentError {
     /// A check could not even be started.
     #[error("a check could not run")]
     Check(#[source] ToolError),
+
+    /// The request spent its budget. [`crate::Session::send`] turns it into
+    /// [`crate::Verdict::OverBudget`]; it is only seen inside the crate.
+    #[error("the request spent its budget")]
+    OverBudget,
 }

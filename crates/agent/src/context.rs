@@ -227,7 +227,7 @@ pub(crate) fn approx_tokens(messages: &[Message]) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn conversation() -> Vec<Message> {

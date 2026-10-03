@@ -1,4 +1,4 @@
-use ironquill_core::ModelId;
+use ironquill_core::{ModelId, Usd};
 use ironquill_tools::Check;
 
 use crate::error::AgentError;
@@ -10,6 +10,18 @@ pub struct AgentConfig {
     pub(crate) rounds_per_tier: u32,
     pub(crate) max_turns: u32,
     pub(crate) checks: Vec<Check>,
+    pub(crate) team: Vec<Member>,
+    pub(crate) budget: Option<Usd>,
+}
+
+/// A model the first one may hand a task to, with what it should know to
+/// choose it, such as its price.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Member {
+    /// The model, or an agent such as `claude-code/opus`.
+    pub model: ModelId,
+    /// A few words for the model choosing: price, context, strengths.
+    pub note: String,
 }
 
 impl AgentConfig {
@@ -19,7 +31,7 @@ impl AgentConfig {
     ///
     /// ```
     /// use ironquill_agent::AgentConfig;
-    /// use ironquill_core::ModelId;
+    /// use ironquill_core::{ModelId, Usd};
     /// use ironquill_tools::Check;
     ///
     /// let config = AgentConfig::builder()
@@ -35,6 +47,8 @@ impl AgentConfig {
             rounds_per_tier: 2,
             max_turns: 30,
             checks: Vec::new(),
+            team: Vec::new(),
+            budget: None,
         }
     }
 }
@@ -46,6 +60,8 @@ pub struct AgentConfigBuilder {
     rounds_per_tier: u32,
     max_turns: u32,
     checks: Vec<Check>,
+    team: Vec<Member>,
+    budget: Option<Usd>,
 }
 
 impl AgentConfigBuilder {
@@ -76,6 +92,21 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// Adds a model the first one may hand tasks to, through a `delegate`
+    /// tool. Without any, it has no such tool.
+    pub fn member(mut self, member: Member) -> Self {
+        self.team.push(member);
+        self
+    }
+
+    /// The most one request may cost. Once it is spent, the work stops and
+    /// the first model explains where it is and asks what to do. Turns run
+    /// on a subscription do not count.
+    pub fn budget(mut self, budget: Usd) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
     /// Validates and builds.
     ///
     /// # Errors
@@ -97,6 +128,8 @@ impl AgentConfigBuilder {
             rounds_per_tier: self.rounds_per_tier,
             max_turns: self.max_turns,
             checks: self.checks,
+            team: self.team,
+            budget: self.budget,
         })
     }
 }

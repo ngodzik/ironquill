@@ -6,13 +6,15 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use ironquill_agent::{AgentConfig, Event, Outcome, Verdict};
-use ironquill_core::{ChatModel, ChatRequest, Message, ModelId};
-use ironquill_llm::{Agents, ClaudeCode, Codex, OpenAiCompatible};
+use ironquill_agent::{AgentConfig, Event, Member, Outcome, Verdict};
+use ironquill_core::{ChatModel, ChatRequest, Message, ModelId, Usd};
+use ironquill_llm::{Agents, ClaudeCode, Codex, Listed, OpenAiCompatible};
 use ironquill_tools::{Check, ToolSummary, Toolbox, Workspace};
+use ironquill_tui::Defaults;
 use tracing_subscriber::EnvFilter;
 
 /// How many tracked file names go to the model up front. Enough to orient it
@@ -54,6 +56,12 @@ struct Cli {
     /// Checks for the interface. Defaults as for `do`.
     #[arg(long = "check", value_name = "COMMAND")]
     checks: Vec<String>,
+
+    /// The most one request may cost, in dollars. Past it the work stops
+    /// and the model says where it is. Defaults to the one kept with
+    /// /defaults, or 0.10.
+    #[arg(long, env = "IRONQUILL_BUDGET")]
+    budget: Option<f64>,
 
     /// Continue this project's most recent conversation.
     #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
@@ -127,8 +135,14 @@ async fn main() -> Result<()> {
         } else {
             ironquill_tui::Start::New
         };
-        let models = cli.models;
-        return interface(provider, cli.model, cli.escalate, models, cli.checks, start).await;
+        let choices = Choices {
+            model: cli.model,
+            escalate: cli.escalate,
+            offered: cli.models,
+            checks: cli.checks,
+            budget: cli.budget,
+        };
+        return interface(provider, choices, start).await;
     };
 
     tracing_subscriber::fmt()
@@ -161,38 +175,87 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn interface(
-    provider: OpenAiCompatible,
+/// What the command line chose for the interface; the rest comes from the
+/// defaults kept with /defaults.
+struct Choices {
     model: Option<String>,
     escalate: Vec<String>,
     offered: Vec<String>,
     checks: Vec<String>,
+    budget: Option<f64>,
+}
+
+async fn interface(
+    provider: OpenAiCompatible,
+    choices: Choices,
     start: ironquill_tui::Start,
 ) -> Result<()> {
     let workspace = Workspace::new(".")?;
+    let defaults = match Defaults::path() {
+        Some(path) => Defaults::load(&path).map_err(anyhow::Error::msg)?,
+        None => Defaults::default(),
+    };
 
     let mut tiers = Vec::new();
-    for id in model.into_iter().chain(escalate) {
+    for id in choices
+        .model
+        .or(defaults.model)
+        .into_iter()
+        .chain(choices.escalate)
+    {
         tiers.push(ModelId::new(id)?);
     }
-    let checks = checks_or_default(checks)?;
+    let checks = checks_or_default(choices.checks)?;
 
     let claude = ClaudeCode::find();
     let codex = Codex::find();
-    let mut models = Vec::new();
-    for id in offered.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        models.push(ModelId::new(id)?);
+    let mut models: Vec<ModelId> = Vec::new();
+    for id in choices.offered.iter().chain(&defaults.models) {
+        let id = ModelId::new(id.trim())?;
+        if !models.contains(&id) {
+            models.push(id);
+        }
     }
     if claude.is_some() {
         for id in ["claude-code/opus", "claude-code/sonnet"] {
-            models.push(ModelId::new(id)?);
+            let id = ModelId::new(id)?;
+            if !models.contains(&id) {
+                models.push(id);
+            }
         }
     }
     if let Some(codex) = &codex {
         for id in codex.models() {
-            models.push(ModelId::new(format!("codex/{id}"))?);
+            let id = ModelId::new(format!("codex/{id}"))?;
+            if !models.contains(&id) {
+                models.push(id);
+            }
         }
     }
+    let team = defaults
+        .team
+        .iter()
+        .map(ModelId::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    let budget = choices
+        .budget
+        .or(defaults.budget)
+        .unwrap_or(Defaults::BUDGET);
+    // The provider's list, to search and to price the team; without it the
+    // interface still works, with less to show.
+    let catalog = tokio::time::timeout(Duration::from_secs(10), provider.list())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|listed| {
+            Some(Member {
+                note: note(&listed),
+                model: ModelId::new(listed.id).ok()?,
+            })
+        })
+        .collect();
 
     let settings = ironquill_tui::Settings {
         tiers,
@@ -200,6 +263,9 @@ async fn interface(
         rounds: 2,
         max_turns: 30,
         models,
+        team,
+        budget: (budget > 0.0).then_some(Usd(budget)),
+        catalog,
     };
     // Without an agent installed, choosing one of its models fails with a
     // message saying so rather than at startup.
@@ -216,6 +282,42 @@ async fn interface(
     )
     .await?;
     Ok(())
+}
+
+/// A few words on a listed model for the person and the model choosing:
+/// `$0.14 / $0.28 per M tokens · 1M context`.
+fn note(listed: &Listed) -> String {
+    let per_million = |price: f64| {
+        let dollars = price * 1_000_000.0;
+        let text = format!("{dollars:.3}");
+        let text = text.trim_end_matches('0');
+        let text = if text.ends_with('.') {
+            format!("{text}00")
+        } else if text.split('.').nth(1).is_some_and(|d| d.len() == 1) {
+            format!("{text}0")
+        } else {
+            text.to_owned()
+        };
+        format!("${text}")
+    };
+    let price = match (listed.input_price, listed.output_price) {
+        (Some(input), Some(output)) => Some(format!(
+            "{} / {} per M tokens",
+            per_million(input),
+            per_million(output)
+        )),
+        _ => None,
+    };
+    let window = listed.context_window.map(|w| match w {
+        w if w >= 1_000_000 && w % 1_000_000 == 0 => format!("{}M context", w / 1_000_000),
+        w if w >= 1_000 => format!("{}k context", w / 1_000),
+        w => format!("{w} context"),
+    });
+    price
+        .into_iter()
+        .chain(window)
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {
@@ -342,6 +444,10 @@ fn show(event: Event) {
         Event::Passed => eprintln!("✓ checks passed"),
         Event::Failed { command, .. } => eprintln!("✗ {command} failed"),
         Event::Escalating { from, to } => eprintln!("↑ {from} gave up, escalating to {to}"),
+        Event::Delegating { from, to, task } => eprintln!("→ {from} hands to {to}: {task}"),
+        Event::OverBudget { spent, budget } => {
+            eprintln!("✗ budget of {budget} spent ({spent}), stopping");
+        }
     }
 }
 
@@ -381,5 +487,6 @@ fn summarize(outcome: &Outcome) -> Result<()> {
             }
             bail!("no model made the checks pass")
         }
+        Verdict::OverBudget { budget } => bail!("the budget of {budget} was spent first"),
     }
 }

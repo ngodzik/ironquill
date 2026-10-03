@@ -31,6 +31,11 @@ pub(crate) enum Command {
     Delegate(Agent, Option<String>),
     /// `/context` opens the conversation's context in the editor.
     Context,
+    /// `/budget <dollars>` sets the most one request may cost; `none`
+    /// removes the limit, `/budget` alone shows it.
+    Budget(Option<String>),
+    /// `/defaults` keeps the current choices for every new session.
+    Defaults,
     /// `/claude-reset` ends Claude Code's session, `/codex-reset` Codex's.
     Reset(Agent),
     /// `:help`
@@ -71,6 +76,8 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "cost" => Ok(Command::Cost),
         "claude" | "cc" => Ok(Command::Delegate(Agent::ClaudeCode, rest_opt)),
         "codex" | "cx" => Ok(Command::Delegate(Agent::Codex, rest_opt)),
+        "budget" => Ok(Command::Budget(rest_opt)),
+        "defaults" => Ok(Command::Defaults),
         "context" | "ctx" => Ok(Command::Context),
         "claude-reset" => Ok(Command::Reset(Agent::ClaudeCode)),
         "codex-reset" => Ok(Command::Reset(Agent::Codex)),
@@ -84,6 +91,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
 /// Every command name, as Tab completes them. A test checks that each one
 /// parses, so that the list cannot drift from `parse`.
 pub(crate) const NAMES: &[&str] = &[
+    "budget",
     "check",
     "claude",
     "claude-reset",
@@ -92,6 +100,7 @@ pub(crate) const NAMES: &[&str] = &[
     "codex-reset",
     "context",
     "cost",
+    "defaults",
     "diff",
     "escalate",
     "help",
@@ -192,7 +201,14 @@ pub(crate) fn candidates(line: &str, names: &[&str], models: &[String]) -> Vec<S
 
 pub(crate) const HELP: &str = "\
 Type a question or a change and press Enter. Changes are checked before they are kept.
-/model               pick the model that answers (Ctrl-E); /model <id> sets it
+/model               pick the model that answers (Ctrl-E); /model <id> sets it.
+                     In the list, type to search every model of the provider,
+                     Space puts the selected one in the team or takes it out:
+                     the model that answers may hand tasks to the team
+/budget <dollars>    the most one request may cost (none: no limit); past it the
+                     work stops and the model says where it is and asks what next
+/defaults            start every new session with the current model, list, team
+                     and budget
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation
 /codex <task>        the same with Codex, which runs commands in its sandbox, without network
 /context             edit what the next request sends: delete, shorten, annotate; :w applies

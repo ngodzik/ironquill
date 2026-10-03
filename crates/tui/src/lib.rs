@@ -14,6 +14,7 @@
 mod app;
 mod clipboard;
 mod command;
+mod defaults;
 mod editor;
 mod error;
 mod highlight;
@@ -42,6 +43,7 @@ use crate::app::{AgentMessage, App, Effect};
 use crate::sessions::Store;
 
 pub use app::Settings;
+pub use defaults::Defaults;
 
 /// How the interface starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -223,6 +225,23 @@ where
                 app.on_context_applied(result);
                 if applied {
                     save(&store, &mut app, &conversation).await;
+                }
+            }
+            Some(Effect::SaveDefaults(defaults)) => {
+                let saved = Defaults::path()
+                    .ok_or_else(|| "no home directory to keep them in".to_owned())
+                    .and_then(|path| {
+                        defaults
+                            .save(&path)
+                            .map(|()| path)
+                            .map_err(|e| e.to_string())
+                    });
+                match saved {
+                    Ok(path) => app.report_info(&format!(
+                        "New sessions will start with these choices ({})",
+                        path.display()
+                    )),
+                    Err(e) => app.report_error(format!("Could not keep the defaults: {e}")),
                 }
             }
             Some(Effect::ForgetDelegate(agent)) => {

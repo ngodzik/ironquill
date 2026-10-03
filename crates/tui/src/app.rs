@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ironquill_agent::{AgentConfig, Event, Outcome, Session, Verdict};
+use ironquill_agent::{AgentConfig, Event, Member, Outcome, Session, Verdict};
 use ironquill_core::{Agent, ContextUse, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, ToolSummary};
 use ratatui::crossterm::event::{
@@ -13,6 +13,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 
 use crate::command::{self, Command};
+use crate::defaults::Defaults;
 use crate::editor::{Editor, Outcome as EditorOutcome};
 use crate::highlight::Highlighter;
 use crate::keymap::{self, Action, Focus, Mode, Pending};
@@ -60,8 +61,33 @@ pub struct Settings {
     /// Turns per try.
     pub max_turns: u32,
     /// The models offered by the model picker (Ctrl-E). Identifiers starting
-    /// with `claude-code` hand the task to Claude Code.
+    /// with `claude-code` or `codex` hand the task to that agent.
     pub models: Vec<ModelId>,
+    /// The models the first one may hand tasks to.
+    pub team: Vec<ModelId>,
+    /// The most one request may cost; `None` sets no limit.
+    pub budget: Option<Usd>,
+    /// Every model the provider lists, with a note on its price and context,
+    /// to search from the model picker and to tell the team apart.
+    pub catalog: Vec<Member>,
+}
+
+/// The model picker (Ctrl-E) while it is open.
+#[derive(Debug, Default)]
+pub(crate) struct ModelPicker {
+    /// What was typed to search the provider's models.
+    pub(crate) filter: String,
+    pub(crate) selected: usize,
+}
+
+/// One row of the model picker.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ModelRow {
+    pub(crate) model: ModelId,
+    pub(crate) note: String,
+    /// Among the models offered every time, not only found by the search.
+    pub(crate) offered: bool,
+    pub(crate) in_team: bool,
 }
 
 /// Something only the event loop can do, asked for by the state.
@@ -89,6 +115,8 @@ pub(crate) enum Effect {
     ApplyContext(String),
     /// End this agent's session.
     ForgetDelegate(Agent),
+    /// Keep the current choices for every new session.
+    SaveDefaults(Defaults),
 }
 
 /// What the agent task sends back to the interface.
@@ -123,6 +151,17 @@ pub(crate) enum Entry {
         to: ModelId,
     },
     GaveUp,
+    /// The model handed a task to another of the team.
+    Delegating {
+        from: ModelId,
+        to: ModelId,
+        task: String,
+    },
+    /// The request spent its budget and stopped.
+    OverBudget {
+        spent: Usd,
+        budget: Usd,
+    },
     /// What one request cost, shown under it.
     Cost {
         usage: Usage,
@@ -279,7 +318,7 @@ pub(crate) struct App {
     /// The list of shortcuts, open at this scroll offset.
     keys_open: Option<usize>,
     /// The model picker, open on the row selected.
-    model_picker: Option<usize>,
+    model_picker: Option<ModelPicker>,
     /// How full the context was on the latest call, for the status line.
     context: Option<ContextUse>,
     /// The model working on the current request, for the activity line.
@@ -1017,6 +1056,12 @@ impl App {
         for check in &self.settings.checks {
             builder = builder.check(check.clone());
         }
+        for member in self.members() {
+            builder = builder.member(member);
+        }
+        if let Some(budget) = self.settings.budget {
+            builder = builder.budget(budget);
+        }
         match builder.build() {
             Ok(config) => {
                 self.input.take();
@@ -1193,6 +1238,28 @@ impl App {
                 return Some(Effect::ForgetDelegate(agent));
             }
             Command::Keys => self.keys_open = Some(0),
+            Command::Budget(None) => match self.settings.budget {
+                Some(budget) => self.info(format!("Budget: {budget} per request")),
+                None => self.info("No budget: requests may cost any amount"),
+            },
+            Command::Budget(Some(amount)) => {
+                let amount = amount.trim_start_matches('$');
+                if amount == "none" {
+                    self.settings.budget = None;
+                    self.info("No budget: requests may cost any amount");
+                } else {
+                    match amount.parse::<f64>() {
+                        Ok(dollars) if dollars.is_finite() && dollars > 0.0 => {
+                            self.settings.budget = Some(Usd(dollars));
+                            self.info(format!("Budget: {} per request", Usd(dollars)));
+                        }
+                        _ => self.error(format!(
+                            "A budget is an amount in dollars, such as /budget 0.25, or none; got {amount:?}"
+                        )),
+                    }
+                }
+            }
+            Command::Defaults => return Some(Effect::SaveDefaults(self.defaults())),
         }
         None
     }
@@ -1346,9 +1413,79 @@ impl App {
         true
     }
 
-    /// The row selected in the model picker, while it is open.
-    pub(crate) fn model_picker(&self) -> Option<usize> {
-        self.model_picker
+    /// How many models the first one may hand tasks to.
+    pub(crate) fn team_size(&self) -> usize {
+        self.settings.team.len()
+    }
+
+    /// The most one request may cost.
+    pub(crate) fn budget(&self) -> Option<Usd> {
+        self.settings.budget
+    }
+
+    /// The model picker, while it is open.
+    pub(crate) fn model_picker(&self) -> Option<&ModelPicker> {
+        self.model_picker.as_ref()
+    }
+
+    /// The rows of the model picker: the offered models that match what was
+    /// typed, then the provider's other models that do.
+    pub(crate) fn model_rows(&self) -> Vec<ModelRow> {
+        let filter = self
+            .model_picker
+            .as_ref()
+            .map(|p| p.filter.to_lowercase())
+            .unwrap_or_default();
+        let matches = |model: &ModelId| model.as_str().to_lowercase().contains(&filter);
+        let row = |model: &ModelId, offered: bool| ModelRow {
+            model: model.clone(),
+            note: self.note(model),
+            offered,
+            in_team: self.settings.team.contains(model),
+        };
+        let mut rows: Vec<ModelRow> = self
+            .settings
+            .models
+            .iter()
+            .filter(|m| matches(m))
+            .map(|m| row(m, true))
+            .collect();
+        if !filter.is_empty() {
+            rows.extend(
+                self.settings
+                    .catalog
+                    .iter()
+                    .map(|m| &m.model)
+                    .filter(|m| matches(m) && !self.settings.models.contains(m))
+                    .map(|m| row(m, false)),
+            );
+        }
+        rows
+    }
+
+    /// A few words on `model`: its price and context, or the agent it is.
+    pub(crate) fn note(&self, model: &ModelId) -> String {
+        if let Some((agent, _)) = model.delegate() {
+            return format!("{agent} · subscription");
+        }
+        self.settings
+            .catalog
+            .iter()
+            .find(|m| &m.model == model)
+            .map(|m| m.note.clone())
+            .unwrap_or_default()
+    }
+
+    /// The team as the agent gets it, with what tells its members apart.
+    fn members(&self) -> Vec<Member> {
+        self.settings
+            .team
+            .iter()
+            .map(|model| Member {
+                model: model.clone(),
+                note: self.note(model),
+            })
+            .collect()
     }
 
     /// The model the first request goes to.
@@ -1362,31 +1499,44 @@ impl App {
     }
 
     fn open_model_picker(&mut self) {
-        let models = self.models();
-        if models.is_empty() {
+        if self.models().is_empty() && self.settings.catalog.is_empty() {
             self.error("No model configured: start with --model, or set IRONQUILL_MODELS");
             return;
         }
-        let current = self
+        let selected = self
             .current_model()
-            .and_then(|m| models.iter().position(|x| x == m))
+            .and_then(|m| self.settings.models.iter().position(|x| x == m))
             .unwrap_or(0);
-        self.model_picker = Some(current);
+        self.model_picker = Some(ModelPicker {
+            filter: String::new(),
+            selected,
+        });
     }
 
     /// Keys while the model picker is open. Returns whether the key was for it.
+    ///
+    /// Typing searches the provider's models, Enter answers with the selected
+    /// one, Space puts it in the team or takes it out.
     fn model_picker_key(&mut self, key: KeyEvent) -> bool {
-        let Some(selected) = self.model_picker else {
+        let Some(picker) = &self.model_picker else {
             return false;
         };
-        let models = self.models();
-        let last = models.len().saturating_sub(1);
+        let selected = picker.selected;
+        let rows = self.model_rows();
+        let last = rows.len().saturating_sub(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let set = |app: &mut Self, selected: usize| {
+            if let Some(p) = &mut app.model_picker {
+                p.selected = selected;
+            }
+        };
         match key.code {
-            KeyCode::Up => self.model_picker = Some(selected.saturating_sub(1)),
-            KeyCode::Down => self.model_picker = Some((selected + 1).min(last)),
+            KeyCode::Up => set(self, selected.saturating_sub(1)),
+            KeyCode::Down => set(self, (selected + 1).min(last)),
             KeyCode::Enter => {
                 self.model_picker = None;
-                if let Some(model) = models.get(selected).cloned() {
+                if let Some(row) = rows.get(selected) {
+                    let model = row.model.clone();
                     self.use_model(model.clone());
                     if let Some((agent, _)) = model.delegate() {
                         self.info(format!(
@@ -1397,14 +1547,53 @@ impl App {
                     }
                 }
             }
-            KeyCode::Esc | KeyCode::Char('q') => self.model_picker = None,
+            KeyCode::Char(' ') => {
+                if let Some(row) = rows.get(selected) {
+                    self.toggle_team(row.model.clone());
+                }
+            }
+            KeyCode::Esc => self.model_picker = None,
             // Ctrl-E again closes it, as the shortcut that opened it.
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.model_picker = None;
+            KeyCode::Char('e') if ctrl => self.model_picker = None,
+            KeyCode::Backspace => {
+                if let Some(p) = &mut self.model_picker {
+                    p.filter.pop();
+                    p.selected = 0;
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(p) = &mut self.model_picker {
+                    p.filter.push(c);
+                    p.selected = 0;
+                }
             }
             _ => {}
         }
         true
+    }
+
+    /// Puts `model` in the team, or takes it out. A model found by the search
+    /// is offered from then on.
+    fn toggle_team(&mut self, model: ModelId) {
+        if !self.settings.models.contains(&model) {
+            self.settings.models.push(model.clone());
+        }
+        if let Some(i) = self.settings.team.iter().position(|m| m == &model) {
+            self.settings.team.remove(i);
+        } else {
+            self.settings.team.push(model);
+        }
+    }
+
+    /// The choices of this session, to keep as the defaults of the next.
+    fn defaults(&self) -> Defaults {
+        let ids = |models: &[ModelId]| models.iter().map(ToString::to_string).collect();
+        Defaults {
+            model: self.current_model().map(ToString::to_string),
+            models: ids(&self.settings.models),
+            team: ids(&self.settings.team),
+            budget: self.settings.budget.map(|b| b.0),
+        }
     }
 
     /// The model `/claude` or `/codex` hands tasks to: the first offered
@@ -1591,6 +1780,8 @@ impl App {
                 self.working_model = Some(to.clone());
                 Entry::Escalating { from, to }
             }
+            Event::Delegating { from, to, task } => Entry::Delegating { from, to, task },
+            Event::OverBudget { spent, budget } => Entry::OverBudget { spent, budget },
         };
         self.transcript.push(entry);
     }
@@ -1667,7 +1858,7 @@ mod tests {
                 checks: vec![Check::parse("cargo check").unwrap()],
                 rounds: 2,
                 max_turns: 30,
-                models: vec![],
+                ..Settings::default()
             },
             PathBuf::from("/p"),
         )
@@ -2012,10 +2203,10 @@ mod tests {
             PathBuf::from("/p"),
         );
         app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
-        assert_eq!(app.model_picker(), Some(0));
+        assert_eq!(app.model_picker().map(|p| p.selected), Some(0));
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.model_picker(), None);
+        assert!(app.model_picker().is_none());
         assert_eq!(app.current_model().unwrap().as_str(), "claude-code/opus");
     }
 
@@ -2037,7 +2228,7 @@ mod tests {
 
         // Back to the first one: it is still offered, at the same place.
         app.on_key(ctrl_e);
-        assert_eq!(app.model_picker(), Some(1));
+        assert_eq!(app.model_picker().map(|p| p.selected), Some(1));
         press(&mut app, KeyCode::Up);
         press(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -2045,6 +2236,72 @@ mod tests {
             "deepseek/deepseek-chat"
         );
         assert_eq!(app.models().len(), 2);
+    }
+
+    #[test]
+    fn the_picker_searches_the_catalog_and_builds_the_team() {
+        let member = |id: &str, note: &str| Member {
+            model: ModelId::new(id).unwrap(),
+            note: note.into(),
+        };
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                models: vec![ModelId::new("cheap").unwrap()],
+                catalog: vec![
+                    member("cheap", "$0.14 / $0.28 per M tokens"),
+                    member("anthropic/claude-sonnet", "$3.00 / $15.00 per M tokens"),
+                    member("openai/gpt-mini", "$0.25 / $2.00 per M tokens"),
+                ],
+                budget: Some(Usd(0.10)),
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        // Only the offered models until something is typed.
+        assert_eq!(app.model_rows().len(), 1);
+        for c in "sonn".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let rows = app.model_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model.as_str(), "anthropic/claude-sonnet");
+        assert!(!rows[0].offered);
+        assert_eq!(rows[0].note, "$3.00 / $15.00 per M tokens");
+
+        // Space puts it in the team, and offers it from then on.
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.model_rows()[0].in_team);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.team_size(), 1);
+        assert_eq!(app.models().len(), 2);
+        assert_eq!(app.current_model().unwrap().as_str(), "cheap");
+
+        let members = app.members();
+        assert_eq!(members[0].note, "$3.00 / $15.00 per M tokens");
+
+        type_text(&mut app, "/budget 0.25");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.budget(), Some(Usd(0.25)));
+        type_text(&mut app, "/budget lots");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.budget(), Some(Usd(0.25)));
+
+        type_text(&mut app, "/defaults");
+        let effect = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(Effect::SaveDefaults(defaults)) = effect else {
+            panic!("expected the defaults to be saved, got {effect:?}");
+        };
+        assert_eq!(
+            defaults,
+            Defaults {
+                model: Some("cheap".into()),
+                models: vec!["cheap".into(), "anthropic/claude-sonnet".into()],
+                team: vec!["anthropic/claude-sonnet".into()],
+                budget: Some(0.25),
+            }
+        );
     }
 
     #[test]

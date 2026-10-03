@@ -67,4 +67,20 @@ pub enum Event {
         /// The model taking over.
         to: ModelId,
     },
+    /// The model hands one task to another of the team.
+    Delegating {
+        /// The model handing it over.
+        from: ModelId,
+        /// The model doing it.
+        to: ModelId,
+        /// The task, as the first model wrote it.
+        task: String,
+    },
+    /// The request spent its budget: the work stops here.
+    OverBudget {
+        /// What the request cost so far.
+        spent: Usd,
+        /// The budget it had.
+        budget: Usd,
+    },
 }
