@@ -1,7 +1,10 @@
-use ironquill_core::{ChatModel, ChatRequest, Message, ModelId, Usage, Usd};
+use ironquill_core::{
+    ChatModel, ChatRequest, Delegate, DelegateEvent, DelegateRequest, Message, ModelId, Usage, Usd,
+};
 use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox};
 
 use crate::config::AgentConfig;
+use crate::delegate;
 use crate::error::AgentError;
 use crate::event::Event;
 
@@ -13,6 +16,14 @@ Edit existing files with `replace`, not `write_file`. \
 You cannot run commands: when you stop calling tools, the project's checks run automatically \
 and you will be shown any failure. Do not ask questions; when you are done, reply with one \
 short sentence saying what you changed.";
+
+/// For a task handed to an agent such as Claude Code. It gets the task alone,
+/// not ironquill's conversation, and works in its own session.
+const DELEGATE_PROMPT: &str = "This task was handed to you by ironquill, which runs the project's \
+checks after you finish and sends you any failure. You cannot run shell commands; do not try to \
+work around that. Make the smallest change that completes the task, reading files before editing \
+them. When you are done, end with a short report: what you changed and why, and anything left to \
+do. Write the report in the language the task is written in.";
 
 /// For a conversation with a person.
 const CHAT_PROMPT: &str = "You are a careful software engineer helping a person with the project \
@@ -58,6 +69,8 @@ pub struct Outcome {
     pub cost: Usd,
     /// Whether every turn's cost was reported, so that `cost` is the full bill.
     pub cost_complete: bool,
+    /// Whether part of the work ran on a subscription, which `cost` leaves out.
+    pub subscription: bool,
     /// Files written or edited, relative to the workspace root.
     pub changed: Vec<String>,
 }
@@ -66,6 +79,7 @@ struct Ledger {
     usage: Usage,
     cost: Usd,
     cost_complete: bool,
+    subscription: bool,
 }
 
 impl Ledger {
@@ -74,6 +88,7 @@ impl Ledger {
             usage: Usage::default(),
             cost: Usd::default(),
             cost_complete: true,
+            subscription: false,
         }
     }
 
@@ -83,6 +98,7 @@ impl Ledger {
             usage: self.usage,
             cost: self.cost,
             cost_complete: self.cost_complete,
+            subscription: self.subscription,
             changed: toolbox.changed().map(str::to_owned).collect(),
         }
     }
@@ -90,8 +106,9 @@ impl Ledger {
 
 /// Everything one attempt needs besides the conversation, gathered so that
 /// the functions below do not take nine arguments.
-struct Ctx<'a, M, O> {
+struct Ctx<'a, M, D, O> {
     model: &'a M,
+    delegate: &'a D,
     config: &'a AgentConfig,
     toolbox: &'a mut Toolbox,
     ledger: Ledger,
@@ -142,14 +159,16 @@ impl Session {
     /// # Errors
     ///
     /// As [`run`].
-    pub async fn send<M: ChatModel>(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send<M: ChatModel, D: Delegate>(
         &mut self,
         model: &M,
+        delegate: &D,
         toolbox: &mut Toolbox,
         config: &AgentConfig,
         text: &str,
         context: &str,
-        observe: impl FnMut(Event),
+        observe: impl FnMut(Event) + Send,
     ) -> Result<Outcome, AgentError> {
         self.settle();
         if !self.context_added && !context.is_empty() {
@@ -164,6 +183,7 @@ impl Session {
 
         let mut ctx = Ctx {
             model,
+            delegate,
             config,
             toolbox,
             ledger: Ledger::new(),
@@ -259,16 +279,18 @@ impl Session {
 ///
 /// [`AgentError::Model`] when the provider fails, [`AgentError::Check`] when a
 /// check cannot be started. Failing checks are not an error, see [`Verdict`].
-pub async fn run<M: ChatModel>(
+pub async fn run<M: ChatModel, D: Delegate>(
     model: &M,
+    delegate: &D,
     toolbox: &mut Toolbox,
     config: &AgentConfig,
     task: &str,
     context: &str,
-    observe: impl FnMut(Event),
+    observe: impl FnMut(Event) + Send,
 ) -> Result<Outcome, AgentError> {
     let mut ctx = Ctx {
         model,
+        delegate,
         config,
         toolbox,
         ledger: Ledger::new(),
@@ -311,13 +333,16 @@ pub async fn run<M: ChatModel>(
 ///
 /// With `may_answer`, a first round that changes no file ends the attempt as
 /// an answer: there is nothing to check in a reply to a question.
-async fn attempt<M: ChatModel, O: FnMut(Event)>(
-    ctx: &mut Ctx<'_, M, O>,
+async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
     tier: &ModelId,
     messages: &mut Vec<Message>,
     failure: &mut Option<CheckFailure>,
     may_answer: bool,
 ) -> Result<Attempt, AgentError> {
+    if let Some(model) = tier.delegate() {
+        return attempt_delegated(ctx, tier, model, messages, failure, may_answer).await;
+    }
     for round in 0..ctx.config.rounds_per_tier {
         if round > 0
             && let Some(f) = failure.as_ref()
@@ -353,8 +378,120 @@ async fn attempt<M: ChatModel, O: FnMut(Event)>(
     Ok(Attempt::Failed)
 }
 
-async fn check<M, O: FnMut(Event)>(
-    ctx: &mut Ctx<'_, M, O>,
+/// Hands the task to an agent such as Claude Code, then judges what it did
+/// with the checks, as for a model.
+///
+/// The agent gets the last message of `messages` and nothing before it: it
+/// works from the task alone, in its own session. A failing check goes back
+/// into that session. Its reports are added to `messages`, so that the models
+/// of the conversation know what was done.
+async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    tier: &ModelId,
+    model: &str,
+    messages: &mut Vec<Message>,
+    failure: &mut Option<CheckFailure>,
+    may_answer: bool,
+) -> Result<Attempt, AgentError> {
+    let root = ctx.toolbox.workspace().root().to_owned();
+    let mut prompt = messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::User(text) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut session = None;
+
+    for round in 0..ctx.config.rounds_per_tier {
+        if round > 0
+            && let Some(f) = failure.as_ref()
+        {
+            prompt = format!("The checks failed.\n\n{}", describe(f));
+            messages.push(Message::user(prompt.clone()));
+        }
+        let request = DelegateRequest {
+            model: model.to_owned(),
+            prompt: prompt.clone(),
+            instructions: DELEGATE_PROMPT.to_owned(),
+            resume: session.clone(),
+            directory: root.clone(),
+        };
+
+        let reply = {
+            let Ctx {
+                delegate,
+                toolbox,
+                observe,
+                ..
+            } = &mut *ctx;
+            let mut on_event = |event: DelegateEvent| {
+                let event = match event {
+                    DelegateEvent::TextStart => Event::Saying {
+                        model: tier.clone(),
+                        text: String::new(),
+                        new_block: true,
+                    },
+                    DelegateEvent::Text(text) => Event::Saying {
+                        model: tier.clone(),
+                        text,
+                        new_block: false,
+                    },
+                    DelegateEvent::Tool {
+                        name,
+                        input,
+                        output,
+                    } => {
+                        let report = delegate::report(&name, &input, &output, &root);
+                        if let Some(path) = report.changed {
+                            toolbox.mark_changed(path);
+                        }
+                        Event::Tool {
+                            name,
+                            path: report.path,
+                            outcome: report.outcome,
+                        }
+                    }
+                };
+                observe(event);
+            };
+            delegate
+                .run(&request, &mut on_event)
+                .await
+                .map_err(|e| AgentError::Model(Box::new(e)))?
+        };
+
+        ctx.ledger.usage += reply.usage;
+        ctx.ledger.subscription = true;
+        (ctx.observe)(Event::Turn {
+            model: tier.clone(),
+            usage: reply.usage,
+            cost: None,
+            subscription: true,
+        });
+        messages.push(Message::Assistant {
+            content: Some(reply.text.clone()),
+            tool_calls: Vec::new(),
+        });
+        session = Some(reply.session);
+
+        if may_answer && round == 0 && ctx.toolbox.changed().next().is_none() {
+            return Ok(Attempt::Answered);
+        }
+        if ctx.config.checks.is_empty() {
+            return Ok(Attempt::Unchecked);
+        }
+        match check(ctx).await? {
+            None => return Ok(Attempt::Passed),
+            Some(f) => *failure = Some(f),
+        }
+    }
+    Ok(Attempt::Failed)
+}
+
+async fn check<M, D, O: FnMut(Event)>(
+    ctx: &mut Ctx<'_, M, D, O>,
 ) -> Result<Option<CheckFailure>, AgentError> {
     (ctx.observe)(Event::Checking {
         commands: ctx.config.checks.iter().map(Check::command).collect(),
@@ -379,8 +516,8 @@ async fn check<M, O: FnMut(Event)>(
 
 /// Lets the model call tools until it stops or runs out of turns. Returns
 /// whether it stopped on its own.
-async fn converse<M: ChatModel, O: FnMut(Event)>(
-    ctx: &mut Ctx<'_, M, O>,
+async fn converse<M: ChatModel, D, O: FnMut(Event)>(
+    ctx: &mut Ctx<'_, M, D, O>,
     model_id: &ModelId,
     messages: &mut Vec<Message>,
 ) -> Result<bool, AgentError> {
@@ -406,6 +543,7 @@ async fn converse<M: ChatModel, O: FnMut(Event)>(
             model: model_id.clone(),
             usage: response.usage,
             cost: response.cost,
+            subscription: false,
         });
         if let Some(text) = &response.content {
             (ctx.observe)(Event::Said {
@@ -478,8 +616,8 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Mutex;
 
-    use ironquill_core::{ChatResponse, TokenCount, ToolCall};
-    use ironquill_tools::Workspace;
+    use ironquill_core::{ChatResponse, DelegateReply, TokenCount, ToolCall};
+    use ironquill_tools::{ToolSummary, Workspace};
     use serde_json::json;
 
     use super::*;
@@ -510,6 +648,73 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("the script ran out"))
+        }
+    }
+
+    /// For tests where nothing is delegated.
+    struct NoDelegate;
+
+    impl Delegate for NoDelegate {
+        type Error = Infallible;
+
+        async fn run(
+            &self,
+            _: &DelegateRequest,
+            _: &mut (dyn FnMut(DelegateEvent) + Send),
+        ) -> Result<DelegateReply, Infallible> {
+            panic!("nothing should be delegated in this test")
+        }
+    }
+
+    /// An agent that writes `done.txt` on the round given, says so, and
+    /// remembers each request.
+    struct FakeClaude {
+        writes_on_round: usize,
+        requests: Mutex<Vec<DelegateRequest>>,
+    }
+
+    impl Delegate for FakeClaude {
+        type Error = Infallible;
+
+        async fn run(
+            &self,
+            request: &DelegateRequest,
+            on_event: &mut (dyn FnMut(DelegateEvent) + Send),
+        ) -> Result<DelegateReply, Infallible> {
+            let round = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                requests.len()
+            };
+            on_event(DelegateEvent::TextStart);
+            on_event(DelegateEvent::Text("Working".into()));
+            on_event(DelegateEvent::Text(" on it.".into()));
+            if round == self.writes_on_round {
+                let path = request.directory.join("done.txt");
+                std::fs::write(&path, "ok").unwrap();
+                on_event(DelegateEvent::Tool {
+                    name: "Write".into(),
+                    input: json!({"file_path": path.to_string_lossy(), "content": "ok"}),
+                    output: Ok("File created successfully".into()),
+                });
+            } else {
+                let path = request.directory.join("notes.txt");
+                std::fs::write(&path, "draft").unwrap();
+                on_event(DelegateEvent::Tool {
+                    name: "Write".into(),
+                    input: json!({"file_path": path.to_string_lossy(), "content": "draft"}),
+                    output: Ok("File created successfully".into()),
+                });
+            }
+            Ok(DelegateReply {
+                text: format!("Report {round}"),
+                session: "claude-session".into(),
+                usage: Usage {
+                    input: TokenCount(30_000),
+                    output: TokenCount(200),
+                },
+                estimate: Some(Usd(0.09)),
+            })
         }
     }
 
@@ -562,6 +767,7 @@ mod tests {
 
         let outcome = run(
             &model,
+            &NoDelegate,
             &mut toolbox,
             &config(),
             "create done.txt",
@@ -597,6 +803,7 @@ mod tests {
 
         let outcome = run(
             &model,
+            &NoDelegate,
             &mut toolbox,
             &config(),
             "create done.txt",
@@ -632,9 +839,17 @@ mod tests {
             says("Done."),
         ]);
 
-        run(&model, &mut toolbox, &config(), "t", "", |_| {})
-            .await
-            .unwrap();
+        run(
+            &model,
+            &NoDelegate,
+            &mut toolbox,
+            &config(),
+            "t",
+            "",
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         let seen = model.seen.lock().unwrap();
         let Some(Message::Tool { content, .. }) = seen[1].messages.last() else {
@@ -648,9 +863,17 @@ mod tests {
         let (_dir, mut toolbox) = setup();
         let model = Scripted::new(vec![says("a"), says("b"), says("c"), says("d")]);
 
-        let outcome = run(&model, &mut toolbox, &config(), "t", "", |_| {})
-            .await
-            .unwrap();
+        let outcome = run(
+            &model,
+            &NoDelegate,
+            &mut toolbox,
+            &config(),
+            "t",
+            "",
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             outcome.verdict,
@@ -673,12 +896,128 @@ mod tests {
         let mut session = Session::new();
 
         let outcome = session
-            .send(&model, &mut toolbox, &config, "write a.txt", "", |_| {})
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "write a.txt",
+                "",
+                |_| {},
+            )
             .await
             .unwrap();
 
         assert_eq!(outcome.verdict, Verdict::Unchecked);
         assert_eq!(outcome.changed, ["a.txt"]);
+    }
+
+    fn claude_config() -> AgentConfig {
+        AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .check(Check::parse("test -f done.txt").unwrap())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_delegated_task_gets_the_request_alone_and_is_checked() {
+        let (_dir, mut toolbox) = setup();
+        let claude = FakeClaude {
+            writes_on_round: 1,
+            requests: Mutex::new(Vec::new()),
+        };
+        let model = Scripted::new(vec![says("Hi.")]);
+        let mut session = Session::new();
+        let mut events = Vec::new();
+
+        // A first exchange with the chat model, which Claude must not see.
+        session
+            .send(
+                &model,
+                &claude,
+                &mut toolbox,
+                &config(),
+                "hello",
+                "FILES",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let outcome = session
+            .send(
+                &model,
+                &claude,
+                &mut toolbox,
+                &claude_config(),
+                "create done.txt",
+                "FILES",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Passed {
+                model: ModelId::new("claude-code/opus").unwrap()
+            }
+        );
+        assert!(outcome.subscription);
+        assert_eq!(outcome.cost, Usd(0.0));
+        assert_eq!(outcome.changed, ["done.txt"]);
+
+        let requests = claude.requests.lock().unwrap();
+        assert_eq!(requests[0].prompt, "create done.txt");
+        assert_eq!(requests[0].model, "opus");
+        assert_eq!(requests[0].resume, None);
+
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Saying { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, "Working on it.");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Tool { path: Some(p), outcome: Ok(ToolSummary::Changed { created: true, .. }), .. } if p == "done.txt"
+        )));
+        assert!(session.messages.contains(&Message::Assistant {
+            content: Some("Report 1".into()),
+            tool_calls: vec![],
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_failing_check_goes_back_into_the_delegates_own_session() {
+        let (_dir, mut toolbox) = setup();
+        let claude = FakeClaude {
+            writes_on_round: 2,
+            requests: Mutex::new(Vec::new()),
+        };
+        let model = Scripted::new(vec![]);
+        let mut session = Session::new();
+
+        let outcome = session
+            .send(
+                &model,
+                &claude,
+                &mut toolbox,
+                &claude_config(),
+                "create done.txt",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
+        let requests = claude.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].resume.as_deref(), Some("claude-session"));
+        assert!(requests[1].prompt.starts_with("The checks failed."));
     }
 
     #[tokio::test]
@@ -689,9 +1028,15 @@ mod tests {
         let mut events = Vec::new();
 
         let outcome = session
-            .send(&model, &mut toolbox, &config(), "hello", "", |e| {
-                events.push(e)
-            })
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config(),
+                "hello",
+                "",
+                |e| events.push(e),
+            )
             .await
             .unwrap();
 
@@ -707,12 +1052,21 @@ mod tests {
         let config = config();
 
         session
-            .send(&model, &mut toolbox, &config, "hello", "FILES", |_| {})
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "hello",
+                "FILES",
+                |_| {},
+            )
             .await
             .unwrap();
         session
             .send(
                 &model,
+                &NoDelegate,
                 &mut toolbox,
                 &config,
                 "what did I say?",
@@ -747,7 +1101,15 @@ mod tests {
         let model = Scripted::new(vec![says("Sure.")]);
 
         session
-            .send(&model, &mut toolbox, &config(), "never mind", "", |_| {})
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config(),
+                "never mind",
+                "",
+                |_| {},
+            )
             .await
             .unwrap();
 

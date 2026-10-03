@@ -25,6 +25,8 @@ pub(crate) enum Command {
     Resume,
     /// `/cost` shows what the conversation has cost so far.
     Cost,
+    /// `/claude <task>` hands one task to Claude Code.
+    Claude(Option<String>),
     /// `:help`
     Help,
 }
@@ -59,6 +61,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "name" | "rename" => Ok(Command::Name(rest_opt)),
         "resume" => Ok(Command::Resume),
         "cost" => Ok(Command::Cost),
+        "claude" | "cc" => Ok(Command::Claude(rest_opt)),
         "help" | "h" => Ok(Command::Help),
         "" => Err("Empty command".into()),
         other => Err(format!("Unknown command /{other}, see /help")),
@@ -67,7 +70,8 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
 
 pub(crate) const HELP: &str = "\
 Type a question or a change and press Enter. Changes are checked before they are kept.
-/model <id>          the model that answers
+/model               pick the model that answers (Ctrl-P); /model <id> sets it
+/claude <task>       hand one task to Claude Code, which works without this conversation
 /escalate <id> ...   stronger models used only when the checks keep failing (empty: none)
 /check <command>     add a check, run without a shell; /check alone lists them
 /nocheck             remove every check
@@ -88,6 +92,7 @@ Open file: Vim keys. i a o insert, Esc stops, x dd yy p edit, u undo, Ctrl-R red
 Panes: Tab or Ctrl-W ← → switches between tree, file, chat and Docker; ,c closes the file.
 Ctrl-G (or ,i): back to typing a message, from anywhere.
 Ctrl-K (or ,d): show or hide the running Docker containers.
+Ctrl-P (or ,m): pick the model; the one in use shows at the bottom right.
 Vim: Esc for normal mode, i to type, : for commands. Ctrl-C stops a request; Ctrl-C twice quits";
 
 #[cfg(test)]

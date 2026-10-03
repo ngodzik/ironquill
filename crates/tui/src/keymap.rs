@@ -85,6 +85,8 @@ pub enum Action {
     ToggleDocker,
     /// Go to the message box, ready to type, from wherever the focus is.
     FocusInput,
+    /// Open the model picker.
+    PickModel,
     /// Close the open file and return to the conversation.
     ShowChat,
     /// Close the focused pane.
@@ -116,6 +118,7 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         // "Go" back to typing a message, wherever the focus is.
         KeyCode::Char('g') if ctrl => return Some(Action::FocusInput),
         KeyCode::Char('k') if ctrl => return Some(Action::ToggleDocker),
+        KeyCode::Char('p') if ctrl => return Some(Action::PickModel),
         _ => {}
     }
 
@@ -125,6 +128,7 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
             (Pending::Leader, KeyCode::Char('c')) => Some(Action::ShowChat),
             (Pending::Leader, KeyCode::Char('i')) => Some(Action::FocusInput),
             (Pending::Leader, KeyCode::Char('d')) => Some(Action::ToggleDocker),
+            (Pending::Leader, KeyCode::Char('m')) => Some(Action::PickModel),
             (Pending::Window, KeyCode::Char('w')) => Some(Action::FocusNext),
             (Pending::Window, KeyCode::Char('h') | KeyCode::Left) => Some(Action::FocusLeft),
             (Pending::Window, KeyCode::Char('l') | KeyCode::Right) => Some(Action::FocusRight),

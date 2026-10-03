@@ -59,6 +59,9 @@ pub struct Settings {
     pub rounds: u32,
     /// Turns per try.
     pub max_turns: u32,
+    /// The models offered by the model picker (Ctrl-P). Identifiers starting
+    /// with `claude-code` hand the task to Claude Code.
+    pub models: Vec<ModelId>,
 }
 
 /// Something only the event loop can do, asked for by the state.
@@ -120,6 +123,9 @@ pub(crate) enum Entry {
         cost: Usd,
         complete: bool,
         seconds: u64,
+        /// Ran on a subscription (Claude Code): no cost is owed for it.
+        #[serde(default)]
+        subscription: bool,
     },
 }
 
@@ -236,6 +242,10 @@ pub(crate) struct App {
     created: u64,
     requests: usize,
     picker: Option<Picker>,
+    /// The model picker, open on the row selected.
+    model_picker: Option<usize>,
+    /// The model working on the current request, for the activity line.
+    working_model: Option<ModelId>,
     docker: Option<DockerPane>,
 }
 
@@ -290,6 +300,8 @@ impl App {
             created: sessions::now(),
             requests: 0,
             picker: None,
+            model_picker: None,
+            working_model: None,
             docker: None,
         }
     }
@@ -405,6 +417,9 @@ impl App {
             if let Some(effect) = self.picker_key(key) {
                 return effect;
             }
+            if self.model_picker_key(key) {
+                return None;
+            }
         }
         if self.focus == Focus::File
             && self.pending.is_none()
@@ -413,7 +428,7 @@ impl App {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             // Stopping a request and the tree work from anywhere; Tab, Ctrl-W
             // and the leader leave the file only when Vim is not mid-command.
-            let global = ctrl && matches!(key.code, KeyCode::Char('c' | 'b' | 'g' | 'k'));
+            let global = ctrl && matches!(key.code, KeyCode::Char('c' | 'b' | 'g' | 'k' | 'p'));
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
                     || key.code == KeyCode::Char(',')
@@ -523,6 +538,7 @@ impl App {
                 }
             }
             Action::ShowChat => self.close_file(Focus::Chat),
+            Action::PickModel => self.open_model_picker(),
             Action::FocusInput => {
                 self.focus = Focus::Chat;
                 self.mode = Mode::Insert;
@@ -741,6 +757,12 @@ impl App {
     }
 
     fn submit(&mut self, text: String) -> Option<Effect> {
+        let tiers = self.settings.tiers.clone();
+        self.submit_to(text, tiers)
+    }
+
+    /// Sends `text` to `tiers` rather than the configured models, as `/claude` does.
+    fn submit_to(&mut self, text: String, tiers: Vec<ModelId>) -> Option<Effect> {
         if text.is_empty() {
             return None;
         }
@@ -753,7 +775,7 @@ impl App {
         let mut builder = AgentConfig::builder()
             .rounds_per_tier(self.settings.rounds)
             .max_turns(self.settings.max_turns);
-        for tier in &self.settings.tiers {
+        for tier in &tiers {
             builder = builder.tier(tier.clone());
         }
         for check in &self.settings.checks {
@@ -764,6 +786,7 @@ impl App {
                 self.input.take();
                 self.transcript.push(Entry::User(text.clone()));
                 self.running_since = Some(Instant::now());
+                self.working_model = tiers.first().cloned();
                 self.scroll_back = 0;
                 Some(Effect::Send { text, config })
             }
@@ -792,9 +815,16 @@ impl App {
         };
         match command {
             Command::Quit => self.quit = true,
-            Command::Model(None) => {
-                let chain = self.chain();
-                self.info(format!("Models: {chain}"));
+            Command::Model(None) => self.open_model_picker(),
+            Command::Claude(None) => {
+                self.error("Give it a task: /claude <what to do>");
+            }
+            Command::Claude(Some(task)) => {
+                let claude = self.claude_model();
+                self.info(format!(
+                    "Handed to {claude}, which works on the task alone, without this conversation"
+                ));
+                return self.submit_to(task, vec![claude]);
             }
             Command::Model(Some(id)) => match ModelId::new(id) {
                 Ok(model) => {
@@ -937,6 +967,7 @@ impl App {
                     cost: outcome.cost,
                     complete: outcome.cost_complete,
                     seconds,
+                    subscription: outcome.subscription,
                 });
                 true
             }
@@ -1019,6 +1050,85 @@ impl App {
         self.picker.as_ref()
     }
 
+    /// The models the picker offers: those configured, the ones in use first.
+    pub(crate) fn models(&self) -> Vec<ModelId> {
+        let mut models: Vec<ModelId> = self.settings.tiers.clone();
+        for model in &self.settings.models {
+            if !models.contains(model) {
+                models.push(model.clone());
+            }
+        }
+        models
+    }
+
+    /// The row selected in the model picker, while it is open.
+    pub(crate) fn model_picker(&self) -> Option<usize> {
+        self.model_picker
+    }
+
+    /// The model the first request goes to.
+    pub(crate) fn current_model(&self) -> Option<&ModelId> {
+        self.settings.tiers.first()
+    }
+
+    /// The model working right now, while a request runs.
+    pub(crate) fn working_model(&self) -> Option<&ModelId> {
+        self.working_model.as_ref().filter(|_| self.is_running())
+    }
+
+    fn open_model_picker(&mut self) {
+        let models = self.models();
+        if models.is_empty() {
+            self.error("No model configured: start with --model, or set IRONQUILL_MODELS");
+            return;
+        }
+        let current = self
+            .current_model()
+            .and_then(|m| models.iter().position(|x| x == m))
+            .unwrap_or(0);
+        self.model_picker = Some(current);
+    }
+
+    /// Keys while the model picker is open. Returns whether the key was for it.
+    fn model_picker_key(&mut self, key: KeyEvent) -> bool {
+        let Some(selected) = self.model_picker else {
+            return false;
+        };
+        let models = self.models();
+        let last = models.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up => self.model_picker = Some(selected.saturating_sub(1)),
+            KeyCode::Down => self.model_picker = Some((selected + 1).min(last)),
+            KeyCode::Enter => {
+                self.model_picker = None;
+                if let Some(model) = models.get(selected).cloned() {
+                    if self.settings.tiers.is_empty() {
+                        self.settings.tiers.push(model.clone());
+                    } else {
+                        self.settings.tiers[0] = model.clone();
+                    }
+                    self.info(format!("Model: {model}"));
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.model_picker = None,
+            // Ctrl-P again closes it, as the shortcut that opened it.
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.model_picker = None;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// The Claude Code model `/claude` hands tasks to: the first offered, or
+    /// Claude Code's own default.
+    fn claude_model(&self) -> ModelId {
+        self.models()
+            .into_iter()
+            .find(|m| m.delegate().is_some())
+            .unwrap_or_else(ModelId::claude_code)
+    }
+
     pub(crate) fn docker(&self) -> Option<&DockerPane> {
         self.docker.as_ref()
     }
@@ -1075,11 +1185,28 @@ impl App {
     fn on_event(&mut self, event: Event) {
         let entry = match event {
             // Tokens and cost go to the status line, not the transcript.
-            Event::Turn { usage, cost, .. } => {
+            Event::Turn {
+                usage,
+                cost,
+                subscription,
+                ..
+            } => {
                 self.usage += usage;
                 match cost {
                     Some(c) => self.cost += c,
+                    // A subscription owes nothing per request: the total is
+                    // not incomplete for lack of a cost here.
+                    None if subscription => {}
                     None => self.cost_complete = false,
+                }
+                return;
+            }
+            Event::Saying {
+                text, new_block, ..
+            } => {
+                match self.transcript.last_mut() {
+                    Some(Entry::Said(said)) if !new_block => said.push_str(&text),
+                    _ => self.transcript.push(Entry::Said(text)),
                 }
                 return;
             }
@@ -1101,7 +1228,10 @@ impl App {
             Event::Checking { commands } => Entry::Checks(commands),
             Event::Passed => Entry::Passed,
             Event::Failed { command, excerpt } => Entry::Failed { command, excerpt },
-            Event::Escalating { from, to } => Entry::Escalating { from, to },
+            Event::Escalating { from, to } => {
+                self.working_model = Some(to.clone());
+                Entry::Escalating { from, to }
+            }
         };
         self.transcript.push(entry);
     }
@@ -1171,6 +1301,7 @@ mod tests {
                 checks: vec![Check::parse("cargo check").unwrap()],
                 rounds: 2,
                 max_turns: 30,
+                models: vec![],
             },
             PathBuf::from("/p"),
         )
@@ -1239,6 +1370,7 @@ mod tests {
                     output: TokenCount(100),
                 },
                 cost: Some(Usd(0.002)),
+                subscription: false,
             }));
         }
         let (usage, cost, complete) = app.totals();
@@ -1385,6 +1517,7 @@ mod tests {
                 output: TokenCount(50),
             },
             cost: Some(Usd(0.0003)),
+            subscription: false,
         }));
         let finished = app.on_agent(AgentMessage::Done(Ok(Outcome {
             verdict: Verdict::Answered,
@@ -1394,6 +1527,7 @@ mod tests {
             },
             cost: Usd(0.0003),
             cost_complete: true,
+            subscription: false,
             changed: vec![],
         })));
         assert!(finished);
@@ -1467,6 +1601,84 @@ mod tests {
         app.on_key(ctrl_k);
         assert!(app.docker().is_none());
         assert_eq!(app.focus(), Focus::Chat);
+    }
+
+    #[test]
+    fn streamed_text_builds_one_reply_and_a_new_block_starts_another() {
+        let mut app = ready();
+        let saying = |text: &str, new_block: bool| {
+            AgentMessage::Event(Event::Saying {
+                model: ModelId::claude_code(),
+                text: text.into(),
+                new_block,
+            })
+        };
+        app.on_agent(saying("", true));
+        app.on_agent(saying("Working", false));
+        app.on_agent(saying(" on it.", false));
+        app.on_agent(saying("", true));
+        app.on_agent(saying("Done.", false));
+        let said: Vec<&Entry> = app
+            .transcript()
+            .iter()
+            .filter(|e| matches!(e, Entry::Said(_)))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                &Entry::Said("Working on it.".into()),
+                &Entry::Said("Done.".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn ctrl_p_picks_the_model_with_arrows() {
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                models: vec![ModelId::new("claude-code/opus").unwrap()],
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.model_picker(), Some(0));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.model_picker(), None);
+        assert_eq!(app.current_model().unwrap().as_str(), "claude-code/opus");
+    }
+
+    #[test]
+    fn slash_claude_hands_one_task_over_without_changing_the_model() {
+        let mut app = ready();
+        type_text(&mut app, "/claude refactor the parser");
+        let effect = press(&mut app, KeyCode::Enter);
+        let Some(Effect::Send { text, .. }) = effect else {
+            panic!("/claude should send the task");
+        };
+        assert_eq!(text, "refactor the parser");
+        assert_eq!(app.working_model().unwrap().as_str(), "claude-code");
+        assert_eq!(app.current_model().unwrap().as_str(), "cheap");
+    }
+
+    #[test]
+    fn a_subscription_turn_leaves_the_total_complete() {
+        let mut app = ready();
+        app.on_agent(AgentMessage::Event(Event::Turn {
+            model: ModelId::claude_code(),
+            usage: Usage {
+                input: TokenCount(30_000),
+                output: TokenCount(200),
+            },
+            cost: None,
+            subscription: true,
+        }));
+        let (usage, cost, complete) = app.totals();
+        assert_eq!(usage.input, TokenCount(30_000));
+        assert_eq!(cost, Usd(0.0));
+        assert!(complete);
     }
 
     #[test]

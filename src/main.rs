@@ -2,14 +2,16 @@
 
 #![deny(unsafe_code)]
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use ironquill_agent::{AgentConfig, Event, Outcome, Verdict};
 use ironquill_core::{ChatModel, ChatRequest, Message, ModelId};
-use ironquill_llm::OpenAiCompatible;
+use ironquill_llm::{ClaudeCode, OpenAiCompatible};
 use ironquill_tools::{Check, Toolbox, Workspace};
 use tracing_subscriber::EnvFilter;
 
@@ -41,6 +43,12 @@ struct Cli {
     /// Stronger models for the interface, cheapest first.
     #[arg(long = "escalate", value_name = "MODEL")]
     escalate: Vec<String>,
+
+    /// Models offered by the model picker (Ctrl-P), comma separated. When
+    /// the claude command is installed, `claude-code/opus` and
+    /// `claude-code/sonnet` are offered too.
+    #[arg(long, env = "IRONQUILL_MODELS", value_delimiter = ',')]
+    models: Vec<String>,
 
     /// Checks for the interface. Defaults as for `do`.
     #[arg(long = "check", value_name = "COMMAND")]
@@ -118,7 +126,8 @@ async fn main() -> Result<()> {
         } else {
             ironquill_tui::Start::New
         };
-        return interface(provider, cli.model, cli.escalate, cli.checks, start).await;
+        let models = cli.models;
+        return interface(provider, cli.model, cli.escalate, models, cli.checks, start).await;
     };
 
     tracing_subscriber::fmt()
@@ -155,6 +164,7 @@ async fn interface(
     provider: OpenAiCompatible,
     model: Option<String>,
     escalate: Vec<String>,
+    offered: Vec<String>,
     checks: Vec<String>,
     start: ironquill_tui::Start,
 ) -> Result<()> {
@@ -166,13 +176,35 @@ async fn interface(
     }
     let checks = checks_or_default(checks)?;
 
+    let claude = ClaudeCode::find();
+    let mut models = Vec::new();
+    for id in offered.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        models.push(ModelId::new(id)?);
+    }
+    if claude.is_some() {
+        for id in ["claude-code/opus", "claude-code/sonnet"] {
+            models.push(ModelId::new(id)?);
+        }
+    }
+
     let settings = ironquill_tui::Settings {
         tiers,
         checks,
         rounds: 2,
         max_turns: 30,
+        models,
     };
-    ironquill_tui::run(Arc::new(provider), workspace, settings, start).await?;
+    // Without the claude command installed, choosing a claude-code model
+    // fails with a message saying so rather than at startup.
+    let claude = claude.unwrap_or_else(|| ClaudeCode::new("claude"));
+    ironquill_tui::run(
+        Arc::new(provider),
+        Arc::new(claude),
+        workspace,
+        settings,
+        start,
+    )
+    .await?;
     Ok(())
 }
 
@@ -228,15 +260,53 @@ async fn run_task(provider: &OpenAiCompatible, config: &AgentConfig, task: &str)
     let context = ironquill_tools::project_context(workspace.root(), FILE_LIST_LIMIT).await;
 
     let mut toolbox = Toolbox::new(workspace);
-    let outcome =
-        ironquill_agent::run(provider, &mut toolbox, config, task, &context, show).await?;
+    let claude = ClaudeCode::find().unwrap_or_else(|| ClaudeCode::new("claude"));
+    let outcome = ironquill_agent::run(
+        provider,
+        &claude,
+        &mut toolbox,
+        config,
+        task,
+        &context,
+        show,
+    )
+    .await?;
     summarize(&outcome)
 }
 
+/// Whether streamed text left the cursor mid-line, so that the next event
+/// starts on a line of its own.
+static MID_LINE: AtomicBool = AtomicBool::new(false);
+
 fn show(event: Event) {
+    if let Event::Saying {
+        text, new_block, ..
+    } = &event
+    {
+        if *new_block {
+            eprint!("\n  ");
+        }
+        eprint!("{text}");
+        let _ = std::io::stderr().flush();
+        MID_LINE.store(true, Ordering::Relaxed);
+        return;
+    }
+    if MID_LINE.swap(false, Ordering::Relaxed) {
+        eprintln!();
+    }
     match event {
-        Event::Turn { model, usage, cost } => {
-            let cost = cost.map_or_else(|| "cost ?".to_owned(), |c| c.to_string());
+        Event::Saying { .. } => {}
+        Event::Turn {
+            model,
+            usage,
+            cost,
+            subscription,
+        } => {
+            let cost = match cost {
+                Some(c) => c.to_string(),
+                None if subscription => "subscription".to_owned(),
+                None => "cost ?".to_owned(),
+            };
             eprintln!(
                 "· {model}  in {}  out {}  {cost}",
                 usage.input, usage.output

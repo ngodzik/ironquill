@@ -15,6 +15,18 @@ pub enum Event {
         usage: Usage,
         /// Cost for this turn alone, if the provider reported it.
         cost: Option<Usd>,
+        /// Whether the turn ran on a subscription (Claude Code), so that no
+        /// cost is owed for it and none should be expected.
+        subscription: bool,
+    },
+    /// Text as it is being written, by an agent that reports it in pieces.
+    Saying {
+        /// Which model or agent.
+        model: ModelId,
+        /// The next piece of text.
+        text: String,
+        /// Whether this piece starts a new block of text.
+        new_block: bool,
     },
     /// A model wrote text: an explanation, or its closing summary.
     Said {

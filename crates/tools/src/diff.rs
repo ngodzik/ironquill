@@ -14,10 +14,21 @@ const CONTEXT: usize = 1;
 
 /// The lines that differ between `old` and `new`, framed by a little context.
 ///
+/// # Examples
+///
+/// ```
+/// use ironquill_tools::{DiffLine, line_diff};
+///
+/// assert_eq!(
+///     line_diff("a = 1", "a = 2"),
+///     [DiffLine::Removed("a = 1".into()), DiffLine::Added("a = 2".into())]
+/// );
+/// ```
+///
 /// Not a minimal diff: the common head and tail are trimmed and everything in
 /// between is shown as removed then added. Model edits are local, so the middle
 /// is small, and this is exact about what changed without a diff algorithm.
-pub(crate) fn line_diff(old: &str, new: &str) -> Vec<DiffLine> {
+pub fn line_diff(old: &str, new: &str) -> Vec<DiffLine> {
     let old: Vec<&str> = old.lines().collect();
     let new: Vec<&str> = new.lines().collect();
 

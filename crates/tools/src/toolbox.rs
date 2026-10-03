@@ -27,6 +27,13 @@ pub enum ToolSummary {
         /// How many entries it holds.
         entries: usize,
     },
+    /// Any other tool, described by a label such as `Grep(fn main)`.
+    Ran {
+        /// What was called, and on what.
+        label: String,
+        /// How many lines it returned.
+        lines: usize,
+    },
     /// A file was edited, or written over an earlier version.
     Changed {
         /// The file.
@@ -216,6 +223,13 @@ impl Toolbox {
                 diff: line_diff(before, after),
             },
         }
+    }
+
+    /// Records a file changed by someone else than these tools, such as an
+    /// agent the task was handed to, so that the checks and the summary
+    /// count it.
+    pub fn mark_changed(&mut self, path: impl Into<String>) {
+        self.changed.insert(path.into());
     }
 
     /// Forgets which files were changed, so that the next calls are counted

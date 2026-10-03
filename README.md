@@ -25,6 +25,7 @@ The interface follows my editor habits: Vim-like modes, a leader key, files open
 
 - A conversation in the terminal: questions get answers, requests for changes get edits shown as diffs, then the checks (`cargo check` and `cargo test` in a Rust project, any command with `/check`)
 - Escalation from a cheap model to stronger ones when the checks keep failing
+- Tasks handed to [Claude Code](https://code.claude.com/docs/en/overview) as a sub-agent, through the `claude` command installed and signed in on the machine: pick a `claude-code/...` model with Ctrl-P, or send one task with `/claude <task>`. It gets the task alone, not the conversation; what it does shows live, and ironquill still runs the checks on what it changed
 - Cost and tokens per request and for the whole conversation
 - Conversations saved locally and resumed with `ironquill -c` or `/resume`
 - A file tree, an open file coloured by language and editable with Vim keys (visual mode, registers including the system clipboard, `:s`, search)
@@ -46,7 +47,7 @@ cd your-project
 ironquill --model <cheap-model> --escalate <strong-model>
 ```
 
-`/help` lists the commands and keys. `IRONQUILL_BASE_URL` points it at another OpenAI compatible endpoint.
+`/help` lists the commands and keys. `IRONQUILL_BASE_URL` points it at another OpenAI compatible endpoint. `IRONQUILL_MODELS` (comma separated) lists the models Ctrl-P offers; `claude-code/opus` and `claude-code/sonnet` are added when the `claude` command is installed.
 
 ## Building
 

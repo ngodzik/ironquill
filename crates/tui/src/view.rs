@@ -39,6 +39,57 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     if app.picker().is_some() {
         render_picker(frame, app);
     }
+    if app.model_picker().is_some() {
+        render_model_picker(frame, app);
+    }
+}
+
+/// The model picker (Ctrl-P), over everything else.
+fn render_model_picker(frame: &mut Frame, app: &App) {
+    let Some(selected) = app.model_picker() else {
+        return;
+    };
+    let models = app.models();
+    let screen = frame.area();
+    let width = (screen.width * 3 / 5).clamp(30, 80).min(screen.width);
+    let height = (models.len() as u16 + 2).clamp(3, screen.height.saturating_sub(4).max(3));
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = pane_block(" Model ".into(), true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let room = usize::from(inner.width);
+    let current = app.current_model();
+    let lines: Vec<Line> = models
+        .iter()
+        .enumerate()
+        .map(|(i, model)| {
+            let mark = if Some(model) == current { "● " } else { "  " };
+            let kind = if model.delegate().is_some() {
+                "Claude Code · subscription"
+            } else {
+                "API · pay per request"
+            };
+            let name = format!("{mark}{model}");
+            let gap = room.saturating_sub(name.chars().count() + kind.chars().count() + 1);
+            let style = if i == selected {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            Line::from(vec![
+                Span::styled(format!("{name}{}", " ".repeat(gap)), style),
+                Span::styled(kind, style.fg(DIM)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The `/resume` list, over everything else.
@@ -644,11 +695,13 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
             cost,
             complete,
             seconds,
+            subscription,
         } => {
-            let cost = if *complete {
-                cost.to_string()
-            } else {
-                format!("{cost} reported, part of the cost unknown")
+            let cost = match (*subscription, cost.0 > 0.0, *complete) {
+                (true, false, _) => "subscription".to_owned(),
+                (true, true, _) => format!("{cost} + subscription"),
+                (false, _, true) => cost.to_string(),
+                (false, _, false) => format!("{cost} reported, part of the cost unknown"),
             };
             let text = format!(
                 "{cost} · {} in · {} out · {seconds}s",
@@ -688,6 +741,13 @@ fn tool_lines(
                 fg(DIM),
                 width,
             );
+        }
+        Ok(ToolSummary::Ran { label, lines }) => {
+            out.push(Line::from(vec![
+                Span::styled("● ", fg(Color::Green)),
+                Span::styled(label.clone(), Style::new().add_modifier(Modifier::BOLD)),
+            ]));
+            result(out, &plural(*lines, "line", "lines"), fg(DIM), width);
         }
         Ok(ToolSummary::Listed { path, entries }) => {
             out.push(action(Color::Green, "List", path));
@@ -836,13 +896,15 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let glyph = SPINNER[app.spinner() % SPINNER.len()];
-    let line = Line::from(vec![
-        Span::styled(format!("{glyph} Working… "), fg(ACCENT)),
-        Span::styled(
-            format!("({}s · Ctrl-C to stop)", elapsed.as_secs()),
-            fg(DIM),
-        ),
-    ]);
+    let mut spans = vec![Span::styled(format!("{glyph} Working… "), fg(ACCENT))];
+    if let Some(model) = app.working_model() {
+        spans.push(Span::styled(format!("{model} "), fg(Color::Gray)));
+    }
+    spans.push(Span::styled(
+        format!("({}s · Ctrl-C to stop)", elapsed.as_secs()),
+        fg(DIM),
+    ));
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -907,17 +969,31 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     ]);
 
     let (usage, cost, complete) = app.totals();
-    let right = Line::styled(
-        format!(
-            "{} · {} in · {} out · {}{}  ",
-            app.chain(),
-            usage.input,
-            usage.output,
-            cost,
-            if complete { "" } else { "+?" }
+    // The model in use stands out: it is what Ctrl-P changes.
+    let current = app
+        .current_model()
+        .map_or_else(|| "no model".to_owned(), ToString::to_string);
+    let rest = app
+        .chain()
+        .strip_prefix(&current)
+        .unwrap_or_default()
+        .to_owned();
+    let right = Line::from(vec![
+        // Room between the conversation's name and the model, however long
+        // the name.
+        Span::raw("  "),
+        Span::styled(current, fg(ACCENT)),
+        Span::styled(
+            format!(
+                "{rest} · {} in · {} out · {}{}  ",
+                usage.input,
+                usage.output,
+                cost,
+                if complete { "" } else { "+?" }
+            ),
+            fg(DIM),
         ),
-        fg(DIM),
-    );
+    ]);
 
     // The model and the cost matter more than the hint: they get their room
     // first, and the left side gets what is left.

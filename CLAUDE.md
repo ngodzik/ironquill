@@ -34,7 +34,7 @@ Separation of concerns is **enforced by the crate dependency graph**, not by con
 | Crate             | Single responsibility                                                      |
 |-------------------|----------------------------------------------------------------------------|
 | `ironquill-core`  | Domain types and traits, zero I/O, zero network                            |
-| `ironquill-llm`   | Model providers, one `impl ChatModel` per protocol                         |
+| `ironquill-llm`   | Model providers, one `impl ChatModel` per protocol, and the Claude Code `Delegate` |
 | `ironquill-tools` | Deterministic tools: sandboxed workspace, file edits, checks, git          |
 | `ironquill-agent` | The loop: edit, check, retry, escalate. Generic over `ChatModel`           |
 | `ironquill-tui`   | The terminal interface. Generic over `ChatModel`                           |
@@ -43,6 +43,8 @@ Separation of concerns is **enforced by the crate dependency graph**, not by con
 In `ironquill-tui`, keys become actions only in `keymap.rs`, `App` turns actions into state changes and returns an `Effect` for the loop instead of doing I/O, and `view.rs` draws without changing anything. A new key binding touches `keymap.rs` only; a new `:` command touches `command.rs` and `App::run_command`.
 
 `ironquill-agent` does not depend on `ironquill-llm`: it is generic over `ChatModel`, which is what lets its tests run against a scripted model with no network.
+
+A `Delegate` (Claude Code) is an agent rather than a model: it gets a whole task, edits files itself and reports what it does as events. It still never runs commands (`Bash` is disallowed), and its changes go through the same checks.
 
 The model never runs commands. It edits files through `Toolbox`; checks are run by the agent, so a model can neither skip nor fake them.
 
