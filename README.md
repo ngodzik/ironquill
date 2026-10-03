@@ -25,7 +25,7 @@ The interface follows my editor habits: Vim-like modes, a leader key, files open
 
 - A conversation in the terminal: questions get answers, requests for changes get edits shown as diffs, then the checks (`cargo check` and `cargo test` in a Rust project, any command with `/check`)
 - Escalation from a cheap model to stronger ones when the checks keep failing
-- Tasks handed to [Claude Code](https://code.claude.com/docs/en/overview) as a sub-agent, through the `claude` command installed and signed in on the machine: pick a `claude-code/...` model with Ctrl-E, or send one task with `/claude <task>`. It gets the task alone, not the conversation; what it does shows live, and ironquill still runs the checks on what it changed
+- Tasks handed to [Claude Code](https://code.claude.com/docs/en/overview) as a sub-agent, through the `claude` command installed and signed in on the machine: pick a `claude-code/...` model with Ctrl-E, or send one task with `/claude <task>`. It keeps its own session for the whole conversation, across model switches and restarts (`/claude-reset` ends it), and is told what was said with the other models since it last took part; what it does shows live, and ironquill still runs the checks on what it changed
 - Cost, tokens and how full the context is, per request and for the whole conversation
 - The context in your hands: `/context` opens what the next request will send in the Vim editor, to delete passages, shorten tool results or add notes; `:w` applies it. Long replies fold, and Ctrl-Z gives the conversation the whole screen
 - Conversations saved locally and resumed with `ironquill -c` or `/resume`

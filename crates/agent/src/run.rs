@@ -122,6 +122,9 @@ struct Ctx<'a, M, D, O> {
     /// The delegate session to continue, and after a delegated attempt the
     /// session it ended in.
     thread: Option<String>,
+    /// What the conversation said since the delegate last took part, put
+    /// before its next request so that it does not miss it.
+    catch_up: String,
 }
 
 enum Attempt {
@@ -144,11 +147,18 @@ enum Attempt {
 pub struct Session {
     messages: Vec<Message>,
     context_added: bool,
-    /// The delegate's own session while consecutive requests go to the same
-    /// delegate model, so that Claude Code follows the conversation from the
-    /// moment it was picked. A request to any other model ends it.
+    /// Claude Code's own session. It lasts for the whole conversation, across
+    /// requests to other models and restarts, until `/claude-reset`.
     #[serde(default)]
-    delegate_thread: Option<(ModelId, String)>,
+    delegate: Option<Thread>,
+}
+
+/// A delegate's session and how much of the conversation it has seen.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Thread {
+    session: String,
+    /// The number of messages of the conversation the delegate knows about.
+    seen: usize,
 }
 
 impl Default for Session {
@@ -163,7 +173,7 @@ impl Session {
         Self {
             messages: vec![Message::system(CHAT_PROMPT)],
             context_added: false,
-            delegate_thread: None,
+            delegate: None,
         }
     }
 
@@ -204,24 +214,28 @@ impl Session {
             ledger: Ledger::new(),
             observe,
             thread: None,
+            catch_up: String::new(),
         };
         let Some(first) = config.tiers.first() else {
             return Err(AgentError::Config("at least one model is needed"));
         };
         let mut failure = None;
 
-        // Claude Code continues its own session for as long as requests keep
-        // going to it; a request to another model, or to another Claude
-        // model, starts it afresh next time.
-        ctx.thread = match &self.delegate_thread {
-            Some((model, session)) if model == first => Some(session.clone()),
-            _ => None,
-        };
+        // Claude Code continues its own session whichever Claude model is
+        // picked, and is told what was said with other models meanwhile.
+        if first.delegate().is_some() {
+            let seen = self.delegate.as_ref().map_or(1, |t| t.seen);
+            ctx.thread = self.delegate.as_ref().map(|t| t.session.clone());
+            let request = self.messages.len() - 1;
+            ctx.catch_up = catch_up(&self.messages[seen.min(request)..request]);
+        }
         let first_attempt = attempt(&mut ctx, first, &mut self.messages, &mut failure, true).await;
-        self.delegate_thread = match (first.delegate(), ctx.thread.take()) {
-            (Some(_), Some(session)) => Some((first.clone(), session)),
-            _ => None,
-        };
+        if let Some(session) = ctx.thread.take() {
+            self.delegate = Some(Thread {
+                session,
+                seen: self.messages.len(),
+            });
+        }
 
         match first_attempt? {
             Attempt::Answered => return Ok(ctx.ledger.outcome(Verdict::Answered, ctx.toolbox)),
@@ -248,6 +262,7 @@ impl Session {
                 Message::user(brief(text, context, failure.as_ref(), ctx.toolbox)),
             ];
             ctx.thread = None;
+            ctx.catch_up.clear();
             if let Attempt::Passed =
                 attempt(&mut ctx, to, &mut brief_messages, &mut failure, false).await?
             {
@@ -284,6 +299,9 @@ impl Session {
     /// conversation is then left as it was.
     pub fn apply_text(&mut self, text: &str) -> Result<(), String> {
         self.messages = crate::context::sanitize(crate::context::from_text(text)?);
+        if let Some(thread) = &mut self.delegate {
+            thread.seen = thread.seen.min(self.messages.len());
+        }
         // The edited system message holds whatever context the person kept.
         self.context_added = true;
         Ok(())
@@ -296,12 +314,12 @@ impl Session {
 
     /// The delegate session the next request would continue, if any.
     pub fn delegate_session(&self) -> Option<&str> {
-        self.delegate_thread.as_ref().map(|(_, s)| s.as_str())
+        self.delegate.as_ref().map(|t| t.session.as_str())
     }
 
     /// Ends the delegate's session: its next request starts from nothing.
     pub fn forget_delegate(&mut self) {
-        self.delegate_thread = None;
+        self.delegate = None;
     }
 
     /// Writes what happened outside the conversation into it.
@@ -347,6 +365,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         ledger: Ledger::new(),
         observe,
         thread: None,
+        catch_up: String::new(),
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -433,8 +452,8 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
 /// Hands the task to an agent such as Claude Code, then judges what it did
 /// with the checks, as for a model.
 ///
-/// The agent gets the last message of `messages` and nothing before it: it
-/// works from the task alone, in its own session. A failing check goes back
+/// The agent gets the last message of `messages`, after what it missed of
+/// the conversation, and works in its own session. A failing check goes back
 /// into that session. Its reports are added to `messages`, so that the models
 /// of the conversation know what was done.
 async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
@@ -454,9 +473,16 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
             _ => None,
         })
         .unwrap_or_default();
-    // A session to continue, when the conversation was already with this
-    // delegate; otherwise the delegate starts fresh.
+    // A session to continue, when the delegate already took part in the
+    // conversation; otherwise it starts fresh.
     let mut session = ctx.thread.take();
+    let catch_up = std::mem::take(&mut ctx.catch_up);
+    if !catch_up.is_empty() {
+        prompt = format!(
+            "Meanwhile the conversation went on with another assistant:\n\n{catch_up}\n\
+             The request now:\n\n{prompt}"
+        );
+    }
 
     for round in 0..ctx.config.rounds_per_tier {
         if round > 0
@@ -641,6 +667,31 @@ async fn converse<M: ChatModel, D, O: FnMut(Event)>(
 
 /// The opening message of a tier: the task, the free context, and, when a
 /// weaker model went first, where it left things.
+/// What these messages said, as text for a delegate that did not see them:
+/// the people's requests and the replies, with the tools named but not their
+/// results, which the delegate can read again itself.
+fn catch_up(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        match message {
+            Message::User(text) => out.push_str(&format!("User: {text}\n\n")),
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                for call in tool_calls {
+                    out.push_str(&format!("(ran {} {})\n", call.name, call.arguments));
+                }
+                if let Some(text) = content.as_deref().filter(|t| !t.is_empty()) {
+                    out.push_str(&format!("Assistant: {text}\n\n"));
+                }
+            }
+            Message::System(_) | Message::Tool { .. } => {}
+        }
+    }
+    out
+}
+
 fn brief(task: &str, context: &str, failure: Option<&CheckFailure>, toolbox: &Toolbox) -> String {
     let mut text = format!("Task: {task}\n\n{context}");
     if let Some(f) = failure {
@@ -986,7 +1037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_delegated_task_gets_the_request_alone_and_is_checked() {
+    async fn a_delegated_task_hears_what_was_said_before_and_is_checked() {
         let (_dir, mut toolbox) = setup();
         let claude = FakeClaude {
             writes_on_round: 1,
@@ -996,7 +1047,7 @@ mod tests {
         let mut session = Session::new();
         let mut events = Vec::new();
 
-        // A first exchange with the chat model, which Claude must not see.
+        // A first exchange with the chat model, which Claude is told about.
         session
             .send(
                 &model,
@@ -1033,7 +1084,13 @@ mod tests {
         assert_eq!(outcome.changed, ["done.txt"]);
 
         let requests = claude.requests.lock().unwrap();
-        assert_eq!(requests[0].prompt, "create done.txt");
+        assert_eq!(
+            requests[0].prompt,
+            "Meanwhile the conversation went on with another assistant:\n\n\
+             User: hello\n\nAssistant: Hi.\n\n\n\
+             The request now:\n\ncreate done.txt"
+        );
+        assert!(!requests[0].prompt.contains("FILES"));
         assert_eq!(requests[0].model, "opus");
         assert_eq!(requests[0].resume, None);
 
@@ -1056,7 +1113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consecutive_requests_to_claude_continue_its_session_until_another_model_answers() {
+    async fn claudes_session_lasts_across_other_models_and_restarts() {
         let (_dir, mut toolbox) = setup();
         let claude = FakeClaude {
             writes_on_round: 1,
@@ -1065,31 +1122,52 @@ mod tests {
         let model = Scripted::new(vec![says("Hi from the chat model.")]);
         let mut session = Session::new();
         // No check, so each request is one round.
-        let claude_only = AgentConfig::builder()
-            .tier(ModelId::new("claude-code/opus").unwrap())
-            .build()
-            .unwrap();
-        let chat_only = AgentConfig::builder()
-            .tier(ModelId::new("cheap").unwrap())
-            .build()
-            .unwrap();
-
-        for (config, text) in [
-            (&claude_only, "first"),
-            (&claude_only, "second"),
-            (&chat_only, "elsewhere"),
-            (&claude_only, "third"),
-        ] {
+        let only = |model: &str| {
+            AgentConfig::builder()
+                .tier(ModelId::new(model).unwrap())
+                .build()
+                .unwrap()
+        };
+        let mut send = async |session: &mut Session, model_id: &str, text: &str| {
             session
-                .send(&model, &claude, &mut toolbox, config, text, "", |_| {})
+                .send(
+                    &model,
+                    &claude,
+                    &mut toolbox,
+                    &only(model_id),
+                    text,
+                    "",
+                    |_| {},
+                )
                 .await
                 .unwrap();
-        }
+        };
+
+        send(&mut session, "claude-code/opus", "first").await;
+        send(&mut session, "claude-code/sonnet", "second").await;
+        send(&mut session, "cheap", "elsewhere").await;
+        // As `ironquill -c` does after a restart.
+        let mut session: Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        send(&mut session, "claude-code/opus", "third").await;
 
         let requests = claude.requests.lock().unwrap();
         let resumes: Vec<Option<&str>> = requests.iter().map(|r| r.resume.as_deref()).collect();
-        assert_eq!(resumes, [None, Some("claude-session-1"), None]);
+        assert_eq!(
+            resumes,
+            [None, Some("claude-session-1"), Some("claude-session-2")]
+        );
         assert_eq!(requests[1].prompt, "second");
+        // Only what Claude missed is repeated to it.
+        assert_eq!(
+            requests[2].prompt,
+            "Meanwhile the conversation went on with another assistant:\n\n\
+             User: elsewhere\n\nAssistant: Hi from the chat model.\n\n\n\
+             The request now:\n\nthird"
+        );
+
+        session.forget_delegate();
+        assert_eq!(session.delegate_session(), None);
     }
 
     #[tokio::test]

@@ -187,7 +187,7 @@ pub(crate) fn candidates(line: &str, names: &[&str], models: &[String]) -> Vec<S
 pub(crate) const HELP: &str = "\
 Type a question or a change and press Enter. Changes are checked before they are kept.
 /model               pick the model that answers (Ctrl-E); /model <id> sets it
-/claude <task>       hand one task to Claude Code, which works without this conversation
+/claude <task>       hand one task to Claude Code, told what it missed of this conversation
 /context             edit what the next request sends: delete, shorten, annotate; :w applies
 /claude-reset        end Claude Code's session: its next request starts from nothing
 /escalate <id> ...   stronger models used only when the checks keep failing (empty: none)
