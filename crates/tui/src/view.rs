@@ -1121,6 +1121,11 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
     let Some(elapsed) = app.elapsed() else {
+        // While a command is being completed, its candidates take this line.
+        if let Some(matches) = app.completions() {
+            let line = Line::styled(format!("  {}", matches.join("   ")), fg(Color::Gray));
+            frame.render_widget(Paragraph::new(line), area);
+        }
         return;
     };
     let glyph = SPINNER[app.spinner() % SPINNER.len()];

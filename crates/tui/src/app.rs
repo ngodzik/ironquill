@@ -194,6 +194,12 @@ impl LineEditor {
         std::mem::take(&mut self.text)
     }
 
+    /// Replaces the text, the cursor at its end.
+    fn set(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.text = text;
+    }
+
     fn apply(&mut self, action: &Action) {
         let len = self.text.chars().count();
         match action {
@@ -268,6 +274,8 @@ pub(crate) struct App {
     zoomed: bool,
     /// The pane that had the focus before zooming in, given back after.
     zoom_focus: Option<Focus>,
+    /// Tab completion of a command, while it cycles through candidates.
+    completion: Option<command::Completion>,
     /// The list of shortcuts, open at this scroll offset.
     keys_open: Option<usize>,
     /// The model picker, open on the row selected.
@@ -346,6 +354,7 @@ impl App {
             transcript_view: Cell::new((0, Rect::default())),
             zoomed: false,
             zoom_focus: None,
+            completion: None,
             keys_open: None,
             model_picker: None,
             working_model: None,
@@ -501,6 +510,7 @@ impl App {
                     || (ctrl && key.code == KeyCode::Char('w')));
             if !global && !pane {
                 match editor.handle_key(key) {
+                    EditorOutcome::Command(line) => return self.run_command(&line),
                     EditorOutcome::Context { text, close } => {
                         if close {
                             self.file = None;
@@ -530,6 +540,13 @@ impl App {
                 }
                 return None;
             }
+        }
+        if key.code == KeyCode::Tab && self.complete_command() {
+            return None;
+        }
+        // Any other key ends a completion in progress.
+        if key.code != KeyCode::Tab {
+            self.completion = None;
         }
         let pending = self.pending.take();
         let action = keymap::action(self.mode, self.focus, pending, key)?;
@@ -1398,10 +1415,13 @@ impl App {
 
     /// Opens the conversation's context in the editor, in place of a file.
     pub(crate) fn open_context(&mut self, text: &str) {
-        if self.file.as_ref().is_some_and(Editor::is_modified) {
-            if let Some(file) = &mut self.file {
+        if let Some(file) = self.file.as_mut().filter(|f| f.is_modified()) {
+            if file.kind() == crate::editor::Kind::Context {
+                file.say_pending_context();
+            } else {
                 file.refuse_close();
             }
+            self.unzoom();
             self.focus_on(Focus::File);
             return;
         }
@@ -1428,6 +1448,33 @@ impl App {
                 self.error(format!("Context not applied: {e}"));
             }
         }
+    }
+
+    /// Tab while a command is being typed: after `:`, or after `/` in the
+    /// message box. Returns whether Tab was used for that.
+    fn complete_command(&mut self) -> bool {
+        let models: Vec<String> = self.models().iter().map(ToString::to_string).collect();
+        let (editor, slash) = match self.mode {
+            Mode::Command => (&mut self.command, false),
+            Mode::Insert if self.input.text().starts_with('/') => (&mut self.input, true),
+            _ => return false,
+        };
+        let typed = if slash {
+            editor.text()[1..].to_owned()
+        } else {
+            editor.text().to_owned()
+        };
+        if let Some(line) = command::complete(&typed, &mut self.completion, |l| {
+            command::candidates(l, command::NAMES, &models)
+        }) {
+            editor.set(if slash { format!("/{line}") } else { line });
+        }
+        true
+    }
+
+    /// The candidates of a completion in progress, to show them.
+    pub(crate) fn completions(&self) -> Option<&[String]> {
+        self.completion.as_ref().map(|c| c.matches.as_slice())
     }
 
     pub(crate) fn docker(&self) -> Option<&DockerPane> {
@@ -2149,6 +2196,68 @@ mod tests {
 
         app.on_context_applied(Err("Unknown block === robot".into()));
         assert!(app.file().unwrap().is_modified());
+    }
+
+    #[test]
+    fn colon_commands_work_from_inside_the_editor_and_the_open_context() {
+        let mut app = ready();
+        app.open_context("=== user\nhello");
+        assert_eq!(app.focus(), Focus::File);
+        for c in ":context".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::OpenContext)
+        ));
+
+        for c in ":model other".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_model().unwrap().as_str(), "other");
+    }
+
+    #[test]
+    fn reopening_the_context_keeps_edits_not_applied() {
+        let mut app = ready();
+        app.open_context("=== user\nhello\n=== user\nbye");
+        for c in "Gdd".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        app.open_context("=== user\nfresh");
+        assert!(app.file().unwrap().is_modified());
+        assert!(app.file().unwrap().lines().iter().all(|l| l != "fresh"));
+    }
+
+    #[test]
+    fn tab_completes_colon_and_slash_commands() {
+        let mut app = ready();
+        type_text(&mut app, "/cont");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input().text(), "/context");
+        assert_eq!(app.focus(), Focus::Chat);
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char(':'));
+        type_text(&mut app, "cl");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.command_line().text(), "claude");
+        assert_eq!(app.completions().map(<[String]>::len), Some(3));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.command_line().text(), "claude-reset");
+        type_text(&mut app, "x");
+        assert!(app.completions().is_none());
+    }
+
+    #[test]
+    fn tab_still_switches_panes_while_typing_a_message() {
+        let (_dir, mut app) = project();
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Char('i'));
+        type_text(&mut app, "hello");
+        press(&mut app, KeyCode::Tab);
+        assert_ne!(app.focus(), Focus::Chat);
     }
 
     #[test]

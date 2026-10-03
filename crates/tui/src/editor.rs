@@ -19,6 +19,7 @@ use regex::RegexBuilder;
 use ironquill_tools::{LineChanges, committed_lines, line_changes};
 
 use crate::clipboard;
+use crate::command;
 use crate::highlight::{Highlighter, StyledLine};
 
 /// Spaces typed by the Tab key in insert mode, and added by `>`. Spaces
@@ -62,6 +63,9 @@ pub(crate) enum Outcome {
         text: String,
         close: bool,
     },
+    /// A `:` command the editor does not know, for ironquill to run, so that
+    /// its commands (`:context`, `:model`...) work from inside a file too.
+    Command(String),
     Stay,
     /// `:w`: the file was written, so its git status changed.
     Saved,
@@ -198,6 +202,8 @@ pub(crate) struct Editor {
     pending: Option<char>,
     /// In the context document, the block headers whose body is hidden.
     closed: BTreeSet<usize>,
+    /// Tab completion of a `:` command, while it cycles.
+    completion: Option<command::Completion>,
     /// `"` was typed: the next key names a register.
     naming_register: bool,
     /// The register named for the next yank, delete or put.
@@ -272,6 +278,7 @@ impl Editor {
             prompt: String::new(),
             pending: None,
             closed: BTreeSet::new(),
+            completion: None,
             naming_register: false,
             register: None,
             registers: HashMap::new(),
@@ -574,6 +581,11 @@ impl Editor {
 
     // Changes from outside.
 
+    /// Explains why an edited context stays as it is.
+    pub(crate) fn say_pending_context(&mut self) {
+        self.say_error("This context has edits not applied yet: :w applies them, :q! drops them");
+    }
+
     /// Explains why the file stays open.
     pub(crate) fn refuse_close(&mut self) {
         self.say_error("Unsaved changes: :w to save, or :q! to discard them");
@@ -843,7 +855,22 @@ impl Editor {
     }
 
     fn prompt_key(&mut self, key: KeyEvent) -> Outcome {
+        if key.code != KeyCode::Tab {
+            self.completion = None;
+        }
         match key.code {
+            KeyCode::Tab if self.mode == EditorMode::Command => {
+                let names: Vec<&str> = command::EDITOR_NAMES
+                    .iter()
+                    .chain(command::NAMES)
+                    .copied()
+                    .collect();
+                if let Some(line) = command::complete(&self.prompt, &mut self.completion, |l| {
+                    command::candidates(l, &names, &[])
+                }) {
+                    self.prompt = line;
+                }
+            }
             KeyCode::Esc => self.mode = EditorMode::Normal,
             KeyCode::Backspace => {
                 if self.prompt.pop().is_none() {
@@ -951,10 +978,7 @@ impl Editor {
                 Outcome::Stay
             }
             "" => Outcome::Stay,
-            other => {
-                self.say_error(&format!("Not an editor command: {other}"));
-                Outcome::Stay
-            }
+            other => Outcome::Command(other.to_owned()),
         }
     }
 
@@ -2061,6 +2085,18 @@ mod tests {
         assert!(visible(&ed).contains(&"note: keep it short".to_owned()));
         let user = ed.lines().iter().position(|l| l == "=== user").unwrap();
         assert_eq!(ed.folded(user), Some(2));
+    }
+
+    #[test]
+    fn tab_completes_editor_and_ironquill_commands() {
+        let (_dir, mut ed) = editor("x\n");
+        keys(&mut ed, ":wq");
+        ed.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(ed.prompt(), "wq");
+        keys(&mut ed, "\u{1b}:cont");
+        ed.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(ed.prompt(), "context");
+        assert_eq!(keys(&mut ed, "\n"), Outcome::Command("context".into()));
     }
 
     #[test]
