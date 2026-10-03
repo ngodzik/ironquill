@@ -283,7 +283,7 @@ impl Session {
     /// A sentence for the person when the document cannot be read; the
     /// conversation is then left as it was.
     pub fn apply_text(&mut self, text: &str) -> Result<(), String> {
-        self.messages = crate::context::from_text(text)?;
+        self.messages = crate::context::sanitize(crate::context::from_text(text)?);
         // The edited system message holds whatever context the person kept.
         self.context_added = true;
         Ok(())
@@ -312,24 +312,11 @@ impl Session {
         });
     }
 
-    /// Drops a tool request left without its results, as a stopped request
-    /// leaves it. Providers refuse a conversation where a call has no answer.
+    /// Puts the conversation in the shape providers accept before it is sent:
+    /// a stopped request can leave a call without its result, an edit can
+    /// leave either alone. Providers refuse a conversation where they are.
     fn settle(&mut self) {
-        let Some(index) = self.messages.iter().rposition(
-            |m| matches!(m, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()),
-        ) else {
-            return;
-        };
-        let Message::Assistant { tool_calls, .. } = &self.messages[index] else {
-            return;
-        };
-        let answered = self.messages[index + 1..]
-            .iter()
-            .filter(|m| matches!(m, Message::Tool { .. }))
-            .count();
-        if answered < tool_calls.len() {
-            self.messages.truncate(index);
-        }
+        self.messages = crate::context::sanitize(std::mem::take(&mut self.messages));
     }
 }
 
