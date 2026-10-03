@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long = "escalate", value_name = "MODEL")]
     escalate: Vec<String>,
 
-    /// Models offered by the model picker (Ctrl-P), comma separated. When
+    /// Models offered by the model picker (Ctrl-E), comma separated. When
     /// the claude command is installed, `claude-code/opus` and
     /// `claude-code/sonnet` are offered too.
     #[arg(long, env = "IRONQUILL_MODELS", value_delimiter = ',')]

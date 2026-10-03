@@ -59,7 +59,7 @@ pub struct Settings {
     pub rounds: u32,
     /// Turns per try.
     pub max_turns: u32,
-    /// The models offered by the model picker (Ctrl-P). Identifiers starting
+    /// The models offered by the model picker (Ctrl-E). Identifiers starting
     /// with `claude-code` hand the task to Claude Code.
     pub models: Vec<ModelId>,
 }
@@ -428,7 +428,7 @@ impl App {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             // Stopping a request and the tree work from anywhere; Tab, Ctrl-W
             // and the leader leave the file only when Vim is not mid-command.
-            let global = ctrl && matches!(key.code, KeyCode::Char('c' | 'b' | 'g' | 'k' | 'p'));
+            let global = ctrl && matches!(key.code, KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e'));
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
                     || key.code == KeyCode::Char(',')
@@ -1111,8 +1111,8 @@ impl App {
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => self.model_picker = None,
-            // Ctrl-P again closes it, as the shortcut that opened it.
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl-E again closes it, as the shortcut that opened it.
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.model_picker = None;
             }
             _ => {}
@@ -1633,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_picks_the_model_with_arrows() {
+    fn ctrl_e_picks_the_model_with_arrows() {
         let mut app = App::new(
             Settings {
                 tiers: vec![ModelId::new("cheap").unwrap()],
@@ -1642,7 +1642,7 @@ mod tests {
             },
             PathBuf::from("/p"),
         );
-        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert_eq!(app.model_picker(), Some(0));
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);

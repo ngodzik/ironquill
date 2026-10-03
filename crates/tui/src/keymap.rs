@@ -118,7 +118,8 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         // "Go" back to typing a message, wherever the focus is.
         KeyCode::Char('g') if ctrl => return Some(Action::FocusInput),
         KeyCode::Char('k') if ctrl => return Some(Action::ToggleDocker),
-        KeyCode::Char('p') if ctrl => return Some(Action::PickModel),
+        // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
+        KeyCode::Char('e') if ctrl => return Some(Action::PickModel),
         _ => {}
     }
 

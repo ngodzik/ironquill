@@ -44,7 +44,7 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     }
 }
 
-/// The model picker (Ctrl-P), over everything else.
+/// The model picker (Ctrl-E), over everything else.
 fn render_model_picker(frame: &mut Frame, app: &App) {
     let Some(selected) = app.model_picker() else {
         return;
@@ -969,7 +969,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     ]);
 
     let (usage, cost, complete) = app.totals();
-    // The model in use stands out: it is what Ctrl-P changes.
+    // The model in use stands out: it is what Ctrl-E changes.
     let current = app
         .current_model()
         .map_or_else(|| "no model".to_owned(), ToString::to_string);
