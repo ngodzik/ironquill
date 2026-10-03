@@ -16,6 +16,7 @@ use crate::event::Event;
 const TASK_PROMPT: &str = "You are a careful software engineer working in a project through tools. \
 Make the smallest change that completes the task. Read a file before editing it. \
 Edit existing files with `replace`, not `write_file`. \
+Find code with `search` and `outline`, then read only the lines you need. \
 You cannot run commands: when you stop calling tools, the project's checks run automatically \
 and you will be shown any failure. Do not ask questions; when you are done, reply with one \
 short sentence saying what you changed.";
@@ -38,7 +39,8 @@ in the language the task is written in.";
 /// For a model of the team the first model handed a task to.
 const MEMBER_PROMPT: &str = "You are a careful software engineer. Another assistant handed you one \
 task in a project, which you work on through tools; you cannot run commands. Do the task and \
-nothing else. Read a file before editing it, and edit existing files with `replace`. Do not ask \
+nothing else. Find code with `search` and `outline`, then read only the lines you need: every \
+line read is paid for again on each later turn. Read a file before editing it, and edit existing files with `replace`. Do not ask \
 questions. When you are done, reply with a short report: what you found or changed, and anything \
 left to do.";
 
@@ -58,7 +60,9 @@ Only change files when the person asks for a change. \
 If you need to ask the person something, ask it and end your reply there: do not call any tool \
 in that reply, and do not act on a guess of the answer. They will reply in their next message. \
 The project's files are listed below: use the list instead of listing directories, and do not \
-try to read binary files. When you change files, make the smallest change that does the job, \
+try to read binary files. To find code, use `search` and `outline` first, then read only the \
+lines you need with `read_file` and a range: every line read is paid for again on each later \
+turn. When you change files, make the smallest change that does the job, \
 read a file before editing it, and edit existing files with `replace`. When you stop calling \
 tools after changing files, the project's checks run automatically and you will be shown any \
 failure. Be brief. You may use Markdown.";
@@ -1429,7 +1433,8 @@ mod tests {
             .unwrap();
 
         let seen = model.seen.lock().unwrap();
-        assert!(seen[0].tools[4].description.contains("It cannot use tools"));
+        let delegate = seen[0].tools.iter().find(|t| t.name == "delegate").unwrap();
+        assert!(delegate.description.contains("It cannot use tools"));
         assert_eq!(seen[1].model.as_str(), "tiny");
         assert!(seen[1].tools.is_empty());
         assert!(matches!(

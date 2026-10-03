@@ -71,6 +71,25 @@ struct PathArgs {
 }
 
 #[derive(Deserialize)]
+struct ReadArgs {
+    path: String,
+    /// First line to read, from 1.
+    start: Option<usize>,
+    /// Last line to read, included.
+    end: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SearchArgs {
+    pattern: String,
+    path: Option<String>,
+    glob: Option<String>,
+}
+
+/// Past this many lines, reading a whole file says how to read less.
+const LONG_FILE: usize = 300;
+
+#[derive(Deserialize)]
 struct WriteArgs {
     path: String,
     content: String,
@@ -107,11 +126,48 @@ impl Toolbox {
         let path = json!({"type": "string", "description": "Path relative to the project root."});
         vec![
             ToolSpec {
-                name: "read_file".into(),
-                description: "Read a whole text file.".into(),
+                name: "search".into(),
+                description: "Find the lines matching a regular expression in the project, \
+                    as `path:line: text`. Skips what git ignores. Case insensitive unless the \
+                    pattern has a capital letter. Use it to find where something is defined or \
+                    used before reading anything."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "path": {"type": "string", "description": "A directory or file to search, relative to the project root. Default: the whole project."},
+                        "glob": {"type": "string", "description": "Only files whose name matches, such as `*.py`."},
+                    },
+                    "required": ["pattern"],
+                }),
+            },
+            ToolSpec {
+                name: "outline".into(),
+                description: "The map of a file or directory: its functions, classes, methods \
+                    and types with their line numbers, without their code. Knows Rust, Python, \
+                    TypeScript and JavaScript. Cheaper than reading: look at the map, then read \
+                    only the lines you need."
+                    .into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {"path": path},
+                    "required": ["path"],
+                }),
+            },
+            ToolSpec {
+                name: "read_file".into(),
+                description: "Read a text file, or only lines `start` to `end` of it, numbered \
+                    from 1. Read only the lines you need when you know where they are, from \
+                    `search` or `outline`: every line read is paid for again on each later turn."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": path,
+                        "start": {"type": "integer", "minimum": 1},
+                        "end": {"type": "integer", "minimum": 1},
+                    },
                     "required": ["path"],
                 }),
             },
@@ -161,12 +217,76 @@ impl Toolbox {
     pub fn call(&mut self, call: &ToolCall) -> Result<ToolOutput, ToolError> {
         match call.name.as_str() {
             "read_file" => {
-                let args: PathArgs = parse(call)?;
+                let args: ReadArgs = parse(call)?;
                 let text = self.workspace.read(&args.path)?;
+                let total = text.lines().count();
+                if args.start.is_none() && args.end.is_none() {
+                    let mut for_model = text;
+                    if total > LONG_FILE {
+                        for_model.push_str(&format!(
+                            "\n\n({total} lines. Next time, `outline` and `search` then a range \
+                             of lines read less.)"
+                        ));
+                    }
+                    return Ok(ToolOutput {
+                        summary: ToolSummary::Read {
+                            lines: total,
+                            path: args.path,
+                        },
+                        for_model,
+                    });
+                }
+                let start = args.start.unwrap_or(1).max(1);
+                let end = args.end.unwrap_or(total).min(total);
+                if start > end {
+                    return Err(ToolError::InvalidArguments {
+                        tool: call.name.clone(),
+                        reason: format!("no line {start} to {end}: the file has {total} lines"),
+                    });
+                }
+                let lines: Vec<&str> = text.lines().skip(start - 1).take(end + 1 - start).collect();
                 Ok(ToolOutput {
-                    summary: ToolSummary::Read {
+                    summary: ToolSummary::Ran {
+                        label: format!("Read({} {start}-{end})", args.path),
+                        lines: lines.len(),
+                    },
+                    for_model: format!("(lines {start} to {end} of {total})\n{}", lines.join("\n")),
+                })
+            }
+            "search" => {
+                let args: SearchArgs = parse(call)?;
+                let where_ = args.path.as_deref().unwrap_or(".");
+                let dir = self.workspace.resolve(where_)?;
+                let (text, matches) = crate::search::search(
+                    self.workspace.root(),
+                    &dir,
+                    &args.pattern,
+                    args.glob.as_deref(),
+                )?;
+                Ok(ToolOutput {
+                    summary: ToolSummary::Ran {
+                        label: format!("Search({})", args.pattern),
+                        lines: matches,
+                    },
+                    for_model: text,
+                })
+            }
+            "outline" => {
+                let args: PathArgs = parse(call)?;
+                let path = self.workspace.resolve(&args.path)?;
+                let text = if path.is_file() {
+                    crate::outline::outline_file(&path).unwrap_or_else(|| {
+                        "not a Rust, Python, TypeScript or JavaScript file: use search, or read \
+                         a range of lines"
+                            .into()
+                    })
+                } else {
+                    crate::outline::outline_dir(self.workspace.root(), &path)
+                };
+                Ok(ToolOutput {
+                    summary: ToolSummary::Ran {
+                        label: format!("Outline({})", args.path),
                         lines: text.lines().count(),
-                        path: args.path,
                     },
                     for_model: text,
                 })
@@ -345,6 +465,57 @@ mod tests {
                 DiffLine::Removed("two".into()),
                 DiffLine::Added("2".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn reads_a_range_searches_and_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = Toolbox::new(Workspace::new(dir.path()).unwrap());
+        let source = "class A:\n    def go(self):\n        return 1\n\ndef main():\n    A().go()\n";
+        fs::write(dir.path().join("app.py"), source).unwrap();
+
+        let range = tools
+            .call(&call(
+                "read_file",
+                json!({"path": "app.py", "start": 2, "end": 3}),
+            ))
+            .unwrap();
+        assert_eq!(
+            range.for_model,
+            "(lines 2 to 3 of 6)\n    def go(self):\n        return 1"
+        );
+        assert!(
+            tools
+                .call(&call("read_file", json!({"path": "app.py", "start": 9})))
+                .is_err()
+        );
+
+        let found = tools
+            .call(&call("search", json!({"pattern": "go\\("})))
+            .unwrap();
+        assert_eq!(
+            found.for_model,
+            "app.py:2:     def go(self):\napp.py:6:     A().go()"
+        );
+
+        let map = tools
+            .call(&call("outline", json!({"path": "app.py"})))
+            .unwrap();
+        assert_eq!(
+            map.for_model,
+            "L1    class A:\nL2      def go(self):\nL5    def main():"
+        );
+        // Nothing escapes the project.
+        assert!(
+            tools
+                .call(&call("search", json!({"pattern": "x", "path": ".."})))
+                .is_err()
+        );
+        assert!(
+            tools
+                .call(&call("outline", json!({"path": "/etc"})))
+                .is_err()
         );
     }
 

@@ -15,6 +15,8 @@ mod docker;
 mod error;
 mod git;
 mod gitview;
+mod outline;
+mod search;
 mod toolbox;
 mod workspace;
 
