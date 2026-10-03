@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ironquill_agent::{AgentConfig, Event, Outcome, Session, Verdict};
-use ironquill_core::{ModelId, Usage, Usd};
+use ironquill_core::{ContextUse, ModelId, Usage, Usd};
 use ironquill_tools::{Check, Container, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -126,6 +126,9 @@ pub(crate) enum Entry {
         /// Ran on a subscription (Claude Code): no cost is owed for it.
         #[serde(default)]
         subscription: bool,
+        /// How full the context was on the request's last call.
+        #[serde(default)]
+        context: Option<ContextUse>,
     },
 }
 
@@ -263,6 +266,8 @@ pub(crate) struct App {
     keys_open: Option<usize>,
     /// The model picker, open on the row selected.
     model_picker: Option<usize>,
+    /// How full the context was on the latest call, for the status line.
+    context: Option<ContextUse>,
     /// The model working on the current request, for the activity line.
     working_model: Option<ModelId>,
     docker: Option<DockerPane>,
@@ -338,6 +343,7 @@ impl App {
             keys_open: None,
             model_picker: None,
             working_model: None,
+            context: None,
             docker: None,
         }
     }
@@ -423,6 +429,11 @@ impl App {
 
     pub(crate) fn totals(&self) -> (Usage, Usd, bool) {
         (self.usage, self.cost, self.cost_complete)
+    }
+
+    /// How full the context was on the latest call, when known.
+    pub(crate) fn context(&self) -> Option<ContextUse> {
+        self.context
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -1162,6 +1173,7 @@ impl App {
                     complete: outcome.cost_complete,
                     seconds,
                     subscription: outcome.subscription,
+                    context: outcome.context,
                 });
                 true
             }
@@ -1417,8 +1429,12 @@ impl App {
                 usage,
                 cost,
                 subscription,
+                context,
                 ..
             } => {
+                if context.is_some() {
+                    self.context = context;
+                }
                 self.usage += usage;
                 match cost {
                     Some(c) => self.cost += c,
@@ -1599,6 +1615,7 @@ mod tests {
                 },
                 cost: Some(Usd(0.002)),
                 subscription: false,
+                context: None,
             }));
         }
         let (usage, cost, complete) = app.totals();
@@ -1746,6 +1763,7 @@ mod tests {
             },
             cost: Some(Usd(0.0003)),
             subscription: false,
+            context: None,
         }));
         let finished = app.on_agent(AgentMessage::Done(Ok(Outcome {
             verdict: Verdict::Answered,
@@ -1756,6 +1774,7 @@ mod tests {
             cost: Usd(0.0003),
             cost_complete: true,
             subscription: false,
+            context: None,
             changed: vec![],
         })));
         assert!(finished);
@@ -1939,6 +1958,7 @@ mod tests {
             },
             cost: None,
             subscription: true,
+            context: None,
         }));
         let (usage, cost, complete) = app.totals();
         assert_eq!(usage.input, TokenCount(30_000));

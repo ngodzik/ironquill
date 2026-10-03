@@ -301,14 +301,16 @@ fn show(event: Event) {
             usage,
             cost,
             subscription,
+            context,
         } => {
             let cost = match cost {
                 Some(c) => c.to_string(),
                 None if subscription => "subscription".to_owned(),
                 None => "cost ?".to_owned(),
             };
+            let context = context.map(|c| format!("  {c}")).unwrap_or_default();
             eprintln!(
-                "· {model}  in {}  out {}  {cost}",
+                "· {model}  in {}  out {}  {cost}{context}",
                 usage.input, usage.output
             );
         }

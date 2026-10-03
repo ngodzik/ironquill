@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use ironquill_core::{
     ChatModel, ChatRequest, ChatResponse, Message, ModelId, Pricing, TokenCount, ToolCall,
@@ -18,6 +20,8 @@ pub struct OpenAiCompatible {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    /// Context windows by model, read once from the model list.
+    windows: Arc<Mutex<Option<HashMap<String, u64>>>>,
 }
 
 impl fmt::Debug for OpenAiCompatible {
@@ -37,6 +41,7 @@ impl OpenAiCompatible {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
+            windows: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -84,6 +89,38 @@ impl ChatModel for OpenAiCompatible {
         let body = read_body(&url, response).await?;
         parse_completion(&url, &body)
     }
+
+    async fn context_window(&self, model: &ModelId) -> Option<u64> {
+        let known = self.windows.lock().ok()?.clone();
+        let windows = match known {
+            Some(windows) => windows,
+            None => {
+                // Read once: a failure is remembered as "unknown" rather than
+                // asked again on every turn.
+                let url = format!("{}/models", self.base_url);
+                let windows = match self.get(&url).await {
+                    Ok(body) => parse_windows(&body),
+                    Err(_) => HashMap::new(),
+                };
+                if let Ok(mut cache) = self.windows.lock() {
+                    *cache = Some(windows.clone());
+                }
+                windows
+            }
+        };
+        windows.get(model.as_str()).copied()
+    }
+}
+
+fn parse_windows(body: &str) -> HashMap<String, u64> {
+    serde_json::from_str::<WireModelList>(body)
+        .map(|list| {
+            list.data
+                .into_iter()
+                .filter_map(|m| Some((m.id, m.context_window?)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn transport(url: &str, source: reqwest::Error) -> LlmError {
@@ -212,6 +249,7 @@ struct WireModel {
     id: String,
     input_price: Option<f64>,
     output_price: Option<f64>,
+    context_window: Option<u64>,
 }
 
 fn malformed(url: &str, reason: impl Into<String>) -> LlmError {
@@ -382,6 +420,18 @@ mod tests {
             parse_pricing(URL, body, &unpriced),
             Err(LlmError::UnknownModel(_))
         ));
+    }
+
+    #[test]
+    fn context_windows_come_from_the_model_list() {
+        let body = r#"{"data": [
+            {"id": "a/big", "context_window": 1000000},
+            {"id": "b/unknown"}
+        ]}"#;
+        let windows = parse_windows(body);
+        assert_eq!(windows.get("a/big"), Some(&1_000_000));
+        assert_eq!(windows.get("b/unknown"), None);
+        assert!(parse_windows("not json").is_empty());
     }
 
     #[test]

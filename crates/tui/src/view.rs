@@ -837,6 +837,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
             complete,
             seconds,
             subscription,
+            context,
         } => {
             let cost = match (*subscription, cost.0 > 0.0, *complete) {
                 (true, false, _) => "subscription".to_owned(),
@@ -844,10 +845,13 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 (false, _, true) => cost.to_string(),
                 (false, _, false) => format!("{cost} reported, part of the cost unknown"),
             };
-            let text = format!(
+            let mut text = format!(
                 "{cost} · {} in · {} out · {seconds}s",
                 usage.input, usage.output
             );
+            if let Some(context) = context {
+                text.push_str(&format!(" · {context}"));
+            }
             out.push(Line::styled(format!("  {text}"), fg(DIM)));
         }
     }
@@ -1176,11 +1180,14 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(current, fg(ACCENT)),
         Span::styled(
             format!(
-                "{rest} · {} in · {} out · {}{}  ",
+                "{rest} · {} in · {} out · {}{}{}  ",
                 usage.input,
                 usage.output,
                 cost,
-                if complete { "" } else { "+?" }
+                if complete { "" } else { "+?" },
+                app.context()
+                    .map(|c| format!(" · ctx {}%", c.percent()))
+                    .unwrap_or_default()
             ),
             fg(DIM),
         ),
