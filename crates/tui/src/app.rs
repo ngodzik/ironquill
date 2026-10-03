@@ -1260,6 +1260,10 @@ impl App {
                 }
             }
             Command::Defaults => return Some(Effect::SaveDefaults(self.defaults())),
+            Command::Team => {
+                let text = self.describe_team();
+                self.info(text);
+            }
         }
         None
     }
@@ -1413,9 +1417,9 @@ impl App {
         true
     }
 
-    /// How many models the first one may hand tasks to.
-    pub(crate) fn team_size(&self) -> usize {
-        self.settings.team.len()
+    /// The models the first one may hand tasks to.
+    pub(crate) fn team(&self) -> &[ModelId] {
+        &self.settings.team
     }
 
     /// The most one request may cost.
@@ -1578,10 +1582,42 @@ impl App {
         if !self.settings.models.contains(&model) {
             self.settings.models.push(model.clone());
         }
+        let lead = self
+            .current_model()
+            .map_or_else(|| "the model that answers".to_owned(), ToString::to_string);
         if let Some(i) = self.settings.team.iter().position(|m| m == &model) {
             self.settings.team.remove(i);
+            self.info(format!("{model} leaves the team"));
         } else {
-            self.settings.team.push(model);
+            self.settings.team.push(model.clone());
+            self.info(format!(
+                "{model} joins the team: {lead} answers you and may hand it tasks. /team shows the team, /defaults keeps it"
+            ));
+        }
+    }
+
+    /// Who answers and who it may hand tasks to, in words.
+    fn describe_team(&self) -> String {
+        let lead = self
+            .current_model()
+            .map_or_else(|| "no model".to_owned(), ToString::to_string);
+        let members: Vec<String> = self
+            .settings
+            .team
+            .iter()
+            .filter(|m| Some(*m) != self.current_model())
+            .map(|m| match self.note(m).as_str() {
+                "" => format!("  {m}"),
+                note => format!("  {m}  ({note})"),
+            })
+            .collect();
+        if members.is_empty() {
+            format!("{lead} answers you, alone. To give it a team: Ctrl-E, select a model, Space")
+        } else {
+            format!(
+                "{lead} answers you, and may hand tasks to:\n{}\nIt decides when; you can also ask it to",
+                members.join("\n")
+            )
         }
     }
 
@@ -2274,7 +2310,7 @@ mod tests {
         press(&mut app, KeyCode::Char(' '));
         assert!(app.model_rows()[0].in_team);
         press(&mut app, KeyCode::Esc);
-        assert_eq!(app.team_size(), 1);
+        assert_eq!(app.team().len(), 1);
         assert_eq!(app.models().len(), 2);
         assert_eq!(app.current_model().unwrap().as_str(), "cheap");
 

@@ -36,6 +36,8 @@ pub(crate) enum Command {
     Budget(Option<String>),
     /// `/defaults` keeps the current choices for every new session.
     Defaults,
+    /// `/team` says who answers and who it may hand tasks to.
+    Team,
     /// `/claude-reset` ends Claude Code's session, `/codex-reset` Codex's.
     Reset(Agent),
     /// `:help`
@@ -78,6 +80,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "codex" | "cx" => Ok(Command::Delegate(Agent::Codex, rest_opt)),
         "budget" => Ok(Command::Budget(rest_opt)),
         "defaults" => Ok(Command::Defaults),
+        "team" => Ok(Command::Team),
         "context" | "ctx" => Ok(Command::Context),
         "claude-reset" => Ok(Command::Reset(Agent::ClaudeCode)),
         "codex-reset" => Ok(Command::Reset(Agent::Codex)),
@@ -114,6 +117,7 @@ pub(crate) const NAMES: &[&str] = &[
     "rename",
     "resume",
     "rounds",
+    "team",
 ];
 
 /// Commands of the Vim editor, completed on top of ironquill's inside a file.
@@ -207,6 +211,7 @@ Type a question or a change and press Enter. Changes are checked before they are
                      the model that answers may hand tasks to the team
 /budget <dollars>    the most one request may cost (none: no limit); past it the
                      work stops and the model says where it is and asks what next
+/team                who answers and who it may hand tasks to
 /defaults            start every new session with the current model, list, team
                      and budget
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation

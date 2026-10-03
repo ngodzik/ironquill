@@ -112,7 +112,7 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
     let rows = app.model_rows();
     let screen = frame.area();
     let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
-    let height = (rows.len() as u16 + 3).clamp(4, screen.height.saturating_sub(4).max(4));
+    let height = (rows.len() as u16 + 4).clamp(5, screen.height.saturating_sub(4).max(5));
     let area = Rect::new(
         screen.x + (screen.width - width) / 2,
         screen.y + screen.height.saturating_sub(height) / 3,
@@ -131,7 +131,11 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
         Span::raw(picker.filter.clone()),
         Span::styled("▏", fg(ACCENT)),
     ])];
-    let visible = usize::from(inner.height).saturating_sub(1);
+    lines.push(Line::styled(
+        "● answers you   ✓ in its team: it may hand them tasks",
+        fg(DIM),
+    ));
+    let visible = usize::from(inner.height).saturating_sub(2);
     let first = picker.selected.saturating_sub(visible.saturating_sub(1));
     for (i, row) in rows.iter().enumerate().skip(first).take(visible) {
         let mark = if Some(&row.model) == current {
@@ -1180,6 +1184,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(fg(if focused { Color::Gray } else { DIM }))
+        .title(team_title(app))
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
 
@@ -1208,17 +1213,34 @@ fn visible_window(editor: &LineEditor, prompt: &str, width: usize) -> (String, u
     (shown, cursor - start)
 }
 
-/// The size of the team and the budget, for the status line.
-fn team_and_budget(app: &App) -> String {
-    let team = match app.team_size() {
-        0 => String::new(),
-        n => format!(" · team {n}"),
+/// Who answers and its team, on the message box, always in view.
+fn team_title(app: &App) -> Line<'static> {
+    let Some(lead) = app.current_model() else {
+        return Line::default();
     };
-    let budget = app
-        .budget()
+    let mut spans = vec![
+        Span::styled(" answers ", fg(DIM)),
+        Span::styled(lead.to_string(), fg(ACCENT)),
+    ];
+    let team: Vec<String> = app
+        .team()
+        .iter()
+        .filter(|m| *m != lead)
+        .map(ToString::to_string)
+        .collect();
+    if !team.is_empty() {
+        spans.push(Span::styled(" · team ", fg(DIM)));
+        spans.push(Span::raw(team.join(", ")));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+/// The budget, for the status line.
+fn team_and_budget(app: &App) -> String {
+    app.budget()
         .map(|b| format!(" · budget {b}"))
-        .unwrap_or_default();
-    format!("{team}{budget}")
+        .unwrap_or_default()
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {

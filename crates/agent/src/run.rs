@@ -705,6 +705,27 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
     Ok(reply)
 }
 
+/// Who the model is, added to its instructions on every call: models
+/// otherwise guess, and a conversation that went through several of them
+/// misleads them further.
+fn identity(model: &ModelId, leads: bool, team: &[Member]) -> String {
+    let mut text = format!(
+        "\n\nYou are the model `{model}`, used through ironquill, a coding agent in the \
+         person's terminal. When asked which model you are, say `{model}`. Earlier replies in \
+         this conversation may come from other models the person picked; they are not you."
+    );
+    let others: Vec<&Member> = team.iter().filter(|m| &m.model != model).collect();
+    if leads && !others.is_empty() {
+        let names: Vec<String> = others.iter().map(|m| format!("`{}`", m.model)).collect();
+        text.push_str(&format!(
+            " The person gave you a team, {}, that you can hand tasks to with the `delegate` \
+             tool; you remain the one who answers.",
+            names.join(", ")
+        ));
+    }
+    text
+}
+
 /// The `delegate` tool, offering the team to `lead`; `None` when nobody
 /// else is in it.
 fn delegate_spec(team: &[Member], lead: &ModelId) -> Option<ToolSpec> {
@@ -856,6 +877,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         tools.push(spec);
     }
     let window = ctx.model.context_window(model_id).await;
+    let identity = identity(model_id, leads, &ctx.config.team);
     for _ in 0..ctx.config.max_turns {
         if ctx
             .config
@@ -864,9 +886,13 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         {
             return Err(AgentError::OverBudget);
         }
+        let mut sent = messages.clone();
+        if let Some(Message::System(prompt)) = sent.first_mut() {
+            prompt.push_str(&identity);
+        }
         let request = ChatRequest {
             model: model_id.clone(),
-            messages: messages.clone(),
+            messages: sent,
             tools: tools.clone(),
         };
         let response = ctx
@@ -1256,6 +1282,17 @@ mod tests {
             Some(&Message::user("create done.txt"))
         );
         assert!(seen[1].tools.iter().all(|t| t.name != "delegate"));
+        // Each knows which model it is; only the first knows of the team.
+        let system = |i: usize| match &seen[i].messages[0] {
+            Message::System(text) => text.clone(),
+            other => panic!("expected instructions first, got {other:?}"),
+        };
+        assert!(system(0).contains("You are the model `cheap`"));
+        assert!(system(0).contains("a team, `strong`,"));
+        assert!(system(1).contains("You are the model `strong`"));
+        assert!(!system(1).contains("team"));
+        // What is stored stays as it was: the next model gets its own name.
+        assert!(!format!("{:?}", session.messages[0]).contains("You are the model"));
         assert!(matches!(
             seen[3].messages.last(),
             Some(Message::Tool { content, .. })
