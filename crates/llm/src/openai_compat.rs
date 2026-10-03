@@ -45,6 +45,15 @@ impl OpenAiCompatible {
         }
     }
 
+    /// Whether the endpoint is Requesty, which takes options of its own.
+    fn is_requesty(&self) -> bool {
+        self.base_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .is_some_and(|host| host == "requesty.ai" || host.ends_with(".requesty.ai"))
+    }
+
     /// Looks up what `model` costs, from the provider's model list.
     ///
     /// Not every OpenAI compatible endpoint publishes prices; Requesty does, as
@@ -89,7 +98,14 @@ impl ChatModel for OpenAiCompatible {
 
     async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
-        let payload = wire_request(request);
+        let mut payload = wire_request(request);
+        if self.is_requesty() {
+            // Requesty marks what can be cached for providers that need it
+            // and bills cache hits at a fraction of the price; it does so by
+            // itself only for the tools it knows. Each call of the agent
+            // resends the whole conversation, so most of it is a hit.
+            payload["requesty"] = json!({"auto_cache": true});
+        }
         let response = self
             .http
             .post(&url)
@@ -477,6 +493,14 @@ mod tests {
         );
         assert_eq!(body["messages"][2]["role"], "tool");
         assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn caching_is_asked_of_requesty_only() {
+        assert!(OpenAiCompatible::new("https://router.requesty.ai/v1", "k").is_requesty());
+        assert!(!OpenAiCompatible::new("https://openrouter.ai/api/v1", "k").is_requesty());
+        assert!(!OpenAiCompatible::new("https://requesty.ai.evil.test/v1", "k").is_requesty());
+        assert!(!OpenAiCompatible::new("http://127.0.0.1:8080/v1", "k").is_requesty());
     }
 
     #[test]
