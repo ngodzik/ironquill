@@ -554,10 +554,15 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
     // that are gone from that place.
     let height = usize::from(inner.height);
     let changes = file.changes();
+    let hidden = file.hidden();
     let rows_from = |start: usize| {
         let mut rows: Vec<Option<usize>> = Vec::new();
         let mut removed: Vec<(usize, &String)> = Vec::new();
         for i in start..=file.lines().len() {
+            // Lines inside a closed fold are not drawn.
+            if hidden.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             if let Some(gone) = changes.and_then(|c| c.removed.get(&i)) {
                 for text in gone {
                     removed.push((rows.len(), text));
@@ -610,6 +615,23 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
                     Span::raw(" "),
                 ];
                 let mut runs = line_runs(file, i, text);
+                if file.kind() == Kind::Context && text.starts_with("=== ") {
+                    runs = vec![(fg(ACCENT).add_modifier(Modifier::BOLD), text.clone())];
+                    if let Some(count) = file.folded(i) {
+                        // A closed block reads as one line: its size, then
+                        // the start of what it holds.
+                        let preview = file.lines()[i + 1..=i + count]
+                            .iter()
+                            .map(|l| l.trim())
+                            .find(|l| !l.is_empty())
+                            .unwrap_or("");
+                        let preview: String = preview.chars().take(80).collect();
+                        runs.push((
+                            fg(DIM),
+                            format!("  ▸ {} · {preview}", plural(count, "line", "lines")),
+                        ));
+                    }
+                }
                 if let Some(bg) = background {
                     runs = runs
                         .into_iter()

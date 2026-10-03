@@ -181,6 +181,14 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (":w :q :q! :wq :42", "write, close, discard, go to line"),
             (":s/a/b/g", "substitute; with %, '<,'> or 2,5"),
             ("/ n N", "search, next, previous"),
+            (
+                "zo zc za zR zM",
+                "open, close, toggle a block; open all, close all (in /context)",
+            ),
+            (
+                "Enter Space",
+                "open or close the block under the cursor (in /context)",
+            ),
             ("gg G w b 0 ^ $", "move"),
             (
                 "green / yellow / red",

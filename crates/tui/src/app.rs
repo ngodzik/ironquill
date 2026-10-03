@@ -2144,7 +2144,7 @@ mod tests {
         }
         let effect = press(&mut app, KeyCode::Enter);
         assert!(
-            matches!(effect, Some(Effect::ApplyContext(ref text)) if text == "=== user\nhello\n=== assistant")
+            matches!(effect, Some(Effect::ApplyContext(ref text)) if text == "=== user\nhello")
         );
 
         app.on_context_applied(Err("Unknown block === robot".into()));
