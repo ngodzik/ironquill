@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
 use crate::app::{App, Entry, LineEditor, Panes};
 use crate::editor::{Editor, EditorMode};
-use crate::keymap::{Focus, Mode, Pending};
+use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
 use crate::sessions;
 use crate::wrap::wrap;
@@ -42,6 +42,55 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     if app.model_picker().is_some() {
         render_model_picker(frame, app);
     }
+    if app.keys_open().is_some() {
+        render_keys(frame, app);
+    }
+}
+
+/// Every shortcut (Ctrl-S), over everything else, grouped by where it works.
+fn render_keys(frame: &mut Frame, app: &App) {
+    let Some(offset) = app.keys_open() else {
+        return;
+    };
+    let width_keys = SHORTCUTS
+        .iter()
+        .flat_map(|(_, keys)| keys.iter().map(|(k, _)| k.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line> = Vec::new();
+    for (group, keys) in SHORTCUTS {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::styled(
+            format!(" {group}"),
+            fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        for (keys, what) in *keys {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {keys:<width_keys$}  "), fg(Color::Gray)),
+                Span::raw(*what),
+            ]));
+        }
+    }
+
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 90).min(screen.width);
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = pane_block(" Shortcuts ".into(), true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let visible = usize::from(inner.height);
+    let offset = offset.min(lines.len().saturating_sub(visible));
+    let shown: Vec<Line> = lines.into_iter().skip(offset).take(visible).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
 }
 
 /// The model picker (Ctrl-E), over everything else.

@@ -242,6 +242,8 @@ pub(crate) struct App {
     created: u64,
     requests: usize,
     picker: Option<Picker>,
+    /// The list of shortcuts, open at this scroll offset.
+    keys_open: Option<usize>,
     /// The model picker, open on the row selected.
     model_picker: Option<usize>,
     /// The model working on the current request, for the activity line.
@@ -300,6 +302,7 @@ impl App {
             created: sessions::now(),
             requests: 0,
             picker: None,
+            keys_open: None,
             model_picker: None,
             working_model: None,
             docker: None,
@@ -420,6 +423,9 @@ impl App {
             if self.model_picker_key(key) {
                 return None;
             }
+            if self.keys_key(key) {
+                return None;
+            }
         }
         if self.focus == Focus::File
             && self.pending.is_none()
@@ -428,7 +434,11 @@ impl App {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             // Stopping a request and the tree work from anywhere; Tab, Ctrl-W
             // and the leader leave the file only when Vim is not mid-command.
-            let global = ctrl && matches!(key.code, KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e'));
+            let global = ctrl
+                && matches!(
+                    key.code,
+                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's')
+                );
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
                     || key.code == KeyCode::Char(',')
@@ -539,6 +549,12 @@ impl App {
             }
             Action::ShowChat => self.close_file(Focus::Chat),
             Action::PickModel => self.open_model_picker(),
+            Action::ShowKeys => {
+                self.keys_open = match self.keys_open {
+                    Some(_) => None,
+                    None => Some(0),
+                };
+            }
             Action::FocusInput => {
                 self.focus = Focus::Chat;
                 self.mode = Mode::Insert;
@@ -941,6 +957,7 @@ impl App {
                 self.info(text);
             }
             Command::Help => self.info(command::HELP),
+            Command::Keys => self.keys_open = Some(0),
         }
         None
     }
@@ -1059,6 +1076,30 @@ impl App {
             }
         }
         models
+    }
+
+    /// How far the list of shortcuts is scrolled, while it is open.
+    pub(crate) fn keys_open(&self) -> Option<usize> {
+        self.keys_open
+    }
+
+    /// Keys while the list of shortcuts is open. Returns whether the key was
+    /// for it. Ctrl-S itself goes through the keymap, to close it.
+    fn keys_key(&mut self, key: KeyEvent) -> bool {
+        let Some(offset) = self.keys_open else {
+            return false;
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Up => self.keys_open = Some(offset.saturating_sub(1)),
+            KeyCode::Down => self.keys_open = Some(offset + 1),
+            KeyCode::PageUp => self.keys_open = Some(offset.saturating_sub(10)),
+            KeyCode::PageDown => self.keys_open = Some(offset + 10),
+            _ => self.keys_open = None,
+        }
+        true
     }
 
     /// The row selected in the model picker, while it is open.
@@ -1679,6 +1720,38 @@ mod tests {
         assert_eq!(usage.input, TokenCount(30_000));
         assert_eq!(cost, Usd(0.0));
         assert!(complete);
+    }
+
+    #[test]
+    fn ctrl_q_goes_back_to_typing_from_the_editor_in_insert_mode() {
+        let (_dir, mut app) = project();
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('i'));
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert_eq!((app.focus(), app.mode()), (Focus::Chat, Mode::Insert));
+    }
+
+    #[test]
+    fn ctrl_s_and_question_mark_show_the_shortcuts_and_esc_hides_them() {
+        let mut app = ready();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_s);
+        assert_eq!(app.keys_open(), Some(0));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.keys_open(), Some(1));
+        app.on_key(ctrl_s);
+        assert_eq!(app.keys_open(), None);
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.keys_open(), Some(0));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.keys_open(), None);
+        // Typing went nowhere while the list was open.
+        assert_eq!(app.input().text(), "");
     }
 
     #[test]

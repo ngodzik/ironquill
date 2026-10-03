@@ -47,7 +47,7 @@ cd your-project
 ironquill --model <cheap-model> --escalate <strong-model>
 ```
 
-`/help` lists the commands and keys. `IRONQUILL_BASE_URL` points it at another OpenAI compatible endpoint. `IRONQUILL_MODELS` (comma separated) lists the models Ctrl-E offers; `claude-code/opus` and `claude-code/sonnet` are added when the `claude` command is installed.
+`/help` lists the commands, Ctrl-S every shortcut. `IRONQUILL_BASE_URL` points it at another OpenAI compatible endpoint. `IRONQUILL_MODELS` (comma separated) lists the models Ctrl-E offers; `claude-code/opus` and `claude-code/sonnet` are added when the `claude` command is installed.
 
 ## Building
 
