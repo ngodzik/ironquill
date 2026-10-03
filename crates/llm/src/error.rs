@@ -33,6 +33,20 @@ pub enum LlmError {
         reason: String,
     },
 
+    /// An agent program could not be started at all.
+    #[error("could not run {program}")]
+    Spawn {
+        /// The program.
+        program: String,
+        /// The underlying failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// An agent the task was handed to failed, with its own explanation.
+    #[error("{0}")]
+    Delegate(String),
+
     /// The provider does not list the requested model.
     #[error("model {0} is not listed by the provider")]
     UnknownModel(String),

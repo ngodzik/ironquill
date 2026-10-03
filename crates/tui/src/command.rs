@@ -25,8 +25,12 @@ pub(crate) enum Command {
     Resume,
     /// `/cost` shows what the conversation has cost so far.
     Cost,
+    /// `/claude <task>` hands one task to Claude Code.
+    Claude(Option<String>),
     /// `:help`
     Help,
+    /// `/keys` lists every shortcut, as Ctrl-S does.
+    Keys,
 }
 
 /// Parses the text typed after `:`. Errors are messages for the person.
@@ -59,7 +63,9 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "name" | "rename" => Ok(Command::Name(rest_opt)),
         "resume" => Ok(Command::Resume),
         "cost" => Ok(Command::Cost),
+        "claude" | "cc" => Ok(Command::Claude(rest_opt)),
         "help" | "h" => Ok(Command::Help),
+        "keys" | "shortcuts" => Ok(Command::Keys),
         "" => Err("Empty command".into()),
         other => Err(format!("Unknown command /{other}, see /help")),
     }
@@ -67,7 +73,8 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
 
 pub(crate) const HELP: &str = "\
 Type a question or a change and press Enter. Changes are checked before they are kept.
-/model <id>          the model that answers
+/model               pick the model that answers (Ctrl-E); /model <id> sets it
+/claude <task>       hand one task to Claude Code, which works without this conversation
 /escalate <id> ...   stronger models used only when the checks keep failing (empty: none)
 /check <command>     add a check, run without a shell; /check alone lists them
 /nocheck             remove every check
@@ -86,8 +93,9 @@ Open file: Vim keys. i a o insert, Esc stops, x dd yy p edit, u undo, Ctrl-R red
   :w save, :q close, :42 go to line, :s/a/b/g with % '<,'> or 2,5 ranges,
   /text search then n N, gg G, w b, 0 $.
 Panes: Tab or Ctrl-W ← → switches between tree, file, chat and Docker; ,c closes the file.
-Ctrl-G (or ,i): back to typing a message, from anywhere.
+Ctrl-Q (or ,i): back to typing a message, from anywhere. Ctrl-S (or /keys, or ? in normal mode): every shortcut.
 Ctrl-K (or ,d): show or hide the running Docker containers.
+Ctrl-E (or ,m): pick the model; the one in use shows at the bottom right.
 Vim: Esc for normal mode, i to type, : for commands. Ctrl-C stops a request; Ctrl-C twice quits";
 
 #[cfg(test)]

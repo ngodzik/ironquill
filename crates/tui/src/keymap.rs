@@ -81,10 +81,16 @@ pub enum Action {
     Collapse,
     /// Show or hide the file tree.
     ToggleTree,
+    /// Go to the file tree, opening it if it is hidden.
+    FocusTree,
     /// Show or hide the Docker containers pane.
     ToggleDocker,
     /// Go to the message box, ready to type, from wherever the focus is.
     FocusInput,
+    /// Open the model picker.
+    PickModel,
+    /// Show or hide the list of every shortcut.
+    ShowKeys,
     /// Close the open file and return to the conversation.
     ShowChat,
     /// Close the focused pane.
@@ -101,6 +107,85 @@ pub enum Action {
     Quit,
 }
 
+/// Every shortcut, as Ctrl-S lists them. Kept next to the bindings above so
+/// that a change to one shows the other needing the same change.
+pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Anywhere",
+        &[
+            ("Ctrl-Q", "back to typing a message (Ctrl-G too)"),
+            ("Ctrl-E", "pick the model"),
+            ("Ctrl-A", "go to the file tree, opening it if hidden"),
+            ("Ctrl-B", "show or hide the file tree"),
+            ("Ctrl-K", "show or hide the Docker containers"),
+            ("Ctrl-S", "this list"),
+            ("Ctrl-C", "stop the request; twice to quit"),
+            ("Tab", "next pane"),
+        ],
+    ),
+    (
+        "Typing a message",
+        &[
+            ("Enter", "send"),
+            ("/", "a command: /help lists them"),
+            ("Esc", "normal mode"),
+            ("Ctrl-W / Ctrl-U", "delete a word / the line"),
+            ("Up Down PgUp PgDn", "scroll the conversation"),
+        ],
+    ),
+    (
+        "Normal mode",
+        &[
+            ("i", "type a message"),
+            (":", "a command"),
+            ("?", "this list"),
+            (",n ,d ,m ,i", "tree, Docker, model, type"),
+            (",c", "close the file, back to the conversation"),
+            ("Ctrl-W Left/Right", "pane on the left / right"),
+            ("Up Down Home End", "move in the pane"),
+        ],
+    ),
+    (
+        "File tree",
+        &[
+            (
+                "M ? A D",
+                "modified, new, added, deleted since the last commit",
+            ),
+            ("Up Down", "move"),
+            ("Right or Enter", "open a file, unfold a folder"),
+            ("Left", "fold the folder, or go to its parent"),
+            ("q", "hide the tree"),
+        ],
+    ),
+    (
+        "Open file (Vim)",
+        &[
+            ("i a o O I A", "insert; Esc stops"),
+            ("v V", "visual mode, by character / by line"),
+            ("x dd D yy p P", "delete, yank, put"),
+            ("\"+y \"+p", "copy to / paste from the system clipboard"),
+            ("u Ctrl-R", "undo, redo"),
+            (":w :q :q! :wq :42", "write, close, discard, go to line"),
+            (":s/a/b/g", "substitute; with %, '<,'> or 2,5"),
+            ("/ n N", "search, next, previous"),
+            ("gg G w b 0 ^ $", "move"),
+            (
+                "green / yellow / red",
+                "line added / changed / removed since the last commit",
+            ),
+        ],
+    ),
+    (
+        "Lists (resume, model, Docker)",
+        &[
+            ("Up Down", "choose"),
+            ("Enter", "open"),
+            ("Esc or q", "close"),
+        ],
+    ),
+];
+
 /// The action bound to `key` in `mode` with `focus`, after `pending` if a
 /// two-key binding was started.
 pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent) -> Option<Action> {
@@ -113,9 +198,15 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         // As the sidebar shortcut of common editors, so that the tree is one
         // key away even while typing.
         KeyCode::Char('b') if ctrl => return Some(Action::ToggleTree),
-        // "Go" back to typing a message, wherever the focus is.
-        KeyCode::Char('g') if ctrl => return Some(Action::FocusInput),
+        // Back to typing a message, wherever the focus is: Q sits on the home
+        // row right above the left Ctrl on AZERTY. G is kept as an alias.
+        KeyCode::Char('q' | 'g') if ctrl => return Some(Action::FocusInput),
+        KeyCode::Char('s') if ctrl => return Some(Action::ShowKeys),
+        // A, top left on AZERTY, next to Q: the other most used jump.
+        KeyCode::Char('a') if ctrl => return Some(Action::FocusTree),
         KeyCode::Char('k') if ctrl => return Some(Action::ToggleDocker),
+        // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
+        KeyCode::Char('e') if ctrl => return Some(Action::PickModel),
         _ => {}
     }
 
@@ -125,6 +216,7 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
             (Pending::Leader, KeyCode::Char('c')) => Some(Action::ShowChat),
             (Pending::Leader, KeyCode::Char('i')) => Some(Action::FocusInput),
             (Pending::Leader, KeyCode::Char('d')) => Some(Action::ToggleDocker),
+            (Pending::Leader, KeyCode::Char('m')) => Some(Action::PickModel),
             (Pending::Window, KeyCode::Char('w')) => Some(Action::FocusNext),
             (Pending::Window, KeyCode::Char('h') | KeyCode::Left) => Some(Action::FocusLeft),
             (Pending::Window, KeyCode::Char('l') | KeyCode::Right) => Some(Action::FocusRight),
@@ -162,6 +254,7 @@ fn normal(focus: Focus, key: KeyEvent, ctrl: bool) -> Option<Action> {
         KeyCode::Tab => return Some(Action::FocusNext),
         KeyCode::Char('i' | 'a') => return Some(Action::Enter(Mode::Insert)),
         KeyCode::Char(':') => return Some(Action::Enter(Mode::Command)),
+        KeyCode::Char('?') => return Some(Action::ShowKeys),
         KeyCode::Up => return Some(Action::Move(-1)),
         KeyCode::Down => return Some(Action::Move(1)),
         KeyCode::PageUp => return Some(Action::HalfPage(false)),

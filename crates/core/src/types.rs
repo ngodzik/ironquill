@@ -27,7 +27,36 @@ impl ModelId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Claude Code with its own default model.
+    pub fn claude_code() -> Self {
+        Self(DELEGATE.to_owned())
+    }
+
+    /// For a task handed to Claude Code rather than sent to a model:
+    /// `claude-code` gives `Some("")` (Claude Code's own default model),
+    /// `claude-code/opus` gives `Some("opus")`. Any other identifier is a
+    /// model of the configured provider and gives `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironquill_core::ModelId;
+    ///
+    /// assert_eq!(ModelId::new("claude-code/opus")?.delegate(), Some("opus"));
+    /// assert_eq!(ModelId::new("deepseek/deepseek-chat")?.delegate(), None);
+    /// # Ok::<(), ironquill_core::CoreError>(())
+    /// ```
+    pub fn delegate(&self) -> Option<&str> {
+        if self.0 == DELEGATE {
+            return Some("");
+        }
+        self.0.strip_prefix(DELEGATE)?.strip_prefix('/')
+    }
 }
+
+/// The prefix of model identifiers that hand the task to Claude Code.
+pub const DELEGATE: &str = "claude-code";
 
 impl fmt::Display for ModelId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -250,6 +279,54 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     /// The tools the model may call. Empty means none.
     pub tools: Vec<ToolSpec>,
+}
+
+/// A whole task for an external agent that reads and edits files itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegateRequest {
+    /// The model the agent should use; empty for its own default.
+    pub model: String,
+    /// What to do.
+    pub prompt: String,
+    /// Standing instructions added to the agent's own.
+    pub instructions: String,
+    /// The agent's session to continue, to send it a follow-up such as a
+    /// failing check; `None` starts a fresh one.
+    pub resume: Option<String>,
+    /// The project directory the agent works in.
+    pub directory: std::path::PathBuf,
+}
+
+/// Something an external agent did, reported as it happens.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DelegateEvent {
+    /// A new block of text begins.
+    TextStart,
+    /// More text of the current block.
+    Text(String),
+    /// A tool call finished.
+    Tool {
+        /// The agent's name for the tool, such as `Read` or `Edit`.
+        name: String,
+        /// The arguments it was called with.
+        input: serde_json::Value,
+        /// What it returned, or the error it reported.
+        output: Result<String, String>,
+    },
+}
+
+/// How a delegated task ended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelegateReply {
+    /// The agent's closing message.
+    pub text: String,
+    /// The agent's session, to continue it with a follow-up.
+    pub session: String,
+    /// Tokens used, counting the context the agent read from its cache.
+    pub usage: Usage,
+    /// The agent's own estimate of what the tokens would cost at API prices.
+    /// Not a bill: the agent may run on a subscription.
+    pub estimate: Option<Usd>,
 }
 
 /// A model's answer and what it cost.

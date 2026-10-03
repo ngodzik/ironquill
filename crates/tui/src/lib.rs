@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use ironquill_agent::{AgentConfig, Session};
-use ironquill_core::ChatModel;
+use ironquill_core::{ChatModel, Delegate};
 use ironquill_tools::{Toolbox, Workspace};
 use ratatui::crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyEventKind,
@@ -74,21 +74,23 @@ struct Conversation {
 /// # Errors
 ///
 /// [`TuiError::Terminal`] when the terminal cannot be set up or drawn to.
-pub async fn run<M>(
+pub async fn run<M, D>(
     model: Arc<M>,
+    delegate: Arc<D>,
     workspace: Workspace,
     settings: Settings,
     start: Start,
 ) -> Result<(), TuiError>
 where
     M: ChatModel + 'static,
+    D: Delegate + 'static,
 {
     let mut terminal = ratatui::try_init().map_err(TuiError::Terminal)?;
     // Clicks and the wheel reach the interface. Selecting text with the mouse
     // then needs Shift held, as in most terminal applications that do this.
     let mouse = execute!(std::io::stdout(), EnableMouseCapture).map_err(TuiError::Terminal);
     let result = match mouse {
-        Ok(()) => event_loop(&mut terminal, model, workspace, settings, start).await,
+        Ok(()) => event_loop(&mut terminal, model, delegate, workspace, settings, start).await,
         Err(e) => Err(e),
     };
     // Restored whatever happened, or the person's shell is left in raw mode.
@@ -97,15 +99,17 @@ where
     result
 }
 
-async fn event_loop<M>(
+async fn event_loop<M, D>(
     terminal: &mut ratatui::DefaultTerminal,
     model: Arc<M>,
+    delegate: Arc<D>,
     workspace: Workspace,
     settings: Settings,
     start: Start,
 ) -> Result<(), TuiError>
 where
     M: ChatModel + 'static,
+    D: Delegate + 'static,
 {
     let mut app = App::new(settings, workspace.root().to_owned());
     let conversation = Arc::new(Mutex::new(Conversation {
@@ -173,6 +177,7 @@ where
             Some(Effect::Send { text, config }) => {
                 task = Some(spawn_agent(
                     Arc::clone(&model),
+                    Arc::clone(&delegate),
                     Arc::clone(&conversation),
                     config,
                     text,
@@ -262,8 +267,9 @@ async fn resume(
     }
 }
 
-fn spawn_agent<M>(
+fn spawn_agent<M, D>(
     model: Arc<M>,
+    delegate: Arc<D>,
     conversation: Arc<Mutex<Conversation>>,
     config: AgentConfig,
     text: String,
@@ -271,6 +277,7 @@ fn spawn_agent<M>(
 ) -> JoinHandle<()>
 where
     M: ChatModel + 'static,
+    D: Delegate + 'static,
 {
     tokio::spawn(async move {
         let mut guard = conversation.lock().await;
@@ -279,10 +286,18 @@ where
         let context = ironquill_tools::project_context(&root, FILE_LIST_LIMIT).await;
         let events = tx.clone();
         let result = session
-            .send(&*model, toolbox, &config, &text, &context, |e| {
-                // The receiver only goes away when the interface is closing.
-                let _ = events.send(AgentMessage::Event(e));
-            })
+            .send(
+                &*model,
+                &*delegate,
+                toolbox,
+                &config,
+                &text,
+                &context,
+                |e| {
+                    // The receiver only goes away when the interface is closing.
+                    let _ = events.send(AgentMessage::Event(e));
+                },
+            )
             .await;
         let _ = tx.send(AgentMessage::Done(result.map_err(|e| error_chain(&e))));
     })

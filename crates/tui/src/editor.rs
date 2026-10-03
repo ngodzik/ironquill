@@ -7,7 +7,7 @@
 //! redo, `:w`, `:q`, `:42`, `:s` with ranges, and `/` search. Not covered:
 //! counts, block visual mode, macros.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,8 @@ use std::rc::Rc;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::RegexBuilder;
+
+use ironquill_tools::{LineChanges, committed_lines, line_changes};
 
 use crate::clipboard;
 use crate::highlight::{Highlighter, StyledLine};
@@ -52,6 +54,8 @@ pub(crate) enum EditorMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Stay,
+    /// `:w`: the file was written, so its git status changed.
+    Saved,
     /// `:q`: close the file.
     Close,
 }
@@ -148,6 +152,13 @@ pub(crate) struct Editor {
     /// Set for binary or unreadable files, which are shown but not edited.
     read_only: bool,
     styled: Option<Vec<StyledLine>>,
+    /// The file as of the last commit, `None` outside git.
+    base: Option<Vec<String>>,
+    /// How the lines on screen differ from `base`.
+    changes: LineChanges,
+    /// For each row the view drew, the line it shows, or `None` for a line
+    /// of the last commit that is gone. Written by the view, read by clicks.
+    rows: RefCell<Vec<Option<usize>>>,
     highlighter: Rc<Highlighter>,
     clipboard: Rc<dyn Clipboard>,
     row: usize,
@@ -223,6 +234,9 @@ impl Editor {
             trailing_newline: loaded.trailing_newline,
             read_only: loaded.read_only,
             styled: None,
+            base: None,
+            changes: LineChanges::default(),
+            rows: RefCell::new(Vec::new()),
             highlighter,
             clipboard: Rc::new(SystemClipboard),
             row: 0,
@@ -244,8 +258,18 @@ impl Editor {
             modified: false,
             message: None,
         };
+        editor.load_base();
         editor.restyle();
         editor
+    }
+
+    /// Reads the last committed version of the file, to show what changed.
+    fn load_base(&mut self) {
+        self.base = if self.read_only {
+            None
+        } else {
+            committed_lines(&self.root, &self.path)
+        };
     }
 
     #[cfg(test)]
@@ -265,6 +289,7 @@ impl Editor {
         self.row = self.row.min(self.lines.len() - 1);
         self.clamp_col();
         self.scroll = self.scroll.min(self.row);
+        self.load_base();
         self.restyle();
     }
 
@@ -280,6 +305,18 @@ impl Editor {
 
     pub(crate) fn styled(&self) -> Option<&[StyledLine]> {
         self.styled.as_deref()
+    }
+
+    /// How the lines differ from the last commit, while that is known and in
+    /// step with the lines; `None` outside git or while it is being redone.
+    pub(crate) fn changes(&self) -> Option<&LineChanges> {
+        (self.base.is_some() && self.changes.marks.len() == self.lines.len())
+            .then_some(&self.changes)
+    }
+
+    /// Records which line each drawn row shows.
+    pub(crate) fn set_rows(&self, rows: Vec<Option<usize>>) {
+        *self.rows.borrow_mut() = rows;
     }
 
     pub(crate) fn cursor(&self) -> (usize, usize) {
@@ -351,7 +388,8 @@ impl Editor {
 
     /// Width of the line number column, gutter spaces included.
     pub(crate) fn gutter(&self) -> usize {
-        self.lines.len().max(1).to_string().len() + 2
+        // The number, a space, the change mark, a space.
+        self.lines.len().max(1).to_string().len() + 3
     }
 
     /// The first column shown, so that the cursor stays on screen in long
@@ -398,7 +436,16 @@ impl Editor {
         if matches!(self.mode, EditorMode::Command | EditorMode::Search) {
             self.mode = EditorMode::Normal;
         }
-        self.row = (self.scroll + row).min(self.lines.len() - 1);
+        // A row showing a removed line maps to no line: the click lands on
+        // the line after it.
+        let target = {
+            let rows = self.rows.borrow();
+            rows.iter()
+                .skip(row)
+                .find_map(|r| *r)
+                .unwrap_or(self.scroll + row)
+        };
+        self.row = target.min(self.lines.len() - 1);
         self.col = column.saturating_sub(self.gutter()) + self.left_offset();
         self.clamp_col();
     }
@@ -682,8 +729,11 @@ impl Editor {
         }
         match rest {
             "w" => {
-                self.save();
-                Outcome::Stay
+                if self.save() {
+                    Outcome::Saved
+                } else {
+                    Outcome::Stay
+                }
             }
             "wq" | "x" => {
                 if self.save() {
@@ -1390,6 +1440,9 @@ impl Editor {
     }
 
     fn restyle(&mut self) {
+        if let Some(base) = &self.base {
+            self.changes = line_changes(base, &self.lines);
+        }
         self.styled = if self.read_only {
             None
         } else {
@@ -1623,6 +1676,56 @@ mod tests {
         assert_eq!(ed.lines(), ["a", "b"]);
         keys(&mut ed, "vcz\u{1b}");
         assert_eq!(ed.lines(), ["z", "b"]);
+    }
+
+    #[test]
+    fn edits_are_compared_with_the_last_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        run(&["init", "-q"]);
+        fs::write(dir.path().join("a.py"), "one\ntwo\nthree\n").unwrap();
+        run(&["add", "a.py"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "x",
+        ]);
+
+        let mut ed = Editor::open(
+            dir.path(),
+            PathBuf::from("a.py"),
+            Rc::new(Highlighter::new()),
+        )
+        .with_clipboard(Rc::new(Memory::default()));
+        assert!(ed.changes().unwrap().is_empty());
+
+        keys(&mut ed, "jddOnew\u{1b}");
+        let changes = ed.changes().unwrap();
+        assert_eq!(ed.lines(), ["one", "new", "three"]);
+        assert_eq!(changes.marks[1], ironquill_tools::LineMark::Changed);
+        assert_eq!(changes.removed[&1], ["two"]);
+        assert_eq!(keys(&mut ed, ":w\n"), Outcome::Saved);
+    }
+
+    #[test]
+    fn outside_git_nothing_is_marked() {
+        let (_dir, ed) = editor("x\n");
+        assert!(ed.changes().is_none());
     }
 
     #[test]

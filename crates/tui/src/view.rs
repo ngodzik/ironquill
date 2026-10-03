@@ -1,4 +1,4 @@
-use ironquill_tools::{Container, DiffLine, ToolSummary};
+use ironquill_tools::{Container, DiffLine, LineMark, ToolSummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -7,12 +7,21 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
 use crate::app::{App, Entry, LineEditor, Panes};
 use crate::editor::{Editor, EditorMode};
-use crate::keymap::{Focus, Mode, Pending};
+use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
 use crate::sessions;
 use crate::wrap::wrap;
 
 const ACCENT: Color = Color::Rgb(215, 119, 87);
+// Changes since the last commit, in the open file. Backgrounds stay dark and
+// soft so that the code's own colours remain readable on top of them.
+const ADDED_SIGN: Color = Color::Rgb(110, 180, 120);
+const ADDED_BG: Color = Color::Rgb(26, 44, 32);
+const CHANGED_SIGN: Color = Color::Rgb(205, 170, 90);
+const CHANGED_BG: Color = Color::Rgb(46, 41, 24);
+const REMOVED_SIGN: Color = Color::Rgb(200, 110, 110);
+const REMOVED_FG: Color = Color::Rgb(175, 125, 125);
+const REMOVED_BG: Color = Color::Rgb(46, 26, 28);
 const DIM: Color = Color::DarkGray;
 const SPINNER: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
 /// Diff lines shown under an edit before the rest is summarized.
@@ -39,6 +48,106 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     if app.picker().is_some() {
         render_picker(frame, app);
     }
+    if app.model_picker().is_some() {
+        render_model_picker(frame, app);
+    }
+    if app.keys_open().is_some() {
+        render_keys(frame, app);
+    }
+}
+
+/// Every shortcut (Ctrl-S), over everything else, grouped by where it works.
+fn render_keys(frame: &mut Frame, app: &App) {
+    let Some(offset) = app.keys_open() else {
+        return;
+    };
+    let width_keys = SHORTCUTS
+        .iter()
+        .flat_map(|(_, keys)| keys.iter().map(|(k, _)| k.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line> = Vec::new();
+    for (group, keys) in SHORTCUTS {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::styled(
+            format!(" {group}"),
+            fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        for (keys, what) in *keys {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {keys:<width_keys$}  "), fg(Color::Gray)),
+                Span::raw(*what),
+            ]));
+        }
+    }
+
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 90).min(screen.width);
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = pane_block(" Shortcuts ".into(), true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let visible = usize::from(inner.height);
+    let offset = offset.min(lines.len().saturating_sub(visible));
+    let shown: Vec<Line> = lines.into_iter().skip(offset).take(visible).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// The model picker (Ctrl-E), over everything else.
+fn render_model_picker(frame: &mut Frame, app: &App) {
+    let Some(selected) = app.model_picker() else {
+        return;
+    };
+    let models = app.models();
+    let screen = frame.area();
+    let width = (screen.width * 3 / 5).clamp(30, 80).min(screen.width);
+    let height = (models.len() as u16 + 2).clamp(3, screen.height.saturating_sub(4).max(3));
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = pane_block(" Model ".into(), true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let room = usize::from(inner.width);
+    let current = app.current_model();
+    let lines: Vec<Line> = models
+        .iter()
+        .enumerate()
+        .map(|(i, model)| {
+            let mark = if Some(model) == current { "● " } else { "  " };
+            let kind = if model.delegate().is_some() {
+                "Claude Code · subscription"
+            } else {
+                "API · pay per request"
+            };
+            let name = format!("{mark}{model}");
+            let gap = room.saturating_sub(name.chars().count() + kind.chars().count() + 1);
+            let style = if i == selected {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            Line::from(vec![
+                Span::styled(format!("{name}{}", " ".repeat(gap)), style),
+                Span::styled(kind, style.fg(DIM)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The `/resume` list, over everything else.
@@ -293,6 +402,7 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
                 "▸ "
             };
             let changed = app.is_changed(&row.path, row.is_dir);
+            let git = tree.git_status(&row.path, row.is_dir);
             let mut text = format!("{}{icon}{}", "  ".repeat(row.depth), row.name);
             if row.is_dir {
                 text.push('/');
@@ -300,13 +410,18 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
             if changed {
                 text.push_str(" ●");
             }
-            let text: String = text.chars().take(width).collect();
-            let mut style = if changed {
-                fg(Color::Yellow)
-            } else if row.is_dir {
-                fg(Color::Blue)
-            } else {
-                Style::new()
+            // Git's letter at the right edge, as editors show it.
+            let letter = git.map(|l| format!(" {l}")).unwrap_or_default();
+            let room = width.saturating_sub(letter.chars().count());
+            let mut text: String = text.chars().take(room).collect();
+            text = format!("{text:<room$}{letter}");
+            let mut style = match git {
+                Some('?' | 'A') => fg(ADDED_SIGN),
+                Some('D') => fg(REMOVED_SIGN),
+                Some(_) => fg(CHANGED_SIGN),
+                None if changed => fg(Color::Yellow),
+                None if row.is_dir => fg(Color::Blue),
+                None => Style::new(),
             };
             if i == tree.selected() {
                 style = if focused {
@@ -415,38 +530,106 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
     let (cursor_row, cursor_col) = file.cursor();
     let selection = file.selection();
 
-    let lines: Vec<Line> = file
-        .lines()
+    // Rows to draw: each line, preceded by the lines of the last commit
+    // that are gone from that place.
+    let height = usize::from(inner.height);
+    let changes = file.changes();
+    let rows_from = |start: usize| {
+        let mut rows: Vec<Option<usize>> = Vec::new();
+        let mut removed: Vec<(usize, &String)> = Vec::new();
+        for i in start..=file.lines().len() {
+            if let Some(gone) = changes.and_then(|c| c.removed.get(&i)) {
+                for text in gone {
+                    removed.push((rows.len(), text));
+                    rows.push(None);
+                }
+            }
+            if i < file.lines().len() {
+                rows.push(Some(i));
+            }
+            if rows.len() >= height {
+                break;
+            }
+        }
+        rows.truncate(height);
+        (rows, removed)
+    };
+    // Removed lines take rows too, so the start may need to move down for
+    // the cursor to stay on screen.
+    let mut start = file.scroll();
+    let (mut rows, mut removed) = rows_from(start);
+    while start < cursor_row && !rows.contains(&Some(cursor_row)) {
+        start += 1;
+        (rows, removed) = rows_from(start);
+    }
+
+    let lines: Vec<Line> = rows
         .iter()
         .enumerate()
-        .skip(file.scroll())
-        .take(usize::from(inner.height))
-        .map(|(i, text)| {
-            let number_style = if i == cursor_row && focused {
-                fg(Color::Gray)
-            } else {
-                fg(DIM)
-            };
-            let mut spans = vec![Span::styled(
-                format!("{:>width$}  ", i + 1, width = gutter - 2),
-                number_style,
-            )];
-            let mut runs = line_runs(file, i, text);
-            if let Some((from, to)) = selection.and_then(|sel| sel.columns(i, text.chars().count()))
-            {
-                runs = select(runs, from, to);
+        .map(|(at, row)| match row {
+            Some(i) => {
+                let i = *i;
+                let text = &file.lines()[i];
+                let number_style = if i == cursor_row && focused {
+                    fg(Color::Gray)
+                } else {
+                    fg(DIM)
+                };
+                let mark = changes.map_or(LineMark::Same, |c| c.marks[i]);
+                let (sign, background) = match mark {
+                    LineMark::Same => (Span::raw(" "), None),
+                    LineMark::Added => (Span::styled("▎", fg(ADDED_SIGN)), Some(ADDED_BG)),
+                    LineMark::Changed => (Span::styled("▎", fg(CHANGED_SIGN)), Some(CHANGED_BG)),
+                };
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{:>width$} ", i + 1, width = gutter - 3),
+                        number_style,
+                    ),
+                    sign,
+                    Span::raw(" "),
+                ];
+                let mut runs = line_runs(file, i, text);
+                if let Some(bg) = background {
+                    runs = runs
+                        .into_iter()
+                        .map(|(style, t)| (style.bg(bg), t))
+                        .collect();
+                }
+                if let Some((from, to)) =
+                    selection.and_then(|sel| sel.columns(i, text.chars().count()))
+                {
+                    runs = select(runs, from, to);
+                }
+                spans.extend(clip(&runs, left, room));
+                Line::from(spans)
             }
-            spans.extend(clip(&runs, left, room));
-            Line::from(spans)
+            None => {
+                let text = removed
+                    .iter()
+                    .find(|(row, _)| *row == at)
+                    .map_or("", |(_, t)| t.as_str());
+                let style = Style::new().fg(REMOVED_FG).bg(REMOVED_BG);
+                let mut spans = vec![
+                    Span::raw(" ".repeat(gutter - 2)),
+                    Span::styled("-", fg(REMOVED_SIGN)),
+                    Span::raw(" "),
+                ];
+                spans.extend(clip(&[(style, text.to_owned())], left, room));
+                Line::from(spans)
+            }
         })
         .collect();
+    file.set_rows(rows.clone());
     frame.render_widget(Paragraph::new(lines), inner);
 
     let typing_below = matches!(file.mode(), EditorMode::Command | EditorMode::Search);
-    if focused && !typing_below && cursor_row >= file.scroll() {
-        let y = cursor_row - file.scroll();
+    if focused
+        && !typing_below
+        && let Some(y) = rows.iter().position(|r| *r == Some(cursor_row))
+    {
         let x = gutter + cursor_col.saturating_sub(left);
-        if y < usize::from(inner.height) && x < usize::from(inner.width) {
+        if x < usize::from(inner.width) {
             frame.set_cursor_position(Position::new(inner.x + x as u16, inner.y + y as u16));
         }
     }
@@ -644,11 +827,13 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
             cost,
             complete,
             seconds,
+            subscription,
         } => {
-            let cost = if *complete {
-                cost.to_string()
-            } else {
-                format!("{cost} reported, part of the cost unknown")
+            let cost = match (*subscription, cost.0 > 0.0, *complete) {
+                (true, false, _) => "subscription".to_owned(),
+                (true, true, _) => format!("{cost} + subscription"),
+                (false, _, true) => cost.to_string(),
+                (false, _, false) => format!("{cost} reported, part of the cost unknown"),
             };
             let text = format!(
                 "{cost} · {} in · {} out · {seconds}s",
@@ -688,6 +873,13 @@ fn tool_lines(
                 fg(DIM),
                 width,
             );
+        }
+        Ok(ToolSummary::Ran { label, lines }) => {
+            out.push(Line::from(vec![
+                Span::styled("● ", fg(Color::Green)),
+                Span::styled(label.clone(), Style::new().add_modifier(Modifier::BOLD)),
+            ]));
+            result(out, &plural(*lines, "line", "lines"), fg(DIM), width);
         }
         Ok(ToolSummary::Listed { path, entries }) => {
             out.push(action(Color::Green, "List", path));
@@ -836,13 +1028,15 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let glyph = SPINNER[app.spinner() % SPINNER.len()];
-    let line = Line::from(vec![
-        Span::styled(format!("{glyph} Working… "), fg(ACCENT)),
-        Span::styled(
-            format!("({}s · Ctrl-C to stop)", elapsed.as_secs()),
-            fg(DIM),
-        ),
-    ]);
+    let mut spans = vec![Span::styled(format!("{glyph} Working… "), fg(ACCENT))];
+    if let Some(model) = app.working_model() {
+        spans.push(Span::styled(format!("{model} "), fg(Color::Gray)));
+    }
+    spans.push(Span::styled(
+        format!("({}s · Ctrl-C to stop)", elapsed.as_secs()),
+        fg(DIM),
+    ));
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -907,17 +1101,31 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     ]);
 
     let (usage, cost, complete) = app.totals();
-    let right = Line::styled(
-        format!(
-            "{} · {} in · {} out · {}{}  ",
-            app.chain(),
-            usage.input,
-            usage.output,
-            cost,
-            if complete { "" } else { "+?" }
+    // The model in use stands out: it is what Ctrl-E changes.
+    let current = app
+        .current_model()
+        .map_or_else(|| "no model".to_owned(), ToString::to_string);
+    let rest = app
+        .chain()
+        .strip_prefix(&current)
+        .unwrap_or_default()
+        .to_owned();
+    let right = Line::from(vec![
+        // Room between the conversation's name and the model, however long
+        // the name.
+        Span::raw("  "),
+        Span::styled(current, fg(ACCENT)),
+        Span::styled(
+            format!(
+                "{rest} · {} in · {} out · {}{}  ",
+                usage.input,
+                usage.output,
+                cost,
+                if complete { "" } else { "+?" }
+            ),
+            fg(DIM),
         ),
-        fg(DIM),
-    );
+    ]);
 
     // The model and the cost matter more than the hint: they get their room
     // first, and the left side gets what is left.

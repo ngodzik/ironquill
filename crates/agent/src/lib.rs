@@ -11,6 +11,7 @@
 #![warn(missing_docs)]
 
 mod config;
+mod delegate;
 mod error;
 mod event;
 mod run;
