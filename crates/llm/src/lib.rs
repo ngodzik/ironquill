@@ -14,9 +14,11 @@ mod claude_code;
 mod codex;
 mod error;
 mod openai_compat;
+mod rankings;
 
 pub use agents::Agents;
 pub use claude_code::ClaudeCode;
 pub use codex::Codex;
 pub use error::LlmError;
-pub use openai_compat::OpenAiCompatible;
+pub use openai_compat::{Listed, OpenAiCompatible};
+pub use rankings::{ArtificialAnalysis, RANKINGS_SOURCE, Ranking, find as find_ranking};

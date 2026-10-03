@@ -1,4 +1,4 @@
-use ironquill_core::{ContextUse, ModelId, Usage, Usd};
+use ironquill_core::{ContextUse, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::ToolSummary;
 
 /// Something that happened during a session, for whoever is watching.
@@ -66,5 +66,30 @@ pub enum Event {
         from: ModelId,
         /// The model taking over.
         to: ModelId,
+    },
+    /// The model hands one task to another of the team.
+    Delegating {
+        /// The model handing it over.
+        from: ModelId,
+        /// The model doing it.
+        to: ModelId,
+        /// The task, as the first model wrote it.
+        task: String,
+    },
+    /// Old tool results were dropped from the conversation to resend less.
+    Compacted {
+        /// Results dropped.
+        dropped: usize,
+        /// About how many tokens the conversation held before.
+        before: TokenCount,
+        /// And after.
+        after: TokenCount,
+    },
+    /// The request spent its budget: the work stops here.
+    OverBudget {
+        /// What the request cost so far.
+        spent: Usd,
+        /// The budget it had.
+        budget: Usd,
     },
 }

@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
-use crate::app::{App, Entry, LineEditor, Panes};
+use crate::app::{App, Entry, LineEditor, Panes, SubAgent};
 use crate::editor::{Editor, EditorMode, Kind};
 use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
@@ -103,15 +103,16 @@ fn render_keys(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(shown), inner);
 }
 
-/// The model picker (Ctrl-E), over everything else.
+/// The model picker (Ctrl-E), over everything else: what was typed to
+/// search, then the models, the current one marked ●, the team ✓.
 fn render_model_picker(frame: &mut Frame, app: &App) {
-    let Some(selected) = app.model_picker() else {
+    let Some(picker) = app.model_picker() else {
         return;
     };
-    let models = app.models();
+    let rows = app.model_rows();
     let screen = frame.area();
-    let width = (screen.width * 3 / 5).clamp(30, 80).min(screen.width);
-    let height = (models.len() as u16 + 2).clamp(3, screen.height.saturating_sub(4).max(3));
+    let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
+    let height = (rows.len() as u16 + 4).clamp(5, screen.height.saturating_sub(4).max(5));
     let area = Rect::new(
         screen.x + (screen.width - width) / 2,
         screen.y + screen.height.saturating_sub(height) / 3,
@@ -125,28 +126,45 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
 
     let room = usize::from(inner.width);
     let current = app.current_model();
-    let lines: Vec<Line> = models
-        .iter()
-        .enumerate()
-        .map(|(i, model)| {
-            let mark = if Some(model) == current { "● " } else { "  " };
-            let kind = match model.delegate() {
-                Some((agent, _)) => format!("{agent} · subscription"),
-                None => "API · pay per request".to_owned(),
-            };
-            let name = format!("{mark}{model}");
-            let gap = room.saturating_sub(name.chars().count() + kind.chars().count() + 1);
-            let style = if i == selected {
-                Style::new().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::new()
-            };
-            Line::from(vec![
-                Span::styled(format!("{name}{}", " ".repeat(gap)), style),
-                Span::styled(kind, style.fg(DIM)),
-            ])
-        })
-        .collect();
+    let mut lines = vec![Line::from(vec![
+        Span::styled("search ", fg(DIM)),
+        Span::raw(picker.filter.clone()),
+        Span::styled("▏", fg(ACCENT)),
+    ])];
+    let credits = app
+        .credits()
+        .map(|c| format!("   scores: {c}"))
+        .unwrap_or_default();
+    lines.push(Line::styled(
+        format!("● answers you   ✓ in its team: it may hand them tasks{credits}"),
+        fg(DIM),
+    ));
+    let visible = usize::from(inner.height).saturating_sub(2);
+    let first = picker.selected.saturating_sub(visible.saturating_sub(1));
+    for (i, row) in rows.iter().enumerate().skip(first).take(visible) {
+        let mark = if Some(&row.model) == current {
+            "●"
+        } else {
+            " "
+        };
+        let team = if row.in_team { "✓" } else { " " };
+        let name = format!("{mark} {team} {}", row.model);
+        let gap = room.saturating_sub(name.chars().count() + row.note.chars().count() + 1);
+        let mut style = Style::new();
+        if !row.offered {
+            style = style.fg(DIM);
+        }
+        if i == picker.selected {
+            style = Style::new().add_modifier(Modifier::REVERSED);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("{name}{}", " ".repeat(gap)), style),
+            Span::styled(row.note.clone(), style.fg(DIM)),
+        ]));
+    }
+    if rows.is_empty() {
+        lines.push(Line::styled("  no model matches", fg(DIM)));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -213,11 +231,12 @@ const SIDE_CHAT_MIN: u16 = 36;
 fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
     if app.is_zoomed() {
         // Only the conversation; the other panes keep their state, unseen.
+        let sub = render_chat(frame, app, area, false);
         app.set_panes(Panes {
             chat: area,
+            sub,
             ..Panes::default()
         });
-        render_chat(frame, app, area, false);
         return;
     }
     // The Docker pane runs along the bottom, under everything else, sized to
@@ -258,6 +277,7 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
         file: None,
         chat: center,
         docker,
+        sub: None,
     };
     if let Some(docker) = docker {
         render_docker(frame, app, docker);
@@ -274,10 +294,10 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
         render_command_frame(frame, app, command);
         panes.chat = side;
         if side_width > 0 {
-            render_chat(frame, app, side, true);
+            panes.sub = render_chat(frame, app, side, true);
         }
     } else {
-        render_chat(frame, app, center, !alone);
+        panes.sub = render_chat(frame, app, center, !alone);
     }
     app.set_panes(panes);
 }
@@ -365,7 +385,95 @@ fn render_docker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) {
+/// The conversation, and under it the sub-agent pane when it is open,
+/// whose area is returned for the mouse.
+fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) -> Option<Rect> {
+    // While a model of the team works, or until the next request, its work
+    // takes most of the room: the conversation keeps a third.
+    if let Some(sub) = app.sub_agent()
+        && area.height >= 14
+    {
+        let top = (area.height / 3).max(6);
+        let [chat, pane] =
+            Layout::vertical([Constraint::Length(top), Constraint::Min(6)]).areas(area);
+        render_conversation(frame, app, chat, true);
+        render_sub_agent(frame, app, &sub, pane);
+        return Some(pane);
+    }
+    render_conversation(frame, app, area, framed);
+    None
+}
+
+/// The model a task was handed to, at work: who it is, the task, then
+/// everything it does, the latest at the bottom.
+fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect) {
+    let state = if sub.working {
+        format!(" working {} ", SPINNER[app.spinner() % SPINNER.len()])
+    } else {
+        format!(" done · {} ", plural(sub.work.len(), "step", "steps"))
+    };
+    let focused = app.focus() == Focus::SubAgent;
+    let border = if focused {
+        fg(Color::LightMagenta).add_modifier(Modifier::BOLD)
+    } else {
+        fg(Color::Magenta)
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border)
+        .title(Line::from(vec![
+            Span::styled(
+                " Sub-agent ",
+                fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                sub.to.to_string(),
+                fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · for {} ·", sub.from), fg(DIM)),
+            Span::styled(state, fg(Color::Magenta)),
+            Span::styled(format!("· {} ", sub.spent), fg(Color::Gray)),
+        ]))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+
+    let width = usize::from(inner.width).saturating_sub(1).max(1);
+    let mut lines: Vec<Line> = Vec::new();
+    push_wrapped(
+        &mut lines,
+        Span::styled("Task  ", fg(Color::Magenta)),
+        "      ",
+        sub.task,
+        fg(Color::Gray),
+        width,
+    );
+    lines.push(Line::default());
+    for entry in &sub.work {
+        lines.extend(entry_lines(entry, app, width));
+        lines.push(Line::default());
+    }
+    if sub.work.is_empty() {
+        lines.push(Line::styled("  starting…", fg(DIM)));
+    }
+    // The latest at the bottom, as in the conversation, unless scrolled up.
+    let height = usize::from(inner.height);
+    let max = lines.len().saturating_sub(height);
+    app.set_sub_max(max);
+    let up = app.sub_scroll().min(max);
+    let skip = max - up;
+    let below = if up > 0 {
+        format!(" ↓ {} below · ", plural(up, "line", "lines"))
+    } else {
+        String::from(" ")
+    };
+    let block =
+        block.title_bottom(Line::styled(format!("{below}Ctrl-T hides "), fg(DIM)).right_aligned());
+    frame.render_widget(block, area);
+    let shown: Vec<Line> = lines.into_iter().skip(skip).take(height).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+fn render_conversation(frame: &mut Frame, app: &App, area: Rect, framed: bool) {
     if framed {
         let block = pane_block(" Chat ".into(), app.focus() == Focus::Chat);
         let inner = block.inner(area);
@@ -853,6 +961,50 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 width,
             );
         }
+        // A member's work, set apart by a bar in the colour of the handover,
+        // its replies under its name.
+        Entry::Member { model, entry } => {
+            let bar = || Span::styled("  ┃ ", fg(Color::Magenta));
+            if matches!(**entry, Entry::Said(_)) {
+                out.push(Line::from(vec![
+                    bar(),
+                    Span::styled(model.to_string(), fg(Color::Magenta)),
+                ]));
+            }
+            for line in entry_lines(entry, app, width.saturating_sub(4)) {
+                let mut spans = vec![bar()];
+                spans.extend(line.spans);
+                out.push(Line::from(spans));
+            }
+        }
+        Entry::Delegating { from, to, task, .. } => {
+            out.push(action(
+                Color::Magenta,
+                "Delegate",
+                &format!("{from} → {to}"),
+            ));
+            result(&mut out, task, fg(DIM), width);
+        }
+        Entry::OverBudget { spent, budget } => {
+            push_wrapped(
+                &mut out,
+                Span::styled("✗ ", fg(Color::Yellow)),
+                "  ",
+                &if spent.0 > budget.0 {
+                    format!(
+                        "Budget of {budget} for this request passed ({spent}): the work stopped. \
+                         /budget <dollars> changes it"
+                    )
+                } else {
+                    format!(
+                        "Budget of {budget} for this request: {spent} spent, and the next call \
+                         would go past it, so the work stopped. /budget <dollars> changes it"
+                    )
+                },
+                fg(Color::Yellow),
+                width,
+            );
+        }
         Entry::GaveUp => {
             push_wrapped(
                 &mut out,
@@ -1057,9 +1209,27 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     let mut ranges = Vec::new();
     for (i, entry) in app.transcript().iter().enumerate() {
+        // A member's work shows in the sub-agent pane; here a line says how
+        // much there was.
+        if matches!(entry, Entry::Member { .. }) {
+            continue;
+        }
         let first = lines.len();
         let mut block = entry_lines(entry, app, width);
-        if matches!(entry, Entry::Said(_)) && block.len() > FOLD_AT && !app.is_expanded(i) {
+        if let Entry::Delegating { to, spent, .. } = entry {
+            let steps = app.transcript()[i + 1..]
+                .iter()
+                .take_while(|e| matches!(e, Entry::Member { .. }))
+                .count();
+            block.push(Line::styled(
+                format!(
+                    "  ┃ {to}: {} · {spent} · Ctrl-T shows them",
+                    plural(steps, "step", "steps")
+                ),
+                fg(Color::Magenta),
+            ));
+        }
+        if entry.is_reply() && block.len() > FOLD_AT && !app.is_expanded(i) {
             let hidden = block.len() - FOLD_SHOW;
             block.truncate(FOLD_SHOW);
             block.push(Line::styled(
@@ -1132,6 +1302,19 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(model) = app.working_model() {
         spans.push(Span::styled(format!("{model} "), fg(Color::Gray)));
     }
+    // The answering model's own cost so far, named when a sub-agent is the
+    // one working, whose cost is in its pane.
+    let spent = app.request_spent();
+    if spent.usage.input.0 > 0 {
+        let lead = app
+            .current_model()
+            .filter(|lead| app.working_model() != Some(*lead));
+        let text = match lead {
+            Some(lead) => format!("· {lead} so far {spent} "),
+            None => format!("· {spent} "),
+        };
+        spans.push(Span::styled(text, fg(Color::Gray)));
+    }
     spans.push(Span::styled(
         format!("({}s · Ctrl-C to stop)", elapsed.as_secs()),
         fg(DIM),
@@ -1149,6 +1332,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(fg(if focused { Color::Gray } else { DIM }))
+        .title(team_title(app))
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
 
@@ -1175,6 +1359,38 @@ fn visible_window(editor: &LineEditor, prompt: &str, width: usize) -> (String, u
     let start = (cursor + 1).saturating_sub(width);
     let shown: String = full.iter().skip(start).take(width).collect();
     (shown, cursor - start)
+}
+
+/// Who answers and its team, on the message box, always in view.
+fn team_title(app: &App) -> Line<'static> {
+    let Some(lead) = app.current_model() else {
+        return Line::default();
+    };
+    let mut spans = vec![
+        Span::styled(" answers ", fg(DIM)),
+        Span::styled(lead.to_string(), fg(ACCENT)),
+    ];
+    let team: Vec<String> = app
+        .team()
+        .iter()
+        .filter(|m| *m != lead)
+        .map(ToString::to_string)
+        .collect();
+    spans.push(Span::styled(" · team ", fg(DIM)));
+    if team.is_empty() {
+        spans.push(Span::styled("none", fg(DIM)));
+    } else {
+        spans.push(Span::raw(team.join(", ")));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+/// The budget, for the status line.
+fn team_and_budget(app: &App) -> String {
+    app.budget()
+        .map(|b| format!(" · budget {b}"))
+        .unwrap_or_default()
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
@@ -1217,14 +1433,15 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(current, fg(ACCENT)),
         Span::styled(
             format!(
-                "{rest} · {} in · {} out · {}{}{}  ",
+                "{rest}{} · {} in · {} out · {}{}{}  ",
+                team_and_budget(app),
                 usage.input,
                 usage.output,
                 cost,
                 if complete { "" } else { "+?" },
                 app.context()
                     .map(|c| format!(" · ctx {}%", c.percent()))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
             ),
             fg(DIM),
         ),

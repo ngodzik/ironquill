@@ -4,15 +4,16 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ironquill_agent::{AgentConfig, Event, Outcome, Session, Verdict};
+use ironquill_agent::{AgentConfig, Event, Member, Outcome, Session, Verdict};
 use ironquill_core::{Agent, ContextUse, ModelId, TokenCount, Usage, Usd};
-use ironquill_tools::{Check, Container, ToolSummary};
+use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
 
 use crate::command::{self, Command};
+use crate::defaults::Defaults;
 use crate::editor::{Editor, Outcome as EditorOutcome};
 use crate::highlight::Highlighter;
 use crate::keymap::{self, Action, Focus, Mode, Pending};
@@ -30,6 +31,7 @@ pub(crate) struct Panes {
     pub(crate) file: Option<Rect>,
     pub(crate) chat: Rect,
     pub(crate) docker: Option<Rect>,
+    pub(crate) sub: Option<Rect>,
 }
 
 /// The Docker pane: what `docker ps` said last.
@@ -60,8 +62,68 @@ pub struct Settings {
     /// Turns per try.
     pub max_turns: u32,
     /// The models offered by the model picker (Ctrl-E). Identifiers starting
-    /// with `claude-code` hand the task to Claude Code.
+    /// with `claude-code` or `codex` hand the task to that agent.
     pub models: Vec<ModelId>,
+    /// The models the first one may hand tasks to.
+    pub team: Vec<ModelId>,
+    /// The most one request may cost; `None` sets no limit.
+    pub budget: Option<Usd>,
+    /// Every model the provider lists, with a note on its price and context,
+    /// to search from the model picker and to tell the team apart.
+    pub catalog: Vec<Member>,
+    /// Where scores in the notes come from, to credit it.
+    pub credits: Option<String>,
+}
+
+/// Tokens and cost of one part of a request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Spent {
+    pub(crate) usage: Usage,
+    pub(crate) cost: Usd,
+    /// Some turns ran on a subscription, which costs nothing per request.
+    pub(crate) subscription: bool,
+}
+
+impl std::fmt::Display for Spent {
+    /// `$0.012 · 12.3k in · 800 out`, or `subscription · …`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.subscription && self.cost.0 == 0.0 {
+            f.write_str("subscription")?;
+        } else {
+            write!(f, "{}", self.cost)?;
+        }
+        write!(f, " · {} in · {} out", self.usage.input, self.usage.output)
+    }
+}
+
+/// A task handed to a model of the team, as the sub-agent pane shows it.
+pub(crate) struct SubAgent<'a> {
+    pub(crate) from: &'a ModelId,
+    pub(crate) to: &'a ModelId,
+    pub(crate) task: &'a str,
+    pub(crate) spent: Spent,
+    /// What it did, in order.
+    pub(crate) work: Vec<&'a Entry>,
+    /// Still working on it.
+    pub(crate) working: bool,
+}
+
+/// The model picker (Ctrl-E) while it is open.
+#[derive(Debug, Default)]
+pub(crate) struct ModelPicker {
+    /// What was typed to search the provider's models.
+    pub(crate) filter: String,
+    pub(crate) selected: usize,
+}
+
+/// One row of the model picker.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ModelRow {
+    pub(crate) model: ModelId,
+    pub(crate) note: String,
+    /// Among the models offered every time, not only found by the search.
+    pub(crate) offered: bool,
+    pub(crate) in_team: bool,
 }
 
 /// Something only the event loop can do, asked for by the state.
@@ -89,6 +151,8 @@ pub(crate) enum Effect {
     ApplyContext(String),
     /// End this agent's session.
     ForgetDelegate(Agent),
+    /// Keep the current choices for every new session.
+    SaveDefaults(Defaults),
 }
 
 /// What the agent task sends back to the interface.
@@ -123,6 +187,26 @@ pub(crate) enum Entry {
         to: ModelId,
     },
     GaveUp,
+    /// The model handed a task to another of the team.
+    Delegating {
+        from: ModelId,
+        to: ModelId,
+        task: String,
+        /// What the member's work cost, as it accrues.
+        #[serde(default)]
+        spent: Spent,
+    },
+    /// The request spent its budget and stopped.
+    OverBudget {
+        spent: Usd,
+        budget: Usd,
+    },
+    /// What a model of the team did on a task handed to it, shown apart
+    /// from the model that answers.
+    Member {
+        model: ModelId,
+        entry: Box<Entry>,
+    },
     /// What one request cost, shown under it.
     Cost {
         usage: Usage,
@@ -136,6 +220,17 @@ pub(crate) enum Entry {
         #[serde(default)]
         context: Option<ContextUse>,
     },
+}
+
+impl Entry {
+    /// A model's reply, which folds when long.
+    pub(crate) fn is_reply(&self) -> bool {
+        match self {
+            Entry::Said(_) => true,
+            Entry::Member { entry, .. } => entry.is_reply(),
+            _ => false,
+        }
+    }
 }
 
 /// A single line of text being edited, with a cursor counted in characters.
@@ -250,6 +345,21 @@ pub(crate) struct App {
     quit: bool,
     /// The first Ctrl-C was pressed: a second one quits.
     quit_armed: bool,
+    /// The model of the team working on a task handed to it, if one is.
+    member: Option<ModelId>,
+    /// The handover whose work the sub-agent pane shows, by its place in
+    /// the transcript.
+    sub_view: Option<usize>,
+    /// How many lines the sub-agent pane is scrolled up from its end; 0
+    /// follows the work as it comes.
+    sub_scroll: Cell<usize>,
+    /// The most it can be, written by the view.
+    sub_max: Cell<usize>,
+    /// What the current request cost so far, without its sub-agents.
+    request_spent: Spent,
+    /// The choices as last kept for new sessions, to keep them again as
+    /// soon as they change.
+    kept: Defaults,
     /// A one-line note in the status line, cleared by the next key.
     notice: Option<String>,
     session_id: String,
@@ -279,7 +389,7 @@ pub(crate) struct App {
     /// The list of shortcuts, open at this scroll offset.
     keys_open: Option<usize>,
     /// The model picker, open on the row selected.
-    model_picker: Option<usize>,
+    model_picker: Option<ModelPicker>,
     /// How full the context was on the latest call, for the status line.
     context: Option<ContextUse>,
     /// The model working on the current request, for the activity line.
@@ -317,7 +427,7 @@ impl App {
             || root.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        Self {
+        let mut app = Self {
             settings,
             root,
             project,
@@ -341,6 +451,12 @@ impl App {
             cost_complete: true,
             quit: false,
             quit_armed: false,
+            member: None,
+            sub_view: None,
+            sub_scroll: Cell::new(0),
+            sub_max: Cell::new(0),
+            request_spent: Spent::default(),
+            kept: Defaults::default(),
             notice: None,
             session_id: sessions::new_id(),
             session_name: None,
@@ -360,7 +476,9 @@ impl App {
             working_model: None,
             context: None,
             docker: None,
-        }
+        };
+        app.kept = app.defaults();
+        app
     }
 
     // Read access for the view.
@@ -502,7 +620,7 @@ impl App {
             let global = ctrl
                 && matches!(
                     key.code,
-                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a' | 'z')
+                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a' | 'z' | 't')
                 );
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
@@ -621,6 +739,7 @@ impl App {
                 }
                 Focus::Chat => self.scroll_back.set(self.max_scroll.get()),
                 Focus::Docker => self.move_focused(i32::MIN / 2),
+                Focus::SubAgent => self.sub_scroll.set(self.sub_max.get()),
             },
             Action::Bottom => match self.focus {
                 Focus::Tree => {
@@ -635,6 +754,7 @@ impl App {
                 }
                 Focus::Chat => self.scroll_back.set(0),
                 Focus::Docker => self.move_focused(i32::MAX / 2),
+                Focus::SubAgent => self.sub_scroll.set(0),
             },
             Action::Open => self.open_selected(),
             Action::Collapse => {
@@ -659,6 +779,25 @@ impl App {
             }
             Action::ShowChat => self.close_file(Focus::Chat),
             Action::PickModel => self.open_model_picker(),
+            Action::ToggleSubAgent => {
+                self.sub_scroll.set(0);
+                if self.focus == Focus::SubAgent {
+                    self.focus_on(Focus::Chat);
+                }
+                self.sub_view = match self.sub_view {
+                    Some(_) => None,
+                    None => {
+                        let last = self
+                            .transcript
+                            .iter()
+                            .rposition(|e| matches!(e, Entry::Delegating { .. }));
+                        if last.is_none() {
+                            self.info("No task was handed to the team in this conversation yet");
+                        }
+                        last
+                    }
+                };
+            }
             Action::Zoom => {
                 self.zoomed = !self.zoomed;
                 if self.zoomed {
@@ -720,6 +859,10 @@ impl App {
                     self.docker = None;
                     self.focus_on(Focus::Chat);
                 }
+                Focus::SubAgent => {
+                    self.sub_view = None;
+                    self.focus_on(Focus::Chat);
+                }
                 Focus::Chat => {}
             },
             Action::FocusNext => self.cycle_focus(1, true),
@@ -759,7 +902,7 @@ impl App {
         self.transcript
             .iter()
             .enumerate()
-            .filter(|(_, e)| matches!(e, Entry::Said(_)))
+            .filter(|(_, e)| e.is_reply())
             .map(|(i, _)| i)
             .collect()
     }
@@ -841,6 +984,9 @@ impl App {
             panes.push(Focus::File);
         }
         panes.push(Focus::Chat);
+        if self.sub_view.is_some() {
+            panes.push(Focus::SubAgent);
+        }
         if self.docker.is_some() {
             panes.push(Focus::Docker);
         }
@@ -881,6 +1027,11 @@ impl App {
                 }
             }
             Focus::Chat => self.scroll(lines),
+            Focus::SubAgent => {
+                let up = self.sub_scroll.get() as i64 - i64::from(lines);
+                self.sub_scroll
+                    .set(up.clamp(0, self.sub_max.get() as i64) as usize);
+            }
             Focus::Docker => {
                 if let Some(docker) = &mut self.docker {
                     let last = docker.containers.len().saturating_sub(1) as i64;
@@ -917,6 +1068,8 @@ impl App {
         let panes = self.panes.get();
         let hit = if panes.docker.is_some_and(|r| r.contains(at)) {
             Focus::Docker
+        } else if panes.sub.is_some_and(|r| r.contains(at)) {
+            Focus::SubAgent
         } else if panes.tree.is_some_and(|r| r.contains(at)) {
             Focus::Tree
         } else if panes.file.is_some_and(|r| r.contains(at)) {
@@ -954,7 +1107,7 @@ impl App {
                             .find(|(_, first, last)| (*first..=*last).contains(&line))
                             .map(|(e, _, _)| *e);
                         if let Some(entry) = entry
-                            && matches!(self.transcript.get(entry), Some(Entry::Said(_)))
+                            && self.transcript.get(entry).is_some_and(Entry::is_reply)
                         {
                             self.toggle_fold(entry);
                         }
@@ -1017,10 +1170,23 @@ impl App {
         for check in &self.settings.checks {
             builder = builder.check(check.clone());
         }
+        for member in self.members() {
+            builder = builder.member(member);
+        }
+        if let Some(budget) = self.settings.budget {
+            builder = builder.budget(budget);
+        }
         match builder.build() {
             Ok(config) => {
                 self.input.take();
                 self.transcript.push(Entry::User(text.clone()));
+                // A new request: the last sub-agent's work leaves the screen,
+                // Ctrl-T brings it back.
+                self.sub_view = None;
+                self.request_spent = Spent::default();
+                if self.focus == Focus::SubAgent {
+                    self.focus = Focus::Chat;
+                }
                 self.running_since = Some(Instant::now());
                 self.working_model = tiers.first().cloned();
                 self.scroll_back.set(0);
@@ -1193,6 +1359,33 @@ impl App {
                 return Some(Effect::ForgetDelegate(agent));
             }
             Command::Keys => self.keys_open = Some(0),
+            Command::Budget(None) => match self.settings.budget {
+                Some(budget) => self.info(format!("Budget: {budget} per request")),
+                None => self.info("No budget: requests may cost any amount"),
+            },
+            Command::Budget(Some(amount)) => {
+                let amount = amount.trim_start_matches('$');
+                if amount == "none" {
+                    self.settings.budget = None;
+                    self.info("No budget: requests may cost any amount");
+                } else {
+                    match amount.parse::<f64>() {
+                        Ok(dollars) if dollars.is_finite() && dollars > 0.0 => {
+                            self.settings.budget = Some(Usd(dollars));
+                            self.info(format!("Budget: {} per request", Usd(dollars)));
+                        }
+                        _ => self.error(format!(
+                            "A budget is an amount in dollars, such as /budget 0.25, or none; got {amount:?}"
+                        )),
+                    }
+                }
+            }
+            Command::Defaults => return Some(Effect::SaveDefaults(self.defaults())),
+            Command::Copy => self.open_transcript(),
+            Command::Team => {
+                let text = self.describe_team();
+                self.info(text);
+            }
         }
         None
     }
@@ -1346,9 +1539,139 @@ impl App {
         true
     }
 
-    /// The row selected in the model picker, while it is open.
-    pub(crate) fn model_picker(&self) -> Option<usize> {
-        self.model_picker
+    /// The models the first one may hand tasks to.
+    pub(crate) fn team(&self) -> &[ModelId] {
+        &self.settings.team
+    }
+
+    /// The handover the sub-agent pane shows: who, the task, what it did,
+    /// and whether it is still at it.
+    pub(crate) fn sub_agent(&self) -> Option<SubAgent<'_>> {
+        let i = self.sub_view?;
+        let Some(Entry::Delegating {
+            from,
+            to,
+            task,
+            spent,
+        }) = self.transcript.get(i)
+        else {
+            return None;
+        };
+        let work: Vec<&Entry> = self.transcript[i + 1..]
+            .iter()
+            .map_while(|e| match e {
+                Entry::Member { entry, .. } => Some(&**entry),
+                _ => None,
+            })
+            .collect();
+        let working = self.is_running()
+            && self.member.as_ref() == Some(to)
+            && i + 1 + work.len() == self.transcript.len();
+        Some(SubAgent {
+            from,
+            to,
+            task,
+            spent: *spent,
+            work,
+            working,
+        })
+    }
+
+    /// How far the sub-agent pane is scrolled up from its end, and the
+    /// view's report of how far it can go.
+    pub(crate) fn sub_scroll(&self) -> usize {
+        self.sub_scroll.get()
+    }
+
+    pub(crate) fn set_sub_max(&self, max: usize) {
+        self.sub_max.set(max);
+        if self.sub_scroll.get() > max {
+            self.sub_scroll.set(max);
+        }
+    }
+
+    /// What the running request cost so far, its sub-agents apart.
+    pub(crate) fn request_spent(&self) -> Spent {
+        self.request_spent
+    }
+
+    /// Where the scores shown come from.
+    pub(crate) fn credits(&self) -> Option<&str> {
+        self.settings.credits.as_deref()
+    }
+
+    /// The most one request may cost.
+    pub(crate) fn budget(&self) -> Option<Usd> {
+        self.settings.budget
+    }
+
+    /// The model picker, while it is open.
+    pub(crate) fn model_picker(&self) -> Option<&ModelPicker> {
+        self.model_picker.as_ref()
+    }
+
+    /// The rows of the model picker: the offered models that match what was
+    /// typed, then the provider's other models that do.
+    pub(crate) fn model_rows(&self) -> Vec<ModelRow> {
+        let filter = self
+            .model_picker
+            .as_ref()
+            .map(|p| p.filter.to_lowercase())
+            .unwrap_or_default();
+        let matches = |model: &ModelId| model.as_str().to_lowercase().contains(&filter);
+        let row = |model: &ModelId, offered: bool| ModelRow {
+            model: model.clone(),
+            note: self.note(model),
+            offered,
+            in_team: self.settings.team.contains(model),
+        };
+        let mut rows: Vec<ModelRow> = self
+            .settings
+            .models
+            .iter()
+            .filter(|m| matches(m))
+            .map(|m| row(m, true))
+            .collect();
+        if !filter.is_empty() {
+            rows.extend(
+                self.settings
+                    .catalog
+                    .iter()
+                    .map(|m| &m.model)
+                    .filter(|m| matches(m) && !self.settings.models.contains(m))
+                    .map(|m| row(m, false)),
+            );
+        }
+        rows
+    }
+
+    /// A few words on `model`: its price and context, or the agent it is.
+    pub(crate) fn note(&self, model: &ModelId) -> String {
+        if let Some((agent, _)) = model.delegate() {
+            return format!("{agent} · subscription");
+        }
+        self.settings
+            .catalog
+            .iter()
+            .find(|m| &m.model == model)
+            .map(|m| m.note.clone())
+            .unwrap_or_default()
+    }
+
+    /// The team as the agent gets it, with what tells its members apart.
+    fn members(&self) -> Vec<Member> {
+        self.settings
+            .team
+            .iter()
+            .map(|model| {
+                self.settings
+                    .catalog
+                    .iter()
+                    .find(|m| &m.model == model)
+                    .cloned()
+                    .unwrap_or_else(|| Member::new(model.clone(), self.note(model)))
+            })
+            .collect()
     }
 
     /// The model the first request goes to.
@@ -1362,31 +1685,44 @@ impl App {
     }
 
     fn open_model_picker(&mut self) {
-        let models = self.models();
-        if models.is_empty() {
+        if self.models().is_empty() && self.settings.catalog.is_empty() {
             self.error("No model configured: start with --model, or set IRONQUILL_MODELS");
             return;
         }
-        let current = self
+        let selected = self
             .current_model()
-            .and_then(|m| models.iter().position(|x| x == m))
+            .and_then(|m| self.settings.models.iter().position(|x| x == m))
             .unwrap_or(0);
-        self.model_picker = Some(current);
+        self.model_picker = Some(ModelPicker {
+            filter: String::new(),
+            selected,
+        });
     }
 
     /// Keys while the model picker is open. Returns whether the key was for it.
+    ///
+    /// Typing searches the provider's models, Enter answers with the selected
+    /// one, Space puts it in the team or takes it out.
     fn model_picker_key(&mut self, key: KeyEvent) -> bool {
-        let Some(selected) = self.model_picker else {
+        let Some(picker) = &self.model_picker else {
             return false;
         };
-        let models = self.models();
-        let last = models.len().saturating_sub(1);
+        let selected = picker.selected;
+        let rows = self.model_rows();
+        let last = rows.len().saturating_sub(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let set = |app: &mut Self, selected: usize| {
+            if let Some(p) = &mut app.model_picker {
+                p.selected = selected;
+            }
+        };
         match key.code {
-            KeyCode::Up => self.model_picker = Some(selected.saturating_sub(1)),
-            KeyCode::Down => self.model_picker = Some((selected + 1).min(last)),
+            KeyCode::Up => set(self, selected.saturating_sub(1)),
+            KeyCode::Down => set(self, (selected + 1).min(last)),
             KeyCode::Enter => {
                 self.model_picker = None;
-                if let Some(model) = models.get(selected).cloned() {
+                if let Some(row) = rows.get(selected) {
+                    let model = row.model.clone();
                     self.use_model(model.clone());
                     if let Some((agent, _)) = model.delegate() {
                         self.info(format!(
@@ -1397,14 +1733,121 @@ impl App {
                     }
                 }
             }
-            KeyCode::Esc | KeyCode::Char('q') => self.model_picker = None,
+            KeyCode::Char(' ') => {
+                if let Some(row) = rows.get(selected) {
+                    self.toggle_team(row.model.clone());
+                }
+            }
+            KeyCode::Esc => self.model_picker = None,
             // Ctrl-E again closes it, as the shortcut that opened it.
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.model_picker = None;
+            KeyCode::Char('e') if ctrl => self.model_picker = None,
+            KeyCode::Backspace => {
+                if let Some(p) = &mut self.model_picker {
+                    p.filter.pop();
+                    p.selected = 0;
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(p) = &mut self.model_picker {
+                    p.filter.push(c);
+                    p.selected = 0;
+                }
             }
             _ => {}
         }
         true
+    }
+
+    /// Puts `model` in the team, or takes it out. A model found by the search
+    /// is offered from then on.
+    fn toggle_team(&mut self, model: ModelId) {
+        if !self.settings.models.contains(&model) {
+            self.settings.models.push(model.clone());
+        }
+        let lead = self
+            .current_model()
+            .map_or_else(|| "the model that answers".to_owned(), ToString::to_string);
+        if let Some(i) = self.settings.team.iter().position(|m| m == &model) {
+            self.settings.team.remove(i);
+            self.info(format!("{model} leaves the team"));
+        } else {
+            self.settings.team.push(model.clone());
+            let tools = self
+                .settings
+                .catalog
+                .iter()
+                .find(|m| m.model == model)
+                .is_none_or(|m| m.tools);
+            if tools {
+                self.info(format!(
+                    "{model} joins the team: {lead} answers you and may hand it tasks. /team shows the team"
+                ));
+            } else {
+                self.error(format!(
+                    "{model} joins the team, but the provider says it cannot use tools: it reads and changes no file, and only answers questions put to it in full"
+                ));
+            }
+        }
+    }
+
+    /// Who answers and who it may hand tasks to, in words.
+    fn describe_team(&self) -> String {
+        let lead = self
+            .current_model()
+            .map_or_else(|| "no model".to_owned(), ToString::to_string);
+        let members: Vec<String> = self
+            .settings
+            .team
+            .iter()
+            .filter(|m| Some(*m) != self.current_model())
+            .map(|m| match self.note(m).as_str() {
+                "" => format!("  {m}"),
+                note => format!("  {m}  ({note})"),
+            })
+            .collect();
+        if members.is_empty() {
+            format!("{lead} answers you, alone. To give it a team: Ctrl-E, select a model, Space")
+        } else {
+            format!(
+                "{lead} answers you, and may hand tasks to:\n{}\nIt decides when; you can also ask it to",
+                members.join("\n")
+            )
+        }
+    }
+
+    /// The choices of this session, to keep as the defaults of the next.
+    /// The agents found on this machine are offered anyway: only those
+    /// picked are kept, so that another machine is not offered them.
+    fn defaults(&self) -> Defaults {
+        let ids = |models: &[ModelId]| models.iter().map(ToString::to_string).collect();
+        let picked = |m: &&ModelId| {
+            m.delegate().is_none()
+                || self.settings.team.contains(m)
+                || self.current_model() == Some(*m)
+        };
+        Defaults {
+            model: self.current_model().map(ToString::to_string),
+            models: self
+                .settings
+                .models
+                .iter()
+                .filter(picked)
+                .map(ToString::to_string)
+                .collect(),
+            team: ids(&self.settings.team),
+            budget: self.settings.budget.map(|b| b.0),
+        }
+    }
+
+    /// The choices, when they changed since they were last kept: the model,
+    /// the models offered, the team and the budget carry over to the next
+    /// session without having to ask.
+    pub(crate) fn defaults_to_keep(&mut self) -> Option<Defaults> {
+        let now = self.defaults();
+        (now != self.kept).then(|| {
+            self.kept = now.clone();
+            now
+        })
     }
 
     /// The model `/claude` or `/codex` hands tasks to: the first offered
@@ -1414,6 +1857,88 @@ impl App {
             .into_iter()
             .find(|m| m.delegate().is_some_and(|(a, _)| a == agent))
             .unwrap_or_else(|| ModelId::agent(agent))
+    }
+
+    /// Opens the conversation as text in the editor, to select and copy
+    /// from. A file with unsaved edits stays open.
+    fn open_transcript(&mut self) {
+        if let Some(file) = self.file.as_mut().filter(|f| f.is_modified()) {
+            file.refuse_close();
+            self.unzoom();
+            self.focus_on(Focus::File);
+            return;
+        }
+        let text = self.transcript_text();
+        let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
+        self.unzoom();
+        self.file = Some(Editor::transcript(&text, highlighter));
+        self.focus_on(Focus::File);
+        self.info("The conversation as text: v or V selects, y copies to the clipboard, :q closes");
+    }
+
+    /// The conversation as plain text, as it reads on screen.
+    pub(crate) fn transcript_text(&self) -> String {
+        self.transcript
+            .iter()
+            .filter_map(Self::entry_text)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// One entry as plain text, `None` for what is not part of the talk.
+    fn entry_text(entry: &Entry) -> Option<String> {
+        let text = match entry {
+            Entry::Welcome | Entry::Cost { .. } => return None,
+            Entry::Info(text) | Entry::Error(text) | Entry::Said(text) => text.clone(),
+            Entry::User(text) => format!("> {text}"),
+            Entry::Tool {
+                name,
+                path,
+                outcome,
+            } => {
+                let mut text = format!("● {name} {}", path.as_deref().unwrap_or_default());
+                match outcome {
+                    Ok(ToolSummary::Changed { diff, .. }) => {
+                        for line in diff {
+                            text.push('\n');
+                            text.push_str(&match line {
+                                DiffLine::Context(l) => format!("  {l}"),
+                                DiffLine::Removed(l) => format!("- {l}"),
+                                DiffLine::Added(l) => format!("+ {l}"),
+                            });
+                        }
+                    }
+                    Ok(ToolSummary::Ran { label, .. }) => text = format!("● {label}"),
+                    Ok(_) => {}
+                    Err(error) => text.push_str(&format!("  ✗ {error}")),
+                }
+                text
+            }
+            Entry::Checks(commands) => format!("▸ {}", commands.join(", then ")),
+            Entry::Passed => "✓ checks passed".into(),
+            Entry::Failed { command, excerpt } => format!("✗ {command}\n{excerpt}"),
+            Entry::Escalating { from, to } => format!("↑ {from} → {to}"),
+            Entry::GaveUp => "✗ the checks still fail after every model tried".into(),
+            Entry::Delegating {
+                from,
+                to,
+                task,
+                spent,
+            } => format!("→ {from} → {to}: {task} ({spent})"),
+            Entry::OverBudget { spent, budget } => {
+                format!("✗ budget of {budget} spent ({spent})")
+            }
+            Entry::Member { model, entry } => {
+                let inner = Self::entry_text(entry).unwrap_or_default();
+                let mut text = format!("│ {model}");
+                for line in inner.lines() {
+                    text.push_str("\n│ ");
+                    text.push_str(line);
+                }
+                text
+            }
+        };
+        Some(text)
     }
 
     /// Opens the conversation's context in the editor, in place of a file.
@@ -1504,8 +2029,11 @@ impl App {
         self.notice.as_deref()
     }
 
+    /// The conversation's name in the status line: only one given with
+    /// /name. The first message, which names it in the /resume list, is
+    /// not repeated there.
     pub(crate) fn session_label(&self) -> String {
-        self.name()
+        self.session_name.clone().unwrap_or_default()
     }
 
     pub(crate) fn report_info(&mut self, text: &str) {
@@ -1541,12 +2069,38 @@ impl App {
         let entry = match event {
             // Tokens and cost go to the status line, not the transcript.
             Event::Turn {
+                model,
                 usage,
                 cost,
                 subscription,
                 context,
-                ..
             } => {
+                // The model that answers is back: the member is done.
+                if self.member.as_ref().is_some_and(|m| *m != model) {
+                    self.member = None;
+                    self.working_model = Some(model);
+                }
+                if self.member.is_none() {
+                    self.request_spent.usage += usage;
+                    match cost {
+                        Some(c) => self.request_spent.cost += c,
+                        None => self.request_spent.subscription |= subscription,
+                    }
+                }
+                // The member's turns count for its handover too, live.
+                if self.member.is_some()
+                    && let Some(Entry::Delegating { spent, .. }) = self
+                        .transcript
+                        .iter_mut()
+                        .rev()
+                        .find(|e| matches!(e, Entry::Delegating { .. }))
+                {
+                    spent.usage += usage;
+                    match cost {
+                        Some(c) => spent.cost += c,
+                        None => spent.subscription |= subscription,
+                    }
+                }
                 if context.is_some() {
                     self.context = context;
                 }
@@ -1563,9 +2117,16 @@ impl App {
             Event::Saying {
                 text, new_block, ..
             } => {
-                match self.transcript.last_mut() {
+                let last = match self.transcript.last_mut() {
+                    Some(Entry::Member { entry, .. }) if self.member.is_some() => {
+                        Some(&mut **entry)
+                    }
+                    Some(entry) if self.member.is_none() => Some(entry),
+                    _ => None,
+                };
+                match last {
                     Some(Entry::Said(said)) if !new_block => said.push_str(&text),
-                    _ => self.transcript.push(Entry::Said(text)),
+                    _ => self.push_entry(Entry::Said(text)),
                 }
                 return;
             }
@@ -1591,6 +2152,48 @@ impl App {
                 self.working_model = Some(to.clone());
                 Entry::Escalating { from, to }
             }
+            Event::Delegating { from, to, task } => {
+                self.transcript.push(Entry::Delegating {
+                    from,
+                    to: to.clone(),
+                    task,
+                    spent: Spent::default(),
+                });
+                // The sub-agent pane opens on it, the status line names it.
+                self.sub_view = Some(self.transcript.len() - 1);
+                self.sub_scroll.set(0);
+                self.working_model = Some(to.clone());
+                self.member = Some(to);
+                return;
+            }
+            Event::Compacted {
+                dropped,
+                before,
+                after,
+            } => Entry::Info(format!(
+                "Context compacted: {} dropped, about {before} → {after} tokens. /context shows what is left",
+                if dropped == 1 {
+                    "1 old tool result".to_owned()
+                } else {
+                    format!("{dropped} old tool results")
+                }
+            )),
+            Event::OverBudget { spent, budget } => {
+                self.member = None;
+                Entry::OverBudget { spent, budget }
+            }
+        };
+        self.push_entry(entry);
+    }
+
+    /// Adds an entry, set apart under the member's name while one works.
+    fn push_entry(&mut self, entry: Entry) {
+        let entry = match &self.member {
+            Some(model) => Entry::Member {
+                model: model.clone(),
+                entry: Box::new(entry),
+            },
+            None => entry,
         };
         self.transcript.push(entry);
     }
@@ -1667,7 +2270,7 @@ mod tests {
                 checks: vec![Check::parse("cargo check").unwrap()],
                 rounds: 2,
                 max_turns: 30,
-                models: vec![],
+                ..Settings::default()
             },
             PathBuf::from("/p"),
         )
@@ -2012,10 +2615,10 @@ mod tests {
             PathBuf::from("/p"),
         );
         app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
-        assert_eq!(app.model_picker(), Some(0));
+        assert_eq!(app.model_picker().map(|p| p.selected), Some(0));
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.model_picker(), None);
+        assert!(app.model_picker().is_none());
         assert_eq!(app.current_model().unwrap().as_str(), "claude-code/opus");
     }
 
@@ -2037,7 +2640,7 @@ mod tests {
 
         // Back to the first one: it is still offered, at the same place.
         app.on_key(ctrl_e);
-        assert_eq!(app.model_picker(), Some(1));
+        assert_eq!(app.model_picker().map(|p| p.selected), Some(1));
         press(&mut app, KeyCode::Up);
         press(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -2045,6 +2648,180 @@ mod tests {
             "deepseek/deepseek-chat"
         );
         assert_eq!(app.models().len(), 2);
+    }
+
+    #[test]
+    fn the_picker_searches_the_catalog_and_builds_the_team() {
+        let member = |id: &str, note: &str| Member::new(ModelId::new(id).unwrap(), note);
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                models: vec![ModelId::new("cheap").unwrap()],
+                catalog: vec![
+                    member("cheap", "$0.14 / $0.28 per M tokens"),
+                    member("anthropic/claude-sonnet", "$3.00 / $15.00 per M tokens"),
+                    member("openai/gpt-mini", "$0.25 / $2.00 per M tokens"),
+                ],
+                budget: Some(Usd(0.10)),
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        // Only the offered models until something is typed.
+        assert_eq!(app.model_rows().len(), 1);
+        for c in "sonn".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let rows = app.model_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model.as_str(), "anthropic/claude-sonnet");
+        assert!(!rows[0].offered);
+        assert_eq!(rows[0].note, "$3.00 / $15.00 per M tokens");
+
+        // Space puts it in the team, and offers it from then on.
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.model_rows()[0].in_team);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.team().len(), 1);
+        assert_eq!(app.models().len(), 2);
+        assert_eq!(app.current_model().unwrap().as_str(), "cheap");
+
+        let members = app.members();
+        assert_eq!(members[0].note, "$3.00 / $15.00 per M tokens");
+
+        type_text(&mut app, "/budget 0.25");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.budget(), Some(Usd(0.25)));
+        type_text(&mut app, "/budget lots");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.budget(), Some(Usd(0.25)));
+
+        type_text(&mut app, "/defaults");
+        let effect = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Every change is handed over once, to be kept.
+        assert!(app.defaults_to_keep().is_some());
+        assert_eq!(app.defaults_to_keep(), None);
+        let Some(Effect::SaveDefaults(defaults)) = effect else {
+            panic!("expected the defaults to be saved, got {effect:?}");
+        };
+        assert_eq!(
+            defaults,
+            Defaults {
+                model: Some("cheap".into()),
+                models: vec!["cheap".into(), "anthropic/claude-sonnet".into()],
+                team: vec!["anthropic/claude-sonnet".into()],
+                budget: Some(0.25),
+            }
+        );
+    }
+
+    #[test]
+    fn copy_opens_the_conversation_as_text_to_select_from() {
+        let mut app = ready();
+        app.transcript.push(Entry::User("fix it".into()));
+        app.transcript
+            .push(Entry::Said("Here:\n```py\nprint(1)\n```".into()));
+        app.transcript.push(Entry::Tool {
+            name: "replace".into(),
+            path: Some("a.py".into()),
+            outcome: Ok(ToolSummary::Changed {
+                path: "a.py".into(),
+                created: false,
+                diff: vec![
+                    DiffLine::Removed("x = 1".into()),
+                    DiffLine::Added("x = 2".into()),
+                ],
+            }),
+        });
+        let text = app.transcript_text();
+        assert!(text.contains("> fix it\n\nHere:\n```py\nprint(1)\n```"));
+        assert!(text.ends_with("● replace a.py\n- x = 1\n+ x = 2"));
+
+        type_text(&mut app, "/copy");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::File);
+        assert!(
+            app.file()
+                .is_some_and(|f| f.lines().iter().any(|l| l == "print(1)"))
+        );
+    }
+
+    #[test]
+    fn a_members_work_is_set_apart_until_the_lead_is_back() {
+        let mut app = ready();
+        let id = |s: &str| ModelId::new(s).unwrap();
+        let turn = |model: &str| {
+            AgentMessage::Event(Event::Turn {
+                model: id(model),
+                usage: Usage::default(),
+                cost: None,
+                subscription: false,
+                context: None,
+            })
+        };
+        app.on_agent(AgentMessage::Event(Event::Delegating {
+            from: id("cheap"),
+            to: id("strong"),
+            task: "read a.py".into(),
+        }));
+        app.on_agent(turn("strong"));
+        app.on_agent(AgentMessage::Event(Event::Turn {
+            model: id("strong"),
+            usage: Usage {
+                input: TokenCount(12_000),
+                output: TokenCount(300),
+            },
+            cost: Some(Usd(0.012)),
+            subscription: false,
+            context: None,
+        }));
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: id("strong"),
+            text: "a.py prints 1.".into(),
+        }));
+        app.on_agent(turn("cheap"));
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: id("cheap"),
+            text: "Done.".into(),
+        }));
+        let n = app.transcript.len();
+        assert!(matches!(
+            &app.transcript[n - 2],
+            Entry::Member { model, entry } if model.as_str() == "strong" && **entry == Entry::Said("a.py prints 1.".into())
+        ));
+        assert_eq!(app.transcript[n - 1], Entry::Said("Done.".into()));
+        assert!(app.transcript_text().contains("│ strong\n│ a.py prints 1."));
+
+        // The sub-agent pane shows the handover and its work, Ctrl-T hides
+        // it and brings it back.
+        let sub = app.sub_agent().unwrap();
+        assert_eq!(sub.to.as_str(), "strong");
+        assert_eq!(sub.task, "read a.py");
+        // Its cost, counted apart; the answering model's turns are not in it.
+        assert_eq!(sub.spent.cost, Usd(0.012));
+        assert_eq!(sub.spent.to_string(), "$0.012 · 12.0k in · 300 out");
+        assert_eq!(sub.work, [&Entry::Said("a.py prints 1.".into())]);
+        // Only the answering model's turns count for the request's own cost.
+        assert_eq!(app.request_spent().cost, Usd(0.0));
+
+        // Tab reaches the pane; Up scrolls it back, End follows the work again.
+        app.set_sub_max(10);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::SubAgent);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.sub_scroll(), 2);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.sub_scroll(), 0);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.sub_scroll(), 10);
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_t);
+        assert!(app.sub_agent().is_none());
+        app.on_key(ctrl_t);
+        assert!(app.sub_agent().is_some());
     }
 
     #[test]

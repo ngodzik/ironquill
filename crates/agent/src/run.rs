@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use ironquill_core::{
-    Agent, ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateRequest, Message,
-    ModelId, TokenCount, Usage, Usd,
+    Agent, ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateReply,
+    DelegateRequest, Message, ModelId, Pricing, TokenCount, ToolSpec, Usage, Usd,
 };
 use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox};
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, Member};
 use crate::delegate;
 use crate::error::AgentError;
 use crate::event::Event;
@@ -16,6 +16,7 @@ use crate::event::Event;
 const TASK_PROMPT: &str = "You are a careful software engineer working in a project through tools. \
 Make the smallest change that completes the task. Read a file before editing it. \
 Edit existing files with `replace`, not `write_file`. \
+Find code with `search` and `outline`, then read only the lines you need. \
 You cannot run commands: when you stop calling tools, the project's checks run automatically \
 and you will be shown any failure. Do not ask questions; when you are done, reply with one \
 short sentence saying what you changed.";
@@ -35,6 +36,22 @@ changes, not to install anything. Make the smallest change that completes the ta
 done, end with a short report: what you changed and why, and anything left to do. Write the report \
 in the language the task is written in.";
 
+/// For a model of the team the first model handed a task to.
+const MEMBER_PROMPT: &str = "You are a careful software engineer. Another assistant handed you one \
+task in a project, which you work on through tools; you cannot run commands. Do the task and \
+nothing else. Find code with `search` and `outline`, then read only the lines you need: every \
+line read is paid for again on each later turn. Read a file before editing it, and edit existing files with `replace`. Do not ask \
+questions. When you are done, reply with a short report: what you found or changed, and anything \
+left to do.";
+
+/// For a member that cannot use tools: everything is in the task.
+const ANSWER_PROMPT: &str = "You are a careful software engineer. Another assistant asked you \
+the question below, with everything you need in it; you cannot read files or run anything. \
+Answer it directly and briefly.";
+
+/// The tool through which the first model hands a task to the team.
+const DELEGATE_TOOL: &str = "delegate";
+
 /// For a conversation with a person.
 const CHAT_PROMPT: &str = "You are a careful software engineer helping a person with the project \
 in the current directory. You can read and edit its files through tools; you cannot run commands. \
@@ -43,7 +60,9 @@ Only change files when the person asks for a change. \
 If you need to ask the person something, ask it and end your reply there: do not call any tool \
 in that reply, and do not act on a guess of the answer. They will reply in their next message. \
 The project's files are listed below: use the list instead of listing directories, and do not \
-try to read binary files. When you change files, make the smallest change that does the job, \
+try to read binary files. To find code, use `search` and `outline` first, then read only the \
+lines you need with `read_file` and a range: every line read is paid for again on each later \
+turn. When you change files, make the smallest change that does the job, \
 read a file before editing it, and edit existing files with `replace`. When you stop calling \
 tools after changing files, the project's checks run automatically and you will be shown any \
 failure. Be brief. You may use Markdown.";
@@ -64,6 +83,12 @@ pub enum Verdict {
     GaveUp {
         /// The last failure, as the checks reported it.
         failure: Option<CheckFailure>,
+    },
+    /// The request spent its budget before it was done; the first model
+    /// said where it stopped and asked what to do.
+    OverBudget {
+        /// The budget it had.
+        budget: Usd,
     },
 }
 
@@ -225,7 +250,32 @@ impl Session {
             thread: None,
             catch_up: String::new(),
         };
-        let Some(first) = config.tiers.first() else {
+        let verdict = match self.work(&mut ctx, text, context).await {
+            Err(AgentError::OverBudget) => {
+                let budget = config.budget.unwrap_or_default();
+                (ctx.observe)(Event::OverBudget {
+                    spent: ctx.ledger.cost,
+                    budget,
+                });
+                // A tool call cut short has no result; the request must not
+                // send it.
+                self.messages = crate::context::sanitize(std::mem::take(&mut self.messages));
+                self.explain_budget(&mut ctx, budget).await?;
+                Verdict::OverBudget { budget }
+            }
+            verdict => verdict?,
+        };
+        Ok(ctx.ledger.outcome(verdict, ctx.toolbox))
+    }
+
+    /// Works on the request just added, from the first model on.
+    async fn work<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+        text: &str,
+        context: &str,
+    ) -> Result<Verdict, AgentError> {
+        let Some(first) = ctx.config.tiers.first() else {
             return Err(AgentError::Config("at least one model is needed"));
         };
         let mut failure = None;
@@ -240,27 +290,26 @@ impl Session {
             let request = self.messages.len() - 1;
             ctx.catch_up = catch_up(&self.messages[seen.min(request)..request]);
         }
-        let first_attempt = attempt(&mut ctx, first, &mut self.messages, &mut failure, true).await;
+        let first_attempt = attempt(ctx, first, &mut self.messages, &mut failure, true).await;
         if let (Some(agent), Some(session)) = (agent, ctx.thread.take()) {
             let seen = self.messages.len();
             self.agents.insert(agent, Thread { session, seen });
         }
 
         match first_attempt? {
-            Attempt::Answered => return Ok(ctx.ledger.outcome(Verdict::Answered, ctx.toolbox)),
+            Attempt::Answered => return Ok(Verdict::Answered),
             Attempt::Unchecked => {
-                return Ok(ctx.ledger.outcome(Verdict::Unchecked, ctx.toolbox));
+                return Ok(Verdict::Unchecked);
             }
             Attempt::Passed => {
-                let verdict = Verdict::Passed {
+                return Ok(Verdict::Passed {
                     model: first.clone(),
-                };
-                return Ok(ctx.ledger.outcome(verdict, ctx.toolbox));
+                });
             }
             Attempt::Failed => {}
         }
 
-        for pair in config.tiers.windows(2) {
+        for pair in ctx.config.tiers.windows(2) {
             let [from, to] = pair else { continue };
             (ctx.observe)(Event::Escalating {
                 from: from.clone(),
@@ -273,15 +322,14 @@ impl Session {
             ctx.thread = None;
             ctx.catch_up.clear();
             if let Attempt::Passed =
-                attempt(&mut ctx, to, &mut brief_messages, &mut failure, false).await?
+                attempt(ctx, to, &mut brief_messages, &mut failure, false).await?
             {
                 let changed = ctx.toolbox.changed().collect::<Vec<_>>().join(", ");
                 self.note(format!(
                     "(The checks kept failing, so {to} took over and made them pass. \
                      Files changed: {changed}.)"
                 ));
-                let verdict = Verdict::Passed { model: to.clone() };
-                return Ok(ctx.ledger.outcome(verdict, ctx.toolbox));
+                return Ok(Verdict::Passed { model: to.clone() });
             }
         }
 
@@ -291,7 +339,80 @@ impl Session {
         self.note(format!(
             "(The checks still fail after every model tried.{last})"
         ));
-        Ok(ctx.ledger.outcome(Verdict::GaveUp { failure }, ctx.toolbox))
+        Ok(Verdict::GaveUp { failure })
+    }
+
+    /// Hands the word back to the person once the budget is spent: the first
+    /// model of the provider says where the work stopped and asks what to do.
+    async fn explain_budget<M: ChatModel, D, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+        budget: Usd,
+    ) -> Result<(), AgentError> {
+        let spent = ctx.ledger.cost;
+        let Some(model) = ctx.config.tiers.iter().find(|m| m.delegate().is_none()) else {
+            self.note(format!(
+                "(The budget of {budget} for this request is spent: {spent}. The work stopped here.)"
+            ));
+            return Ok(());
+        };
+        self.messages.push(Message::user(format!(
+            "(ironquill: the budget of {budget} for this request is spent, {spent} so far, so the \
+             work stopped here. Do not call any tool. In the language of the request, explain \
+             briefly what was done, what is left and what made it cost this much, then ask what \
+             to do next: for example go on with a bigger budget (/budget <dollars>), take \
+             another approach, or stop.)"
+        )));
+        let request = ChatRequest {
+            model: model.clone(),
+            messages: self.messages.clone(),
+            tools: Vec::new(),
+        };
+        // Saying where things stand may go a little past the budget, not far:
+        // a conversation too long for that gets ironquill's own words.
+        let likely = likely_cost(ctx.model.pricing(model).await, &request);
+        if spent.0 + likely.0 > budget.0 * 1.25 {
+            self.messages.pop();
+            let text = format!(
+                "The budget of {budget} for this request is reached, {spent} spent: the work \
+                 stopped before a call that would have gone past it. Say how to go on, or raise \
+                 the budget with /budget."
+            );
+            (ctx.observe)(Event::Said {
+                model: model.clone(),
+                text: text.clone(),
+            });
+            self.note(format!("({text})"));
+            return Ok(());
+        }
+        let response = ctx
+            .model
+            .complete(&request)
+            .await
+            .map_err(|e| AgentError::Model(Box::new(e)))?;
+        ctx.ledger.usage += response.usage;
+        match response.cost {
+            Some(cost) => ctx.ledger.cost += cost,
+            None => ctx.ledger.cost_complete = false,
+        }
+        (ctx.observe)(Event::Turn {
+            model: model.clone(),
+            usage: response.usage,
+            cost: response.cost,
+            subscription: false,
+            context: None,
+        });
+        if let Some(text) = &response.content {
+            (ctx.observe)(Event::Said {
+                model: model.clone(),
+                text: text.clone(),
+            });
+        }
+        self.messages.push(Message::Assistant {
+            content: response.content,
+            tool_calls: Vec::new(),
+        });
+        Ok(())
     }
 
     /// The conversation as a document to edit; see [`Session::apply_text`].
@@ -392,7 +513,17 @@ pub async fn run<M: ChatModel, D: Delegate>(
             Message::system(TASK_PROMPT),
             Message::user(brief(task, context, failure.as_ref(), ctx.toolbox)),
         ];
-        match attempt(&mut ctx, tier, &mut messages, &mut failure, false).await? {
+        let result = attempt(&mut ctx, tier, &mut messages, &mut failure, false).await;
+        if let (Err(AgentError::OverBudget), Some(budget)) = (&result, config.budget) {
+            (ctx.observe)(Event::OverBudget {
+                spent: ctx.ledger.cost,
+                budget,
+            });
+            return Ok(ctx
+                .ledger
+                .outcome(Verdict::OverBudget { budget }, ctx.toolbox));
+        }
+        match result? {
             Attempt::Passed => {
                 let verdict = Verdict::Passed {
                     model: tier.clone(),
@@ -433,7 +564,7 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             )));
         }
 
-        let finished = converse(ctx, tier, messages).await?;
+        let finished = converse(ctx, tier, messages, may_answer).await?;
 
         if may_answer && round == 0 && ctx.toolbox.changed().next().is_none() {
             return Ok(Attempt::Answered);
@@ -514,59 +645,7 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
             directory: root.clone(),
         };
 
-        let reply = {
-            let Ctx {
-                delegate,
-                toolbox,
-                observe,
-                ..
-            } = &mut *ctx;
-            let mut on_event = |event: DelegateEvent| {
-                let event = match event {
-                    DelegateEvent::TextStart => Event::Saying {
-                        model: tier.clone(),
-                        text: String::new(),
-                        new_block: true,
-                    },
-                    DelegateEvent::Text(text) => Event::Saying {
-                        model: tier.clone(),
-                        text,
-                        new_block: false,
-                    },
-                    DelegateEvent::Tool {
-                        name,
-                        input,
-                        output,
-                    } => {
-                        let report = delegate::report(&name, &input, &output, &root);
-                        if let Some(path) = report.changed {
-                            toolbox.mark_changed(path);
-                        }
-                        Event::Tool {
-                            name,
-                            path: report.path,
-                            outcome: report.outcome,
-                        }
-                    }
-                };
-                observe(event);
-            };
-            delegate
-                .run(&request, &mut on_event)
-                .await
-                .map_err(|e| AgentError::Model(Box::new(e)))?
-        };
-
-        ctx.ledger.usage += reply.usage;
-        ctx.ledger.subscription = true;
-        ctx.ledger.context = reply.context.or(ctx.ledger.context);
-        (ctx.observe)(Event::Turn {
-            model: tier.clone(),
-            usage: reply.usage,
-            cost: None,
-            subscription: true,
-            context: reply.context,
-        });
+        let reply = run_agent(ctx, tier, &request).await?;
         messages.push(Message::Assistant {
             content: Some(reply.text.clone()),
             tool_calls: Vec::new(),
@@ -586,6 +665,314 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
         }
     }
     Ok(Attempt::Failed)
+}
+
+/// Runs one request of an agent, showing what it does as it goes and
+/// counting what it used.
+async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    tier: &ModelId,
+    request: &DelegateRequest,
+) -> Result<DelegateReply, AgentError> {
+    let root = request.directory.clone();
+    let reply = {
+        let Ctx {
+            delegate,
+            toolbox,
+            observe,
+            ..
+        } = &mut *ctx;
+        let mut on_event = |event: DelegateEvent| {
+            let event = match event {
+                DelegateEvent::TextStart => Event::Saying {
+                    model: tier.clone(),
+                    text: String::new(),
+                    new_block: true,
+                },
+                DelegateEvent::Text(text) => Event::Saying {
+                    model: tier.clone(),
+                    text,
+                    new_block: false,
+                },
+                DelegateEvent::Tool {
+                    name,
+                    input,
+                    output,
+                } => {
+                    let report = delegate::report(&name, &input, &output, &root);
+                    if let Some(path) = report.changed {
+                        toolbox.mark_changed(path);
+                    }
+                    Event::Tool {
+                        name,
+                        path: report.path,
+                        outcome: report.outcome,
+                    }
+                }
+            };
+            observe(event);
+        };
+        delegate
+            .run(request, &mut on_event)
+            .await
+            .map_err(|e| AgentError::Model(Box::new(e)))?
+    };
+
+    ctx.ledger.usage += reply.usage;
+    ctx.ledger.subscription = true;
+    ctx.ledger.context = reply.context.or(ctx.ledger.context);
+    (ctx.observe)(Event::Turn {
+        model: tier.clone(),
+        usage: reply.usage,
+        cost: None,
+        subscription: true,
+        context: reply.context,
+    });
+    Ok(reply)
+}
+
+/// Tool results a compaction keeps at most: the latest ones are what the
+/// model is working on. It keeps fewer when that is not enough.
+const KEEP_RESULTS: usize = 4;
+
+/// Output tokens counted for a call before it is made: a reply that edits
+/// code is rarely longer.
+const OUTPUT_RESERVE: u64 = 2_000;
+
+/// What `request` will likely cost at `pricing`: what it sends, by a rough
+/// count, and a reply of [`OUTPUT_RESERVE`] tokens.
+fn likely_cost(pricing: Option<Pricing>, request: &ChatRequest) -> Usd {
+    let Some(pricing) = pricing else {
+        return Usd(0.0);
+    };
+    let tools: usize = request
+        .tools
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+        .sum();
+    let input = crate::context::approx_tokens(&request.messages) + (tools / 4) as u64;
+    pricing.cost(&Usage {
+        input: TokenCount(input),
+        output: TokenCount(OUTPUT_RESERVE),
+    })
+}
+
+/// Stops before a call that would take the request past its budget: what
+/// was spent, plus what the call will likely cost when the price is known.
+/// Each call resends the whole conversation, so with an expensive model one
+/// call alone can cost more than what is left.
+fn within_budget<M, D, O>(
+    ctx: &Ctx<'_, M, D, O>,
+    pricing: Option<Pricing>,
+    request: &ChatRequest,
+) -> Result<(), AgentError> {
+    match ctx.config.budget {
+        Some(budget) if ctx.ledger.cost.0 + likely_cost(pricing, request).0 > budget.0 => {
+            Err(AgentError::OverBudget)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Who the model is, added to its instructions on every call: models
+/// otherwise guess, and a conversation that went through several of them
+/// misleads them further.
+fn identity(model: &ModelId, leads: bool, team: &[Member]) -> String {
+    let mut text = format!(
+        "\n\nYou are the model `{model}`, used through ironquill, a coding agent in the \
+         person's terminal. When asked which model you are, say `{model}`. Earlier replies in \
+         this conversation may come from other models the person picked; they are not you."
+    );
+    let others: Vec<&Member> = team.iter().filter(|m| &m.model != model).collect();
+    if leads && !others.is_empty() {
+        let names: Vec<String> = others.iter().map(|m| format!("`{}`", m.model)).collect();
+        text.push_str(&format!(
+            " The person gave you a team, {}, that you can hand tasks to with the `delegate` \
+             tool; you remain the one who answers. Before working on a request, check whether \
+             a member is better suited to it, from what the tool says each is good at, and \
+             hand it over when one is. When a member did the work, say which.",
+            names.join(", ")
+        ));
+    }
+    text
+}
+
+/// The `delegate` tool, offering the team to `lead`; `None` when nobody
+/// else is in it.
+fn delegate_spec(team: &[Member], lead: &ModelId) -> Option<ToolSpec> {
+    let members: Vec<&Member> = team.iter().filter(|m| &m.model != lead).collect();
+    if members.is_empty() {
+        return None;
+    }
+    let list: String = members
+        .iter()
+        .map(|m| {
+            let mut line = format!("- {}", m.model);
+            for part in [m.note.as_str(), m.about.as_str()] {
+                if !part.is_empty() {
+                    line.push_str(" — ");
+                    line.push_str(part);
+                }
+            }
+            if !m.tools {
+                line.push_str(
+                    " — It cannot use tools: it reads no file and changes nothing, so put \
+                     everything it needs in the task, such as a question with the code it is about.",
+                );
+            }
+            line.push('\n');
+            line
+        })
+        .collect();
+    let ids: Vec<&str> = members.iter().map(|m| m.model.as_str()).collect();
+    Some(ToolSpec {
+        name: DELEGATE_TOOL.into(),
+        description: format!(
+            "Hand one task to another model of the team and get its report back. It works on \
+             the same files with the same tools, but does not see this conversation: write a \
+             task that says everything it needs. Choose by what each member is good at, as \
+             described below: hand over what another model does better or more cheaply, such \
+             as a hard change to a stronger model or a long read to a cheaper one, and do the \
+             rest yourself. Every request has a budget, so mind the prices.\nTeam:\n{list}"
+        ),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "model": {"type": "string", "enum": ids},
+                "task": {"type": "string", "description": "What to do, complete in itself."}
+            },
+            "required": ["model", "task"]
+        }),
+    })
+}
+
+/// Runs a `delegate` call: the member works on the task, and its report,
+/// with the files it changed, is what the calling model gets back.
+async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    from: &ModelId,
+    arguments: &str,
+) -> Result<String, AgentError> {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        model: String,
+        task: String,
+    }
+    let Ok(args) = serde_json::from_str::<Args>(arguments) else {
+        return Ok("error: expected {\"model\": ..., \"task\": ...}".into());
+    };
+    let Some(member) = ctx
+        .config
+        .team
+        .iter()
+        .find(|m| m.model.as_str() == args.model && &m.model != from)
+        .cloned()
+    else {
+        return Ok(format!("error: {} is not in the team", args.model));
+    };
+    let to = member.model;
+    (ctx.observe)(Event::Delegating {
+        from: from.clone(),
+        to: to.clone(),
+        task: args.task.clone(),
+    });
+    let before: Vec<String> = ctx.toolbox.changed().map(str::to_owned).collect();
+
+    let report = if let Some((agent, model)) = to.delegate() {
+        let request = DelegateRequest {
+            agent,
+            model: model.to_owned(),
+            prompt: args.task,
+            instructions: match agent {
+                Agent::ClaudeCode => DELEGATE_PROMPT,
+                Agent::Codex => CODEX_PROMPT,
+            }
+            .to_owned(),
+            resume: None,
+            directory: ctx.toolbox.workspace().root().to_owned(),
+        };
+        run_agent(ctx, &to, &request).await?.text
+    } else if !member.tools {
+        answer_only(ctx, &to, args.task).await?
+    } else {
+        let mut messages = vec![Message::system(MEMBER_PROMPT), Message::user(args.task)];
+        let finished = converse(ctx, &to, &mut messages, false).await?;
+        let last = messages.iter().rev().find_map(|m| match m {
+            Message::Assistant {
+                content: Some(text),
+                ..
+            } if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        });
+        let mut report = last.unwrap_or_else(|| "(no report)".into());
+        if !finished {
+            report.push_str("\n(It ran out of turns before it was done.)");
+        }
+        report
+    };
+
+    let changed: Vec<&str> = ctx
+        .toolbox
+        .changed()
+        .filter(|path| !before.iter().any(|b| b == path))
+        .collect();
+    let changed = if changed.is_empty() {
+        "none".to_owned()
+    } else {
+        changed.join(", ")
+    };
+    Ok(format!(
+        "{to} reports:\n{report}\n\nFiles it changed: {changed}"
+    ))
+}
+
+/// Asks a member that cannot use tools: one call, no tools, its answer as
+/// the report.
+async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    model: &ModelId,
+    task: String,
+) -> Result<String, AgentError> {
+    let request = ChatRequest {
+        model: model.clone(),
+        messages: vec![
+            Message::system(format!(
+                "{ANSWER_PROMPT}{}",
+                identity(model, false, &ctx.config.team)
+            )),
+            Message::user(task),
+        ],
+        tools: Vec::new(),
+    };
+    let pricing = ctx.model.pricing(model).await;
+    within_budget(ctx, pricing, &request)?;
+    let response = ctx
+        .model
+        .complete(&request)
+        .await
+        .map_err(|e| AgentError::Model(Box::new(e)))?;
+    ctx.ledger.usage += response.usage;
+    match response.cost {
+        Some(cost) => ctx.ledger.cost += cost,
+        None => ctx.ledger.cost_complete = false,
+    }
+    (ctx.observe)(Event::Turn {
+        model: model.clone(),
+        usage: response.usage,
+        cost: response.cost,
+        subscription: false,
+        context: None,
+    });
+    let text = response.content.unwrap_or_default();
+    (ctx.observe)(Event::Said {
+        model: model.clone(),
+        text: text.clone(),
+    });
+    Ok(if text.is_empty() {
+        "(no report)".into()
+    } else {
+        text
+    })
 }
 
 async fn check<M, D, O: FnMut(Event)>(
@@ -613,20 +1000,52 @@ async fn check<M, D, O: FnMut(Event)>(
 }
 
 /// Lets the model call tools until it stops or runs out of turns. Returns
-/// whether it stopped on its own.
-async fn converse<M: ChatModel, D, O: FnMut(Event)>(
+/// whether it stopped on its own. The model that `leads` the conversation
+/// may also hand tasks to the team.
+async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     ctx: &mut Ctx<'_, M, D, O>,
     model_id: &ModelId,
     messages: &mut Vec<Message>,
+    leads: bool,
 ) -> Result<bool, AgentError> {
-    let tools = ctx.toolbox.specs();
+    let mut tools = ctx.toolbox.specs();
+    if leads && let Some(spec) = delegate_spec(&ctx.config.team, model_id) {
+        tools.push(spec);
+    }
     let window = ctx.model.context_window(model_id).await;
+    let identity = identity(model_id, leads, &ctx.config.team);
+    let pricing = ctx.model.pricing(model_id).await;
+    let compact_at = window.map_or(ctx.config.compact_at, |w| ctx.config.compact_at.min(w / 2));
     for _ in 0..ctx.config.max_turns {
+        let before = crate::context::approx_tokens(messages);
+        if before > compact_at {
+            // Down to half the threshold, so that the next calls only add
+            // to it: each compaction makes the provider's cache start over.
+            let mut dropped = 0;
+            for keep in (1..=KEEP_RESULTS).rev() {
+                dropped += crate::context::compact(messages, keep);
+                if crate::context::approx_tokens(messages) <= compact_at / 2 {
+                    break;
+                }
+            }
+            if dropped > 0 {
+                (ctx.observe)(Event::Compacted {
+                    dropped,
+                    before: TokenCount(before),
+                    after: TokenCount(crate::context::approx_tokens(messages)),
+                });
+            }
+        }
+        let mut sent = messages.clone();
+        if let Some(Message::System(prompt)) = sent.first_mut() {
+            prompt.push_str(&identity);
+        }
         let request = ChatRequest {
             model: model_id.clone(),
-            messages: messages.clone(),
+            messages: sent,
             tools: tools.clone(),
         };
+        within_budget(ctx, pricing, &request)?;
         let response = ctx
             .model
             .complete(&request)
@@ -662,6 +1081,14 @@ async fn converse<M: ChatModel, D, O: FnMut(Event)>(
             return Ok(true);
         }
         for call in &response.tool_calls {
+            if leads && call.name == DELEGATE_TOOL {
+                let report = Box::pin(hand_over(ctx, model_id, &call.arguments)).await?;
+                messages.push(Message::Tool {
+                    call_id: call.id.clone(),
+                    content: report,
+                });
+                continue;
+            }
             let result = ctx.toolbox.call(call);
             (ctx.observe)(Event::Tool {
                 name: call.name.clone(),
@@ -680,8 +1107,6 @@ async fn converse<M: ChatModel, D, O: FnMut(Event)>(
     Ok(false)
 }
 
-/// The opening message of a tier: the task, the free context, and, when a
-/// weaker model went first, where it left things.
 /// What these messages said, as text for a delegate that did not see them:
 /// the people's requests and the replies, with the tools named but not their
 /// results, which the delegate can read again itself.
@@ -707,6 +1132,8 @@ fn catch_up(messages: &[Message]) -> String {
     out
 }
 
+/// The opening message of a tier: the task, the free context, and, when a
+/// weaker model went first, where it left things.
 fn brief(task: &str, context: &str, failure: Option<&CheckFailure>, toolbox: &Toolbox) -> String {
     let mut text = format!("Task: {task}\n\n{context}");
     if let Some(f) = failure {
@@ -756,6 +1183,7 @@ mod tests {
     struct Scripted {
         answers: Mutex<VecDeque<ChatResponse>>,
         seen: Mutex<Vec<ChatRequest>>,
+        pricing: Option<Pricing>,
     }
 
     impl Scripted {
@@ -763,6 +1191,14 @@ mod tests {
             Self {
                 answers: Mutex::new(answers.into()),
                 seen: Mutex::new(Vec::new()),
+                pricing: None,
+            }
+        }
+
+        fn priced(self, input: f64, output: f64) -> Self {
+            Self {
+                pricing: Some(Pricing::per_token(Usd(input), Usd(output)).unwrap()),
+                ..self
             }
         }
     }
@@ -778,6 +1214,10 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("the script ran out"))
+        }
+
+        async fn pricing(&self, _: &ModelId) -> Option<Pricing> {
+            self.pricing
         }
     }
 
@@ -886,6 +1326,280 @@ mod tests {
             .check(Check::parse("test -f done.txt").unwrap())
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_long_conversation_is_compacted_once_past_the_threshold() {
+        let (dir, mut toolbox) = setup();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            std::fs::write(dir.path().join(format!("{name}.txt")), "word ".repeat(500)).unwrap();
+        }
+        let mut answers: Vec<ChatResponse> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|n| calls("read_file", json!({"path": format!("{n}.txt")})))
+            .collect();
+        answers.push(says("Read them all."));
+        let model = Scripted::new(answers);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .compact_at(2_500)
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let mut events = Vec::new();
+        session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "read all",
+                "",
+                |e| {
+                    events.push(e);
+                },
+            )
+            .await
+            .unwrap();
+
+        let compactions: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Compacted { .. }))
+            .collect();
+        assert_eq!(compactions.len(), 1, "once, all at once: {compactions:?}");
+        let seen = model.seen.lock().unwrap();
+        let last = &seen.last().unwrap().messages;
+        assert!(crate::context::tests::valid(last));
+        let dropped = last
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { content, .. } if content.starts_with("[Earlier result")))
+            .count();
+        assert!(dropped >= 1);
+        // The latest results are kept whole.
+        assert!(matches!(
+            &last[last.len() - 1],
+            Message::Tool { content, .. } if content.starts_with("word")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_call_likely_to_pass_the_budget_is_not_made() {
+        let (dir, mut toolbox) = setup();
+        // A large file makes the second call expensive before it is sent.
+        std::fs::write(dir.path().join("big.txt"), "word ".repeat(40_000)).unwrap();
+        let model = Scripted::new(vec![
+            calls("read_file", json!({"path": "big.txt"})),
+            says("Stopped: reading on would pass the budget. Go on?"),
+        ])
+        // $1 per million tokens in, nothing out: the 50k tokens of the
+        // file make the next call about $0.05.
+        .priced(1e-6, 0.0);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .budget(Usd(0.04))
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "read big.txt",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.verdict, Verdict::OverBudget { budget: Usd(0.04) });
+        // The call with the file was never made; what stayed under the
+        // budget is what was spent.
+        assert!(outcome.cost.0 <= 0.04);
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_stops_the_work_and_the_model_explains() {
+        let (_dir, mut toolbox) = setup();
+        let costly = |r: ChatResponse| ChatResponse {
+            cost: Some(Usd(0.06)),
+            ..r
+        };
+        let model = Scripted::new(vec![
+            costly(calls("read_file", json!({"path": "a.txt"}))),
+            costly(calls("read_file", json!({"path": "b.txt"}))),
+            says("I read two files and stopped. Go on?"),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .budget(Usd(0.10))
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let mut events = Vec::new();
+
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "look around",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.verdict, Verdict::OverBudget { budget: Usd(0.10) });
+        assert!(events.contains(&Event::OverBudget {
+            spent: Usd(0.12),
+            budget: Usd(0.10)
+        }));
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        // The explanation is asked without tools, after every result.
+        assert!(seen[2].tools.is_empty());
+        assert!(matches!(
+            seen[2].messages.last(),
+            Some(Message::User(text)) if text.contains("budget of $0.10")
+        ));
+        assert!(crate::context::tests::valid(&seen[2].messages));
+        assert_eq!(
+            session.messages.last(),
+            Some(&Message::Assistant {
+                content: Some("I read two files and stopped. Go on?".into()),
+                tool_calls: vec![],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_without_tools_only_answers() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            calls(
+                "delegate",
+                json!({"model": "tiny", "task": "Is 2 + 2 = 4?"}),
+            ),
+            says("Yes."),
+            says("tiny says yes."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .member(Member {
+                tools: false,
+                ..Member::new(ModelId::new("tiny").unwrap(), "")
+            })
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "ask tiny",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        let seen = model.seen.lock().unwrap();
+        let delegate = seen[0].tools.iter().find(|t| t.name == "delegate").unwrap();
+        assert!(delegate.description.contains("It cannot use tools"));
+        assert_eq!(seen[1].model.as_str(), "tiny");
+        assert!(seen[1].tools.is_empty());
+        assert!(matches!(
+            seen[2].messages.last(),
+            Some(Message::Tool { content, .. }) if content.starts_with("tiny reports:\nYes.")
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_first_model_hands_a_task_to_the_team() {
+        let (dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            calls(
+                "delegate",
+                json!({"model": "strong", "task": "create done.txt"}),
+            ),
+            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
+            says("Created done.txt."),
+            says("Done, by the strong model."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .member(Member::new(ModelId::new("cheap").unwrap(), ""))
+            .member(Member {
+                about: "Good at hard changes.".into(),
+                ..Member::new(ModelId::new("strong").unwrap(), "$3/M in")
+            })
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let mut events = Vec::new();
+
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "make done.txt",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.verdict, Verdict::Unchecked);
+        assert!(dir.path().join("done.txt").exists());
+        assert!(events.contains(&Event::Delegating {
+            from: ModelId::new("cheap").unwrap(),
+            to: ModelId::new("strong").unwrap(),
+            task: "create done.txt".into(),
+        }));
+        let seen = model.seen.lock().unwrap();
+        let delegate = seen[0].tools.iter().find(|t| t.name == "delegate").unwrap();
+        // The team is offered without the model itself.
+        assert_eq!(
+            delegate.parameters["properties"]["model"]["enum"],
+            json!(["strong"])
+        );
+        assert!(
+            delegate
+                .description
+                .contains("- strong — $3/M in — Good at hard changes.\n")
+        );
+        // The member works from the task alone, and cannot hand it on.
+        assert_eq!(seen[1].model.as_str(), "strong");
+        assert_eq!(
+            seen[1].messages.last(),
+            Some(&Message::user("create done.txt"))
+        );
+        assert!(seen[1].tools.iter().all(|t| t.name != "delegate"));
+        // Each knows which model it is; only the first knows of the team.
+        let system = |i: usize| match &seen[i].messages[0] {
+            Message::System(text) => text.clone(),
+            other => panic!("expected instructions first, got {other:?}"),
+        };
+        assert!(system(0).contains("You are the model `cheap`"));
+        assert!(system(0).contains("a team, `strong`,"));
+        assert!(system(1).contains("You are the model `strong`"));
+        assert!(!system(1).contains("team"));
+        // What is stored stays as it was: the next model gets its own name.
+        assert!(!format!("{:?}", session.messages[0]).contains("You are the model"));
+        assert!(matches!(
+            seen[3].messages.last(),
+            Some(Message::Tool { content, .. })
+                if content == "strong reports:\nCreated done.txt.\n\nFiles it changed: done.txt"
+        ));
     }
 
     #[tokio::test]

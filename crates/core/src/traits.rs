@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use crate::types::{
-    ChatRequest, ChatResponse, DelegateEvent, DelegateReply, DelegateRequest, ModelId,
+    ChatRequest, ChatResponse, DelegateEvent, DelegateReply, DelegateRequest, ModelId, Pricing,
 };
 
 /// Something that can answer a chat request.
@@ -21,6 +21,14 @@ pub trait ChatModel: Send + Sync {
     /// The most `model` can read at once, in tokens, when the provider says.
     /// Used to show how full the context is; `None` shows nothing.
     fn context_window(&self, model: &ModelId) -> impl Future<Output = Option<u64>> + Send {
+        let _ = model;
+        std::future::ready(None)
+    }
+
+    /// What `model` charges, when the provider says. Used to stop before a
+    /// call that would spend more than the budget; `None` checks only what
+    /// was already spent.
+    fn pricing(&self, model: &ModelId) -> impl Future<Output = Option<Pricing>> + Send {
         let _ = model;
         std::future::ready(None)
     }

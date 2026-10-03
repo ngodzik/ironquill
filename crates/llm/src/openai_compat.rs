@@ -20,8 +20,8 @@ pub struct OpenAiCompatible {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
-    /// Context windows by model, read once from the model list.
-    windows: Arc<Mutex<Option<HashMap<String, u64>>>>,
+    /// Context windows and prices by model, read once from the model list.
+    known: Arc<Mutex<Option<HashMap<String, Known>>>>,
 }
 
 impl fmt::Debug for OpenAiCompatible {
@@ -41,8 +41,17 @@ impl OpenAiCompatible {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
-            windows: Arc::new(Mutex::new(None)),
+            known: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Whether the endpoint is Requesty, which takes options of its own.
+    fn is_requesty(&self) -> bool {
+        self.base_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .is_some_and(|host| host == "requesty.ai" || host.ends_with(".requesty.ai"))
     }
 
     /// Looks up what `model` costs, from the provider's model list.
@@ -58,6 +67,18 @@ impl OpenAiCompatible {
         let url = format!("{}/models", self.base_url);
         let body = self.get(&url).await?;
         parse_pricing(&url, &body, model)
+    }
+
+    /// Every model the provider lists, with its prices and context window
+    /// when it gives them, to choose from.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pricing`], when the list cannot be fetched or read.
+    pub async fn list(&self) -> Result<Vec<Listed>, LlmError> {
+        let url = format!("{}/models", self.base_url);
+        let body = self.get(&url).await?;
+        parse_list(&url, &body)
     }
 
     async fn get(&self, url: &str) -> Result<String, LlmError> {
@@ -77,7 +98,14 @@ impl ChatModel for OpenAiCompatible {
 
     async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
-        let payload = wire_request(request);
+        let mut payload = wire_request(request);
+        if self.is_requesty() {
+            // Requesty marks what can be cached for providers that need it
+            // and bills cache hits at a fraction of the price; it does so by
+            // itself only for the tools it knows. Each call of the agent
+            // resends the whole conversation, so most of it is a hit.
+            payload["requesty"] = json!({"auto_cache": true});
+        }
         let response = self
             .http
             .post(&url)
@@ -91,46 +119,118 @@ impl ChatModel for OpenAiCompatible {
     }
 
     async fn context_window(&self, model: &ModelId) -> Option<u64> {
-        let known = self.windows.lock().ok()?.clone();
-        let windows = match known {
-            Some(windows) => windows,
-            None => {
-                // Read once: a failure is remembered as "unknown" rather than
-                // asked again on every turn.
-                let url = format!("{}/models", self.base_url);
-                let windows = match self.get(&url).await {
-                    Ok(body) => parse_windows(&body),
-                    Err(_) => HashMap::new(),
-                };
-                if let Ok(mut cache) = self.windows.lock() {
-                    *cache = Some(windows.clone());
-                }
-                windows
-            }
-        };
-        windows.get(model.as_str()).copied()
+        self.known(model).await?.window
+    }
+
+    async fn pricing(&self, model: &ModelId) -> Option<Pricing> {
+        self.known(model).await?.pricing
     }
 }
 
-fn parse_windows(body: &str) -> HashMap<String, u64> {
+/// What the model list says of one model.
+#[derive(Debug, Clone, Copy)]
+struct Known {
+    window: Option<u64>,
+    pricing: Option<Pricing>,
+}
+
+impl OpenAiCompatible {
+    /// What the model list says of `model`, read once: a failure is
+    /// remembered as "unknown" rather than asked again on every turn.
+    async fn known(&self, model: &ModelId) -> Option<Known> {
+        let cached = self.known.lock().ok()?.clone();
+        let known = match cached {
+            Some(known) => known,
+            None => {
+                let url = format!("{}/models", self.base_url);
+                let known = match self.get(&url).await {
+                    Ok(body) => parse_known(&body),
+                    Err(_) => HashMap::new(),
+                };
+                if let Ok(mut cache) = self.known.lock() {
+                    *cache = Some(known.clone());
+                }
+                known
+            }
+        };
+        known.get(model.as_str()).copied()
+    }
+}
+
+/// A model of the provider's list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed {
+    /// Its identifier, as requests name it.
+    pub id: String,
+    /// Dollars per input token, when listed.
+    pub input_price: Option<f64>,
+    /// Dollars per output token, when listed.
+    pub output_price: Option<f64>,
+    /// The most it reads at once, in tokens, when listed.
+    pub context_window: Option<u64>,
+    /// What the provider says it is good at.
+    pub description: Option<String>,
+    /// Whether it can call tools, when listed.
+    pub tool_calling: Option<bool>,
+    /// Whether it reasons before answering, when listed.
+    pub reasoning: Option<bool>,
+    /// Whether it reads images, when listed.
+    pub vision: Option<bool>,
+    /// Its name without the host serving it, such as `glm-5.3-flash`.
+    pub canonical: Option<String>,
+}
+
+fn parse_list(url: &str, body: &str) -> Result<Vec<Listed>, LlmError> {
+    let wire: WireModelList =
+        serde_json::from_str(body).map_err(|e| malformed(url, e.to_string()))?;
+    Ok(wire
+        .data
+        .into_iter()
+        .map(|m| Listed {
+            id: m.id,
+            input_price: m.input_price,
+            output_price: m.output_price,
+            context_window: m.context_window,
+            description: m.description.filter(|d| !d.trim().is_empty()),
+            tool_calling: m.supports_tool_calling,
+            reasoning: m.supports_reasoning,
+            vision: m.supports_vision,
+            canonical: m.model_canonical_name,
+        })
+        .collect())
+}
+
+fn parse_known(body: &str) -> HashMap<String, Known> {
     serde_json::from_str::<WireModelList>(body)
         .map(|list| {
             list.data
                 .into_iter()
-                .filter_map(|m| Some((m.id, m.context_window?)))
+                .map(|m| {
+                    let pricing = match (m.input_price, m.output_price) {
+                        (Some(input), Some(output)) => {
+                            Pricing::per_token(Usd(input), Usd(output)).ok()
+                        }
+                        _ => None,
+                    };
+                    let known = Known {
+                        window: m.context_window,
+                        pricing,
+                    };
+                    (m.id, known)
+                })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn transport(url: &str, source: reqwest::Error) -> LlmError {
+pub(crate) fn transport(url: &str, source: reqwest::Error) -> LlmError {
     LlmError::Transport {
         url: url.to_owned(),
         source,
     }
 }
 
-async fn read_body(url: &str, response: reqwest::Response) -> Result<String, LlmError> {
+pub(crate) async fn read_body(url: &str, response: reqwest::Response) -> Result<String, LlmError> {
     let status = response.status();
     let body = response
         .text()
@@ -250,9 +350,19 @@ struct WireModel {
     input_price: Option<f64>,
     output_price: Option<f64>,
     context_window: Option<u64>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    supports_tool_calling: Option<bool>,
+    #[serde(default)]
+    supports_reasoning: Option<bool>,
+    #[serde(default)]
+    supports_vision: Option<bool>,
+    #[serde(default)]
+    model_canonical_name: Option<String>,
 }
 
-fn malformed(url: &str, reason: impl Into<String>) -> LlmError {
+pub(crate) fn malformed(url: &str, reason: impl Into<String>) -> LlmError {
     LlmError::Malformed {
         url: url.to_owned(),
         reason: reason.into(),
@@ -386,6 +496,14 @@ mod tests {
     }
 
     #[test]
+    fn caching_is_asked_of_requesty_only() {
+        assert!(OpenAiCompatible::new("https://router.requesty.ai/v1", "k").is_requesty());
+        assert!(!OpenAiCompatible::new("https://openrouter.ai/api/v1", "k").is_requesty());
+        assert!(!OpenAiCompatible::new("https://requesty.ai.evil.test/v1", "k").is_requesty());
+        assert!(!OpenAiCompatible::new("http://127.0.0.1:8080/v1", "k").is_requesty());
+    }
+
+    #[test]
     fn missing_usage_is_zero_not_an_error() {
         let body = r#"{"choices": [{"message": {"content": "hi"}}]}"#;
         let response = parse_completion(URL, body).unwrap();
@@ -423,15 +541,33 @@ mod tests {
     }
 
     #[test]
+    fn the_model_list_reads_prices_and_windows() {
+        let body = r#"{"data": [
+            {"id": "a/big", "input_price": 1.4e-7, "output_price": 2.8e-7, "context_window": 1000000,
+             "description": "Good at code.", "supports_tool_calling": false},
+            {"id": "b/bare"}
+        ]}"#;
+        let list = parse_list(URL, body).unwrap();
+        assert_eq!(list[0].id, "a/big");
+        assert_eq!(list[0].input_price, Some(1.4e-7));
+        assert_eq!(list[0].context_window, Some(1_000_000));
+        assert_eq!(list[0].description.as_deref(), Some("Good at code."));
+        assert_eq!(list[0].tool_calling, Some(false));
+        assert_eq!(list[1].output_price, None);
+        assert_eq!(list[1].tool_calling, None);
+        assert!(parse_list(URL, "nope").is_err());
+    }
+
+    #[test]
     fn context_windows_come_from_the_model_list() {
         let body = r#"{"data": [
             {"id": "a/big", "context_window": 1000000},
             {"id": "b/unknown"}
         ]}"#;
-        let windows = parse_windows(body);
-        assert_eq!(windows.get("a/big"), Some(&1_000_000));
-        assert_eq!(windows.get("b/unknown"), None);
-        assert!(parse_windows("not json").is_empty());
+        let known = parse_known(body);
+        assert_eq!(known["a/big"].window, Some(1_000_000));
+        assert_eq!(known["b/unknown"].window, None);
+        assert!(parse_known("not json").is_empty());
     }
 
     #[test]
