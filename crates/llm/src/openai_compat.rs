@@ -143,6 +143,8 @@ pub struct Listed {
     pub reasoning: Option<bool>,
     /// Whether it reads images, when listed.
     pub vision: Option<bool>,
+    /// Its name without the host serving it, such as `glm-5.3-flash`.
+    pub canonical: Option<String>,
 }
 
 fn parse_list(url: &str, body: &str) -> Result<Vec<Listed>, LlmError> {
@@ -160,6 +162,7 @@ fn parse_list(url: &str, body: &str) -> Result<Vec<Listed>, LlmError> {
             tool_calling: m.supports_tool_calling,
             reasoning: m.supports_reasoning,
             vision: m.supports_vision,
+            canonical: m.model_canonical_name,
         })
         .collect())
 }
@@ -175,14 +178,14 @@ fn parse_windows(body: &str) -> HashMap<String, u64> {
         .unwrap_or_default()
 }
 
-fn transport(url: &str, source: reqwest::Error) -> LlmError {
+pub(crate) fn transport(url: &str, source: reqwest::Error) -> LlmError {
     LlmError::Transport {
         url: url.to_owned(),
         source,
     }
 }
 
-async fn read_body(url: &str, response: reqwest::Response) -> Result<String, LlmError> {
+pub(crate) async fn read_body(url: &str, response: reqwest::Response) -> Result<String, LlmError> {
     let status = response.status();
     let body = response
         .text()
@@ -310,9 +313,11 @@ struct WireModel {
     supports_reasoning: Option<bool>,
     #[serde(default)]
     supports_vision: Option<bool>,
+    #[serde(default)]
+    model_canonical_name: Option<String>,
 }
 
-fn malformed(url: &str, reason: impl Into<String>) -> LlmError {
+pub(crate) fn malformed(url: &str, reason: impl Into<String>) -> LlmError {
     LlmError::Malformed {
         url: url.to_owned(),
         reason: reason.into(),

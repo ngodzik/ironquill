@@ -70,6 +70,8 @@ pub struct Settings {
     /// Every model the provider lists, with a note on its price and context,
     /// to search from the model picker and to tell the team apart.
     pub catalog: Vec<Member>,
+    /// Where scores in the notes come from, to credit it.
+    pub credits: Option<String>,
 }
 
 /// The model picker (Ctrl-E) while it is open.
@@ -1427,6 +1429,11 @@ impl App {
     /// The models the first one may hand tasks to.
     pub(crate) fn team(&self) -> &[ModelId] {
         &self.settings.team
+    }
+
+    /// Where the scores shown come from.
+    pub(crate) fn credits(&self) -> Option<&str> {
+        self.settings.credits.as_deref()
     }
 
     /// The most one request may cost.

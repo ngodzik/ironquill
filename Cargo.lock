@@ -1176,6 +1176,8 @@ dependencies = [
  "ironquill-llm",
  "ironquill-tools",
  "ironquill-tui",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -131,8 +131,12 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
         Span::raw(picker.filter.clone()),
         Span::styled("▏", fg(ACCENT)),
     ])];
+    let credits = app
+        .credits()
+        .map(|c| format!("   scores: {c}"))
+        .unwrap_or_default();
     lines.push(Line::styled(
-        "● answers you   ✓ in its team: it may hand them tasks",
+        format!("● answers you   ✓ in its team: it may hand them tasks{credits}"),
         fg(DIM),
     ));
     let visible = usize::from(inner.height).saturating_sub(2);

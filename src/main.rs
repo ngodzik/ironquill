@@ -12,7 +12,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use ironquill_agent::{AgentConfig, Event, Member, Outcome, Verdict};
 use ironquill_core::{ChatModel, ChatRequest, Message, ModelId, Usd};
-use ironquill_llm::{Agents, ClaudeCode, Codex, Listed, OpenAiCompatible};
+use ironquill_llm::{
+    Agents, ArtificialAnalysis, ClaudeCode, Codex, Listed, OpenAiCompatible, RANKINGS_SOURCE,
+    Ranking, find_ranking,
+};
 use ironquill_tools::{Check, ToolSummary, Toolbox, Workspace};
 use ironquill_tui::Defaults;
 use tracing_subscriber::EnvFilter;
@@ -243,16 +246,20 @@ async fn interface(
         .unwrap_or(Defaults::BUDGET);
     // The provider's list, to search and to price the team; without it the
     // interface still works, with less to show.
-    let catalog = tokio::time::timeout(Duration::from_secs(10), provider.list())
+    let listed = tokio::time::timeout(Duration::from_secs(10), provider.list())
         .await
         .ok()
         .and_then(Result::ok)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let chosen: Vec<&ModelId> = models.iter().chain(&team).collect();
+    let rankings = rankings(&listed, &chosen).await;
+    let catalog = listed
         .into_iter()
         .filter_map(|listed| {
+            let ranking = find_ranking(&rankings, &listed.id, listed.canonical.as_deref());
             Some(Member {
-                note: note(&listed),
-                about: about(&listed),
+                note: note(&listed, ranking),
+                about: about(&listed, ranking),
                 tools: listed.tool_calling != Some(false),
                 model: ModelId::new(listed.id).ok()?,
             })
@@ -268,6 +275,7 @@ async fn interface(
         team,
         budget: (budget > 0.0).then_some(Usd(budget)),
         catalog,
+        credits: (!rankings.is_empty()).then(|| RANKINGS_SOURCE.to_owned()),
     };
     // Without an agent installed, choosing one of its models fails with a
     // message saying so rather than at startup.
@@ -286,9 +294,77 @@ async fn interface(
     Ok(())
 }
 
+/// The scores kept from Artificial Analysis, and when they were fetched.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Scores {
+    fetched: u64,
+    rankings: Vec<Ranking>,
+}
+
+/// Scores for the models, from the copy kept on disk. Scores of a model do
+/// not change once measured: the list is fetched again only when it is a
+/// month old, or a day old and missing a model picked here. Without
+/// `ARTIFICIAL_ANALYSIS_API_KEY` only the kept copy is used.
+async fn rankings(listed: &[Listed], chosen: &[&ModelId]) -> Vec<Ranking> {
+    const DAY: u64 = 24 * 60 * 60;
+    let Some(path) = Defaults::path().map(|p| p.with_file_name("rankings.json")) else {
+        return Vec::new();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let kept: Option<Scores> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let age = kept.as_ref().map(|k| now.saturating_sub(k.fetched));
+    let missing = |rankings: &[Ranking]| {
+        chosen
+            .iter()
+            .filter(|m| m.delegate().is_none())
+            .any(|model| {
+                let canonical = listed
+                    .iter()
+                    .find(|l| l.id == model.as_str())
+                    .and_then(|l| l.canonical.as_deref());
+                find_ranking(rankings, model.as_str(), canonical).is_none()
+            })
+    };
+    let stale = match (&kept, age) {
+        (Some(kept), Some(age)) => age > 30 * DAY || (age > DAY && missing(&kept.rankings)),
+        _ => true,
+    };
+    let key = std::env::var("ARTIFICIAL_ANALYSIS_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    if stale && let Some(key) = key {
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(10),
+            ArtificialAnalysis::new(key.trim()).rankings(),
+        )
+        .await;
+        if let Ok(Ok(rankings)) = fetched {
+            let scores = Scores {
+                fetched: now,
+                rankings,
+            };
+            if let Ok(json) = serde_json::to_vec(&scores) {
+                let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
+                let _ = std::fs::write(&path, json);
+            }
+            return scores.rankings;
+        }
+    }
+    kept.map(|k| k.rankings).unwrap_or_default()
+}
+
+/// A score out of 100, as a whole number.
+fn score(name: &str, value: Option<f64>) -> Option<String> {
+    value.map(|v| format!("{name} {v:.0}"))
+}
+
 /// A few words on a listed model for the person and the model choosing:
-/// `$0.14 / $0.28 per M tokens · 1M context`.
-fn note(listed: &Listed) -> String {
+/// `code 38 · intel 41 · $0.14 / $0.28 per M tokens · 1M context`.
+fn note(listed: &Listed, ranking: Option<&Ranking>) -> String {
     let per_million = |price: f64| {
         let dollars = price * 1_000_000.0;
         let text = format!("{dollars:.3}");
@@ -315,8 +391,12 @@ fn note(listed: &Listed) -> String {
         w if w >= 1_000 => format!("{}k context", w / 1_000),
         w => format!("{w} context"),
     });
-    price
+    let scores = ranking
         .into_iter()
+        .flat_map(|r| [score("code", r.coding), score("intel", r.intelligence)])
+        .flatten();
+    scores
+        .chain(price)
         .chain(window)
         .chain((listed.tool_calling == Some(false)).then(|| "no tools".to_owned()))
         .collect::<Vec<_>>()
@@ -325,7 +405,7 @@ fn note(listed: &Listed) -> String {
 
 /// What the provider says a model is good at, with what it can do, for the
 /// model choosing whom to hand a task to.
-fn about(listed: &Listed) -> String {
+fn about(listed: &Listed, ranking: Option<&Ranking>) -> String {
     let can: Vec<&str> = [
         (listed.reasoning, "reasons"),
         (listed.vision, "reads images"),
@@ -334,12 +414,28 @@ fn about(listed: &Listed) -> String {
     .filter_map(|(flag, what)| (flag == Some(true)).then_some(what))
     .collect();
     let description = listed.description.as_deref().unwrap_or_default().trim();
-    match (description.is_empty(), can.is_empty()) {
+    let mut about = match (description.is_empty(), can.is_empty()) {
         (true, true) => String::new(),
         (true, false) => format!("It {}.", can.join(", ")),
         (false, true) => description.to_owned(),
         (false, false) => format!("{description} It {}.", can.join(", ")),
+    };
+    if let Some(ranking) = ranking {
+        let scores: Vec<String> = [
+            score("coding", ranking.coding),
+            score("intelligence", ranking.intelligence),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !scores.is_empty() {
+            about.push_str(&format!(
+                " Artificial Analysis scores out of 100, the same tests for every model: {}.",
+                scores.join(", ")
+            ));
+        }
     }
+    about.trim().to_owned()
 }
 
 fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {
