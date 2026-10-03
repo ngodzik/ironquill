@@ -85,6 +85,8 @@ pub enum Action {
     FocusTree,
     /// Give the whole screen to the conversation, or give the other panes back.
     Zoom,
+    /// Show or hide what the last model of the team handed a task did.
+    ToggleSubAgent,
     /// Unfold or fold the selected reply.
     Fold,
     /// Show or hide the Docker containers pane.
@@ -124,6 +126,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (
                 "Ctrl-Z",
                 "conversation full screen, and back to the panes as they were",
+            ),
+            (
+                "Ctrl-T",
+                "show or hide the sub-agent pane: what the model handed a task did",
             ),
             ("Ctrl-K", "show or hide the Docker containers"),
             ("Ctrl-S", "this list"),
@@ -226,6 +232,8 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         KeyCode::Char('a') if ctrl => return Some(Action::FocusTree),
         // Z for zoom, top left on AZERTY.
         KeyCode::Char('z') if ctrl => return Some(Action::Zoom),
+        // T for team.
+        KeyCode::Char('t') if ctrl => return Some(Action::ToggleSubAgent),
         KeyCode::Char('k') if ctrl => return Some(Action::ToggleDocker),
         // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
         KeyCode::Char('e') if ctrl => return Some(Action::PickModel),

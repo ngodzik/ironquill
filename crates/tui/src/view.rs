@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
-use crate::app::{App, Entry, LineEditor, Panes};
+use crate::app::{App, Entry, LineEditor, Panes, SubAgent};
 use crate::editor::{Editor, EditorMode, Kind};
 use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
@@ -384,6 +384,75 @@ fn render_docker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) {
+    // While a model of the team works, or until the next request, its work
+    // takes most of the room: the conversation keeps a third.
+    if let Some(sub) = app.sub_agent()
+        && area.height >= 14
+    {
+        let top = (area.height / 3).max(6);
+        let [chat, pane] =
+            Layout::vertical([Constraint::Length(top), Constraint::Min(6)]).areas(area);
+        render_conversation(frame, app, chat, true);
+        render_sub_agent(frame, app, &sub, pane);
+        return;
+    }
+    render_conversation(frame, app, area, framed);
+}
+
+/// The model a task was handed to, at work: who it is, the task, then
+/// everything it does, the latest at the bottom.
+fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect) {
+    let state = if sub.working {
+        format!(" working {} ", SPINNER[app.spinner() % SPINNER.len()])
+    } else {
+        format!(" done · {} ", plural(sub.work.len(), "step", "steps"))
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(fg(Color::Magenta))
+        .title(Line::from(vec![
+            Span::styled(
+                " Sub-agent ",
+                fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                sub.to.to_string(),
+                fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · for {} ·", sub.from), fg(DIM)),
+            Span::styled(state, fg(Color::Magenta)),
+        ]))
+        .title_bottom(Line::styled(" Ctrl-T hides ", fg(DIM)).right_aligned())
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = usize::from(inner.width).saturating_sub(1).max(1);
+    let mut lines: Vec<Line> = Vec::new();
+    push_wrapped(
+        &mut lines,
+        Span::styled("Task  ", fg(Color::Magenta)),
+        "      ",
+        sub.task,
+        fg(Color::Gray),
+        width,
+    );
+    lines.push(Line::default());
+    for entry in &sub.work {
+        lines.extend(entry_lines(entry, app, width));
+        lines.push(Line::default());
+    }
+    if sub.work.is_empty() {
+        lines.push(Line::styled("  starting…", fg(DIM)));
+    }
+    // The latest at the bottom, as in the conversation.
+    let height = usize::from(inner.height);
+    let skip = lines.len().saturating_sub(height);
+    let shown: Vec<Line> = lines.into_iter().skip(skip).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+fn render_conversation(frame: &mut Frame, app: &App, area: Rect, framed: bool) {
     if framed {
         let block = pane_block(" Chat ".into(), app.focus() == Focus::Chat);
         let inner = block.inner(area);
@@ -1119,8 +1188,26 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     let mut ranges = Vec::new();
     for (i, entry) in app.transcript().iter().enumerate() {
+        // A member's work shows in the sub-agent pane; here a line says how
+        // much there was.
+        if matches!(entry, Entry::Member { .. }) {
+            continue;
+        }
         let first = lines.len();
         let mut block = entry_lines(entry, app, width);
+        if let Entry::Delegating { to, .. } = entry {
+            let steps = app.transcript()[i + 1..]
+                .iter()
+                .take_while(|e| matches!(e, Entry::Member { .. }))
+                .count();
+            block.push(Line::styled(
+                format!(
+                    "  ┃ {to}: {} · Ctrl-T shows them",
+                    plural(steps, "step", "steps")
+                ),
+                fg(Color::Magenta),
+            ));
+        }
         if entry.is_reply() && block.len() > FOLD_AT && !app.is_expanded(i) {
             let hidden = block.len() - FOLD_SHOW;
             block.truncate(FOLD_SHOW);
@@ -1149,12 +1236,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             app.transcript().get(i + 1),
             Some(Entry::Passed | Entry::Failed { .. })
         );
-        // The bar of a member's work runs on between its entries.
-        let member_goes_on = matches!(entry, Entry::Member { .. })
-            && matches!(app.transcript().get(i + 1), Some(Entry::Member { .. }));
-        if member_goes_on {
-            lines.push(Line::styled("  ┃", fg(Color::Magenta)));
-        } else if !next_is_result {
+        if !next_is_result {
             lines.push(Line::default());
         }
     }

@@ -74,6 +74,17 @@ pub struct Settings {
     pub credits: Option<String>,
 }
 
+/// A task handed to a model of the team, as the sub-agent pane shows it.
+pub(crate) struct SubAgent<'a> {
+    pub(crate) from: &'a ModelId,
+    pub(crate) to: &'a ModelId,
+    pub(crate) task: &'a str,
+    /// What it did, in order.
+    pub(crate) work: Vec<&'a Entry>,
+    /// Still working on it.
+    pub(crate) working: bool,
+}
+
 /// The model picker (Ctrl-E) while it is open.
 #[derive(Debug, Default)]
 pub(crate) struct ModelPicker {
@@ -310,6 +321,9 @@ pub(crate) struct App {
     quit_armed: bool,
     /// The model of the team working on a task handed to it, if one is.
     member: Option<ModelId>,
+    /// The handover whose work the sub-agent pane shows, by its place in
+    /// the transcript.
+    sub_view: Option<usize>,
     /// The choices as last kept for new sessions, to keep them again as
     /// soon as they change.
     kept: Defaults,
@@ -405,6 +419,7 @@ impl App {
             quit: false,
             quit_armed: false,
             member: None,
+            sub_view: None,
             kept: Defaults::default(),
             notice: None,
             session_id: sessions::new_id(),
@@ -569,7 +584,7 @@ impl App {
             let global = ctrl
                 && matches!(
                     key.code,
-                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a' | 'z')
+                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a' | 'z' | 't')
                 );
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
@@ -726,6 +741,21 @@ impl App {
             }
             Action::ShowChat => self.close_file(Focus::Chat),
             Action::PickModel => self.open_model_picker(),
+            Action::ToggleSubAgent => {
+                self.sub_view = match self.sub_view {
+                    Some(_) => None,
+                    None => {
+                        let last = self
+                            .transcript
+                            .iter()
+                            .rposition(|e| matches!(e, Entry::Delegating { .. }));
+                        if last.is_none() {
+                            self.info("No task was handed to the team in this conversation yet");
+                        }
+                        last
+                    }
+                };
+            }
             Action::Zoom => {
                 self.zoomed = !self.zoomed;
                 if self.zoomed {
@@ -1094,6 +1124,9 @@ impl App {
             Ok(config) => {
                 self.input.take();
                 self.transcript.push(Entry::User(text.clone()));
+                // A new request: the last sub-agent's work leaves the screen,
+                // Ctrl-T brings it back.
+                self.sub_view = None;
                 self.running_since = Some(Instant::now());
                 self.working_model = tiers.first().cloned();
                 self.scroll_back.set(0);
@@ -1449,6 +1482,32 @@ impl App {
     /// The models the first one may hand tasks to.
     pub(crate) fn team(&self) -> &[ModelId] {
         &self.settings.team
+    }
+
+    /// The handover the sub-agent pane shows: who, the task, what it did,
+    /// and whether it is still at it.
+    pub(crate) fn sub_agent(&self) -> Option<SubAgent<'_>> {
+        let i = self.sub_view?;
+        let Some(Entry::Delegating { from, to, task }) = self.transcript.get(i) else {
+            return None;
+        };
+        let work: Vec<&Entry> = self.transcript[i + 1..]
+            .iter()
+            .map_while(|e| match e {
+                Entry::Member { entry, .. } => Some(&**entry),
+                _ => None,
+            })
+            .collect();
+        let working = self.is_running()
+            && self.member.as_ref() == Some(to)
+            && i + 1 + work.len() == self.transcript.len();
+        Some(SubAgent {
+            from,
+            to,
+            task,
+            work,
+            working,
+        })
     }
 
     /// Where the scores shown come from.
@@ -1929,6 +1988,7 @@ impl App {
                 // The model that answers is back: the member is done.
                 if self.member.as_ref().is_some_and(|m| *m != model) {
                     self.member = None;
+                    self.working_model = Some(model);
                 }
                 if context.is_some() {
                     self.context = context;
@@ -1987,6 +2047,9 @@ impl App {
                     to: to.clone(),
                     task,
                 });
+                // The sub-agent pane opens on it, the status line names it.
+                self.sub_view = Some(self.transcript.len() - 1);
+                self.working_model = Some(to.clone());
                 self.member = Some(to);
                 return;
             }
@@ -2606,6 +2669,18 @@ mod tests {
         ));
         assert_eq!(app.transcript[n - 1], Entry::Said("Done.".into()));
         assert!(app.transcript_text().contains("│ strong\n│ a.py prints 1."));
+
+        // The sub-agent pane shows the handover and its work, Ctrl-T hides
+        // it and brings it back.
+        let sub = app.sub_agent().unwrap();
+        assert_eq!(sub.to.as_str(), "strong");
+        assert_eq!(sub.task, "read a.py");
+        assert_eq!(sub.work, [&Entry::Said("a.py prints 1.".into())]);
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_t);
+        assert!(app.sub_agent().is_none());
+        app.on_key(ctrl_t);
+        assert!(app.sub_agent().is_some());
     }
 
     #[test]
