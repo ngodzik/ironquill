@@ -12,6 +12,7 @@ pub struct AgentConfig {
     pub(crate) checks: Vec<Check>,
     pub(crate) team: Vec<Member>,
     pub(crate) budget: Option<Usd>,
+    pub(crate) compact_at: u64,
 }
 
 /// A model the first one may hand a task to, with what it should know to
@@ -67,9 +68,14 @@ impl AgentConfig {
             checks: Vec::new(),
             team: Vec::new(),
             budget: None,
+            compact_at: COMPACT_AT,
         }
     }
 }
+
+/// Tokens of conversation past which old tool results are dropped, unless
+/// half the model's context is less.
+pub const COMPACT_AT: u64 = 40_000;
 
 /// Collects an [`AgentConfig`] and validates it at [`build`](Self::build).
 #[derive(Debug, Clone)]
@@ -80,6 +86,7 @@ pub struct AgentConfigBuilder {
     checks: Vec<Check>,
     team: Vec<Member>,
     budget: Option<Usd>,
+    compact_at: u64,
 }
 
 impl AgentConfigBuilder {
@@ -125,6 +132,15 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// How long the conversation may grow, in tokens, before the results of
+    /// old tool calls are dropped, all at once: the conversation is then
+    /// resent shorter, and its new start is cached again. Defaults to
+    /// [`COMPACT_AT`], or half the model's context when that is less.
+    pub fn compact_at(mut self, tokens: u64) -> Self {
+        self.compact_at = tokens;
+        self
+    }
+
     /// Validates and builds.
     ///
     /// # Errors
@@ -148,6 +164,7 @@ impl AgentConfigBuilder {
             checks: self.checks,
             team: self.team,
             budget: self.budget,
+            compact_at: self.compact_at,
         })
     }
 }

@@ -731,6 +731,10 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
     Ok(reply)
 }
 
+/// Tool results a compaction keeps at most: the latest ones are what the
+/// model is working on. It keeps fewer when that is not enough.
+const KEEP_RESULTS: usize = 4;
+
 /// Output tokens counted for a call before it is made: a reply that edits
 /// code is rarely longer.
 const OUTPUT_RESERVE: u64 = 2_000;
@@ -1011,7 +1015,27 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     let window = ctx.model.context_window(model_id).await;
     let identity = identity(model_id, leads, &ctx.config.team);
     let pricing = ctx.model.pricing(model_id).await;
+    let compact_at = window.map_or(ctx.config.compact_at, |w| ctx.config.compact_at.min(w / 2));
     for _ in 0..ctx.config.max_turns {
+        let before = crate::context::approx_tokens(messages);
+        if before > compact_at {
+            // Down to half the threshold, so that the next calls only add
+            // to it: each compaction makes the provider's cache start over.
+            let mut dropped = 0;
+            for keep in (1..=KEEP_RESULTS).rev() {
+                dropped += crate::context::compact(messages, keep);
+                if crate::context::approx_tokens(messages) <= compact_at / 2 {
+                    break;
+                }
+            }
+            if dropped > 0 {
+                (ctx.observe)(Event::Compacted {
+                    dropped,
+                    before: TokenCount(before),
+                    after: TokenCount(crate::context::approx_tokens(messages)),
+                });
+            }
+        }
         let mut sent = messages.clone();
         if let Some(Message::System(prompt)) = sent.first_mut() {
             prompt.push_str(&identity);
@@ -1302,6 +1326,60 @@ mod tests {
             .check(Check::parse("test -f done.txt").unwrap())
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_long_conversation_is_compacted_once_past_the_threshold() {
+        let (dir, mut toolbox) = setup();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            std::fs::write(dir.path().join(format!("{name}.txt")), "word ".repeat(500)).unwrap();
+        }
+        let mut answers: Vec<ChatResponse> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|n| calls("read_file", json!({"path": format!("{n}.txt")})))
+            .collect();
+        answers.push(says("Read them all."));
+        let model = Scripted::new(answers);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .compact_at(2_500)
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let mut events = Vec::new();
+        session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "read all",
+                "",
+                |e| {
+                    events.push(e);
+                },
+            )
+            .await
+            .unwrap();
+
+        let compactions: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Compacted { .. }))
+            .collect();
+        assert_eq!(compactions.len(), 1, "once, all at once: {compactions:?}");
+        let seen = model.seen.lock().unwrap();
+        let last = &seen.last().unwrap().messages;
+        assert!(crate::context::tests::valid(last));
+        let dropped = last
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { content, .. } if content.starts_with("[Earlier result")))
+            .count();
+        assert!(dropped >= 1);
+        // The latest results are kept whole.
+        assert!(matches!(
+            &last[last.len() - 1],
+            Message::Tool { content, .. } if content.starts_with("word")
+        ));
     }
 
     #[tokio::test]

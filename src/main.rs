@@ -563,6 +563,15 @@ fn show(event: Event) {
         Event::Failed { command, .. } => eprintln!("✗ {command} failed"),
         Event::Escalating { from, to } => eprintln!("↑ {from} gave up, escalating to {to}"),
         Event::Delegating { from, to, task } => eprintln!("→ {from} hands to {to}: {task}"),
+        Event::Compacted {
+            dropped,
+            before,
+            after,
+        } => {
+            eprintln!(
+                "⇣ compacted: {dropped} old tool results dropped, about {before} → {after} tokens"
+            );
+        }
         Event::OverBudget { spent, budget } => {
             eprintln!("✗ budget of {budget} spent ({spent}), stopping");
         }

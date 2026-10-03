@@ -1990,6 +1990,18 @@ impl App {
                 self.member = Some(to);
                 return;
             }
+            Event::Compacted {
+                dropped,
+                before,
+                after,
+            } => Entry::Info(format!(
+                "Context compacted: {} dropped, about {before} → {after} tokens. /context shows what is left",
+                if dropped == 1 {
+                    "1 old tool result".to_owned()
+                } else {
+                    format!("{dropped} old tool results")
+                }
+            )),
             Event::OverBudget { spent, budget } => {
                 self.member = None;
                 Entry::OverBudget { spent, budget }
