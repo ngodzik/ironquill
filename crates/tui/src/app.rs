@@ -1,4 +1,4 @@
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -215,7 +215,7 @@ pub(crate) struct App {
     command: LineEditor,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
-    scroll_back: usize,
+    scroll_back: Cell<usize>,
     /// The largest useful `scroll_back`, written by the view, which is the
     /// only part that knows how many lines the transcript wraps to.
     max_scroll: Cell<usize>,
@@ -242,6 +242,18 @@ pub(crate) struct App {
     created: u64,
     requests: usize,
     picker: Option<Picker>,
+    /// Replies unfolded by the person, by transcript index. Long replies are
+    /// folded otherwise.
+    expanded: BTreeSet<usize>,
+    /// The reply selected in normal mode, by transcript index.
+    selected_reply: Option<usize>,
+    /// Asks the view to scroll the selected reply into sight.
+    reveal: Cell<bool>,
+    /// Where each entry was drawn, as (entry, first line, last line) in the
+    /// whole transcript, and the transcript's first visible line and area,
+    /// written by the view so that a click finds its entry.
+    entry_lines: RefCell<Vec<(usize, usize, usize)>>,
+    transcript_view: Cell<(usize, Rect)>,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -296,7 +308,7 @@ impl App {
             input: LineEditor::default(),
             command: LineEditor::default(),
             transcript,
-            scroll_back: 0,
+            scroll_back: Cell::new(0),
             max_scroll: Cell::new(0),
             tree: None,
             file: None,
@@ -316,6 +328,11 @@ impl App {
             created: sessions::now(),
             requests: 0,
             picker: None,
+            expanded: BTreeSet::new(),
+            selected_reply: None,
+            reveal: Cell::new(false),
+            entry_lines: RefCell::new(Vec::new()),
+            transcript_view: Cell::new((0, Rect::default())),
             zoomed: false,
             zoom_focus: None,
             keys_open: None,
@@ -344,7 +361,13 @@ impl App {
     }
 
     pub(crate) fn scroll_back(&self) -> usize {
-        self.scroll_back
+        self.scroll_back.get()
+    }
+
+    /// Scrolls the conversation so that a given line range is in view. Called
+    /// by the view, the only part that knows where an entry's lines are.
+    pub(crate) fn set_scroll_back(&self, back: usize) {
+        self.scroll_back.set(back);
     }
 
     pub(crate) fn set_max_scroll(&self, max: usize) {
@@ -495,6 +518,12 @@ impl App {
                 if mode == Mode::Command {
                     self.command.take();
                 }
+                if mode == Mode::Normal
+                    && self.focus == Focus::Chat
+                    && self.selected_reply.is_none()
+                {
+                    self.selected_reply = self.replies().last().copied();
+                }
                 // Typing always goes to the conversation.
                 if mode == Mode::Insert {
                     self.focus = Focus::Chat;
@@ -522,7 +551,18 @@ impl App {
                     Mode::Normal => None,
                 };
             }
+            Action::Move(lines) if self.focus == Focus::Chat && self.mode == Mode::Normal => {
+                self.select_reply(lines);
+            }
             Action::Move(lines) => self.move_focused(lines),
+            Action::Fold => match self.selected_reply {
+                Some(entry) => self.toggle_fold(entry),
+                // Nothing to fold: Enter keeps its old meaning.
+                None => {
+                    self.focus = Focus::Chat;
+                    self.mode = Mode::Insert;
+                }
+            },
             Action::HalfPage(down) => {
                 let lines = HALF_PAGE as i32;
                 self.move_focused(if down { lines } else { -lines });
@@ -538,7 +578,7 @@ impl App {
                         file.scroll_by(i32::MIN / 2);
                     }
                 }
-                Focus::Chat => self.scroll_back = self.max_scroll.get(),
+                Focus::Chat => self.scroll_back.set(self.max_scroll.get()),
                 Focus::Docker => self.move_focused(i32::MIN / 2),
             },
             Action::Bottom => match self.focus {
@@ -552,7 +592,7 @@ impl App {
                         file.scroll_by(i32::MAX / 2);
                     }
                 }
-                Focus::Chat => self.scroll_back = 0,
+                Focus::Chat => self.scroll_back.set(0),
                 Focus::Docker => self.move_focused(i32::MAX / 2),
             },
             Action::Open => self.open_selected(),
@@ -671,6 +711,69 @@ impl App {
             },
         }
         None
+    }
+
+    /// Transcript indices of the model's replies, the entries that fold.
+    fn replies(&self) -> Vec<usize> {
+        self.transcript
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, Entry::Said(_)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Moves the selection `step` replies down (up when negative), starting
+    /// from the last reply when none is selected.
+    fn select_reply(&mut self, step: i32) {
+        let replies = self.replies();
+        let Some(last) = replies.len().checked_sub(1) else {
+            return;
+        };
+        let at = match self
+            .selected_reply
+            .and_then(|e| replies.iter().position(|r| *r == e))
+        {
+            Some(at) => (at as i64 + i64::from(step)).clamp(0, last as i64) as usize,
+            None => last,
+        };
+        self.selected_reply = Some(replies[at]);
+        self.reveal.set(true);
+    }
+
+    fn toggle_fold(&mut self, entry: usize) {
+        if !self.expanded.remove(&entry) {
+            self.expanded.insert(entry);
+        }
+        self.selected_reply = Some(entry);
+        self.reveal.set(true);
+    }
+
+    pub(crate) fn is_expanded(&self, entry: usize) -> bool {
+        self.expanded.contains(&entry)
+    }
+
+    /// The selected reply, shown as such only in normal mode in the conversation.
+    pub(crate) fn selected_reply(&self) -> Option<usize> {
+        (self.focus == Focus::Chat && self.mode == Mode::Normal)
+            .then_some(self.selected_reply)
+            .flatten()
+    }
+
+    /// Whether the view should scroll the selected reply into sight; reading
+    /// it clears it.
+    pub(crate) fn take_reveal(&self) -> bool {
+        self.reveal.replace(false)
+    }
+
+    pub(crate) fn set_entry_lines(
+        &self,
+        lines: Vec<(usize, usize, usize)>,
+        top: usize,
+        area: Rect,
+    ) {
+        *self.entry_lines.borrow_mut() = lines;
+        self.transcript_view.set((top, area));
     }
 
     pub(crate) fn is_zoomed(&self) -> bool {
@@ -800,6 +903,21 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if hit == Focus::Chat {
                     self.focus = Focus::Chat;
+                    let (top, area) = self.transcript_view.get();
+                    if area.contains(at) {
+                        let line = top + usize::from(mouse.row - area.y);
+                        let entry = self
+                            .entry_lines
+                            .borrow()
+                            .iter()
+                            .find(|(_, first, last)| (*first..=*last).contains(&line))
+                            .map(|(e, _, _)| *e);
+                        if let Some(entry) = entry
+                            && matches!(self.transcript.get(entry), Some(Entry::Said(_)))
+                        {
+                            self.toggle_fold(entry);
+                        }
+                    }
                     return;
                 }
                 self.focus_on(hit);
@@ -828,9 +946,9 @@ impl App {
     }
 
     fn scroll(&mut self, down: i32) {
-        let current = self.scroll_back.min(self.max_scroll.get()) as i64;
+        let current = self.scroll_back.get().min(self.max_scroll.get()) as i64;
         let next = (current - i64::from(down)).clamp(0, self.max_scroll.get() as i64);
-        self.scroll_back = next as usize;
+        self.scroll_back.set(next as usize);
     }
 
     fn submit(&mut self, text: String) -> Option<Effect> {
@@ -864,7 +982,7 @@ impl App {
                 self.transcript.push(Entry::User(text.clone()));
                 self.running_since = Some(Instant::now());
                 self.working_model = tiers.first().cloned();
-                self.scroll_back = 0;
+                self.scroll_back.set(0);
                 Some(Effect::Send { text, config })
             }
             Err(e) => {
@@ -970,7 +1088,9 @@ impl App {
                     return None;
                 }
                 self.transcript = vec![Entry::Welcome];
-                self.scroll_back = 0;
+                self.scroll_back.set(0);
+                self.expanded.clear();
+                self.selected_reply = None;
                 // A new conversation is a new file; the old one stays resumable.
                 self.session_id = sessions::new_id();
                 self.session_name = None;
@@ -1104,11 +1224,13 @@ impl App {
         self.cost = saved.cost;
         self.cost_complete = saved.cost_complete;
         self.transcript = saved.transcript;
+        self.expanded.clear();
+        self.selected_reply = None;
         self.transcript.push(Entry::Info(format!(
             "Resumed \"{}\": the conversation continues where it stopped",
             saved.name
         )));
-        self.scroll_back = 0;
+        self.scroll_back.set(0);
         self.picker = None;
     }
 
@@ -1897,12 +2019,38 @@ mod tests {
     }
 
     #[test]
+    fn arrows_select_replies_and_enter_folds_them_in_normal_mode() {
+        let mut app = ready();
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: ModelId::new("cheap").unwrap(),
+            text: "first".into(),
+        }));
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: ModelId::new("cheap").unwrap(),
+            text: "second".into(),
+        }));
+        let replies = app.replies();
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.selected_reply(), Some(replies[1]));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.selected_reply(), Some(replies[0]));
+        assert!(!app.is_expanded(replies[0]));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_expanded(replies[0]));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.is_expanded(replies[0]));
+        // Not shown as selected while typing.
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.selected_reply(), None);
+    }
+
+    #[test]
     fn scrolling_stays_within_the_transcript() {
         let mut app = ready();
         app.set_max_scroll(5);
         press(&mut app, KeyCode::Esc);
         for _ in 0..20 {
-            press(&mut app, KeyCode::Up);
+            press(&mut app, KeyCode::PageUp);
         }
         assert_eq!(app.scroll_back(), 5);
         press(&mut app, KeyCode::End);

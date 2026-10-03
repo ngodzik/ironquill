@@ -1007,11 +1007,44 @@ fn welcome(out: &mut Vec<Line<'static>>, app: &App, width: usize) {
     out.push(Line::styled(format!("╰{}╯", "─".repeat(inner)), border));
 }
 
+/// A reply longer than this many lines is folded unless unfolded.
+const FOLD_AT: usize = 12;
+/// How many lines of a folded reply stay visible.
+const FOLD_SHOW: usize = 6;
+/// The background of the reply selected in normal mode: a shade lighter than
+/// the terminal's, enough to see it, not enough to hurt reading.
+const SELECTED_BG: Color = Color::Rgb(34, 36, 44);
+
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let width = usize::from(area.width).saturating_sub(1).max(1);
+    let selected = app.selected_reply();
     let mut lines: Vec<Line> = Vec::new();
+    let mut ranges = Vec::new();
     for (i, entry) in app.transcript().iter().enumerate() {
-        lines.extend(entry_lines(entry, app, width));
+        let first = lines.len();
+        let mut block = entry_lines(entry, app, width);
+        if matches!(entry, Entry::Said(_)) && block.len() > FOLD_AT && !app.is_expanded(i) {
+            let hidden = block.len() - FOLD_SHOW;
+            block.truncate(FOLD_SHOW);
+            block.push(Line::styled(
+                format!("  ▸ {}", plural(hidden, "more line", "more lines")),
+                fg(DIM),
+            ));
+        }
+        if selected == Some(i) {
+            block = block
+                .into_iter()
+                .map(|line| {
+                    // Pad to the full width so that the shade reads as a block.
+                    let pad = width.saturating_sub(line.width());
+                    let mut spans = line.spans;
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    Line::from(spans).style(Style::new().bg(SELECTED_BG))
+                })
+                .collect();
+        }
+        lines.extend(block);
+        ranges.push((i, first, lines.len().saturating_sub(1).max(first)));
         // A blank line after each block, except where a result line follows
         // the action it belongs to.
         let next_is_result = matches!(
@@ -1026,8 +1059,25 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let height = usize::from(area.height);
     let max_scroll = lines.len().saturating_sub(height);
     app.set_max_scroll(max_scroll);
+
+    // Bring the selected reply into sight when it was just selected or folded.
+    if app.take_reveal()
+        && let Some((_, first, last)) = ranges.iter().find(|(e, _, _)| Some(*e) == selected)
+    {
+        let top = max_scroll - app.scroll_back().min(max_scroll);
+        let new_top = if *first < top {
+            *first
+        } else if *last >= top + height {
+            (last + 1).saturating_sub(height).min(*first)
+        } else {
+            top
+        };
+        app.set_scroll_back(max_scroll - new_top.min(max_scroll));
+    }
+
     let back = app.scroll_back().min(max_scroll);
     let top = max_scroll - back;
+    app.set_entry_lines(ranges, top, area);
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
 }

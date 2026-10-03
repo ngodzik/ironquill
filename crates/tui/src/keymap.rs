@@ -85,6 +85,8 @@ pub enum Action {
     FocusTree,
     /// Give the whole screen to the conversation, or give the other panes back.
     Zoom,
+    /// Unfold or fold the selected reply.
+    Fold,
     /// Show or hide the Docker containers pane.
     ToggleDocker,
     /// Go to the message box, ready to type, from wherever the focus is.
@@ -148,7 +150,11 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (",n ,d ,m ,i", "tree, Docker, model, type"),
             (",c", "close the file, back to the conversation"),
             ("Ctrl-W Left/Right", "pane on the left / right"),
-            ("Up Down Home End", "move in the pane"),
+            (
+                "Up Down Home End",
+                "move in the pane; in the conversation, select a reply",
+            ),
+            ("Enter Space", "unfold or fold the selected reply"),
         ],
     ),
     (
@@ -285,8 +291,10 @@ fn normal(focus: Focus, key: KeyEvent, ctrl: bool) -> Option<Action> {
             KeyCode::Char('q') | KeyCode::Esc => Some(Action::ClosePane),
             _ => None,
         },
+        // Up and Down select replies here, Enter and Space fold them; Page
+        // keys and the wheel scroll.
         Focus::Chat => match key.code {
-            KeyCode::Enter => Some(Action::Enter(Mode::Insert)),
+            KeyCode::Enter | KeyCode::Char(' ') => Some(Action::Fold),
             _ => None,
         },
     }
