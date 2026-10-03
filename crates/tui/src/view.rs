@@ -231,11 +231,12 @@ const SIDE_CHAT_MIN: u16 = 36;
 fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
     if app.is_zoomed() {
         // Only the conversation; the other panes keep their state, unseen.
+        let sub = render_chat(frame, app, area, false);
         app.set_panes(Panes {
             chat: area,
+            sub,
             ..Panes::default()
         });
-        render_chat(frame, app, area, false);
         return;
     }
     // The Docker pane runs along the bottom, under everything else, sized to
@@ -276,6 +277,7 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
         file: None,
         chat: center,
         docker,
+        sub: None,
     };
     if let Some(docker) = docker {
         render_docker(frame, app, docker);
@@ -292,10 +294,10 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
         render_command_frame(frame, app, command);
         panes.chat = side;
         if side_width > 0 {
-            render_chat(frame, app, side, true);
+            panes.sub = render_chat(frame, app, side, true);
         }
     } else {
-        render_chat(frame, app, center, !alone);
+        panes.sub = render_chat(frame, app, center, !alone);
     }
     app.set_panes(panes);
 }
@@ -383,7 +385,9 @@ fn render_docker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) {
+/// The conversation, and under it the sub-agent pane when it is open,
+/// whose area is returned for the mouse.
+fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) -> Option<Rect> {
     // While a model of the team works, or until the next request, its work
     // takes most of the room: the conversation keeps a third.
     if let Some(sub) = app.sub_agent()
@@ -394,9 +398,10 @@ fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) {
             Layout::vertical([Constraint::Length(top), Constraint::Min(6)]).areas(area);
         render_conversation(frame, app, chat, true);
         render_sub_agent(frame, app, &sub, pane);
-        return;
+        return Some(pane);
     }
     render_conversation(frame, app, area, framed);
+    None
 }
 
 /// The model a task was handed to, at work: who it is, the task, then
@@ -407,9 +412,15 @@ fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect
     } else {
         format!(" done · {} ", plural(sub.work.len(), "step", "steps"))
     };
+    let focused = app.focus() == Focus::SubAgent;
+    let border = if focused {
+        fg(Color::LightMagenta).add_modifier(Modifier::BOLD)
+    } else {
+        fg(Color::Magenta)
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(fg(Color::Magenta))
+        .border_style(border)
         .title(Line::from(vec![
             Span::styled(
                 " Sub-agent ",
@@ -423,10 +434,8 @@ fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect
             Span::styled(state, fg(Color::Magenta)),
             Span::styled(format!("· {} ", sub.spent), fg(Color::Gray)),
         ]))
-        .title_bottom(Line::styled(" Ctrl-T hides ", fg(DIM)).right_aligned())
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
-    frame.render_widget(block, area);
 
     let width = usize::from(inner.width).saturating_sub(1).max(1);
     let mut lines: Vec<Line> = Vec::new();
@@ -446,10 +455,21 @@ fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect
     if sub.work.is_empty() {
         lines.push(Line::styled("  starting…", fg(DIM)));
     }
-    // The latest at the bottom, as in the conversation.
+    // The latest at the bottom, as in the conversation, unless scrolled up.
     let height = usize::from(inner.height);
-    let skip = lines.len().saturating_sub(height);
-    let shown: Vec<Line> = lines.into_iter().skip(skip).collect();
+    let max = lines.len().saturating_sub(height);
+    app.set_sub_max(max);
+    let up = app.sub_scroll().min(max);
+    let skip = max - up;
+    let below = if up > 0 {
+        format!(" ↓ {} below · ", plural(up, "line", "lines"))
+    } else {
+        String::from(" ")
+    };
+    let block =
+        block.title_bottom(Line::styled(format!("{below}Ctrl-T hides "), fg(DIM)).right_aligned());
+    frame.render_widget(block, area);
+    let shown: Vec<Line> = lines.into_iter().skip(skip).take(height).collect();
     frame.render_widget(Paragraph::new(shown), inner);
 }
 
@@ -1281,6 +1301,19 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::styled(format!("{glyph} Working… "), fg(ACCENT))];
     if let Some(model) = app.working_model() {
         spans.push(Span::styled(format!("{model} "), fg(Color::Gray)));
+    }
+    // The answering model's own cost so far, named when a sub-agent is the
+    // one working, whose cost is in its pane.
+    let spent = app.request_spent();
+    if spent.usage.input.0 > 0 {
+        let lead = app
+            .current_model()
+            .filter(|lead| app.working_model() != Some(*lead));
+        let text = match lead {
+            Some(lead) => format!("· {lead} so far {spent} "),
+            None => format!("· {spent} "),
+        };
+        spans.push(Span::styled(text, fg(Color::Gray)));
     }
     spans.push(Span::styled(
         format!("({}s · Ctrl-C to stop)", elapsed.as_secs()),

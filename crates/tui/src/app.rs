@@ -31,6 +31,7 @@ pub(crate) struct Panes {
     pub(crate) file: Option<Rect>,
     pub(crate) chat: Rect,
     pub(crate) docker: Option<Rect>,
+    pub(crate) sub: Option<Rect>,
 }
 
 /// The Docker pane: what `docker ps` said last.
@@ -349,6 +350,13 @@ pub(crate) struct App {
     /// The handover whose work the sub-agent pane shows, by its place in
     /// the transcript.
     sub_view: Option<usize>,
+    /// How many lines the sub-agent pane is scrolled up from its end; 0
+    /// follows the work as it comes.
+    sub_scroll: Cell<usize>,
+    /// The most it can be, written by the view.
+    sub_max: Cell<usize>,
+    /// What the current request cost so far, without its sub-agents.
+    request_spent: Spent,
     /// The choices as last kept for new sessions, to keep them again as
     /// soon as they change.
     kept: Defaults,
@@ -445,6 +453,9 @@ impl App {
             quit_armed: false,
             member: None,
             sub_view: None,
+            sub_scroll: Cell::new(0),
+            sub_max: Cell::new(0),
+            request_spent: Spent::default(),
             kept: Defaults::default(),
             notice: None,
             session_id: sessions::new_id(),
@@ -728,6 +739,7 @@ impl App {
                 }
                 Focus::Chat => self.scroll_back.set(self.max_scroll.get()),
                 Focus::Docker => self.move_focused(i32::MIN / 2),
+                Focus::SubAgent => self.sub_scroll.set(self.sub_max.get()),
             },
             Action::Bottom => match self.focus {
                 Focus::Tree => {
@@ -742,6 +754,7 @@ impl App {
                 }
                 Focus::Chat => self.scroll_back.set(0),
                 Focus::Docker => self.move_focused(i32::MAX / 2),
+                Focus::SubAgent => self.sub_scroll.set(0),
             },
             Action::Open => self.open_selected(),
             Action::Collapse => {
@@ -767,6 +780,10 @@ impl App {
             Action::ShowChat => self.close_file(Focus::Chat),
             Action::PickModel => self.open_model_picker(),
             Action::ToggleSubAgent => {
+                self.sub_scroll.set(0);
+                if self.focus == Focus::SubAgent {
+                    self.focus_on(Focus::Chat);
+                }
                 self.sub_view = match self.sub_view {
                     Some(_) => None,
                     None => {
@@ -840,6 +857,10 @@ impl App {
                 }
                 Focus::Docker => {
                     self.docker = None;
+                    self.focus_on(Focus::Chat);
+                }
+                Focus::SubAgent => {
+                    self.sub_view = None;
                     self.focus_on(Focus::Chat);
                 }
                 Focus::Chat => {}
@@ -963,6 +984,9 @@ impl App {
             panes.push(Focus::File);
         }
         panes.push(Focus::Chat);
+        if self.sub_view.is_some() {
+            panes.push(Focus::SubAgent);
+        }
         if self.docker.is_some() {
             panes.push(Focus::Docker);
         }
@@ -1003,6 +1027,11 @@ impl App {
                 }
             }
             Focus::Chat => self.scroll(lines),
+            Focus::SubAgent => {
+                let up = self.sub_scroll.get() as i64 - i64::from(lines);
+                self.sub_scroll
+                    .set(up.clamp(0, self.sub_max.get() as i64) as usize);
+            }
             Focus::Docker => {
                 if let Some(docker) = &mut self.docker {
                     let last = docker.containers.len().saturating_sub(1) as i64;
@@ -1039,6 +1068,8 @@ impl App {
         let panes = self.panes.get();
         let hit = if panes.docker.is_some_and(|r| r.contains(at)) {
             Focus::Docker
+        } else if panes.sub.is_some_and(|r| r.contains(at)) {
+            Focus::SubAgent
         } else if panes.tree.is_some_and(|r| r.contains(at)) {
             Focus::Tree
         } else if panes.file.is_some_and(|r| r.contains(at)) {
@@ -1152,6 +1183,10 @@ impl App {
                 // A new request: the last sub-agent's work leaves the screen,
                 // Ctrl-T brings it back.
                 self.sub_view = None;
+                self.request_spent = Spent::default();
+                if self.focus == Focus::SubAgent {
+                    self.focus = Focus::Chat;
+                }
                 self.running_since = Some(Instant::now());
                 self.working_model = tiers.first().cloned();
                 self.scroll_back.set(0);
@@ -1540,6 +1575,24 @@ impl App {
             work,
             working,
         })
+    }
+
+    /// How far the sub-agent pane is scrolled up from its end, and the
+    /// view's report of how far it can go.
+    pub(crate) fn sub_scroll(&self) -> usize {
+        self.sub_scroll.get()
+    }
+
+    pub(crate) fn set_sub_max(&self, max: usize) {
+        self.sub_max.set(max);
+        if self.sub_scroll.get() > max {
+            self.sub_scroll.set(max);
+        }
+    }
+
+    /// What the running request cost so far, its sub-agents apart.
+    pub(crate) fn request_spent(&self) -> Spent {
+        self.request_spent
     }
 
     /// Where the scores shown come from.
@@ -2027,6 +2080,13 @@ impl App {
                     self.member = None;
                     self.working_model = Some(model);
                 }
+                if self.member.is_none() {
+                    self.request_spent.usage += usage;
+                    match cost {
+                        Some(c) => self.request_spent.cost += c,
+                        None => self.request_spent.subscription |= subscription,
+                    }
+                }
                 // The member's turns count for its handover too, live.
                 if self.member.is_some()
                     && let Some(Entry::Delegating { spent, .. }) = self
@@ -2101,6 +2161,7 @@ impl App {
                 });
                 // The sub-agent pane opens on it, the status line names it.
                 self.sub_view = Some(self.transcript.len() - 1);
+                self.sub_scroll.set(0);
                 self.working_model = Some(to.clone());
                 self.member = Some(to);
                 return;
@@ -2741,6 +2802,21 @@ mod tests {
         assert_eq!(sub.spent.cost, Usd(0.012));
         assert_eq!(sub.spent.to_string(), "$0.012 · 12.0k in · 300 out");
         assert_eq!(sub.work, [&Entry::Said("a.py prints 1.".into())]);
+        // Only the answering model's turns count for the request's own cost.
+        assert_eq!(app.request_spent().cost, Usd(0.0));
+
+        // Tab reaches the pane; Up scrolls it back, End follows the work again.
+        app.set_sub_max(10);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::SubAgent);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.sub_scroll(), 2);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.sub_scroll(), 0);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.sub_scroll(), 10);
         let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
         app.on_key(ctrl_t);
         assert!(app.sub_agent().is_none());

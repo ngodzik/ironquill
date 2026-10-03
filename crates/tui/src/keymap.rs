@@ -31,6 +31,8 @@ pub enum Focus {
     Chat,
     /// The running Docker containers, under the other panes.
     Docker,
+    /// What a model of the team did on a task handed to it.
+    SubAgent,
 }
 
 /// The first key of a two-key binding, waiting for the second.
@@ -303,7 +305,7 @@ fn normal(focus: Focus, key: KeyEvent, ctrl: bool) -> Option<Action> {
         // Keys in the open file go to its editor, which follows Vim: see
         // `editor.rs`. Only Tab, Ctrl-W and the leader reach this function.
         Focus::File => None,
-        Focus::Docker => match key.code {
+        Focus::Docker | Focus::SubAgent => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Some(Action::ClosePane),
             _ => None,
         },
