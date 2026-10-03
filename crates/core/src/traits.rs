@@ -1,6 +1,8 @@
 use std::future::Future;
 
-use crate::types::{ChatRequest, ChatResponse, DelegateEvent, DelegateReply, DelegateRequest};
+use crate::types::{
+    ChatRequest, ChatResponse, DelegateEvent, DelegateReply, DelegateRequest, ModelId,
+};
 
 /// Something that can answer a chat request.
 ///
@@ -15,6 +17,13 @@ pub trait ChatModel: Send + Sync {
         &self,
         request: &ChatRequest,
     ) -> impl Future<Output = Result<ChatResponse, Self::Error>> + Send;
+
+    /// The most `model` can read at once, in tokens, when the provider says.
+    /// Used to show how full the context is; `None` shows nothing.
+    fn context_window(&self, model: &ModelId) -> impl Future<Output = Option<u64>> + Send {
+        let _ = model;
+        std::future::ready(None)
+    }
 }
 
 /// An external agent a whole task can be handed to, such as Claude Code.

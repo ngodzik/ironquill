@@ -27,6 +27,10 @@ pub(crate) enum Command {
     Cost,
     /// `/claude <task>` hands one task to Claude Code.
     Claude(Option<String>),
+    /// `/context` opens the conversation's context in the editor.
+    Context,
+    /// `/claude-reset` ends Claude Code's session.
+    ClaudeReset,
     /// `:help`
     Help,
     /// `/keys` lists every shortcut, as Ctrl-S does.
@@ -64,6 +68,8 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "resume" => Ok(Command::Resume),
         "cost" => Ok(Command::Cost),
         "claude" | "cc" => Ok(Command::Claude(rest_opt)),
+        "context" | "ctx" => Ok(Command::Context),
+        "claude-reset" => Ok(Command::ClaudeReset),
         "help" | "h" => Ok(Command::Help),
         "keys" | "shortcuts" => Ok(Command::Keys),
         "" => Err("Empty command".into()),
@@ -71,10 +77,119 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
     }
 }
 
+/// Every command name, as Tab completes them. A test checks that each one
+/// parses, so that the list cannot drift from `parse`.
+pub(crate) const NAMES: &[&str] = &[
+    "check",
+    "claude",
+    "claude-reset",
+    "clear",
+    "context",
+    "cost",
+    "diff",
+    "escalate",
+    "help",
+    "keys",
+    "model",
+    "name",
+    "new",
+    "nocheck",
+    "q",
+    "quit",
+    "rename",
+    "resume",
+    "rounds",
+];
+
+/// Commands of the Vim editor, completed on top of ironquill's inside a file.
+pub(crate) const EDITOR_NAMES: &[&str] = &["e!", "q!", "w", "wq", "x"];
+
+/// Where Tab completion stands while it cycles through several candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Completion {
+    /// Every candidate for what was typed before the first Tab.
+    pub(crate) matches: Vec<String>,
+    next: usize,
+}
+
+/// Completes `line` among `candidates(line)`: the only candidate at once,
+/// else the part all candidates share, then each candidate in turn on the
+/// following Tabs. Returns the new line, or `None` when nothing matches.
+pub(crate) fn complete(
+    line: &str,
+    state: &mut Option<Completion>,
+    candidates: impl Fn(&str) -> Vec<String>,
+) -> Option<String> {
+    if let Some(current) = state.as_mut()
+        && current.matches.iter().any(|m| m == line)
+    {
+        let pick = current.matches[current.next % current.matches.len()].clone();
+        current.next += 1;
+        return Some(pick);
+    }
+    let mut matches = candidates(line);
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => {
+            *state = None;
+            None
+        }
+        1 => {
+            *state = None;
+            matches.pop()
+        }
+        _ => {
+            let shared = matches
+                .iter()
+                .skip(1)
+                .fold(matches[0].clone(), |common, m| {
+                    common
+                        .chars()
+                        .zip(m.chars())
+                        .take_while(|(a, b)| a == b)
+                        .map(|(a, _)| a)
+                        .collect()
+                });
+            let first = if shared.len() > line.len() {
+                shared
+            } else {
+                matches[0].clone()
+            };
+            let next = usize::from(first == matches[0]);
+            *state = Some(Completion { matches, next });
+            Some(first)
+        }
+    }
+}
+
+/// Candidates for a command line: command names while the first word is
+/// being typed, then `extra` for the rest, such as model names after `model `.
+pub(crate) fn candidates(line: &str, names: &[&str], models: &[String]) -> Vec<String> {
+    match line.split_once(' ') {
+        None => names
+            .iter()
+            .filter(|n| n.starts_with(line))
+            .map(|n| (*n).to_owned())
+            .collect(),
+        Some(("model" | "m" | "escalate", arg)) => {
+            let command = &line[..line.len() - arg.len()];
+            models
+                .iter()
+                .filter(|m| m.starts_with(arg))
+                .map(|m| format!("{command}{m}"))
+                .collect()
+        }
+        Some(_) => Vec::new(),
+    }
+}
+
 pub(crate) const HELP: &str = "\
 Type a question or a change and press Enter. Changes are checked before they are kept.
 /model               pick the model that answers (Ctrl-E); /model <id> sets it
 /claude <task>       hand one task to Claude Code, which works without this conversation
+/context             edit what the next request sends: delete, shorten, annotate; :w applies
+/claude-reset        end Claude Code's session: its next request starts from nothing
 /escalate <id> ...   stronger models used only when the checks keep failing (empty: none)
 /check <command>     add a check, run without a shell; /check alone lists them
 /nocheck             remove every check
@@ -122,6 +237,62 @@ mod tests {
             parse("name fix the parser"),
             Ok(Command::Name(Some("fix the parser".into())))
         );
+    }
+
+    #[test]
+    fn every_completed_name_parses() {
+        for name in NAMES {
+            assert!(
+                parse(name).is_ok(),
+                "{name} is completed but does not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_completes_one_match_then_the_shared_part_then_cycles() {
+        let names = |l: &str| candidates(l, NAMES, &[]);
+        let mut state = None;
+        assert_eq!(
+            complete("cont", &mut state, names).as_deref(),
+            Some("context")
+        );
+
+        // Several matches sharing nothing more than what was typed: each
+        // Tab gives the next one.
+        let mut state = None;
+        assert_eq!(complete("cl", &mut state, names).as_deref(), Some("claude"));
+        assert!(state.as_ref().is_some_and(|s| s.matches.len() == 3));
+        assert_eq!(
+            complete("claude", &mut state, names).as_deref(),
+            Some("claude-reset")
+        );
+        assert_eq!(
+            complete("claude-reset", &mut state, names).as_deref(),
+            Some("clear")
+        );
+
+        // Several matches sharing more than was typed: the shared part first.
+        let mut state = None;
+        assert_eq!(complete("na", &mut state, names).as_deref(), Some("name"));
+        let mut state = None;
+        assert_eq!(
+            complete("no", &mut state, names).as_deref(),
+            Some("nocheck")
+        );
+
+        assert_eq!(complete("zzz", &mut None, names), None);
+    }
+
+    #[test]
+    fn model_names_complete_after_model() {
+        let models = vec![
+            "claude-code/opus".to_owned(),
+            "deepseek/deepseek-chat".to_owned(),
+        ];
+        let mut state = None;
+        let got = complete("model dee", &mut state, |l| candidates(l, NAMES, &models));
+        assert_eq!(got.as_deref(), Some("model deepseek/deepseek-chat"));
     }
 
     #[test]

@@ -83,6 +83,10 @@ pub enum Action {
     ToggleTree,
     /// Go to the file tree, opening it if it is hidden.
     FocusTree,
+    /// Give the whole screen to the conversation, or give the other panes back.
+    Zoom,
+    /// Unfold or fold the selected reply.
+    Fold,
     /// Show or hide the Docker containers pane.
     ToggleDocker,
     /// Go to the message box, ready to type, from wherever the focus is.
@@ -117,6 +121,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-E", "pick the model"),
             ("Ctrl-A", "go to the file tree, opening it if hidden"),
             ("Ctrl-B", "show or hide the file tree"),
+            (
+                "Ctrl-Z",
+                "conversation full screen, and back to the panes as they were",
+            ),
             ("Ctrl-K", "show or hide the Docker containers"),
             ("Ctrl-S", "this list"),
             ("Ctrl-C", "stop the request; twice to quit"),
@@ -142,7 +150,11 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (",n ,d ,m ,i", "tree, Docker, model, type"),
             (",c", "close the file, back to the conversation"),
             ("Ctrl-W Left/Right", "pane on the left / right"),
-            ("Up Down Home End", "move in the pane"),
+            (
+                "Up Down Home End",
+                "move in the pane; in the conversation, select a reply",
+            ),
+            ("Enter Space", "unfold or fold the selected reply"),
         ],
     ),
     (
@@ -169,6 +181,14 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (":w :q :q! :wq :42", "write, close, discard, go to line"),
             (":s/a/b/g", "substitute; with %, '<,'> or 2,5"),
             ("/ n N", "search, next, previous"),
+            (
+                "zo zc za zR zM",
+                "open, close, toggle a block; open all, close all (in /context)",
+            ),
+            (
+                "Enter Space",
+                "open or close the block under the cursor (in /context)",
+            ),
             ("gg G w b 0 ^ $", "move"),
             (
                 "green / yellow / red",
@@ -204,6 +224,8 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         KeyCode::Char('s') if ctrl => return Some(Action::ShowKeys),
         // A, top left on AZERTY, next to Q: the other most used jump.
         KeyCode::Char('a') if ctrl => return Some(Action::FocusTree),
+        // Z for zoom, top left on AZERTY.
+        KeyCode::Char('z') if ctrl => return Some(Action::Zoom),
         KeyCode::Char('k') if ctrl => return Some(Action::ToggleDocker),
         // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
         KeyCode::Char('e') if ctrl => return Some(Action::PickModel),
@@ -277,8 +299,10 @@ fn normal(focus: Focus, key: KeyEvent, ctrl: bool) -> Option<Action> {
             KeyCode::Char('q') | KeyCode::Esc => Some(Action::ClosePane),
             _ => None,
         },
+        // Up and Down select replies here, Enter and Space fold them; Page
+        // keys and the wheel scroll.
         Focus::Chat => match key.code {
-            KeyCode::Enter => Some(Action::Enter(Mode::Insert)),
+            KeyCode::Enter | KeyCode::Char(' ') => Some(Action::Fold),
             _ => None,
         },
     }

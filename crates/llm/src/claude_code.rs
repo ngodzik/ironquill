@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use ironquill_core::{
-    Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount, Usage, Usd,
+    ContextUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount, Usage, Usd,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -154,6 +154,8 @@ struct StreamParser {
     streamed: bool,
     reply: Option<DelegateReply>,
     error: Option<String>,
+    /// Tokens sent on the latest call to the model: how full the context is.
+    last_input: Option<u64>,
 }
 
 impl StreamParser {
@@ -209,7 +211,17 @@ impl StreamParser {
 
     fn stream_event(&mut self, event: &Value, on_event: &mut (dyn FnMut(DelegateEvent) + Send)) {
         match event["type"].as_str() {
-            Some("message_start") => self.streamed = false,
+            Some("message_start") => {
+                self.streamed = false;
+                let usage = &event["message"]["usage"];
+                let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+                let input = count("input_tokens")
+                    + count("cache_read_input_tokens")
+                    + count("cache_creation_input_tokens");
+                if input > 0 {
+                    self.last_input = Some(input);
+                }
+            }
             Some("content_block_start") if event["content_block"]["type"] == "text" => {
                 self.streamed = true;
                 on_event(DelegateEvent::TextStart);
@@ -241,6 +253,18 @@ impl StreamParser {
                 .as_f64()
                 .filter(|c| c.is_finite() && *c >= 0.0)
                 .map(Usd),
+            context: None,
+        };
+        // The window of the model used, from the per-model breakdown.
+        let window = event["modelUsage"]
+            .as_object()
+            .and_then(|models| models.values().find_map(|m| m["contextWindow"].as_u64()));
+        let reply = DelegateReply {
+            context: window.map(|window| ContextUse {
+                used: TokenCount(self.last_input.unwrap_or(reply.usage.input.0)),
+                window: TokenCount(window),
+            }),
+            ..reply
         };
         if event["is_error"].as_bool() == Some(true) {
             let reason = if reply.text.is_empty() {
@@ -304,12 +328,12 @@ mod tests {
         r#"{"type":"stream_event","event":{"type":"message_start"}}"#,
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/p/hello.py"}}]}}"#,
         r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"1\tprint(1)\n"}]}}"#,
-        r#"{"type":"stream_event","event":{"type":"message_start"}}"#,
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":18000}}}}"#,
         r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text"}}}"#,
         r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"It prints "}}}"#,
         r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"1."}}}"#,
         r#"{"type":"assistant","message":{"content":[{"type":"text","text":"It prints 1."}]}}"#,
-        r#"{"type":"result","subtype":"success","is_error":false,"result":"It prints 1.","session_id":"s1","total_cost_usd":0.09,"usage":{"input_tokens":4,"output_tokens":171,"cache_read_input_tokens":26705,"cache_creation_input_tokens":10153}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"It prints 1.","session_id":"s1","total_cost_usd":0.09,"usage":{"input_tokens":4,"output_tokens":171,"cache_read_input_tokens":26705,"cache_creation_input_tokens":10153},"modelUsage":{"claude-opus-5-5":{"contextWindow":1000000}}}"#,
     ];
 
     #[test]
@@ -332,6 +356,14 @@ mod tests {
         assert_eq!(reply.session, "s1");
         assert_eq!(reply.usage.input, TokenCount(4 + 26_705 + 10_153));
         assert_eq!(reply.estimate, Some(Usd(0.09)));
+        // How full the context was on the last call, not the run's total.
+        assert_eq!(
+            reply.context,
+            Some(ContextUse {
+                used: TokenCount(18_002),
+                window: TokenCount(1_000_000),
+            })
+        );
     }
 
     #[test]

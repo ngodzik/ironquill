@@ -1,11 +1,11 @@
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ironquill_agent::{AgentConfig, Event, Outcome, Session, Verdict};
-use ironquill_core::{ModelId, Usage, Usd};
+use ironquill_core::{ContextUse, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -83,6 +83,12 @@ pub(crate) enum Effect {
     Resume(String),
     /// Ask docker for its running containers now.
     RefreshDocker,
+    /// Open the conversation's context in the editor.
+    OpenContext,
+    /// Replace the conversation's context with this edited text.
+    ApplyContext(String),
+    /// End the delegate's session.
+    ForgetDelegate,
 }
 
 /// What the agent task sends back to the interface.
@@ -126,6 +132,9 @@ pub(crate) enum Entry {
         /// Ran on a subscription (Claude Code): no cost is owed for it.
         #[serde(default)]
         subscription: bool,
+        /// How full the context was on the request's last call.
+        #[serde(default)]
+        context: Option<ContextUse>,
     },
 }
 
@@ -185,6 +194,12 @@ impl LineEditor {
         std::mem::take(&mut self.text)
     }
 
+    /// Replaces the text, the cursor at its end.
+    fn set(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.text = text;
+    }
+
     fn apply(&mut self, action: &Action) {
         let len = self.text.chars().count();
         match action {
@@ -215,7 +230,7 @@ pub(crate) struct App {
     command: LineEditor,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
-    scroll_back: usize,
+    scroll_back: Cell<usize>,
     /// The largest useful `scroll_back`, written by the view, which is the
     /// only part that knows how many lines the transcript wraps to.
     max_scroll: Cell<usize>,
@@ -242,10 +257,31 @@ pub(crate) struct App {
     created: u64,
     requests: usize,
     picker: Option<Picker>,
+    /// Replies unfolded by the person, by transcript index. Long replies are
+    /// folded otherwise.
+    expanded: BTreeSet<usize>,
+    /// The reply selected in normal mode, by transcript index.
+    selected_reply: Option<usize>,
+    /// Asks the view to scroll the selected reply into sight.
+    reveal: Cell<bool>,
+    /// Where each entry was drawn, as (entry, first line, last line) in the
+    /// whole transcript, and the transcript's first visible line and area,
+    /// written by the view so that a click finds its entry.
+    entry_lines: RefCell<Vec<(usize, usize, usize)>>,
+    transcript_view: Cell<(usize, Rect)>,
+    /// The conversation has the whole screen; the other panes keep their
+    /// state, hidden, until zooming back out.
+    zoomed: bool,
+    /// The pane that had the focus before zooming in, given back after.
+    zoom_focus: Option<Focus>,
+    /// Tab completion of a command, while it cycles through candidates.
+    completion: Option<command::Completion>,
     /// The list of shortcuts, open at this scroll offset.
     keys_open: Option<usize>,
     /// The model picker, open on the row selected.
     model_picker: Option<usize>,
+    /// How full the context was on the latest call, for the status line.
+    context: Option<ContextUse>,
     /// The model working on the current request, for the activity line.
     working_model: Option<ModelId>,
     docker: Option<DockerPane>,
@@ -291,7 +327,7 @@ impl App {
             input: LineEditor::default(),
             command: LineEditor::default(),
             transcript,
-            scroll_back: 0,
+            scroll_back: Cell::new(0),
             max_scroll: Cell::new(0),
             tree: None,
             file: None,
@@ -311,9 +347,18 @@ impl App {
             created: sessions::now(),
             requests: 0,
             picker: None,
+            expanded: BTreeSet::new(),
+            selected_reply: None,
+            reveal: Cell::new(false),
+            entry_lines: RefCell::new(Vec::new()),
+            transcript_view: Cell::new((0, Rect::default())),
+            zoomed: false,
+            zoom_focus: None,
+            completion: None,
             keys_open: None,
             model_picker: None,
             working_model: None,
+            context: None,
             docker: None,
         }
     }
@@ -337,7 +382,13 @@ impl App {
     }
 
     pub(crate) fn scroll_back(&self) -> usize {
-        self.scroll_back
+        self.scroll_back.get()
+    }
+
+    /// Scrolls the conversation so that a given line range is in view. Called
+    /// by the view, the only part that knows where an entry's lines are.
+    pub(crate) fn set_scroll_back(&self, back: usize) {
+        self.scroll_back.set(back);
     }
 
     pub(crate) fn set_max_scroll(&self, max: usize) {
@@ -395,6 +446,11 @@ impl App {
         (self.usage, self.cost, self.cost_complete)
     }
 
+    /// How full the context was on the latest call, when known.
+    pub(crate) fn context(&self) -> Option<ContextUse> {
+        self.context
+    }
+
     pub(crate) fn is_running(&self) -> bool {
         self.running_since.is_some()
     }
@@ -446,7 +502,7 @@ impl App {
             let global = ctrl
                 && matches!(
                     key.code,
-                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a')
+                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a' | 'z')
                 );
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
@@ -454,6 +510,14 @@ impl App {
                     || (ctrl && key.code == KeyCode::Char('w')));
             if !global && !pane {
                 match editor.handle_key(key) {
+                    EditorOutcome::Command(line) => return self.run_command(&line),
+                    EditorOutcome::Context { text, close } => {
+                        if close {
+                            self.file = None;
+                            self.focus_on(Focus::Chat);
+                        }
+                        return Some(Effect::ApplyContext(text));
+                    }
                     EditorOutcome::Close => {
                         let next = if self.tree.is_some() {
                             Focus::Tree
@@ -477,6 +541,13 @@ impl App {
                 return None;
             }
         }
+        if key.code == KeyCode::Tab && self.complete_command() {
+            return None;
+        }
+        // Any other key ends a completion in progress.
+        if key.code != KeyCode::Tab {
+            self.completion = None;
+        }
         let pending = self.pending.take();
         let action = keymap::action(self.mode, self.focus, pending, key)?;
         self.on_action(action)
@@ -487,6 +558,12 @@ impl App {
             Action::Enter(mode) => {
                 if mode == Mode::Command {
                     self.command.take();
+                }
+                if mode == Mode::Normal
+                    && self.focus == Focus::Chat
+                    && self.selected_reply.is_none()
+                {
+                    self.selected_reply = self.replies().last().copied();
                 }
                 // Typing always goes to the conversation.
                 if mode == Mode::Insert {
@@ -515,7 +592,18 @@ impl App {
                     Mode::Normal => None,
                 };
             }
+            Action::Move(lines) if self.focus == Focus::Chat && self.mode == Mode::Normal => {
+                self.select_reply(lines);
+            }
             Action::Move(lines) => self.move_focused(lines),
+            Action::Fold => match self.selected_reply {
+                Some(entry) => self.toggle_fold(entry),
+                // Nothing to fold: Enter keeps its old meaning.
+                None => {
+                    self.focus = Focus::Chat;
+                    self.mode = Mode::Insert;
+                }
+            },
             Action::HalfPage(down) => {
                 let lines = HALF_PAGE as i32;
                 self.move_focused(if down { lines } else { -lines });
@@ -531,7 +619,7 @@ impl App {
                         file.scroll_by(i32::MIN / 2);
                     }
                 }
-                Focus::Chat => self.scroll_back = self.max_scroll.get(),
+                Focus::Chat => self.scroll_back.set(self.max_scroll.get()),
                 Focus::Docker => self.move_focused(i32::MIN / 2),
             },
             Action::Bottom => match self.focus {
@@ -545,7 +633,7 @@ impl App {
                         file.scroll_by(i32::MAX / 2);
                     }
                 }
-                Focus::Chat => self.scroll_back = 0,
+                Focus::Chat => self.scroll_back.set(0),
                 Focus::Docker => self.move_focused(i32::MAX / 2),
             },
             Action::Open => self.open_selected(),
@@ -555,6 +643,7 @@ impl App {
                 }
             }
             Action::ToggleTree => {
+                self.unzoom();
                 if self.tree.take().is_some() {
                     if self.focus == Focus::Tree {
                         self.focus_on(if self.file.is_some() {
@@ -570,7 +659,17 @@ impl App {
             }
             Action::ShowChat => self.close_file(Focus::Chat),
             Action::PickModel => self.open_model_picker(),
+            Action::Zoom => {
+                self.zoomed = !self.zoomed;
+                if self.zoomed {
+                    self.zoom_focus = Some(self.focus);
+                    self.focus = Focus::Chat;
+                } else if let Some(focus) = self.zoom_focus.take() {
+                    self.focus_on(focus);
+                }
+            }
             Action::FocusTree => {
+                self.unzoom();
                 match &mut self.tree {
                     Some(tree) => tree.refresh(),
                     None => self.tree = Some(FileTree::new(self.root.clone())),
@@ -588,6 +687,7 @@ impl App {
                 self.mode = Mode::Insert;
             }
             Action::ToggleDocker => {
+                self.unzoom();
                 if self.docker.take().is_some() {
                     if self.focus == Focus::Docker {
                         self.focus_on(Focus::Chat);
@@ -654,8 +754,85 @@ impl App {
         None
     }
 
+    /// Transcript indices of the model's replies, the entries that fold.
+    fn replies(&self) -> Vec<usize> {
+        self.transcript
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, Entry::Said(_)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Moves the selection `step` replies down (up when negative), starting
+    /// from the last reply when none is selected.
+    fn select_reply(&mut self, step: i32) {
+        let replies = self.replies();
+        let Some(last) = replies.len().checked_sub(1) else {
+            return;
+        };
+        let at = match self
+            .selected_reply
+            .and_then(|e| replies.iter().position(|r| *r == e))
+        {
+            Some(at) => (at as i64 + i64::from(step)).clamp(0, last as i64) as usize,
+            None => last,
+        };
+        self.selected_reply = Some(replies[at]);
+        self.reveal.set(true);
+    }
+
+    fn toggle_fold(&mut self, entry: usize) {
+        if !self.expanded.remove(&entry) {
+            self.expanded.insert(entry);
+        }
+        self.selected_reply = Some(entry);
+        self.reveal.set(true);
+    }
+
+    pub(crate) fn is_expanded(&self, entry: usize) -> bool {
+        self.expanded.contains(&entry)
+    }
+
+    /// The selected reply, shown as such only in normal mode in the conversation.
+    pub(crate) fn selected_reply(&self) -> Option<usize> {
+        (self.focus == Focus::Chat && self.mode == Mode::Normal)
+            .then_some(self.selected_reply)
+            .flatten()
+    }
+
+    /// Whether the view should scroll the selected reply into sight; reading
+    /// it clears it.
+    pub(crate) fn take_reveal(&self) -> bool {
+        self.reveal.replace(false)
+    }
+
+    pub(crate) fn set_entry_lines(
+        &self,
+        lines: Vec<(usize, usize, usize)>,
+        top: usize,
+        area: Rect,
+    ) {
+        *self.entry_lines.borrow_mut() = lines;
+        self.transcript_view.set((top, area));
+    }
+
+    pub(crate) fn is_zoomed(&self) -> bool {
+        self.zoomed
+    }
+
+    /// Leaves full screen without moving the focus: for actions that need
+    /// another pane on screen.
+    fn unzoom(&mut self) {
+        self.zoomed = false;
+        self.zoom_focus = None;
+    }
+
     /// The panes on screen, left to right.
     fn visible_panes(&self) -> Vec<Focus> {
+        if self.zoomed {
+            return vec![Focus::Chat];
+        }
         let mut panes = Vec::new();
         if self.tree.is_some() {
             panes.push(Focus::Tree);
@@ -767,6 +944,21 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if hit == Focus::Chat {
                     self.focus = Focus::Chat;
+                    let (top, area) = self.transcript_view.get();
+                    if area.contains(at) {
+                        let line = top + usize::from(mouse.row - area.y);
+                        let entry = self
+                            .entry_lines
+                            .borrow()
+                            .iter()
+                            .find(|(_, first, last)| (*first..=*last).contains(&line))
+                            .map(|(e, _, _)| *e);
+                        if let Some(entry) = entry
+                            && matches!(self.transcript.get(entry), Some(Entry::Said(_)))
+                        {
+                            self.toggle_fold(entry);
+                        }
+                    }
                     return;
                 }
                 self.focus_on(hit);
@@ -795,9 +987,9 @@ impl App {
     }
 
     fn scroll(&mut self, down: i32) {
-        let current = self.scroll_back.min(self.max_scroll.get()) as i64;
+        let current = self.scroll_back.get().min(self.max_scroll.get()) as i64;
         let next = (current - i64::from(down)).clamp(0, self.max_scroll.get() as i64);
-        self.scroll_back = next as usize;
+        self.scroll_back.set(next as usize);
     }
 
     fn submit(&mut self, text: String) -> Option<Effect> {
@@ -831,7 +1023,7 @@ impl App {
                 self.transcript.push(Entry::User(text.clone()));
                 self.running_since = Some(Instant::now());
                 self.working_model = tiers.first().cloned();
-                self.scroll_back = 0;
+                self.scroll_back.set(0);
                 Some(Effect::Send { text, config })
             }
             Err(e) => {
@@ -937,7 +1129,9 @@ impl App {
                     return None;
                 }
                 self.transcript = vec![Entry::Welcome];
-                self.scroll_back = 0;
+                self.scroll_back.set(0);
+                self.expanded.clear();
+                self.selected_reply = None;
                 // A new conversation is a new file; the old one stays resumable.
                 self.session_id = sessions::new_id();
                 self.session_name = None;
@@ -981,6 +1175,20 @@ impl App {
                 self.info(text);
             }
             Command::Help => self.info(command::HELP),
+            Command::Context => {
+                if self.is_running() {
+                    self.error("Still working on the last message: stop it with Ctrl-C first");
+                    return None;
+                }
+                return Some(Effect::OpenContext);
+            }
+            Command::ClaudeReset => {
+                if self.is_running() {
+                    self.error("Still working on the last message: stop it with Ctrl-C first");
+                    return None;
+                }
+                return Some(Effect::ForgetDelegate);
+            }
             Command::Keys => self.keys_open = Some(0),
         }
         None
@@ -1009,6 +1217,7 @@ impl App {
                     complete: outcome.cost_complete,
                     seconds,
                     subscription: outcome.subscription,
+                    context: outcome.context,
                 });
                 true
             }
@@ -1071,11 +1280,13 @@ impl App {
         self.cost = saved.cost;
         self.cost_complete = saved.cost_complete;
         self.transcript = saved.transcript;
+        self.expanded.clear();
+        self.selected_reply = None;
         self.transcript.push(Entry::Info(format!(
             "Resumed \"{}\": the conversation continues where it stopped",
             saved.name
         )));
-        self.scroll_back = 0;
+        self.scroll_back.set(0);
         self.picker = None;
     }
 
@@ -1202,6 +1413,70 @@ impl App {
             .unwrap_or_else(ModelId::claude_code)
     }
 
+    /// Opens the conversation's context in the editor, in place of a file.
+    pub(crate) fn open_context(&mut self, text: &str) {
+        if let Some(file) = self.file.as_mut().filter(|f| f.is_modified()) {
+            if file.kind() == crate::editor::Kind::Context {
+                file.say_pending_context();
+            } else {
+                file.refuse_close();
+            }
+            self.unzoom();
+            self.focus_on(Focus::File);
+            return;
+        }
+        let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
+        self.unzoom();
+        self.file = Some(Editor::context(text, highlighter));
+        self.focus_on(Focus::File);
+    }
+
+    /// Reports how applying an edited context went.
+    pub(crate) fn on_context_applied(&mut self, result: Result<(u64, u64), String>) {
+        match result {
+            Ok((before, after)) => self.info(format!(
+                "Context applied: about {} tokens, from {}. The next request is sent with it",
+                TokenCount(after),
+                TokenCount(before)
+            )),
+            Err(e) => {
+                if let Some(file) = &mut self.file
+                    && file.kind() == crate::editor::Kind::Context
+                {
+                    file.mark_modified();
+                }
+                self.error(format!("Context not applied: {e}"));
+            }
+        }
+    }
+
+    /// Tab while a command is being typed: after `:`, or after `/` in the
+    /// message box. Returns whether Tab was used for that.
+    fn complete_command(&mut self) -> bool {
+        let models: Vec<String> = self.models().iter().map(ToString::to_string).collect();
+        let (editor, slash) = match self.mode {
+            Mode::Command => (&mut self.command, false),
+            Mode::Insert if self.input.text().starts_with('/') => (&mut self.input, true),
+            _ => return false,
+        };
+        let typed = if slash {
+            editor.text()[1..].to_owned()
+        } else {
+            editor.text().to_owned()
+        };
+        if let Some(line) = command::complete(&typed, &mut self.completion, |l| {
+            command::candidates(l, command::NAMES, &models)
+        }) {
+            editor.set(if slash { format!("/{line}") } else { line });
+        }
+        true
+    }
+
+    /// The candidates of a completion in progress, to show them.
+    pub(crate) fn completions(&self) -> Option<&[String]> {
+        self.completion.as_ref().map(|c| c.matches.as_slice())
+    }
+
     pub(crate) fn docker(&self) -> Option<&DockerPane> {
         self.docker.as_ref()
     }
@@ -1228,6 +1503,10 @@ impl App {
 
     pub(crate) fn session_label(&self) -> String {
         self.name()
+    }
+
+    pub(crate) fn report_info(&mut self, text: &str) {
+        self.info(text);
     }
 
     pub(crate) fn report_error(&mut self, text: String) {
@@ -1262,8 +1541,12 @@ impl App {
                 usage,
                 cost,
                 subscription,
+                context,
                 ..
             } => {
+                if context.is_some() {
+                    self.context = context;
+                }
                 self.usage += usage;
                 match cost {
                     Some(c) => self.cost += c,
@@ -1352,7 +1635,6 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use ironquill_core::TokenCount;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
     use super::*;
@@ -1444,6 +1726,7 @@ mod tests {
                 },
                 cost: Some(Usd(0.002)),
                 subscription: false,
+                context: None,
             }));
         }
         let (usage, cost, complete) = app.totals();
@@ -1591,6 +1874,7 @@ mod tests {
             },
             cost: Some(Usd(0.0003)),
             subscription: false,
+            context: None,
         }));
         let finished = app.on_agent(AgentMessage::Done(Ok(Outcome {
             verdict: Verdict::Answered,
@@ -1601,6 +1885,7 @@ mod tests {
             cost: Usd(0.0003),
             cost_complete: true,
             subscription: false,
+            context: None,
             changed: vec![],
         })));
         assert!(finished);
@@ -1784,6 +2069,7 @@ mod tests {
             },
             cost: None,
             subscription: true,
+            context: None,
         }));
         let (usage, cost, complete) = app.totals();
         assert_eq!(usage.input, TokenCount(30_000));
@@ -1842,12 +2128,145 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_z_zooms_the_conversation_and_gives_the_panes_back() {
+        let (_dir, mut app) = project();
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('a'));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::File);
+
+        app.on_key(ctrl('z'));
+        assert!(app.is_zoomed());
+        assert_eq!(app.focus(), Focus::Chat);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Chat);
+
+        app.on_key(ctrl('z'));
+        assert!(!app.is_zoomed());
+        assert_eq!(app.focus(), Focus::File);
+        assert!(app.tree().is_some() && app.file().is_some());
+    }
+
+    #[test]
+    fn arrows_select_replies_and_enter_folds_them_in_normal_mode() {
+        let mut app = ready();
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: ModelId::new("cheap").unwrap(),
+            text: "first".into(),
+        }));
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: ModelId::new("cheap").unwrap(),
+            text: "second".into(),
+        }));
+        let replies = app.replies();
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.selected_reply(), Some(replies[1]));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.selected_reply(), Some(replies[0]));
+        assert!(!app.is_expanded(replies[0]));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_expanded(replies[0]));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.is_expanded(replies[0]));
+        // Not shown as selected while typing.
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.selected_reply(), None);
+    }
+
+    #[test]
+    fn slash_context_opens_the_editor_and_w_applies_it() {
+        let mut app = ready();
+        type_text(&mut app, "/context");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::OpenContext)
+        ));
+
+        app.open_context("=== user\nhello\n=== assistant\nhi");
+        assert_eq!(app.focus(), Focus::File);
+        for c in "Gdd:w".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let effect = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(effect, Some(Effect::ApplyContext(ref text)) if text == "=== user\nhello")
+        );
+
+        app.on_context_applied(Err("Unknown block === robot".into()));
+        assert!(app.file().unwrap().is_modified());
+    }
+
+    #[test]
+    fn colon_commands_work_from_inside_the_editor_and_the_open_context() {
+        let mut app = ready();
+        app.open_context("=== user\nhello");
+        assert_eq!(app.focus(), Focus::File);
+        for c in ":context".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::OpenContext)
+        ));
+
+        for c in ":model other".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_model().unwrap().as_str(), "other");
+    }
+
+    #[test]
+    fn reopening_the_context_keeps_edits_not_applied() {
+        let mut app = ready();
+        app.open_context("=== user\nhello\n=== user\nbye");
+        for c in "Gdd".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        app.open_context("=== user\nfresh");
+        assert!(app.file().unwrap().is_modified());
+        assert!(app.file().unwrap().lines().iter().all(|l| l != "fresh"));
+    }
+
+    #[test]
+    fn tab_completes_colon_and_slash_commands() {
+        let mut app = ready();
+        type_text(&mut app, "/cont");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input().text(), "/context");
+        assert_eq!(app.focus(), Focus::Chat);
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char(':'));
+        type_text(&mut app, "cl");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.command_line().text(), "claude");
+        assert_eq!(app.completions().map(<[String]>::len), Some(3));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.command_line().text(), "claude-reset");
+        type_text(&mut app, "x");
+        assert!(app.completions().is_none());
+    }
+
+    #[test]
+    fn tab_still_switches_panes_while_typing_a_message() {
+        let (_dir, mut app) = project();
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Char('i'));
+        type_text(&mut app, "hello");
+        press(&mut app, KeyCode::Tab);
+        assert_ne!(app.focus(), Focus::Chat);
+    }
+
+    #[test]
     fn scrolling_stays_within_the_transcript() {
         let mut app = ready();
         app.set_max_scroll(5);
         press(&mut app, KeyCode::Esc);
         for _ in 0..20 {
-            press(&mut app, KeyCode::Up);
+            press(&mut app, KeyCode::PageUp);
         }
         assert_eq!(app.scroll_back(), 5);
         press(&mut app, KeyCode::End);

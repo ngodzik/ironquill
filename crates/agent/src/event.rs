@@ -1,4 +1,4 @@
-use ironquill_core::{ModelId, Usage, Usd};
+use ironquill_core::{ContextUse, ModelId, Usage, Usd};
 use ironquill_tools::ToolSummary;
 
 /// Something that happened during a session, for whoever is watching.
@@ -18,6 +18,8 @@ pub enum Event {
         /// Whether the turn ran on a subscription (Claude Code), so that no
         /// cost is owed for it and none should be expected.
         subscription: bool,
+        /// How full the model's context was, when its window is known.
+        context: Option<ContextUse>,
     },
     /// Text as it is being written, by an agent that reports it in pieces.
     Saying {

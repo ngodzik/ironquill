@@ -1,3 +1,4 @@
+use ironquill_core::TokenCount;
 use ironquill_tools::{Container, DiffLine, LineMark, ToolSummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -6,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
 use crate::app::{App, Entry, LineEditor, Panes};
-use crate::editor::{Editor, EditorMode};
+use crate::editor::{Editor, EditorMode, Kind};
 use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
 use crate::sessions;
@@ -211,6 +212,15 @@ const SIDE_CHAT_MIN: u16 = 36;
 /// Tree on the left if open; the open file or the conversation in the middle;
 /// the conversation on the right while a file is open, if there is room.
 fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
+    if app.is_zoomed() {
+        // Only the conversation; the other panes keep their state, unseen.
+        app.set_panes(Panes {
+            chat: area,
+            ..Panes::default()
+        });
+        render_chat(frame, app, area, false);
+        return;
+    }
     // The Docker pane runs along the bottom, under everything else, sized to
     // its containers but never more than a third of the screen.
     let (area, docker) = match app.docker() {
@@ -509,16 +519,26 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
     };
     let focused = app.focus() == Focus::File;
     let changed_by_agent = app.is_changed(file.path(), false);
-    let title = format!(
-        " {}{}{} ",
-        file.path().display(),
-        if file.is_modified() { " [+]" } else { "" },
-        if changed_by_agent {
-            " ● changed by the agent"
-        } else {
-            ""
-        }
-    );
+    let title = if file.kind() == Kind::Context {
+        // What an edit saves, as it is made.
+        let chars: usize = file.lines().iter().map(|l| l.len() + 1).sum();
+        format!(
+            " context · about {} tokens{} ",
+            TokenCount((chars / 4) as u64),
+            if file.is_modified() { " [+]" } else { "" }
+        )
+    } else {
+        format!(
+            " {}{}{} ",
+            file.path().display(),
+            if file.is_modified() { " [+]" } else { "" },
+            if changed_by_agent {
+                " ● changed by the agent"
+            } else {
+                ""
+            }
+        )
+    };
     let block = pane_block(title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -534,10 +554,15 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
     // that are gone from that place.
     let height = usize::from(inner.height);
     let changes = file.changes();
+    let hidden = file.hidden();
     let rows_from = |start: usize| {
         let mut rows: Vec<Option<usize>> = Vec::new();
         let mut removed: Vec<(usize, &String)> = Vec::new();
         for i in start..=file.lines().len() {
+            // Lines inside a closed fold are not drawn.
+            if hidden.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             if let Some(gone) = changes.and_then(|c| c.removed.get(&i)) {
                 for text in gone {
                     removed.push((rows.len(), text));
@@ -590,6 +615,23 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
                     Span::raw(" "),
                 ];
                 let mut runs = line_runs(file, i, text);
+                if file.kind() == Kind::Context && text.starts_with("=== ") {
+                    runs = vec![(fg(ACCENT).add_modifier(Modifier::BOLD), text.clone())];
+                    if let Some(count) = file.folded(i) {
+                        // A closed block reads as one line: its size, then
+                        // the start of what it holds.
+                        let preview = file.lines()[i + 1..=i + count]
+                            .iter()
+                            .map(|l| l.trim())
+                            .find(|l| !l.is_empty())
+                            .unwrap_or("");
+                        let preview: String = preview.chars().take(80).collect();
+                        runs.push((
+                            fg(DIM),
+                            format!("  ▸ {} · {preview}", plural(count, "line", "lines")),
+                        ));
+                    }
+                }
                 if let Some(bg) = background {
                     runs = runs
                         .into_iter()
@@ -828,6 +870,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
             complete,
             seconds,
             subscription,
+            context,
         } => {
             let cost = match (*subscription, cost.0 > 0.0, *complete) {
                 (true, false, _) => "subscription".to_owned(),
@@ -835,10 +878,13 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 (false, _, true) => cost.to_string(),
                 (false, _, false) => format!("{cost} reported, part of the cost unknown"),
             };
-            let text = format!(
+            let mut text = format!(
                 "{cost} · {} in · {} out · {seconds}s",
                 usage.input, usage.output
             );
+            if let Some(context) = context {
+                text.push_str(&format!(" · {context}"));
+            }
             out.push(Line::styled(format!("  {text}"), fg(DIM)));
         }
     }
@@ -998,11 +1044,44 @@ fn welcome(out: &mut Vec<Line<'static>>, app: &App, width: usize) {
     out.push(Line::styled(format!("╰{}╯", "─".repeat(inner)), border));
 }
 
+/// A reply longer than this many lines is folded unless unfolded.
+const FOLD_AT: usize = 12;
+/// How many lines of a folded reply stay visible.
+const FOLD_SHOW: usize = 6;
+/// The background of the reply selected in normal mode: a shade lighter than
+/// the terminal's, enough to see it, not enough to hurt reading.
+const SELECTED_BG: Color = Color::Rgb(34, 36, 44);
+
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let width = usize::from(area.width).saturating_sub(1).max(1);
+    let selected = app.selected_reply();
     let mut lines: Vec<Line> = Vec::new();
+    let mut ranges = Vec::new();
     for (i, entry) in app.transcript().iter().enumerate() {
-        lines.extend(entry_lines(entry, app, width));
+        let first = lines.len();
+        let mut block = entry_lines(entry, app, width);
+        if matches!(entry, Entry::Said(_)) && block.len() > FOLD_AT && !app.is_expanded(i) {
+            let hidden = block.len() - FOLD_SHOW;
+            block.truncate(FOLD_SHOW);
+            block.push(Line::styled(
+                format!("  ▸ {}", plural(hidden, "more line", "more lines")),
+                fg(DIM),
+            ));
+        }
+        if selected == Some(i) {
+            block = block
+                .into_iter()
+                .map(|line| {
+                    // Pad to the full width so that the shade reads as a block.
+                    let pad = width.saturating_sub(line.width());
+                    let mut spans = line.spans;
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    Line::from(spans).style(Style::new().bg(SELECTED_BG))
+                })
+                .collect();
+        }
+        lines.extend(block);
+        ranges.push((i, first, lines.len().saturating_sub(1).max(first)));
         // A blank line after each block, except where a result line follows
         // the action it belongs to.
         let next_is_result = matches!(
@@ -1017,14 +1096,36 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let height = usize::from(area.height);
     let max_scroll = lines.len().saturating_sub(height);
     app.set_max_scroll(max_scroll);
+
+    // Bring the selected reply into sight when it was just selected or folded.
+    if app.take_reveal()
+        && let Some((_, first, last)) = ranges.iter().find(|(e, _, _)| Some(*e) == selected)
+    {
+        let top = max_scroll - app.scroll_back().min(max_scroll);
+        let new_top = if *first < top {
+            *first
+        } else if *last >= top + height {
+            (last + 1).saturating_sub(height).min(*first)
+        } else {
+            top
+        };
+        app.set_scroll_back(max_scroll - new_top.min(max_scroll));
+    }
+
     let back = app.scroll_back().min(max_scroll);
     let top = max_scroll - back;
+    app.set_entry_lines(ranges, top, area);
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
 
 fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
     let Some(elapsed) = app.elapsed() else {
+        // While a command is being completed, its candidates take this line.
+        if let Some(matches) = app.completions() {
+            let line = Line::styled(format!("  {}", matches.join("   ")), fg(Color::Gray));
+            frame.render_widget(Paragraph::new(line), area);
+        }
         return;
     };
     let glyph = SPINNER[app.spinner() % SPINNER.len()];
@@ -1117,11 +1218,14 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(current, fg(ACCENT)),
         Span::styled(
             format!(
-                "{rest} · {} in · {} out · {}{}  ",
+                "{rest} · {} in · {} out · {}{}{}  ",
                 usage.input,
                 usage.output,
                 cost,
-                if complete { "" } else { "+?" }
+                if complete { "" } else { "+?" },
+                app.context()
+                    .map(|c| format!(" · ctx {}%", c.percent()))
+                    .unwrap_or_default()
             ),
             fg(DIM),
         ),

@@ -1,5 +1,6 @@
 use ironquill_core::{
-    ChatModel, ChatRequest, Delegate, DelegateEvent, DelegateRequest, Message, ModelId, Usage, Usd,
+    ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateRequest, Message, ModelId,
+    TokenCount, Usage, Usd,
 };
 use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox};
 
@@ -71,6 +72,8 @@ pub struct Outcome {
     pub cost_complete: bool,
     /// Whether part of the work ran on a subscription, which `cost` leaves out.
     pub subscription: bool,
+    /// How full the context was on the request's last call, when known.
+    pub context: Option<ContextUse>,
     /// Files written or edited, relative to the workspace root.
     pub changed: Vec<String>,
 }
@@ -80,6 +83,7 @@ struct Ledger {
     cost: Usd,
     cost_complete: bool,
     subscription: bool,
+    context: Option<ContextUse>,
 }
 
 impl Ledger {
@@ -89,6 +93,7 @@ impl Ledger {
             cost: Usd::default(),
             cost_complete: true,
             subscription: false,
+            context: None,
         }
     }
 
@@ -99,6 +104,7 @@ impl Ledger {
             cost: self.cost,
             cost_complete: self.cost_complete,
             subscription: self.subscription,
+            context: self.context,
             changed: toolbox.changed().map(str::to_owned).collect(),
         }
     }
@@ -264,6 +270,40 @@ impl Session {
         Ok(ctx.ledger.outcome(Verdict::GaveUp { failure }, ctx.toolbox))
     }
 
+    /// The conversation as a document to edit; see [`Session::apply_text`].
+    pub fn to_text(&self) -> String {
+        crate::context::to_text(&self.messages)
+    }
+
+    /// Replaces the conversation with an edited document. The next request
+    /// is sent with exactly that.
+    ///
+    /// # Errors
+    ///
+    /// A sentence for the person when the document cannot be read; the
+    /// conversation is then left as it was.
+    pub fn apply_text(&mut self, text: &str) -> Result<(), String> {
+        self.messages = crate::context::sanitize(crate::context::from_text(text)?);
+        // The edited system message holds whatever context the person kept.
+        self.context_added = true;
+        Ok(())
+    }
+
+    /// A rough size of what the next request will send, in tokens.
+    pub fn approx_tokens(&self) -> u64 {
+        crate::context::approx_tokens(&self.messages)
+    }
+
+    /// The delegate session the next request would continue, if any.
+    pub fn delegate_session(&self) -> Option<&str> {
+        self.delegate_thread.as_ref().map(|(_, s)| s.as_str())
+    }
+
+    /// Ends the delegate's session: its next request starts from nothing.
+    pub fn forget_delegate(&mut self) {
+        self.delegate_thread = None;
+    }
+
     /// Writes what happened outside the conversation into it.
     fn note(&mut self, text: String) {
         self.messages.push(Message::Assistant {
@@ -272,24 +312,11 @@ impl Session {
         });
     }
 
-    /// Drops a tool request left without its results, as a stopped request
-    /// leaves it. Providers refuse a conversation where a call has no answer.
+    /// Puts the conversation in the shape providers accept before it is sent:
+    /// a stopped request can leave a call without its result, an edit can
+    /// leave either alone. Providers refuse a conversation where they are.
     fn settle(&mut self) {
-        let Some(index) = self.messages.iter().rposition(
-            |m| matches!(m, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()),
-        ) else {
-            return;
-        };
-        let Message::Assistant { tool_calls, .. } = &self.messages[index] else {
-            return;
-        };
-        let answered = self.messages[index + 1..]
-            .iter()
-            .filter(|m| matches!(m, Message::Tool { .. }))
-            .count();
-        if answered < tool_calls.len() {
-            self.messages.truncate(index);
-        }
+        self.messages = crate::context::sanitize(std::mem::take(&mut self.messages));
     }
 }
 
@@ -491,11 +518,13 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
 
         ctx.ledger.usage += reply.usage;
         ctx.ledger.subscription = true;
+        ctx.ledger.context = reply.context.or(ctx.ledger.context);
         (ctx.observe)(Event::Turn {
             model: tier.clone(),
             usage: reply.usage,
             cost: None,
             subscription: true,
+            context: reply.context,
         });
         messages.push(Message::Assistant {
             content: Some(reply.text.clone()),
@@ -550,6 +579,7 @@ async fn converse<M: ChatModel, D, O: FnMut(Event)>(
     messages: &mut Vec<Message>,
 ) -> Result<bool, AgentError> {
     let tools = ctx.toolbox.specs();
+    let window = ctx.model.context_window(model_id).await;
     for _ in 0..ctx.config.max_turns {
         let request = ChatRequest {
             model: model_id.clone(),
@@ -567,11 +597,17 @@ async fn converse<M: ChatModel, D, O: FnMut(Event)>(
             Some(cost) => ctx.ledger.cost += cost,
             None => ctx.ledger.cost_complete = false,
         }
+        let context = window.map(|window| ContextUse {
+            used: response.usage.input,
+            window: TokenCount(window),
+        });
+        ctx.ledger.context = context.or(ctx.ledger.context);
         (ctx.observe)(Event::Turn {
             model: model_id.clone(),
             usage: response.usage,
             cost: response.cost,
             subscription: false,
+            context,
         });
         if let Some(text) = &response.content {
             (ctx.observe)(Event::Said {
@@ -644,7 +680,7 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Mutex;
 
-    use ironquill_core::{ChatResponse, DelegateReply, TokenCount, ToolCall};
+    use ironquill_core::{ChatResponse, DelegateReply, ToolCall};
     use ironquill_tools::{ToolSummary, Workspace};
     use serde_json::json;
 
@@ -742,6 +778,7 @@ mod tests {
                     output: TokenCount(200),
                 },
                 estimate: Some(Usd(0.09)),
+                context: None,
             })
         }
     }

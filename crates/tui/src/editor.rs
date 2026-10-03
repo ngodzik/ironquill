@@ -8,7 +8,7 @@
 //! counts, block visual mode, macros.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -19,6 +19,7 @@ use regex::RegexBuilder;
 use ironquill_tools::{LineChanges, committed_lines, line_changes};
 
 use crate::clipboard;
+use crate::command;
 use crate::highlight::{Highlighter, StyledLine};
 
 /// Spaces typed by the Tab key in insert mode, and added by `>`. Spaces
@@ -31,6 +32,9 @@ const LIVE_HIGHLIGHT_LINES: usize = 3_000;
 
 /// First and last row of a line range, both included.
 type Rows = (usize, usize);
+
+/// How a block starts in the context document.
+const BLOCK: &str = "=== ";
 
 /// The register every yank and delete also lands in, as in Vim.
 const UNNAMED: char = '"';
@@ -51,8 +55,17 @@ pub(crate) enum EditorMode {
 }
 
 /// What the interface should do after a key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
+    /// `:w` on the conversation's context: apply this text to it, and close
+    /// the editor too for `:wq`.
+    Context {
+        text: String,
+        close: bool,
+    },
+    /// A `:` command the editor does not know, for ironquill to run, so that
+    /// its commands (`:context`, `:model`...) work from inside a file too.
+    Command(String),
     Stay,
     /// `:w`: the file was written, so its git status changed.
     Saved,
@@ -142,8 +155,18 @@ struct Snapshot {
     col: usize,
 }
 
-/// One open file.
+/// What the editor holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// A file of the project, written to disk by `:w`.
+    File,
+    /// The conversation's context, handed back to the interface by `:w`.
+    Context,
+}
+
+/// One open file, or the conversation's context.
 pub(crate) struct Editor {
+    kind: Kind,
     /// Relative to the project root.
     path: PathBuf,
     root: PathBuf,
@@ -175,8 +198,12 @@ pub(crate) struct Editor {
     /// Rows of the last visual selection, for `:'<,'>`.
     last_visual: Option<Rows>,
     prompt: String,
-    /// The first key of `dd`, `yy` or `gg`.
+    /// The first key of `dd`, `yy`, `gg` or a `z` fold command.
     pending: Option<char>,
+    /// In the context document, the block headers whose body is hidden.
+    closed: BTreeSet<usize>,
+    /// Tab completion of a `:` command, while it cycles.
+    completion: Option<command::Completion>,
     /// `"` was typed: the next key names a register.
     naming_register: bool,
     /// The register named for the next yank, delete or put.
@@ -228,6 +255,7 @@ impl Editor {
     pub(crate) fn open(root: &Path, path: PathBuf, highlighter: Rc<Highlighter>) -> Self {
         let loaded = load(&root.join(&path));
         let mut editor = Self {
+            kind: Kind::File,
             path,
             root: root.to_owned(),
             lines: loaded.lines,
@@ -249,6 +277,8 @@ impl Editor {
             last_visual: None,
             prompt: String::new(),
             pending: None,
+            closed: BTreeSet::new(),
+            completion: None,
             naming_register: false,
             register: None,
             registers: HashMap::new(),
@@ -270,6 +300,157 @@ impl Editor {
         } else {
             committed_lines(&self.root, &self.path)
         };
+    }
+
+    /// The conversation's context as a document: edited like a file, but
+    /// `:w` hands it back instead of writing anything to disk.
+    pub(crate) fn context(text: &str, highlighter: Rc<Highlighter>) -> Self {
+        let mut editor = Self::open(Path::new("/"), PathBuf::from("<context>"), highlighter);
+        editor.kind = Kind::Context;
+        editor.lines = text.lines().map(str::to_owned).collect();
+        if editor.lines.is_empty() {
+            editor.lines.push(String::new());
+        }
+        editor.read_only = false;
+        editor.base = None;
+        editor.styled = None;
+        editor.message = None;
+        editor.fold_all();
+        editor
+    }
+
+    // Folds, for the context document: each `=== ` header starts a block
+    // that can be shown as one line, deleted and yanked whole, as a closed
+    // fold is in Vim.
+
+    fn is_header(&self, row: usize) -> bool {
+        self.kind == Kind::Context && self.lines.get(row).is_some_and(|l| l.starts_with(BLOCK))
+    }
+
+    /// The row after the last line of the block that starts at `header`.
+    fn block_end(&self, header: usize) -> usize {
+        (header + 1..self.lines.len())
+            .find(|r| self.is_header(*r))
+            .unwrap_or(self.lines.len())
+    }
+
+    /// How many lines a closed fold at `row` hides, if `row` is one.
+    pub(crate) fn folded(&self, row: usize) -> Option<usize> {
+        (self.closed.contains(&row) && self.is_header(row)).then(|| self.block_end(row) - row - 1)
+    }
+
+    /// Which rows a closed fold hides, one flag per line.
+    pub(crate) fn hidden(&self) -> Vec<bool> {
+        let mut mask = vec![false; self.lines.len()];
+        for &header in &self.closed {
+            if self.is_header(header) {
+                for flag in mask
+                    .iter_mut()
+                    .take(self.block_end(header))
+                    .skip(header + 1)
+                {
+                    *flag = true;
+                }
+            }
+        }
+        mask
+    }
+
+    /// The header of the block `row` is in, if any.
+    fn header_of(&self, row: usize) -> Option<usize> {
+        (0..=row.min(self.lines.len().saturating_sub(1)))
+            .rev()
+            .find(|r| self.is_header(*r))
+    }
+
+    /// Closes every block that has a body: the whole document reads as one
+    /// line per message.
+    fn fold_all(&mut self) {
+        self.closed = (0..self.lines.len())
+            .filter(|r| self.is_header(*r) && self.block_end(*r) > r + 1)
+            .collect();
+    }
+
+    /// Opens the fold hiding `row`, if one does, as a search landing in it does.
+    fn reveal(&mut self, row: usize) {
+        if self.hidden().get(row).copied().unwrap_or(false)
+            && let Some(header) = self.header_of(row)
+        {
+            self.closed.remove(&header);
+        }
+    }
+
+    fn fold_command(&mut self, key: char) {
+        let header = self.header_of(self.row);
+        match (key, header) {
+            ('o', Some(h)) => {
+                self.closed.remove(&h);
+            }
+            ('c', Some(h)) => {
+                self.closed.insert(h);
+                self.row = h;
+            }
+            ('a', Some(h)) => {
+                if !self.closed.remove(&h) {
+                    self.closed.insert(h);
+                    self.row = h;
+                }
+            }
+            ('R', _) => self.closed.clear(),
+            ('M', _) => {
+                self.fold_all();
+                if let Some(h) = header {
+                    self.row = h;
+                }
+            }
+            _ => {}
+        }
+        self.clamp_col();
+    }
+
+    // Every change to the number of lines goes through these two, so that
+    // the folds stay on their headers.
+
+    fn insert_line(&mut self, at: usize, line: String) {
+        self.lines.insert(at, line);
+        self.closed = self
+            .closed
+            .iter()
+            .map(|&h| if h >= at { h + 1 } else { h })
+            .collect();
+    }
+
+    fn remove_lines(&mut self, range: std::ops::Range<usize>) -> Vec<String> {
+        let (at, count) = (range.start, range.len());
+        let removed = self.lines.drain(range).collect();
+        self.closed = self
+            .closed
+            .iter()
+            .filter_map(|&h| match h {
+                h if h < at => Some(h),
+                h if h < at + count => None,
+                h => Some(h - count),
+            })
+            .collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        removed
+    }
+
+    /// The last row a line operation on `row` covers: the end of its block
+    /// when it is a closed fold, so that `dd` and `yy` take the block whole.
+    fn through_fold(&self, row: usize) -> usize {
+        self.folded(row).map_or(row, |hidden| row + hidden)
+    }
+
+    pub(crate) fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// Marks the document as edited again, when applying it failed.
+    pub(crate) fn mark_modified(&mut self) {
+        self.modified = true;
     }
 
     #[cfg(test)]
@@ -400,6 +581,11 @@ impl Editor {
 
     // Changes from outside.
 
+    /// Explains why an edited context stays as it is.
+    pub(crate) fn say_pending_context(&mut self) {
+        self.say_error("This context has edits not applied yet: :w applies them, :q! drops them");
+    }
+
     /// Explains why the file stays open.
     pub(crate) fn refuse_close(&mut self) {
         self.say_error("Unsaved changes: :w to save, or :q! to discard them");
@@ -526,6 +712,7 @@ impl Editor {
                 ('d', KeyCode::Char('d')) => self.delete_line(),
                 ('y', KeyCode::Char('y')) => self.yank_line(),
                 ('g', KeyCode::Char('g')) => self.go_to(0),
+                ('z', KeyCode::Char(c @ ('o' | 'c' | 'a' | 'R' | 'M'))) => self.fold_command(c),
                 _ => {}
             }
             self.register = None;
@@ -542,7 +729,10 @@ impl Editor {
         }
         match key.code {
             KeyCode::Char('r') if ctrl => self.restore(true),
-            KeyCode::Char(c @ ('g' | 'd' | 'y')) if !ctrl => {
+            KeyCode::Enter | KeyCode::Char(' ') if self.is_header(self.row) => {
+                self.fold_command('a');
+            }
+            KeyCode::Char(c @ ('g' | 'd' | 'y' | 'z')) if !ctrl => {
                 self.pending = Some(c);
                 // The register stays named until the second key arrives.
                 return Outcome::Stay;
@@ -665,7 +855,22 @@ impl Editor {
     }
 
     fn prompt_key(&mut self, key: KeyEvent) -> Outcome {
+        if key.code != KeyCode::Tab {
+            self.completion = None;
+        }
         match key.code {
+            KeyCode::Tab if self.mode == EditorMode::Command => {
+                let names: Vec<&str> = command::EDITOR_NAMES
+                    .iter()
+                    .chain(command::NAMES)
+                    .copied()
+                    .collect();
+                if let Some(line) = command::complete(&self.prompt, &mut self.completion, |l| {
+                    command::candidates(l, &names, &[])
+                }) {
+                    self.prompt = line;
+                }
+            }
             KeyCode::Esc => self.mode = EditorMode::Normal,
             KeyCode::Backspace => {
                 if self.prompt.pop().is_none() {
@@ -727,6 +932,22 @@ impl Editor {
             }
             return Outcome::Stay;
         }
+        if self.kind == Kind::Context {
+            match rest {
+                "w" | "wq" | "x" => {
+                    self.modified = false;
+                    return Outcome::Context {
+                        text: self.lines.join("\n"),
+                        close: rest != "w",
+                    };
+                }
+                "e!" => {
+                    self.say_error("The context is not a file: :q! drops the edits");
+                    return Outcome::Stay;
+                }
+                _ => {}
+            }
+        }
         match rest {
             "w" => {
                 if self.save() {
@@ -757,10 +978,7 @@ impl Editor {
                 Outcome::Stay
             }
             "" => Outcome::Stay,
-            other => {
-                self.say_error(&format!("Not an editor command: {other}"));
-                Outcome::Stay
-            }
+            other => Outcome::Command(other.to_owned()),
         }
     }
 
@@ -957,6 +1175,10 @@ impl Editor {
             row: self.row,
             col: self.col,
         });
+        // Undo can move any line anywhere: the folds start over.
+        if self.kind == Kind::Context {
+            self.fold_all();
+        }
         self.row = state.row.min(self.lines.len() - 1);
         self.col = state.col;
         self.clamp_col();
@@ -1011,8 +1233,14 @@ impl Editor {
             .chars()
             .take_while(|c| c.is_whitespace())
             .collect();
-        let at = if below { self.row + 1 } else { self.row };
-        self.lines.insert(at, indent.clone());
+        let at = if below {
+            self.through_fold(self.row) + 1
+        } else {
+            self.row
+        };
+        self.insert_line(at, indent.clone());
+        // A line typed into a closed block must be seen while it is typed.
+        self.reveal(at);
         self.row = at;
         self.col = indent.chars().count();
         self.mode = EditorMode::Insert;
@@ -1034,7 +1262,7 @@ impl Editor {
         let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
         self.row += 1;
         self.col = indent.chars().count();
-        self.lines.insert(self.row, indent + rest.trim_start());
+        self.insert_line(self.row, indent + rest.trim_start());
         self.changed();
     }
 
@@ -1044,7 +1272,7 @@ impl Editor {
             let at = byte_index(&self.lines[self.row], self.col);
             self.lines[self.row].remove(at);
         } else if self.row > 0 {
-            let line = self.lines.remove(self.row);
+            let line = self.remove_lines(self.row..self.row + 1).concat();
             self.row -= 1;
             self.col = self.line_len();
             self.lines[self.row].push_str(&line);
@@ -1090,13 +1318,11 @@ impl Editor {
         if !self.begin_change() {
             return;
         }
-        let line = self.lines.remove(self.row);
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
+        let last = self.through_fold(self.row);
+        let lines = self.remove_lines(self.row..last + 1);
         self.store(
             Register {
-                lines: vec![line],
+                lines,
                 linewise: true,
             },
             "",
@@ -1107,11 +1333,13 @@ impl Editor {
     }
 
     fn yank_line(&mut self) {
+        let last = self.through_fold(self.row);
+        let count = last + 1 - self.row;
         let text = Register {
-            lines: vec![self.lines[self.row].clone()],
+            lines: self.lines[self.row..=last].to_vec(),
             linewise: true,
         };
-        self.store(text, "1 line yanked");
+        self.store(text, &format!("{count} line{} yanked", plural(count)));
     }
 
     /// The selected text, as a register would hold it.
@@ -1146,13 +1374,14 @@ impl Editor {
             self.end_visual();
             return false;
         }
+        let selection = Selection {
+            end: (self.through_fold(selection.end.0), selection.end.1),
+            ..selection
+        };
         let text = self.selected(selection);
         let (first, last) = (selection.start.0, selection.end.0);
         if selection.line {
-            self.lines.drain(first..=last);
-            if self.lines.is_empty() {
-                self.lines.push(String::new());
-            }
+            self.remove_lines(first..last + 1);
             self.row = first.min(self.lines.len() - 1);
             self.col = 0;
         } else {
@@ -1166,7 +1395,7 @@ impl Editor {
                 let to = (selection.end.1 + 1).min(end_len);
                 line[byte_index(line, to)..].to_owned()
             };
-            self.lines.drain(first + 1..=last);
+            self.remove_lines(first + 1..last + 1);
             self.lines[first] = head + &tail;
             self.row = first;
             self.col = selection.start.1;
@@ -1222,9 +1451,13 @@ impl Editor {
             return;
         }
         if text.linewise {
-            let at = if after { self.row + 1 } else { self.row };
+            let at = if after {
+                self.through_fold(self.row) + 1
+            } else {
+                self.row
+            };
             for (i, line) in text.lines.iter().enumerate() {
-                self.lines.insert(at + i, line.clone());
+                self.insert_line(at + i, line.clone());
             }
             self.row = at;
             self.col = self.first_non_blank();
@@ -1244,7 +1477,7 @@ impl Editor {
             let mut row = self.row;
             for piece in pieces {
                 row += 1;
-                self.lines.insert(row, piece.clone());
+                self.insert_line(row, piece.clone());
             }
             self.lines[row].push_str(&tail);
             if text.lines.len() == 1 {
@@ -1318,12 +1551,39 @@ impl Editor {
     }
 
     fn move_rows(&mut self, delta: i32) {
-        let last = (self.lines.len() - 1) as i64;
-        self.row = (self.row as i64 + i64::from(delta)).clamp(0, last) as usize;
+        let hidden = self.hidden();
+        let last = self.lines.len() - 1;
+        // One visible row at a time, stepping over what closed folds hide.
+        for _ in 0..delta.unsigned_abs() {
+            let mut next = self.row;
+            loop {
+                next = if delta > 0 {
+                    if next == last {
+                        break;
+                    }
+                    next + 1
+                } else {
+                    match next.checked_sub(1) {
+                        Some(n) => n,
+                        None => break,
+                    }
+                };
+                if !hidden[next] {
+                    self.row = next;
+                    break;
+                }
+            }
+        }
         self.clamp_col();
     }
 
     fn go_to(&mut self, row: usize) {
+        // A row inside a closed fold is reached through its header, as in Vim.
+        let row = if self.hidden().get(row).copied().unwrap_or(false) {
+            self.header_of(row).unwrap_or(row)
+        } else {
+            row
+        };
         self.row = row;
         self.col = self.first_non_blank();
         self.keep_visible();
@@ -1420,8 +1680,10 @@ impl Editor {
                 line.rfind(&pattern)
             };
             if let Some(at) = found {
+                let col = line[..at].chars().count();
+                self.reveal(row);
                 self.row = row;
-                self.col = line[..at].chars().count();
+                self.col = col;
                 self.say(&format!("/{pattern}"));
                 return;
             }
@@ -1720,6 +1982,121 @@ mod tests {
         assert_eq!(changes.marks[1], ironquill_tools::LineMark::Changed);
         assert_eq!(changes.removed[&1], ["two"]);
         assert_eq!(keys(&mut ed, ":w\n"), Outcome::Saved);
+    }
+
+    #[test]
+    fn the_context_is_handed_back_on_w_not_written() {
+        let mut ed = Editor::context(
+            "=== user\nhello\n=== assistant\nhi",
+            Rc::new(Highlighter::new()),
+        );
+        assert_eq!(ed.kind(), Kind::Context);
+        assert!(ed.changes().is_none());
+        // G lands on the last block, closed: dd takes it whole.
+        keys(&mut ed, "Gdd");
+        assert!(ed.is_modified());
+        assert_eq!(
+            keys(&mut ed, ":w\n"),
+            Outcome::Context {
+                text: "=== user\nhello".into(),
+                close: false
+            }
+        );
+        assert!(!ed.is_modified());
+        assert!(matches!(
+            keys(&mut ed, ":wq\n"),
+            Outcome::Context { close: true, .. }
+        ));
+    }
+
+    const DOC: &str = "# note\n\n=== system\nrules\nmore rules\n\n=== user\nread a.py\n\n=== tool read_file {}\nline 1\nline 2\nline 3\n\n=== assistant\nIt reads.";
+
+    fn context_doc() -> Editor {
+        Editor::context(DOC, Rc::new(Highlighter::new())).with_clipboard(Rc::new(Memory::default()))
+    }
+
+    fn visible(ed: &Editor) -> Vec<String> {
+        let hidden = ed.hidden();
+        ed.lines()
+            .iter()
+            .zip(hidden)
+            .filter(|(_, h)| !h)
+            .map(|(l, _)| l.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_context_opens_as_one_line_per_block() {
+        let ed = context_doc();
+        assert_eq!(
+            visible(&ed),
+            [
+                "# note",
+                "",
+                "=== system",
+                "=== user",
+                "=== tool read_file {}",
+                "=== assistant"
+            ]
+        );
+        assert_eq!(ed.folded(9), Some(4));
+    }
+
+    #[test]
+    fn dd_on_a_closed_block_deletes_it_whole_and_u_brings_it_back() {
+        let mut ed = context_doc();
+        keys(&mut ed, "/=== tool\n");
+        assert_eq!(ed.cursor().0, 9);
+        keys(&mut ed, "dd");
+        assert!(
+            !ed.lines()
+                .iter()
+                .any(|l| l.contains("tool") || l.starts_with("line "))
+        );
+        assert_eq!(
+            visible(&ed).last().map(String::as_str),
+            Some("=== assistant")
+        );
+        keys(&mut ed, "u");
+        assert_eq!(ed.lines().len(), DOC.lines().count());
+    }
+
+    #[test]
+    fn arrows_step_over_closed_blocks_and_enter_opens_one() {
+        let mut ed = context_doc();
+        keys(&mut ed, "gg");
+        ed.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ed.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ed.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(ed.lines()[ed.cursor().0], "=== user");
+        keys(&mut ed, "\n");
+        assert_eq!(ed.folded(ed.cursor().0), None);
+        ed.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(ed.lines()[ed.cursor().0], "read a.py");
+        keys(&mut ed, "zc");
+        assert_eq!(ed.lines()[ed.cursor().0], "=== user");
+    }
+
+    #[test]
+    fn a_line_opened_above_a_closed_block_leaves_it_closed() {
+        let mut ed = context_doc();
+        keys(&mut ed, "/=== user\n");
+        keys(&mut ed, "Onote: keep it short\u{1b}");
+        assert!(visible(&ed).contains(&"note: keep it short".to_owned()));
+        let user = ed.lines().iter().position(|l| l == "=== user").unwrap();
+        assert_eq!(ed.folded(user), Some(2));
+    }
+
+    #[test]
+    fn tab_completes_editor_and_ironquill_commands() {
+        let (_dir, mut ed) = editor("x\n");
+        keys(&mut ed, ":wq");
+        ed.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(ed.prompt(), "wq");
+        keys(&mut ed, "\u{1b}:cont");
+        ed.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(ed.prompt(), "context");
+        assert_eq!(keys(&mut ed, "\n"), Outcome::Command("context".into()));
     }
 
     #[test]

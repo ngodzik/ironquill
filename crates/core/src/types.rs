@@ -281,6 +281,40 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSpec>,
 }
 
+/// How full a model's context was on a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUse {
+    /// Tokens the model read on its last call: everything it was sent.
+    pub used: TokenCount,
+    /// The most the model can read at once.
+    pub window: TokenCount,
+}
+
+impl ContextUse {
+    /// The share of the window in use, in percent, rounded down.
+    pub fn percent(&self) -> u64 {
+        if self.window.0 == 0 {
+            return 0;
+        }
+        self.used.0.saturating_mul(100) / self.window.0
+    }
+}
+
+impl fmt::Display for ContextUse {
+    /// `context 23% of 128k`, or `<1%` while barely used.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let window = match self.window.0 {
+            w if w >= 1_000_000 && w % 1_000_000 == 0 => format!("{}M", w / 1_000_000),
+            w if w >= 1_000 && w % 1_000 == 0 => format!("{}k", w / 1_000),
+            _ => self.window.to_string(),
+        };
+        match self.percent() {
+            0 if self.used.0 > 0 => write!(f, "context <1% of {window}"),
+            p => write!(f, "context {p}% of {window}"),
+        }
+    }
+}
+
 /// A whole task for an external agent that reads and edits files itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegateRequest {
@@ -327,6 +361,8 @@ pub struct DelegateReply {
     /// The agent's own estimate of what the tokens would cost at API prices.
     /// Not a bill: the agent may run on a subscription.
     pub estimate: Option<Usd>,
+    /// How full its context was on its last call, when it said.
+    pub context: Option<ContextUse>,
 }
 
 /// A model's answer and what it cost.
@@ -370,6 +406,18 @@ mod tests {
         assert_eq!(TokenCount(8_249).to_string(), "8.2k");
         assert_eq!(TokenCount(1_400).to_string(), "1.4k");
         assert_eq!(TokenCount(1_350_000).to_string(), "1.3M");
+    }
+
+    #[test]
+    fn context_use_reads_as_a_share_of_the_window() {
+        let at = |used, window| ContextUse {
+            used: TokenCount(used),
+            window: TokenCount(window),
+        };
+        assert_eq!(at(32_000, 128_000).to_string(), "context 25% of 128k");
+        assert_eq!(at(16_000, 1_000_000).to_string(), "context 1% of 1M");
+        assert_eq!(at(900, 1_000_000).to_string(), "context <1% of 1M");
+        assert_eq!(at(0, 0).percent(), 0);
     }
 
     #[test]
