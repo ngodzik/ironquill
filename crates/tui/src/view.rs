@@ -1,3 +1,4 @@
+use ironquill_core::TokenCount;
 use ironquill_tools::{Container, DiffLine, LineMark, ToolSummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -6,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
 use crate::app::{App, Entry, LineEditor, Panes};
-use crate::editor::{Editor, EditorMode};
+use crate::editor::{Editor, EditorMode, Kind};
 use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
 use crate::sessions;
@@ -518,16 +519,26 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
     };
     let focused = app.focus() == Focus::File;
     let changed_by_agent = app.is_changed(file.path(), false);
-    let title = format!(
-        " {}{}{} ",
-        file.path().display(),
-        if file.is_modified() { " [+]" } else { "" },
-        if changed_by_agent {
-            " ● changed by the agent"
-        } else {
-            ""
-        }
-    );
+    let title = if file.kind() == Kind::Context {
+        // What an edit saves, as it is made.
+        let chars: usize = file.lines().iter().map(|l| l.len() + 1).sum();
+        format!(
+            " context · about {} tokens{} ",
+            TokenCount((chars / 4) as u64),
+            if file.is_modified() { " [+]" } else { "" }
+        )
+    } else {
+        format!(
+            " {}{}{} ",
+            file.path().display(),
+            if file.is_modified() { " [+]" } else { "" },
+            if changed_by_agent {
+                " ● changed by the agent"
+            } else {
+                ""
+            }
+        )
+    };
     let block = pane_block(title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);

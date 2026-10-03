@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ironquill_agent::{AgentConfig, Event, Outcome, Session, Verdict};
-use ironquill_core::{ContextUse, ModelId, Usage, Usd};
+use ironquill_core::{ContextUse, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -83,6 +83,12 @@ pub(crate) enum Effect {
     Resume(String),
     /// Ask docker for its running containers now.
     RefreshDocker,
+    /// Open the conversation's context in the editor.
+    OpenContext,
+    /// Replace the conversation's context with this edited text.
+    ApplyContext(String),
+    /// End the delegate's session.
+    ForgetDelegate,
 }
 
 /// What the agent task sends back to the interface.
@@ -495,6 +501,13 @@ impl App {
                     || (ctrl && key.code == KeyCode::Char('w')));
             if !global && !pane {
                 match editor.handle_key(key) {
+                    EditorOutcome::Context { text, close } => {
+                        if close {
+                            self.file = None;
+                            self.focus_on(Focus::Chat);
+                        }
+                        return Some(Effect::ApplyContext(text));
+                    }
                     EditorOutcome::Close => {
                         let next = if self.tree.is_some() {
                             Focus::Tree
@@ -1145,6 +1158,20 @@ impl App {
                 self.info(text);
             }
             Command::Help => self.info(command::HELP),
+            Command::Context => {
+                if self.is_running() {
+                    self.error("Still working on the last message: stop it with Ctrl-C first");
+                    return None;
+                }
+                return Some(Effect::OpenContext);
+            }
+            Command::ClaudeReset => {
+                if self.is_running() {
+                    self.error("Still working on the last message: stop it with Ctrl-C first");
+                    return None;
+                }
+                return Some(Effect::ForgetDelegate);
+            }
             Command::Keys => self.keys_open = Some(0),
         }
         None
@@ -1369,6 +1396,40 @@ impl App {
             .unwrap_or_else(ModelId::claude_code)
     }
 
+    /// Opens the conversation's context in the editor, in place of a file.
+    pub(crate) fn open_context(&mut self, text: &str) {
+        if self.file.as_ref().is_some_and(Editor::is_modified) {
+            if let Some(file) = &mut self.file {
+                file.refuse_close();
+            }
+            self.focus_on(Focus::File);
+            return;
+        }
+        let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
+        self.unzoom();
+        self.file = Some(Editor::context(text, highlighter));
+        self.focus_on(Focus::File);
+    }
+
+    /// Reports how applying an edited context went.
+    pub(crate) fn on_context_applied(&mut self, result: Result<(u64, u64), String>) {
+        match result {
+            Ok((before, after)) => self.info(format!(
+                "Context applied: about {} tokens, from {}. The next request is sent with it",
+                TokenCount(after),
+                TokenCount(before)
+            )),
+            Err(e) => {
+                if let Some(file) = &mut self.file
+                    && file.kind() == crate::editor::Kind::Context
+                {
+                    file.mark_modified();
+                }
+                self.error(format!("Context not applied: {e}"));
+            }
+        }
+    }
+
     pub(crate) fn docker(&self) -> Option<&DockerPane> {
         self.docker.as_ref()
     }
@@ -1395,6 +1456,10 @@ impl App {
 
     pub(crate) fn session_label(&self) -> String {
         self.name()
+    }
+
+    pub(crate) fn report_info(&mut self, text: &str) {
+        self.info(text);
     }
 
     pub(crate) fn report_error(&mut self, text: String) {
@@ -1523,7 +1588,6 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use ironquill_core::TokenCount;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
     use super::*;
@@ -2062,6 +2126,29 @@ mod tests {
         // Not shown as selected while typing.
         press(&mut app, KeyCode::Char('i'));
         assert_eq!(app.selected_reply(), None);
+    }
+
+    #[test]
+    fn slash_context_opens_the_editor_and_w_applies_it() {
+        let mut app = ready();
+        type_text(&mut app, "/context");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::OpenContext)
+        ));
+
+        app.open_context("=== user\nhello\n=== assistant\nhi");
+        assert_eq!(app.focus(), Focus::File);
+        for c in "Gdd:w".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let effect = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(effect, Some(Effect::ApplyContext(ref text)) if text == "=== user\nhello\n=== assistant")
+        );
+
+        app.on_context_applied(Err("Unknown block === robot".into()));
+        assert!(app.file().unwrap().is_modified());
     }
 
     #[test]

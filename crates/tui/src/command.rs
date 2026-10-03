@@ -27,6 +27,10 @@ pub(crate) enum Command {
     Cost,
     /// `/claude <task>` hands one task to Claude Code.
     Claude(Option<String>),
+    /// `/context` opens the conversation's context in the editor.
+    Context,
+    /// `/claude-reset` ends Claude Code's session.
+    ClaudeReset,
     /// `:help`
     Help,
     /// `/keys` lists every shortcut, as Ctrl-S does.
@@ -64,6 +68,8 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "resume" => Ok(Command::Resume),
         "cost" => Ok(Command::Cost),
         "claude" | "cc" => Ok(Command::Claude(rest_opt)),
+        "context" | "ctx" => Ok(Command::Context),
+        "claude-reset" => Ok(Command::ClaudeReset),
         "help" | "h" => Ok(Command::Help),
         "keys" | "shortcuts" => Ok(Command::Keys),
         "" => Err("Empty command".into()),
@@ -75,6 +81,8 @@ pub(crate) const HELP: &str = "\
 Type a question or a change and press Enter. Changes are checked before they are kept.
 /model               pick the model that answers (Ctrl-E); /model <id> sets it
 /claude <task>       hand one task to Claude Code, which works without this conversation
+/context             edit what the next request sends: delete, shorten, annotate; :w applies
+/claude-reset        end Claude Code's session: its next request starts from nothing
 /escalate <id> ...   stronger models used only when the checks keep failing (empty: none)
 /check <command>     add a check, run without a shell; /check alone lists them
 /nocheck             remove every check

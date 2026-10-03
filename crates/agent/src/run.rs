@@ -270,6 +270,40 @@ impl Session {
         Ok(ctx.ledger.outcome(Verdict::GaveUp { failure }, ctx.toolbox))
     }
 
+    /// The conversation as a document to edit; see [`Session::apply_text`].
+    pub fn to_text(&self) -> String {
+        crate::context::to_text(&self.messages)
+    }
+
+    /// Replaces the conversation with an edited document. The next request
+    /// is sent with exactly that.
+    ///
+    /// # Errors
+    ///
+    /// A sentence for the person when the document cannot be read; the
+    /// conversation is then left as it was.
+    pub fn apply_text(&mut self, text: &str) -> Result<(), String> {
+        self.messages = crate::context::from_text(text)?;
+        // The edited system message holds whatever context the person kept.
+        self.context_added = true;
+        Ok(())
+    }
+
+    /// A rough size of what the next request will send, in tokens.
+    pub fn approx_tokens(&self) -> u64 {
+        crate::context::approx_tokens(&self.messages)
+    }
+
+    /// The delegate session the next request would continue, if any.
+    pub fn delegate_session(&self) -> Option<&str> {
+        self.delegate_thread.as_ref().map(|(_, s)| s.as_str())
+    }
+
+    /// Ends the delegate's session: its next request starts from nothing.
+    pub fn forget_delegate(&mut self) {
+        self.delegate_thread = None;
+    }
+
     /// Writes what happened outside the conversation into it.
     fn note(&mut self, text: String) {
         self.messages.push(Message::Assistant {

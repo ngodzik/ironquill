@@ -51,8 +51,14 @@ pub(crate) enum EditorMode {
 }
 
 /// What the interface should do after a key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
+    /// `:w` on the conversation's context: apply this text to it, and close
+    /// the editor too for `:wq`.
+    Context {
+        text: String,
+        close: bool,
+    },
     Stay,
     /// `:w`: the file was written, so its git status changed.
     Saved,
@@ -142,8 +148,18 @@ struct Snapshot {
     col: usize,
 }
 
-/// One open file.
+/// What the editor holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// A file of the project, written to disk by `:w`.
+    File,
+    /// The conversation's context, handed back to the interface by `:w`.
+    Context,
+}
+
+/// One open file, or the conversation's context.
 pub(crate) struct Editor {
+    kind: Kind,
     /// Relative to the project root.
     path: PathBuf,
     root: PathBuf,
@@ -228,6 +244,7 @@ impl Editor {
     pub(crate) fn open(root: &Path, path: PathBuf, highlighter: Rc<Highlighter>) -> Self {
         let loaded = load(&root.join(&path));
         let mut editor = Self {
+            kind: Kind::File,
             path,
             root: root.to_owned(),
             lines: loaded.lines,
@@ -270,6 +287,31 @@ impl Editor {
         } else {
             committed_lines(&self.root, &self.path)
         };
+    }
+
+    /// The conversation's context as a document: edited like a file, but
+    /// `:w` hands it back instead of writing anything to disk.
+    pub(crate) fn context(text: &str, highlighter: Rc<Highlighter>) -> Self {
+        let mut editor = Self::open(Path::new("/"), PathBuf::from("<context>"), highlighter);
+        editor.kind = Kind::Context;
+        editor.lines = text.lines().map(str::to_owned).collect();
+        if editor.lines.is_empty() {
+            editor.lines.push(String::new());
+        }
+        editor.read_only = false;
+        editor.base = None;
+        editor.styled = None;
+        editor.message = None;
+        editor
+    }
+
+    pub(crate) fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// Marks the document as edited again, when applying it failed.
+    pub(crate) fn mark_modified(&mut self) {
+        self.modified = true;
     }
 
     #[cfg(test)]
@@ -726,6 +768,22 @@ impl Editor {
                 self.say_error(&format!("A range is not accepted here: {command}"));
             }
             return Outcome::Stay;
+        }
+        if self.kind == Kind::Context {
+            match rest {
+                "w" | "wq" | "x" => {
+                    self.modified = false;
+                    return Outcome::Context {
+                        text: self.lines.join("\n"),
+                        close: rest != "w",
+                    };
+                }
+                "e!" => {
+                    self.say_error("The context is not a file: :q! drops the edits");
+                    return Outcome::Stay;
+                }
+                _ => {}
+            }
         }
         match rest {
             "w" => {
@@ -1720,6 +1778,30 @@ mod tests {
         assert_eq!(changes.marks[1], ironquill_tools::LineMark::Changed);
         assert_eq!(changes.removed[&1], ["two"]);
         assert_eq!(keys(&mut ed, ":w\n"), Outcome::Saved);
+    }
+
+    #[test]
+    fn the_context_is_handed_back_on_w_not_written() {
+        let mut ed = Editor::context(
+            "=== user\nhello\n=== assistant\nhi",
+            Rc::new(Highlighter::new()),
+        );
+        assert_eq!(ed.kind(), Kind::Context);
+        assert!(ed.changes().is_none());
+        keys(&mut ed, "Gdd");
+        assert!(ed.is_modified());
+        assert_eq!(
+            keys(&mut ed, ":w\n"),
+            Outcome::Context {
+                text: "=== user\nhello\n=== assistant".into(),
+                close: false
+            }
+        );
+        assert!(!ed.is_modified());
+        assert!(matches!(
+            keys(&mut ed, ":wq\n"),
+            Outcome::Context { close: true, .. }
+        ));
     }
 
     #[test]

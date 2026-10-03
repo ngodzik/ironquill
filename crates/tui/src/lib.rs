@@ -206,6 +206,39 @@ where
                 app.on_diff(&text);
             }
             Some(Effect::Save) => save(&store, &mut app, &conversation).await,
+            Some(Effect::OpenContext) => {
+                let text = conversation.lock().await.session.to_text();
+                app.open_context(&text);
+            }
+            Some(Effect::ApplyContext(text)) => {
+                let result = {
+                    let mut guard = conversation.lock().await;
+                    let before = guard.session.approx_tokens();
+                    guard
+                        .session
+                        .apply_text(&text)
+                        .map(|()| (before, guard.session.approx_tokens()))
+                };
+                let applied = result.is_ok();
+                app.on_context_applied(result);
+                if applied {
+                    save(&store, &mut app, &conversation).await;
+                }
+            }
+            Some(Effect::ForgetDelegate) => {
+                let ended = {
+                    let mut guard = conversation.lock().await;
+                    let had = guard.session.delegate_session().is_some();
+                    guard.session.forget_delegate();
+                    had
+                };
+                app.report_info(if ended {
+                    "Claude Code's session ended: its next request starts from nothing"
+                } else {
+                    "No Claude Code session to end"
+                });
+                save(&store, &mut app, &conversation).await;
+            }
             Some(Effect::RefreshDocker) => {
                 if !docker_asking {
                     docker_asking = true;
