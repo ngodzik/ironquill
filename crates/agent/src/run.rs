@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use ironquill_core::{
     Agent, ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateReply,
-    DelegateRequest, Message, ModelId, TokenCount, ToolSpec, Usage, Usd,
+    DelegateRequest, Message, ModelId, Pricing, TokenCount, ToolSpec, Usage, Usd,
 };
 use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox};
 
@@ -364,6 +364,23 @@ impl Session {
             messages: self.messages.clone(),
             tools: Vec::new(),
         };
+        // Saying where things stand may go a little past the budget, not far:
+        // a conversation too long for that gets ironquill's own words.
+        let likely = likely_cost(ctx.model.pricing(model).await, &request);
+        if spent.0 + likely.0 > budget.0 * 1.25 {
+            self.messages.pop();
+            let text = format!(
+                "The budget of {budget} for this request is reached, {spent} spent: the work \
+                 stopped before a call that would have gone past it. Say how to go on, or raise \
+                 the budget with /budget."
+            );
+            (ctx.observe)(Event::Said {
+                model: model.clone(),
+                text: text.clone(),
+            });
+            self.note(format!("({text})"));
+            return Ok(());
+        }
         let response = ctx
             .model
             .complete(&request)
@@ -710,6 +727,45 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
     Ok(reply)
 }
 
+/// Output tokens counted for a call before it is made: a reply that edits
+/// code is rarely longer.
+const OUTPUT_RESERVE: u64 = 2_000;
+
+/// What `request` will likely cost at `pricing`: what it sends, by a rough
+/// count, and a reply of [`OUTPUT_RESERVE`] tokens.
+fn likely_cost(pricing: Option<Pricing>, request: &ChatRequest) -> Usd {
+    let Some(pricing) = pricing else {
+        return Usd(0.0);
+    };
+    let tools: usize = request
+        .tools
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+        .sum();
+    let input = crate::context::approx_tokens(&request.messages) + (tools / 4) as u64;
+    pricing.cost(&Usage {
+        input: TokenCount(input),
+        output: TokenCount(OUTPUT_RESERVE),
+    })
+}
+
+/// Stops before a call that would take the request past its budget: what
+/// was spent, plus what the call will likely cost when the price is known.
+/// Each call resends the whole conversation, so with an expensive model one
+/// call alone can cost more than what is left.
+fn within_budget<M, D, O>(
+    ctx: &Ctx<'_, M, D, O>,
+    pricing: Option<Pricing>,
+    request: &ChatRequest,
+) -> Result<(), AgentError> {
+    match ctx.config.budget {
+        Some(budget) if ctx.ledger.cost.0 + likely_cost(pricing, request).0 > budget.0 => {
+            Err(AgentError::OverBudget)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Who the model is, added to its instructions on every call: models
 /// otherwise guess, and a conversation that went through several of them
 /// misleads them further.
@@ -869,13 +925,6 @@ async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
     model: &ModelId,
     task: String,
 ) -> Result<String, AgentError> {
-    if ctx
-        .config
-        .budget
-        .is_some_and(|budget| ctx.ledger.cost.0 >= budget.0)
-    {
-        return Err(AgentError::OverBudget);
-    }
     let request = ChatRequest {
         model: model.clone(),
         messages: vec![
@@ -887,6 +936,8 @@ async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
         ],
         tools: Vec::new(),
     };
+    let pricing = ctx.model.pricing(model).await;
+    within_budget(ctx, pricing, &request)?;
     let response = ctx
         .model
         .complete(&request)
@@ -955,14 +1006,8 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     }
     let window = ctx.model.context_window(model_id).await;
     let identity = identity(model_id, leads, &ctx.config.team);
+    let pricing = ctx.model.pricing(model_id).await;
     for _ in 0..ctx.config.max_turns {
-        if ctx
-            .config
-            .budget
-            .is_some_and(|budget| ctx.ledger.cost.0 >= budget.0)
-        {
-            return Err(AgentError::OverBudget);
-        }
         let mut sent = messages.clone();
         if let Some(Message::System(prompt)) = sent.first_mut() {
             prompt.push_str(&identity);
@@ -972,6 +1017,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             messages: sent,
             tools: tools.clone(),
         };
+        within_budget(ctx, pricing, &request)?;
         let response = ctx
             .model
             .complete(&request)
@@ -1109,6 +1155,7 @@ mod tests {
     struct Scripted {
         answers: Mutex<VecDeque<ChatResponse>>,
         seen: Mutex<Vec<ChatRequest>>,
+        pricing: Option<Pricing>,
     }
 
     impl Scripted {
@@ -1116,6 +1163,14 @@ mod tests {
             Self {
                 answers: Mutex::new(answers.into()),
                 seen: Mutex::new(Vec::new()),
+                pricing: None,
+            }
+        }
+
+        fn priced(self, input: f64, output: f64) -> Self {
+            Self {
+                pricing: Some(Pricing::per_token(Usd(input), Usd(output)).unwrap()),
+                ..self
             }
         }
     }
@@ -1131,6 +1186,10 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("the script ran out"))
+        }
+
+        async fn pricing(&self, _: &ModelId) -> Option<Pricing> {
+            self.pricing
         }
     }
 
@@ -1239,6 +1298,45 @@ mod tests {
             .check(Check::parse("test -f done.txt").unwrap())
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_call_likely_to_pass_the_budget_is_not_made() {
+        let (dir, mut toolbox) = setup();
+        // A large file makes the second call expensive before it is sent.
+        std::fs::write(dir.path().join("big.txt"), "word ".repeat(40_000)).unwrap();
+        let model = Scripted::new(vec![
+            calls("read_file", json!({"path": "big.txt"})),
+            says("Stopped: reading on would pass the budget. Go on?"),
+        ])
+        // $1 per million tokens in, nothing out: the 50k tokens of the
+        // file make the next call about $0.05.
+        .priced(1e-6, 0.0);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .budget(Usd(0.04))
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "read big.txt",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.verdict, Verdict::OverBudget { budget: Usd(0.04) });
+        // The call with the file was never made; what stayed under the
+        // budget is what was spent.
+        assert!(outcome.cost.0 <= 0.04);
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
     }
 
     #[tokio::test]

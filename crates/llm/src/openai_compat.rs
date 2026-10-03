@@ -20,8 +20,8 @@ pub struct OpenAiCompatible {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
-    /// Context windows by model, read once from the model list.
-    windows: Arc<Mutex<Option<HashMap<String, u64>>>>,
+    /// Context windows and prices by model, read once from the model list.
+    known: Arc<Mutex<Option<HashMap<String, Known>>>>,
 }
 
 impl fmt::Debug for OpenAiCompatible {
@@ -41,7 +41,7 @@ impl OpenAiCompatible {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
-            windows: Arc::new(Mutex::new(None)),
+            known: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -103,24 +103,41 @@ impl ChatModel for OpenAiCompatible {
     }
 
     async fn context_window(&self, model: &ModelId) -> Option<u64> {
-        let known = self.windows.lock().ok()?.clone();
-        let windows = match known {
-            Some(windows) => windows,
+        self.known(model).await?.window
+    }
+
+    async fn pricing(&self, model: &ModelId) -> Option<Pricing> {
+        self.known(model).await?.pricing
+    }
+}
+
+/// What the model list says of one model.
+#[derive(Debug, Clone, Copy)]
+struct Known {
+    window: Option<u64>,
+    pricing: Option<Pricing>,
+}
+
+impl OpenAiCompatible {
+    /// What the model list says of `model`, read once: a failure is
+    /// remembered as "unknown" rather than asked again on every turn.
+    async fn known(&self, model: &ModelId) -> Option<Known> {
+        let cached = self.known.lock().ok()?.clone();
+        let known = match cached {
+            Some(known) => known,
             None => {
-                // Read once: a failure is remembered as "unknown" rather than
-                // asked again on every turn.
                 let url = format!("{}/models", self.base_url);
-                let windows = match self.get(&url).await {
-                    Ok(body) => parse_windows(&body),
+                let known = match self.get(&url).await {
+                    Ok(body) => parse_known(&body),
                     Err(_) => HashMap::new(),
                 };
-                if let Ok(mut cache) = self.windows.lock() {
-                    *cache = Some(windows.clone());
+                if let Ok(mut cache) = self.known.lock() {
+                    *cache = Some(known.clone());
                 }
-                windows
+                known
             }
         };
-        windows.get(model.as_str()).copied()
+        known.get(model.as_str()).copied()
     }
 }
 
@@ -167,12 +184,24 @@ fn parse_list(url: &str, body: &str) -> Result<Vec<Listed>, LlmError> {
         .collect())
 }
 
-fn parse_windows(body: &str) -> HashMap<String, u64> {
+fn parse_known(body: &str) -> HashMap<String, Known> {
     serde_json::from_str::<WireModelList>(body)
         .map(|list| {
             list.data
                 .into_iter()
-                .filter_map(|m| Some((m.id, m.context_window?)))
+                .map(|m| {
+                    let pricing = match (m.input_price, m.output_price) {
+                        (Some(input), Some(output)) => {
+                            Pricing::per_token(Usd(input), Usd(output)).ok()
+                        }
+                        _ => None,
+                    };
+                    let known = Known {
+                        window: m.context_window,
+                        pricing,
+                    };
+                    (m.id, known)
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -511,10 +540,10 @@ mod tests {
             {"id": "a/big", "context_window": 1000000},
             {"id": "b/unknown"}
         ]}"#;
-        let windows = parse_windows(body);
-        assert_eq!(windows.get("a/big"), Some(&1_000_000));
-        assert_eq!(windows.get("b/unknown"), None);
-        assert!(parse_windows("not json").is_empty());
+        let known = parse_known(body);
+        assert_eq!(known["a/big"].window, Some(1_000_000));
+        assert_eq!(known["b/unknown"].window, None);
+        assert!(parse_known("not json").is_empty());
     }
 
     #[test]

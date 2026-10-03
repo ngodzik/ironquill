@@ -900,10 +900,17 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 &mut out,
                 Span::styled("✗ ", fg(Color::Yellow)),
                 "  ",
-                &format!(
-                    "Budget of {budget} for this request spent ({spent}): the work stopped. \
-                     /budget <dollars> changes it"
-                ),
+                &if spent.0 > budget.0 {
+                    format!(
+                        "Budget of {budget} for this request passed ({spent}): the work stopped. \
+                         /budget <dollars> changes it"
+                    )
+                } else {
+                    format!(
+                        "Budget of {budget} for this request: {spent} spent, and the next call \
+                         would go past it, so the work stopped. /budget <dollars> changes it"
+                    )
+                },
                 fg(Color::Yellow),
                 width,
             );
