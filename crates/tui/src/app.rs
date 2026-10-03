@@ -259,7 +259,16 @@ pub(crate) struct Picker {
 }
 
 impl App {
-    pub(crate) fn new(settings: Settings, root: PathBuf) -> Self {
+    pub(crate) fn new(mut settings: Settings, root: PathBuf) -> Self {
+        // The picker offers every model known at startup, the ones in use
+        // first, and keeps offering them whatever is picked later.
+        let mut models = settings.tiers.clone();
+        for model in std::mem::take(&mut settings.models) {
+            if !models.contains(&model) {
+                models.push(model);
+            }
+        }
+        settings.models = models;
         let mut transcript = vec![Entry::Welcome];
         if settings.tiers.is_empty() {
             transcript.push(Entry::Error(
@@ -844,11 +853,7 @@ impl App {
             }
             Command::Model(Some(id)) => match ModelId::new(id) {
                 Ok(model) => {
-                    if self.settings.tiers.is_empty() {
-                        self.settings.tiers.push(model);
-                    } else {
-                        self.settings.tiers[0] = model;
-                    }
+                    self.use_model(model);
                     let chain = self.chain();
                     self.info(format!("Models: {chain}"));
                 }
@@ -1067,15 +1072,21 @@ impl App {
         self.picker.as_ref()
     }
 
-    /// The models the picker offers: those configured, the ones in use first.
+    /// The models the picker offers, in a stable order.
     pub(crate) fn models(&self) -> Vec<ModelId> {
-        let mut models: Vec<ModelId> = self.settings.tiers.clone();
-        for model in &self.settings.models {
-            if !models.contains(model) {
-                models.push(model.clone());
-            }
+        self.settings.models.clone()
+    }
+
+    /// Makes `model` the one requests go to, and remembers it in the picker.
+    fn use_model(&mut self, model: ModelId) {
+        if !self.settings.models.contains(&model) {
+            self.settings.models.push(model.clone());
         }
-        models
+        if self.settings.tiers.is_empty() {
+            self.settings.tiers.push(model);
+        } else {
+            self.settings.tiers[0] = model;
+        }
     }
 
     /// How far the list of shortcuts is scrolled, while it is open.
@@ -1143,11 +1154,7 @@ impl App {
             KeyCode::Enter => {
                 self.model_picker = None;
                 if let Some(model) = models.get(selected).cloned() {
-                    if self.settings.tiers.is_empty() {
-                        self.settings.tiers.push(model.clone());
-                    } else {
-                        self.settings.tiers[0] = model.clone();
-                    }
+                    self.use_model(model.clone());
                     self.info(format!("Model: {model}"));
                 }
             }
@@ -1689,6 +1696,43 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.model_picker(), None);
         assert_eq!(app.current_model().unwrap().as_str(), "claude-code/opus");
+    }
+
+    #[test]
+    fn picking_another_model_keeps_the_first_one_in_the_list() {
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("deepseek/deepseek-chat").unwrap()],
+                models: vec![ModelId::new("claude-code/opus").unwrap()],
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_e);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_model().unwrap().as_str(), "claude-code/opus");
+
+        // Back to the first one: it is still offered, at the same place.
+        app.on_key(ctrl_e);
+        assert_eq!(app.model_picker(), Some(1));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.current_model().unwrap().as_str(),
+            "deepseek/deepseek-chat"
+        );
+        assert_eq!(app.models().len(), 2);
+    }
+
+    #[test]
+    fn a_model_set_by_name_joins_the_list() {
+        let mut app = ready();
+        type_text(&mut app, "/model openai/gpt-5-mini");
+        press(&mut app, KeyCode::Enter);
+        let names: Vec<String> = app.models().iter().map(ToString::to_string).collect();
+        assert_eq!(names, ["cheap", "openai/gpt-5-mini"]);
     }
 
     #[test]
