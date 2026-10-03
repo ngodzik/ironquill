@@ -1,7 +1,7 @@
 //! The file tree shown beside the chat.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +28,8 @@ pub(crate) struct FileTree {
     /// The first row on screen, written by the view so that a mouse click
     /// can be mapped back to a row.
     offset: Cell<usize>,
+    /// What git says of changed files, by path relative to the root.
+    git: HashMap<String, char>,
 }
 
 impl FileTree {
@@ -38,6 +40,7 @@ impl FileTree {
             rows: Vec::new(),
             selected: 0,
             offset: Cell::new(0),
+            git: HashMap::new(),
         };
         tree.refresh();
         tree
@@ -55,6 +58,26 @@ impl FileTree {
         self.expanded.contains(path)
     }
 
+    /// Git's letter for a file (`M`, `A`, `?`, `D`, `R`), or for a folder the
+    /// strongest of its files': changes to tracked files before new files.
+    pub(crate) fn git_status(&self, path: &Path, is_dir: bool) -> Option<char> {
+        let path = path.to_string_lossy();
+        if !is_dir {
+            return self.git.get(path.as_ref()).copied();
+        }
+        let prefix = format!("{path}/");
+        let mut found = None;
+        for (file, letter) in &self.git {
+            if file.starts_with(&prefix) {
+                if *letter != '?' {
+                    return Some('M');
+                }
+                found = Some('?');
+            }
+        }
+        found
+    }
+
     pub(crate) fn offset(&self) -> usize {
         self.offset.get()
     }
@@ -67,6 +90,7 @@ impl FileTree {
     /// when it still exists. Called when the agent may have added files.
     pub(crate) fn refresh(&mut self) {
         let keep = self.rows.get(self.selected).map(|r| r.path.clone());
+        self.git = ironquill_tools::file_status(&self.root);
         self.rows.clear();
         let root = self.root.clone();
         self.read_dir(&root, Path::new(""), 0);

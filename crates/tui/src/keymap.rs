@@ -81,6 +81,8 @@ pub enum Action {
     Collapse,
     /// Show or hide the file tree.
     ToggleTree,
+    /// Go to the file tree, opening it if it is hidden.
+    FocusTree,
     /// Show or hide the Docker containers pane.
     ToggleDocker,
     /// Go to the message box, ready to type, from wherever the focus is.
@@ -113,6 +115,7 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Ctrl-Q", "back to typing a message (Ctrl-G too)"),
             ("Ctrl-E", "pick the model"),
+            ("Ctrl-A", "go to the file tree, opening it if hidden"),
             ("Ctrl-B", "show or hide the file tree"),
             ("Ctrl-K", "show or hide the Docker containers"),
             ("Ctrl-S", "this list"),
@@ -145,6 +148,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "File tree",
         &[
+            (
+                "M ? A D",
+                "modified, new, added, deleted since the last commit",
+            ),
             ("Up Down", "move"),
             ("Right or Enter", "open a file, unfold a folder"),
             ("Left", "fold the folder, or go to its parent"),
@@ -163,6 +170,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (":s/a/b/g", "substitute; with %, '<,'> or 2,5"),
             ("/ n N", "search, next, previous"),
             ("gg G w b 0 ^ $", "move"),
+            (
+                "green / yellow / red",
+                "line added / changed / removed since the last commit",
+            ),
         ],
     ),
     (
@@ -191,6 +202,8 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         // row right above the left Ctrl on AZERTY. G is kept as an alias.
         KeyCode::Char('q' | 'g') if ctrl => return Some(Action::FocusInput),
         KeyCode::Char('s') if ctrl => return Some(Action::ShowKeys),
+        // A, top left on AZERTY, next to Q: the other most used jump.
+        KeyCode::Char('a') if ctrl => return Some(Action::FocusTree),
         KeyCode::Char('k') if ctrl => return Some(Action::ToggleDocker),
         // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
         KeyCode::Char('e') if ctrl => return Some(Action::PickModel),

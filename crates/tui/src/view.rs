@@ -1,4 +1,4 @@
-use ironquill_tools::{Container, DiffLine, ToolSummary};
+use ironquill_tools::{Container, DiffLine, LineMark, ToolSummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -13,6 +13,15 @@ use crate::sessions;
 use crate::wrap::wrap;
 
 const ACCENT: Color = Color::Rgb(215, 119, 87);
+// Changes since the last commit, in the open file. Backgrounds stay dark and
+// soft so that the code's own colours remain readable on top of them.
+const ADDED_SIGN: Color = Color::Rgb(110, 180, 120);
+const ADDED_BG: Color = Color::Rgb(26, 44, 32);
+const CHANGED_SIGN: Color = Color::Rgb(205, 170, 90);
+const CHANGED_BG: Color = Color::Rgb(46, 41, 24);
+const REMOVED_SIGN: Color = Color::Rgb(200, 110, 110);
+const REMOVED_FG: Color = Color::Rgb(175, 125, 125);
+const REMOVED_BG: Color = Color::Rgb(46, 26, 28);
 const DIM: Color = Color::DarkGray;
 const SPINNER: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
 /// Diff lines shown under an edit before the rest is summarized.
@@ -393,6 +402,7 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
                 "▸ "
             };
             let changed = app.is_changed(&row.path, row.is_dir);
+            let git = tree.git_status(&row.path, row.is_dir);
             let mut text = format!("{}{icon}{}", "  ".repeat(row.depth), row.name);
             if row.is_dir {
                 text.push('/');
@@ -400,13 +410,18 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
             if changed {
                 text.push_str(" ●");
             }
-            let text: String = text.chars().take(width).collect();
-            let mut style = if changed {
-                fg(Color::Yellow)
-            } else if row.is_dir {
-                fg(Color::Blue)
-            } else {
-                Style::new()
+            // Git's letter at the right edge, as editors show it.
+            let letter = git.map(|l| format!(" {l}")).unwrap_or_default();
+            let room = width.saturating_sub(letter.chars().count());
+            let mut text: String = text.chars().take(room).collect();
+            text = format!("{text:<room$}{letter}");
+            let mut style = match git {
+                Some('?' | 'A') => fg(ADDED_SIGN),
+                Some('D') => fg(REMOVED_SIGN),
+                Some(_) => fg(CHANGED_SIGN),
+                None if changed => fg(Color::Yellow),
+                None if row.is_dir => fg(Color::Blue),
+                None => Style::new(),
             };
             if i == tree.selected() {
                 style = if focused {
@@ -515,38 +530,106 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
     let (cursor_row, cursor_col) = file.cursor();
     let selection = file.selection();
 
-    let lines: Vec<Line> = file
-        .lines()
+    // Rows to draw: each line, preceded by the lines of the last commit
+    // that are gone from that place.
+    let height = usize::from(inner.height);
+    let changes = file.changes();
+    let rows_from = |start: usize| {
+        let mut rows: Vec<Option<usize>> = Vec::new();
+        let mut removed: Vec<(usize, &String)> = Vec::new();
+        for i in start..=file.lines().len() {
+            if let Some(gone) = changes.and_then(|c| c.removed.get(&i)) {
+                for text in gone {
+                    removed.push((rows.len(), text));
+                    rows.push(None);
+                }
+            }
+            if i < file.lines().len() {
+                rows.push(Some(i));
+            }
+            if rows.len() >= height {
+                break;
+            }
+        }
+        rows.truncate(height);
+        (rows, removed)
+    };
+    // Removed lines take rows too, so the start may need to move down for
+    // the cursor to stay on screen.
+    let mut start = file.scroll();
+    let (mut rows, mut removed) = rows_from(start);
+    while start < cursor_row && !rows.contains(&Some(cursor_row)) {
+        start += 1;
+        (rows, removed) = rows_from(start);
+    }
+
+    let lines: Vec<Line> = rows
         .iter()
         .enumerate()
-        .skip(file.scroll())
-        .take(usize::from(inner.height))
-        .map(|(i, text)| {
-            let number_style = if i == cursor_row && focused {
-                fg(Color::Gray)
-            } else {
-                fg(DIM)
-            };
-            let mut spans = vec![Span::styled(
-                format!("{:>width$}  ", i + 1, width = gutter - 2),
-                number_style,
-            )];
-            let mut runs = line_runs(file, i, text);
-            if let Some((from, to)) = selection.and_then(|sel| sel.columns(i, text.chars().count()))
-            {
-                runs = select(runs, from, to);
+        .map(|(at, row)| match row {
+            Some(i) => {
+                let i = *i;
+                let text = &file.lines()[i];
+                let number_style = if i == cursor_row && focused {
+                    fg(Color::Gray)
+                } else {
+                    fg(DIM)
+                };
+                let mark = changes.map_or(LineMark::Same, |c| c.marks[i]);
+                let (sign, background) = match mark {
+                    LineMark::Same => (Span::raw(" "), None),
+                    LineMark::Added => (Span::styled("▎", fg(ADDED_SIGN)), Some(ADDED_BG)),
+                    LineMark::Changed => (Span::styled("▎", fg(CHANGED_SIGN)), Some(CHANGED_BG)),
+                };
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{:>width$} ", i + 1, width = gutter - 3),
+                        number_style,
+                    ),
+                    sign,
+                    Span::raw(" "),
+                ];
+                let mut runs = line_runs(file, i, text);
+                if let Some(bg) = background {
+                    runs = runs
+                        .into_iter()
+                        .map(|(style, t)| (style.bg(bg), t))
+                        .collect();
+                }
+                if let Some((from, to)) =
+                    selection.and_then(|sel| sel.columns(i, text.chars().count()))
+                {
+                    runs = select(runs, from, to);
+                }
+                spans.extend(clip(&runs, left, room));
+                Line::from(spans)
             }
-            spans.extend(clip(&runs, left, room));
-            Line::from(spans)
+            None => {
+                let text = removed
+                    .iter()
+                    .find(|(row, _)| *row == at)
+                    .map_or("", |(_, t)| t.as_str());
+                let style = Style::new().fg(REMOVED_FG).bg(REMOVED_BG);
+                let mut spans = vec![
+                    Span::raw(" ".repeat(gutter - 2)),
+                    Span::styled("-", fg(REMOVED_SIGN)),
+                    Span::raw(" "),
+                ];
+                spans.extend(clip(&[(style, text.to_owned())], left, room));
+                Line::from(spans)
+            }
         })
         .collect();
+    file.set_rows(rows.clone());
     frame.render_widget(Paragraph::new(lines), inner);
 
     let typing_below = matches!(file.mode(), EditorMode::Command | EditorMode::Search);
-    if focused && !typing_below && cursor_row >= file.scroll() {
-        let y = cursor_row - file.scroll();
+    if focused
+        && !typing_below
+        && let Some(y) = rows.iter().position(|r| *r == Some(cursor_row))
+    {
         let x = gutter + cursor_col.saturating_sub(left);
-        if y < usize::from(inner.height) && x < usize::from(inner.width) {
+        if x < usize::from(inner.width) {
             frame.set_cursor_position(Position::new(inner.x + x as u16, inner.y + y as u16));
         }
     }

@@ -446,21 +446,33 @@ impl App {
             let global = ctrl
                 && matches!(
                     key.code,
-                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's')
+                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a')
                 );
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
                     || key.code == KeyCode::Char(',')
                     || (ctrl && key.code == KeyCode::Char('w')));
             if !global && !pane {
-                if editor.handle_key(key) == EditorOutcome::Close {
-                    let next = if self.tree.is_some() {
-                        Focus::Tree
-                    } else {
-                        Focus::Chat
-                    };
-                    self.file = None;
-                    self.focus_on(next);
+                match editor.handle_key(key) {
+                    EditorOutcome::Close => {
+                        let next = if self.tree.is_some() {
+                            Focus::Tree
+                        } else {
+                            Focus::Chat
+                        };
+                        self.file = None;
+                        self.focus_on(next);
+                        if let Some(tree) = &mut self.tree {
+                            tree.refresh();
+                        }
+                    }
+                    // Written: the file's git status may have changed.
+                    EditorOutcome::Saved => {
+                        if let Some(tree) = &mut self.tree {
+                            tree.refresh();
+                        }
+                    }
+                    EditorOutcome::Stay => {}
                 }
                 return None;
             }
@@ -558,6 +570,13 @@ impl App {
             }
             Action::ShowChat => self.close_file(Focus::Chat),
             Action::PickModel => self.open_model_picker(),
+            Action::FocusTree => {
+                match &mut self.tree {
+                    Some(tree) => tree.refresh(),
+                    None => self.tree = Some(FileTree::new(self.root.clone())),
+                }
+                self.focus_on(Focus::Tree);
+            }
             Action::ShowKeys => {
                 self.keys_open = match self.keys_open {
                     Some(_) => None,
@@ -1802,6 +1821,24 @@ mod tests {
         assert_eq!(app.keys_open(), None);
         // Typing went nowhere while the list was open.
         assert_eq!(app.input().text(), "");
+    }
+
+    #[test]
+    fn ctrl_a_opens_the_tree_and_goes_to_it_from_anywhere() {
+        let (_dir, mut app) = project();
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_a);
+        assert!(app.tree().is_some());
+        assert_eq!(app.focus(), Focus::Tree);
+
+        // From the open file, in insert mode, back to the tree.
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('i'));
+        app.on_key(ctrl_a);
+        assert_eq!((app.focus(), app.mode()), (Focus::Tree, Mode::Normal));
+        assert!(app.tree().is_some());
     }
 
     #[test]
