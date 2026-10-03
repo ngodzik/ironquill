@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ironquill_agent::{AgentConfig, Event, Outcome, Session, Verdict};
-use ironquill_core::{ContextUse, ModelId, TokenCount, Usage, Usd};
+use ironquill_core::{Agent, ContextUse, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -87,8 +87,8 @@ pub(crate) enum Effect {
     OpenContext,
     /// Replace the conversation's context with this edited text.
     ApplyContext(String),
-    /// End the delegate's session.
-    ForgetDelegate,
+    /// End this agent's session.
+    ForgetDelegate(Agent),
 }
 
 /// What the agent task sends back to the interface.
@@ -1052,15 +1052,18 @@ impl App {
         match command {
             Command::Quit => self.quit = true,
             Command::Model(None) => self.open_model_picker(),
-            Command::Claude(None) => {
-                self.error("Give it a task: /claude <what to do>");
-            }
-            Command::Claude(Some(task)) => {
-                let claude = self.claude_model();
-                self.info(format!(
-                    "Handed to {claude}, which works on the task alone, without this conversation"
+            Command::Delegate(agent, None) => {
+                self.error(format!(
+                    "Give it a task: /{} <what to do>",
+                    command_name(agent)
                 ));
-                return self.submit_to(task, vec![claude]);
+            }
+            Command::Delegate(agent, Some(task)) => {
+                let model = self.agent_model(agent);
+                self.info(format!(
+                    "Handed to {model}, in its own session, told what it missed of this conversation"
+                ));
+                return self.submit_to(task, vec![model]);
             }
             Command::Model(Some(id)) => match ModelId::new(id) {
                 Ok(model) => {
@@ -1182,12 +1185,12 @@ impl App {
                 }
                 return Some(Effect::OpenContext);
             }
-            Command::ClaudeReset => {
+            Command::Reset(agent) => {
                 if self.is_running() {
                     self.error("Still working on the last message: stop it with Ctrl-C first");
                     return None;
                 }
-                return Some(Effect::ForgetDelegate);
+                return Some(Effect::ForgetDelegate(agent));
             }
             Command::Keys => self.keys_open = Some(0),
         }
@@ -1385,9 +1388,9 @@ impl App {
                 self.model_picker = None;
                 if let Some(model) = models.get(selected).cloned() {
                     self.use_model(model.clone());
-                    if model.delegate().is_some() {
+                    if let Some((agent, _)) = model.delegate() {
                         self.info(format!(
-                            "Model: {model}. Claude Code follows the conversation from here, in its own session; it does not see what was said before"
+                            "Model: {model}. {agent} works in its own session, kept for this conversation, and is told what it missed"
                         ));
                     } else {
                         self.info(format!("Model: {model}"));
@@ -1404,13 +1407,13 @@ impl App {
         true
     }
 
-    /// The Claude Code model `/claude` hands tasks to: the first offered, or
-    /// Claude Code's own default.
-    fn claude_model(&self) -> ModelId {
+    /// The model `/claude` or `/codex` hands tasks to: the first offered
+    /// for that agent, or the agent's own default.
+    fn agent_model(&self, agent: Agent) -> ModelId {
         self.models()
             .into_iter()
-            .find(|m| m.delegate().is_some())
-            .unwrap_or_else(ModelId::claude_code)
+            .find(|m| m.delegate().is_some_and(|(a, _)| a == agent))
+            .unwrap_or_else(|| ModelId::agent(agent))
     }
 
     /// Opens the conversation's context in the editor, in place of a file.
@@ -1630,6 +1633,14 @@ impl App {
 
     pub(crate) fn on_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+    }
+}
+
+/// The command that hands a task to `agent`.
+fn command_name(agent: Agent) -> &'static str {
+    match agent {
+        Agent::ClaudeCode => "claude",
+        Agent::Codex => "codex",
     }
 }
 
@@ -1966,7 +1977,7 @@ mod tests {
         let mut app = ready();
         let saying = |text: &str, new_block: bool| {
             AgentMessage::Event(Event::Saying {
-                model: ModelId::claude_code(),
+                model: ModelId::agent(Agent::ClaudeCode),
                 text: text.into(),
                 new_block,
             })
@@ -2062,7 +2073,7 @@ mod tests {
     fn a_subscription_turn_leaves_the_total_complete() {
         let mut app = ready();
         app.on_agent(AgentMessage::Event(Event::Turn {
-            model: ModelId::claude_code(),
+            model: ModelId::agent(Agent::ClaudeCode),
             usage: Usage {
                 input: TokenCount(30_000),
                 output: TokenCount(200),

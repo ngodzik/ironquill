@@ -225,17 +225,17 @@ where
                     save(&store, &mut app, &conversation).await;
                 }
             }
-            Some(Effect::ForgetDelegate) => {
+            Some(Effect::ForgetDelegate(agent)) => {
                 let ended = {
                     let mut guard = conversation.lock().await;
-                    let had = guard.session.delegate_session().is_some();
-                    guard.session.forget_delegate();
+                    let had = guard.session.delegate_session(agent).is_some();
+                    guard.session.forget_delegate(agent);
                     had
                 };
-                app.report_info(if ended {
-                    "Claude Code's session ended: its next request starts from nothing"
+                app.report_info(&if ended {
+                    format!("{agent}'s session ended: its next request starts from nothing")
                 } else {
-                    "No Claude Code session to end"
+                    format!("No {agent} session to end")
                 });
                 save(&store, &mut app, &conversation).await;
             }

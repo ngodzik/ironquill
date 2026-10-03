@@ -1,5 +1,7 @@
 //! The `:` commands.
 
+use ironquill_core::Agent;
+
 /// A parsed `:` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -25,12 +27,12 @@ pub(crate) enum Command {
     Resume,
     /// `/cost` shows what the conversation has cost so far.
     Cost,
-    /// `/claude <task>` hands one task to Claude Code.
-    Claude(Option<String>),
+    /// `/claude <task>` hands one task to Claude Code, `/codex <task>` to Codex.
+    Delegate(Agent, Option<String>),
     /// `/context` opens the conversation's context in the editor.
     Context,
-    /// `/claude-reset` ends Claude Code's session.
-    ClaudeReset,
+    /// `/claude-reset` ends Claude Code's session, `/codex-reset` Codex's.
+    Reset(Agent),
     /// `:help`
     Help,
     /// `/keys` lists every shortcut, as Ctrl-S does.
@@ -67,9 +69,11 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "name" | "rename" => Ok(Command::Name(rest_opt)),
         "resume" => Ok(Command::Resume),
         "cost" => Ok(Command::Cost),
-        "claude" | "cc" => Ok(Command::Claude(rest_opt)),
+        "claude" | "cc" => Ok(Command::Delegate(Agent::ClaudeCode, rest_opt)),
+        "codex" | "cx" => Ok(Command::Delegate(Agent::Codex, rest_opt)),
         "context" | "ctx" => Ok(Command::Context),
-        "claude-reset" => Ok(Command::ClaudeReset),
+        "claude-reset" => Ok(Command::Reset(Agent::ClaudeCode)),
+        "codex-reset" => Ok(Command::Reset(Agent::Codex)),
         "help" | "h" => Ok(Command::Help),
         "keys" | "shortcuts" => Ok(Command::Keys),
         "" => Err("Empty command".into()),
@@ -84,6 +88,8 @@ pub(crate) const NAMES: &[&str] = &[
     "claude",
     "claude-reset",
     "clear",
+    "codex",
+    "codex-reset",
     "context",
     "cost",
     "diff",
@@ -187,9 +193,11 @@ pub(crate) fn candidates(line: &str, names: &[&str], models: &[String]) -> Vec<S
 pub(crate) const HELP: &str = "\
 Type a question or a change and press Enter. Changes are checked before they are kept.
 /model               pick the model that answers (Ctrl-E); /model <id> sets it
-/claude <task>       hand one task to Claude Code, which works without this conversation
+/claude <task>       hand one task to Claude Code, told what it missed of this conversation
+/codex <task>        the same with Codex, which runs commands in its sandbox, without network
 /context             edit what the next request sends: delete, shorten, annotate; :w applies
 /claude-reset        end Claude Code's session: its next request starts from nothing
+/codex-reset         end Codex's session
 /escalate <id> ...   stronger models used only when the checks keep failing (empty: none)
 /check <command>     add a check, run without a shell; /check alone lists them
 /nocheck             remove every check

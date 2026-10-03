@@ -14,9 +14,10 @@ pub(crate) struct ToolReport {
     pub(crate) changed: Option<String>,
 }
 
-/// Translates one of Claude Code's tool calls: `Read`, `Edit`, `MultiEdit`
-/// and `Write` map onto ironquill's own summaries, any other tool is shown
-/// by name with what it was given.
+/// Translates one of an agent's tool calls: `Read`, `Edit`, `MultiEdit`,
+/// `Write` and `Delete` map onto ironquill's own summaries, any other tool is
+/// shown by name with what it was given. Codex's changes come in these
+/// names too.
 pub(crate) fn report(
     name: &str,
     input: &Value,
@@ -81,8 +82,17 @@ pub(crate) fn report(
             let created = text.to_lowercase().contains("created");
             changed(&path, created, line_diff("", field("content")))
         }
+        // Codex deletes files; Claude Code has no such tool.
+        "Delete" => ToolReport {
+            outcome: Ok(ToolSummary::Ran {
+                label: format!("Delete({})", path.clone().unwrap_or_default()),
+                lines: 0,
+            }),
+            changed: path.clone(),
+            path,
+        },
         _ => {
-            let argument = ["pattern", "path", "query", "url", "description"]
+            let argument = ["pattern", "path", "query", "url", "command", "description"]
                 .iter()
                 .find_map(|key| input[*key].as_str())
                 .unwrap_or_default();

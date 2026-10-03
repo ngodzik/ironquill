@@ -28,35 +28,73 @@ impl ModelId {
         &self.0
     }
 
-    /// Claude Code with its own default model.
-    pub fn claude_code() -> Self {
-        Self(DELEGATE.to_owned())
+    /// `agent` with its own default model.
+    pub fn agent(agent: Agent) -> Self {
+        Self(agent.prefix().to_owned())
     }
 
-    /// For a task handed to Claude Code rather than sent to a model:
-    /// `claude-code` gives `Some("")` (Claude Code's own default model),
-    /// `claude-code/opus` gives `Some("opus")`. Any other identifier is a
-    /// model of the configured provider and gives `None`.
+    /// For a task handed to an agent rather than sent to a model: the agent,
+    /// and the model it should use, empty for its own default.
+    /// `claude-code/opus` gives Claude Code with `opus`, `codex` gives Codex
+    /// with its default. Any other identifier is a model of the configured
+    /// provider and gives `None`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use ironquill_core::ModelId;
+    /// use ironquill_core::{Agent, ModelId};
     ///
-    /// assert_eq!(ModelId::new("claude-code/opus")?.delegate(), Some("opus"));
+    /// assert_eq!(
+    ///     ModelId::new("claude-code/opus")?.delegate(),
+    ///     Some((Agent::ClaudeCode, "opus"))
+    /// );
+    /// assert_eq!(ModelId::new("codex")?.delegate(), Some((Agent::Codex, "")));
     /// assert_eq!(ModelId::new("deepseek/deepseek-chat")?.delegate(), None);
     /// # Ok::<(), ironquill_core::CoreError>(())
     /// ```
-    pub fn delegate(&self) -> Option<&str> {
-        if self.0 == DELEGATE {
-            return Some("");
-        }
-        self.0.strip_prefix(DELEGATE)?.strip_prefix('/')
+    pub fn delegate(&self) -> Option<(Agent, &str)> {
+        Agent::ALL.into_iter().find_map(|agent| {
+            let prefix = agent.prefix();
+            if self.0 == prefix {
+                return Some((agent, ""));
+            }
+            let model = self.0.strip_prefix(prefix)?.strip_prefix('/')?;
+            Some((agent, model))
+        })
     }
 }
 
-/// The prefix of model identifiers that hand the task to Claude Code.
-pub const DELEGATE: &str = "claude-code";
+/// A coding agent installed on the machine that ironquill can hand a task
+/// to, through its command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Agent {
+    /// Anthropic's Claude Code, the `claude` command.
+    ClaudeCode,
+    /// OpenAI's Codex, the `codex` command.
+    Codex,
+}
+
+impl Agent {
+    /// Every agent ironquill knows.
+    pub const ALL: [Self; 2] = [Self::ClaudeCode, Self::Codex];
+
+    /// The start of the model identifiers that hand a task to this agent.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+impl fmt::Display for Agent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+        })
+    }
+}
 
 impl fmt::Display for ModelId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -318,6 +356,8 @@ impl fmt::Display for ContextUse {
 /// A whole task for an external agent that reads and edits files itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegateRequest {
+    /// The agent to hand the task to.
+    pub agent: Agent,
     /// The model the agent should use; empty for its own default.
     pub model: String,
     /// What to do.

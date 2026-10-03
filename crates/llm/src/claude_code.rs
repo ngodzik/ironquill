@@ -40,11 +40,7 @@ impl ClaudeCode {
 
     /// Claude Code as found on the `PATH`, if it is installed.
     pub fn find() -> Option<Self> {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("claude"))
-            .find(|candidate| is_executable(candidate))
-            .map(Self::new)
+        find_program("claude").map(Self::new)
     }
 
     fn command(&self, request: &DelegateRequest) -> Command {
@@ -78,6 +74,14 @@ impl ClaudeCode {
         }
         command
     }
+}
+
+/// `name` as found on the `PATH`, if it is there.
+pub(crate) fn find_program(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -401,6 +405,7 @@ mod tests {
     #[test]
     fn the_command_line_hands_over_the_task_and_forbids_commands() {
         let request = DelegateRequest {
+            agent: ironquill_core::Agent::ClaudeCode,
             model: "opus".into(),
             prompt: "fix it".into(),
             instructions: "be brief".into(),
