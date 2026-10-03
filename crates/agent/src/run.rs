@@ -113,6 +113,9 @@ struct Ctx<'a, M, D, O> {
     toolbox: &'a mut Toolbox,
     ledger: Ledger,
     observe: O,
+    /// The delegate session to continue, and after a delegated attempt the
+    /// session it ended in.
+    thread: Option<String>,
 }
 
 enum Attempt {
@@ -135,6 +138,11 @@ enum Attempt {
 pub struct Session {
     messages: Vec<Message>,
     context_added: bool,
+    /// The delegate's own session while consecutive requests go to the same
+    /// delegate model, so that Claude Code follows the conversation from the
+    /// moment it was picked. A request to any other model ends it.
+    #[serde(default)]
+    delegate_thread: Option<(ModelId, String)>,
 }
 
 impl Default for Session {
@@ -149,6 +157,7 @@ impl Session {
         Self {
             messages: vec![Message::system(CHAT_PROMPT)],
             context_added: false,
+            delegate_thread: None,
         }
     }
 
@@ -188,13 +197,27 @@ impl Session {
             toolbox,
             ledger: Ledger::new(),
             observe,
+            thread: None,
         };
         let Some(first) = config.tiers.first() else {
             return Err(AgentError::Config("at least one model is needed"));
         };
         let mut failure = None;
 
-        match attempt(&mut ctx, first, &mut self.messages, &mut failure, true).await? {
+        // Claude Code continues its own session for as long as requests keep
+        // going to it; a request to another model, or to another Claude
+        // model, starts it afresh next time.
+        ctx.thread = match &self.delegate_thread {
+            Some((model, session)) if model == first => Some(session.clone()),
+            _ => None,
+        };
+        let first_attempt = attempt(&mut ctx, first, &mut self.messages, &mut failure, true).await;
+        self.delegate_thread = match (first.delegate(), ctx.thread.take()) {
+            (Some(_), Some(session)) => Some((first.clone(), session)),
+            _ => None,
+        };
+
+        match first_attempt? {
             Attempt::Answered => return Ok(ctx.ledger.outcome(Verdict::Answered, ctx.toolbox)),
             Attempt::Unchecked => {
                 return Ok(ctx.ledger.outcome(Verdict::Unchecked, ctx.toolbox));
@@ -218,6 +241,7 @@ impl Session {
                 Message::system(TASK_PROMPT),
                 Message::user(brief(text, context, failure.as_ref(), ctx.toolbox)),
             ];
+            ctx.thread = None;
             if let Attempt::Passed =
                 attempt(&mut ctx, to, &mut brief_messages, &mut failure, false).await?
             {
@@ -295,6 +319,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         toolbox,
         ledger: Ledger::new(),
         observe,
+        thread: None,
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -402,7 +427,9 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
             _ => None,
         })
         .unwrap_or_default();
-    let mut session = None;
+    // A session to continue, when the conversation was already with this
+    // delegate; otherwise the delegate starts fresh.
+    let mut session = ctx.thread.take();
 
     for round in 0..ctx.config.rounds_per_tier {
         if round > 0
@@ -475,6 +502,7 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
             tool_calls: Vec::new(),
         });
         session = Some(reply.session);
+        ctx.thread = session.clone();
 
         if may_answer && round == 0 && ctx.toolbox.changed().next().is_none() {
             return Ok(Attempt::Answered);
@@ -708,7 +736,7 @@ mod tests {
             }
             Ok(DelegateReply {
                 text: format!("Report {round}"),
-                session: "claude-session".into(),
+                session: format!("claude-session-{round}"),
                 usage: Usage {
                     input: TokenCount(30_000),
                     output: TokenCount(200),
@@ -991,6 +1019,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consecutive_requests_to_claude_continue_its_session_until_another_model_answers() {
+        let (_dir, mut toolbox) = setup();
+        let claude = FakeClaude {
+            writes_on_round: 1,
+            requests: Mutex::new(Vec::new()),
+        };
+        let model = Scripted::new(vec![says("Hi from the chat model.")]);
+        let mut session = Session::new();
+        // No check, so each request is one round.
+        let claude_only = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap();
+        let chat_only = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+
+        for (config, text) in [
+            (&claude_only, "first"),
+            (&claude_only, "second"),
+            (&chat_only, "elsewhere"),
+            (&claude_only, "third"),
+        ] {
+            session
+                .send(&model, &claude, &mut toolbox, config, text, "", |_| {})
+                .await
+                .unwrap();
+        }
+
+        let requests = claude.requests.lock().unwrap();
+        let resumes: Vec<Option<&str>> = requests.iter().map(|r| r.resume.as_deref()).collect();
+        assert_eq!(resumes, [None, Some("claude-session-1"), None]);
+        assert_eq!(requests[1].prompt, "second");
+    }
+
+    #[tokio::test]
     async fn a_failing_check_goes_back_into_the_delegates_own_session() {
         let (_dir, mut toolbox) = setup();
         let claude = FakeClaude {
@@ -1016,7 +1081,7 @@ mod tests {
         assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
         let requests = claude.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].resume.as_deref(), Some("claude-session"));
+        assert_eq!(requests[1].resume.as_deref(), Some("claude-session-1"));
         assert!(requests[1].prompt.starts_with("The checks failed."));
     }
 

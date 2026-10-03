@@ -1155,7 +1155,13 @@ impl App {
                 self.model_picker = None;
                 if let Some(model) = models.get(selected).cloned() {
                     self.use_model(model.clone());
-                    self.info(format!("Model: {model}"));
+                    if model.delegate().is_some() {
+                        self.info(format!(
+                            "Model: {model}. Claude Code follows the conversation from here, in its own session; it does not see what was said before"
+                        ));
+                    } else {
+                        self.info(format!("Model: {model}"));
+                    }
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => self.model_picker = None,
