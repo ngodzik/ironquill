@@ -211,6 +211,15 @@ const SIDE_CHAT_MIN: u16 = 36;
 /// Tree on the left if open; the open file or the conversation in the middle;
 /// the conversation on the right while a file is open, if there is room.
 fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
+    if app.is_zoomed() {
+        // Only the conversation; the other panes keep their state, unseen.
+        app.set_panes(Panes {
+            chat: area,
+            ..Panes::default()
+        });
+        render_chat(frame, app, area, false);
+        return;
+    }
     // The Docker pane runs along the bottom, under everything else, sized to
     // its containers but never more than a third of the screen.
     let (area, docker) = match app.docker() {

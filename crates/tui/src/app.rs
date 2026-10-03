@@ -242,6 +242,11 @@ pub(crate) struct App {
     created: u64,
     requests: usize,
     picker: Option<Picker>,
+    /// The conversation has the whole screen; the other panes keep their
+    /// state, hidden, until zooming back out.
+    zoomed: bool,
+    /// The pane that had the focus before zooming in, given back after.
+    zoom_focus: Option<Focus>,
     /// The list of shortcuts, open at this scroll offset.
     keys_open: Option<usize>,
     /// The model picker, open on the row selected.
@@ -311,6 +316,8 @@ impl App {
             created: sessions::now(),
             requests: 0,
             picker: None,
+            zoomed: false,
+            zoom_focus: None,
             keys_open: None,
             model_picker: None,
             working_model: None,
@@ -446,7 +453,7 @@ impl App {
             let global = ctrl
                 && matches!(
                     key.code,
-                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a')
+                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a' | 'z')
                 );
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
@@ -555,6 +562,7 @@ impl App {
                 }
             }
             Action::ToggleTree => {
+                self.unzoom();
                 if self.tree.take().is_some() {
                     if self.focus == Focus::Tree {
                         self.focus_on(if self.file.is_some() {
@@ -570,7 +578,17 @@ impl App {
             }
             Action::ShowChat => self.close_file(Focus::Chat),
             Action::PickModel => self.open_model_picker(),
+            Action::Zoom => {
+                self.zoomed = !self.zoomed;
+                if self.zoomed {
+                    self.zoom_focus = Some(self.focus);
+                    self.focus = Focus::Chat;
+                } else if let Some(focus) = self.zoom_focus.take() {
+                    self.focus_on(focus);
+                }
+            }
             Action::FocusTree => {
+                self.unzoom();
                 match &mut self.tree {
                     Some(tree) => tree.refresh(),
                     None => self.tree = Some(FileTree::new(self.root.clone())),
@@ -588,6 +606,7 @@ impl App {
                 self.mode = Mode::Insert;
             }
             Action::ToggleDocker => {
+                self.unzoom();
                 if self.docker.take().is_some() {
                     if self.focus == Focus::Docker {
                         self.focus_on(Focus::Chat);
@@ -654,8 +673,22 @@ impl App {
         None
     }
 
+    pub(crate) fn is_zoomed(&self) -> bool {
+        self.zoomed
+    }
+
+    /// Leaves full screen without moving the focus: for actions that need
+    /// another pane on screen.
+    fn unzoom(&mut self) {
+        self.zoomed = false;
+        self.zoom_focus = None;
+    }
+
     /// The panes on screen, left to right.
     fn visible_panes(&self) -> Vec<Focus> {
+        if self.zoomed {
+            return vec![Focus::Chat];
+        }
         let mut panes = Vec::new();
         if self.tree.is_some() {
             panes.push(Focus::Tree);
@@ -1839,6 +1872,28 @@ mod tests {
         app.on_key(ctrl_a);
         assert_eq!((app.focus(), app.mode()), (Focus::Tree, Mode::Normal));
         assert!(app.tree().is_some());
+    }
+
+    #[test]
+    fn ctrl_z_zooms_the_conversation_and_gives_the_panes_back() {
+        let (_dir, mut app) = project();
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('a'));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::File);
+
+        app.on_key(ctrl('z'));
+        assert!(app.is_zoomed());
+        assert_eq!(app.focus(), Focus::Chat);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Chat);
+
+        app.on_key(ctrl('z'));
+        assert!(!app.is_zoomed());
+        assert_eq!(app.focus(), Focus::File);
+        assert!(app.tree().is_some() && app.file().is_some());
     }
 
     #[test]
