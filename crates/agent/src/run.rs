@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+
 use ironquill_core::{
-    ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateRequest, Message, ModelId,
-    TokenCount, Usage, Usd,
+    Agent, ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateRequest, Message,
+    ModelId, TokenCount, Usage, Usd,
 };
 use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox};
 
@@ -25,6 +27,13 @@ checks after you finish and sends you any failure. You cannot run shell commands
 work around that. Make the smallest change that completes the task, reading files before editing \
 them. When you are done, end with a short report: what you changed and why, and anything left to \
 do. Write the report in the language the task is written in.";
+
+/// Codex reads and edits through commands, in a sandbox without network.
+const CODEX_PROMPT: &str = "This task was handed to you by ironquill, which runs the project's \
+checks after you finish and sends you any failure. Use commands to read the project and make your \
+changes, not to install anything. Make the smallest change that completes the task. When you are \
+done, end with a short report: what you changed and why, and anything left to do. Write the report \
+in the language the task is written in.";
 
 /// For a conversation with a person.
 const CHAT_PROMPT: &str = "You are a careful software engineer helping a person with the project \
@@ -147,10 +156,10 @@ enum Attempt {
 pub struct Session {
     messages: Vec<Message>,
     context_added: bool,
-    /// Claude Code's own session. It lasts for the whole conversation, across
-    /// requests to other models and restarts, until `/claude-reset`.
+    /// Each agent's own session. It lasts for the whole conversation, across
+    /// requests to other models and restarts, until it is reset.
     #[serde(default)]
-    delegate: Option<Thread>,
+    agents: BTreeMap<Agent, Thread>,
 }
 
 /// A delegate's session and how much of the conversation it has seen.
@@ -173,7 +182,7 @@ impl Session {
         Self {
             messages: vec![Message::system(CHAT_PROMPT)],
             context_added: false,
-            delegate: None,
+            agents: BTreeMap::new(),
         }
     }
 
@@ -221,20 +230,20 @@ impl Session {
         };
         let mut failure = None;
 
-        // Claude Code continues its own session whichever Claude model is
-        // picked, and is told what was said with other models meanwhile.
-        if first.delegate().is_some() {
-            let seen = self.delegate.as_ref().map_or(1, |t| t.seen);
-            ctx.thread = self.delegate.as_ref().map(|t| t.session.clone());
+        // An agent continues its own session whichever of its models is
+        // picked, and is told what was said without it meanwhile.
+        let agent = first.delegate().map(|(agent, _)| agent);
+        if let Some(agent) = agent {
+            let thread = self.agents.get(&agent);
+            let seen = thread.map_or(1, |t| t.seen);
+            ctx.thread = thread.map(|t| t.session.clone());
             let request = self.messages.len() - 1;
             ctx.catch_up = catch_up(&self.messages[seen.min(request)..request]);
         }
         let first_attempt = attempt(&mut ctx, first, &mut self.messages, &mut failure, true).await;
-        if let Some(session) = ctx.thread.take() {
-            self.delegate = Some(Thread {
-                session,
-                seen: self.messages.len(),
-            });
+        if let (Some(agent), Some(session)) = (agent, ctx.thread.take()) {
+            let seen = self.messages.len();
+            self.agents.insert(agent, Thread { session, seen });
         }
 
         match first_attempt? {
@@ -299,7 +308,7 @@ impl Session {
     /// conversation is then left as it was.
     pub fn apply_text(&mut self, text: &str) -> Result<(), String> {
         self.messages = crate::context::sanitize(crate::context::from_text(text)?);
-        if let Some(thread) = &mut self.delegate {
+        for thread in self.agents.values_mut() {
             thread.seen = thread.seen.min(self.messages.len());
         }
         // The edited system message holds whatever context the person kept.
@@ -312,14 +321,14 @@ impl Session {
         crate::context::approx_tokens(&self.messages)
     }
 
-    /// The delegate session the next request would continue, if any.
-    pub fn delegate_session(&self) -> Option<&str> {
-        self.delegate.as_ref().map(|t| t.session.as_str())
+    /// The session of `agent` its next request would continue, if any.
+    pub fn delegate_session(&self, agent: Agent) -> Option<&str> {
+        self.agents.get(&agent).map(|t| t.session.as_str())
     }
 
-    /// Ends the delegate's session: its next request starts from nothing.
-    pub fn forget_delegate(&mut self) {
-        self.delegate = None;
+    /// Ends the session of `agent`: its next request starts from nothing.
+    pub fn forget_delegate(&mut self, agent: Agent) {
+        self.agents.remove(&agent);
     }
 
     /// Writes what happened outside the conversation into it.
@@ -411,8 +420,8 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     failure: &mut Option<CheckFailure>,
     may_answer: bool,
 ) -> Result<Attempt, AgentError> {
-    if let Some(model) = tier.delegate() {
-        return attempt_delegated(ctx, tier, model, messages, failure, may_answer).await;
+    if let Some((agent, model)) = tier.delegate() {
+        return attempt_delegated(ctx, tier, agent, model, messages, failure, may_answer).await;
     }
     for round in 0..ctx.config.rounds_per_tier {
         if round > 0
@@ -459,6 +468,7 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
 async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
     ctx: &mut Ctx<'_, M, D, O>,
     tier: &ModelId,
+    agent: Agent,
     model: &str,
     messages: &mut Vec<Message>,
     failure: &mut Option<CheckFailure>,
@@ -492,9 +502,14 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
             messages.push(Message::user(prompt.clone()));
         }
         let request = DelegateRequest {
+            agent,
             model: model.to_owned(),
             prompt: prompt.clone(),
-            instructions: DELEGATE_PROMPT.to_owned(),
+            instructions: match agent {
+                Agent::ClaudeCode => DELEGATE_PROMPT,
+                Agent::Codex => CODEX_PROMPT,
+            }
+            .to_owned(),
             resume: session.clone(),
             directory: root.clone(),
         };
@@ -1166,8 +1181,57 @@ mod tests {
              The request now:\n\nthird"
         );
 
-        session.forget_delegate();
-        assert_eq!(session.delegate_session(), None);
+        session.forget_delegate(Agent::ClaudeCode);
+        assert_eq!(session.delegate_session(Agent::ClaudeCode), None);
+    }
+
+    #[tokio::test]
+    async fn each_agent_keeps_its_own_session() {
+        let (_dir, mut toolbox) = setup();
+        let agents = FakeClaude {
+            writes_on_round: 1,
+            requests: Mutex::new(Vec::new()),
+        };
+        let model = Scripted::new(Vec::new());
+        let mut session = Session::new();
+        for (id, text) in [
+            ("claude-code", "first"),
+            ("codex/gpt-5.5", "second"),
+            ("claude-code", "third"),
+        ] {
+            let config = AgentConfig::builder()
+                .tier(ModelId::new(id).unwrap())
+                .build()
+                .unwrap();
+            session
+                .send(&model, &agents, &mut toolbox, &config, text, "", |_| {})
+                .await
+                .unwrap();
+        }
+
+        let requests = agents.requests.lock().unwrap();
+        let sent: Vec<(Agent, &str, Option<&str>)> = requests
+            .iter()
+            .map(|r| (r.agent, r.model.as_str(), r.resume.as_deref()))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (Agent::ClaudeCode, "", None),
+                (Agent::Codex, "gpt-5.5", None),
+                (Agent::ClaudeCode, "", Some("claude-session-1")),
+            ]
+        );
+        assert!(requests[1].instructions.contains("Use commands"));
+        assert!(
+            requests[2]
+                .prompt
+                .contains("User: second\n\nAssistant: Report 2")
+        );
+        assert_eq!(
+            session.delegate_session(Agent::Codex),
+            Some("claude-session-2")
+        );
     }
 
     #[tokio::test]

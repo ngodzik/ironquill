@@ -130,10 +130,9 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, model)| {
             let mark = if Some(model) == current { "● " } else { "  " };
-            let kind = if model.delegate().is_some() {
-                "Claude Code · subscription"
-            } else {
-                "API · pay per request"
+            let kind = match model.delegate() {
+                Some((agent, _)) => format!("{agent} · subscription"),
+                None => "API · pay per request".to_owned(),
             };
             let name = format!("{mark}{model}");
             let gap = room.saturating_sub(name.chars().count() + kind.chars().count() + 1);

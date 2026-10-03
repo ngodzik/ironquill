@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use ironquill_agent::{AgentConfig, Event, Outcome, Verdict};
 use ironquill_core::{ChatModel, ChatRequest, Message, ModelId};
-use ironquill_llm::{ClaudeCode, OpenAiCompatible};
-use ironquill_tools::{Check, Toolbox, Workspace};
+use ironquill_llm::{Agents, ClaudeCode, Codex, OpenAiCompatible};
+use ironquill_tools::{Check, ToolSummary, Toolbox, Workspace};
 use tracing_subscriber::EnvFilter;
 
 /// How many tracked file names go to the model up front. Enough to orient it
@@ -46,7 +46,8 @@ struct Cli {
 
     /// Models offered by the model picker (Ctrl-E), comma separated. When
     /// the claude command is installed, `claude-code/opus` and
-    /// `claude-code/sonnet` are offered too.
+    /// `claude-code/sonnet` are offered too; when the codex command is,
+    /// `codex/<model>` for each model Codex lists.
     #[arg(long, env = "IRONQUILL_MODELS", value_delimiter = ',')]
     models: Vec<String>,
 
@@ -177,6 +178,7 @@ async fn interface(
     let checks = checks_or_default(checks)?;
 
     let claude = ClaudeCode::find();
+    let codex = Codex::find();
     let mut models = Vec::new();
     for id in offered.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         models.push(ModelId::new(id)?);
@@ -184,6 +186,11 @@ async fn interface(
     if claude.is_some() {
         for id in ["claude-code/opus", "claude-code/sonnet"] {
             models.push(ModelId::new(id)?);
+        }
+    }
+    if let Some(codex) = &codex {
+        for id in codex.models() {
+            models.push(ModelId::new(format!("codex/{id}"))?);
         }
     }
 
@@ -194,12 +201,15 @@ async fn interface(
         max_turns: 30,
         models,
     };
-    // Without the claude command installed, choosing a claude-code model
-    // fails with a message saying so rather than at startup.
-    let claude = claude.unwrap_or_else(|| ClaudeCode::new("claude"));
+    // Without an agent installed, choosing one of its models fails with a
+    // message saying so rather than at startup.
+    let agents = Agents {
+        claude: claude.unwrap_or_else(|| ClaudeCode::new("claude")),
+        codex: codex.unwrap_or_else(|| Codex::new("codex")),
+    };
     ironquill_tui::run(
         Arc::new(provider),
-        Arc::new(claude),
+        Arc::new(agents),
         workspace,
         settings,
         start,
@@ -260,10 +270,10 @@ async fn run_task(provider: &OpenAiCompatible, config: &AgentConfig, task: &str)
     let context = ironquill_tools::project_context(workspace.root(), FILE_LIST_LIMIT).await;
 
     let mut toolbox = Toolbox::new(workspace);
-    let claude = ClaudeCode::find().unwrap_or_else(|| ClaudeCode::new("claude"));
+    let agents = Agents::find();
     let outcome = ironquill_agent::run(
         provider,
-        &claude,
+        &agents,
         &mut toolbox,
         config,
         task,
@@ -322,6 +332,8 @@ fn show(event: Event) {
         } => {
             let path = path.unwrap_or_default();
             match outcome {
+                // An agent's other tools are named with what they were given.
+                Ok(ToolSummary::Ran { label, .. }) => eprintln!("    {label}"),
                 Ok(_) => eprintln!("    {name} {path}"),
                 Err(error) => eprintln!("    {name} {path}  ✗ {error}"),
             }
