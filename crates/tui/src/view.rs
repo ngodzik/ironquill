@@ -421,6 +421,7 @@ fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect
             ),
             Span::styled(format!(" · for {} ·", sub.from), fg(DIM)),
             Span::styled(state, fg(Color::Magenta)),
+            Span::styled(format!("· {} ", sub.spent), fg(Color::Gray)),
         ]))
         .title_bottom(Line::styled(" Ctrl-T hides ", fg(DIM)).right_aligned())
         .padding(Padding::horizontal(1));
@@ -956,7 +957,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 out.push(Line::from(spans));
             }
         }
-        Entry::Delegating { from, to, task } => {
+        Entry::Delegating { from, to, task, .. } => {
             out.push(action(
                 Color::Magenta,
                 "Delegate",
@@ -1195,14 +1196,14 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         }
         let first = lines.len();
         let mut block = entry_lines(entry, app, width);
-        if let Entry::Delegating { to, .. } = entry {
+        if let Entry::Delegating { to, spent, .. } = entry {
             let steps = app.transcript()[i + 1..]
                 .iter()
                 .take_while(|e| matches!(e, Entry::Member { .. }))
                 .count();
             block.push(Line::styled(
                 format!(
-                    "  ┃ {to}: {} · Ctrl-T shows them",
+                    "  ┃ {to}: {} · {spent} · Ctrl-T shows them",
                     plural(steps, "step", "steps")
                 ),
                 fg(Color::Magenta),

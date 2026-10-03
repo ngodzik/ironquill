@@ -74,11 +74,33 @@ pub struct Settings {
     pub credits: Option<String>,
 }
 
+/// Tokens and cost of one part of a request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Spent {
+    pub(crate) usage: Usage,
+    pub(crate) cost: Usd,
+    /// Some turns ran on a subscription, which costs nothing per request.
+    pub(crate) subscription: bool,
+}
+
+impl std::fmt::Display for Spent {
+    /// `$0.012 · 12.3k in · 800 out`, or `subscription · …`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.subscription && self.cost.0 == 0.0 {
+            f.write_str("subscription")?;
+        } else {
+            write!(f, "{}", self.cost)?;
+        }
+        write!(f, " · {} in · {} out", self.usage.input, self.usage.output)
+    }
+}
+
 /// A task handed to a model of the team, as the sub-agent pane shows it.
 pub(crate) struct SubAgent<'a> {
     pub(crate) from: &'a ModelId,
     pub(crate) to: &'a ModelId,
     pub(crate) task: &'a str,
+    pub(crate) spent: Spent,
     /// What it did, in order.
     pub(crate) work: Vec<&'a Entry>,
     /// Still working on it.
@@ -169,6 +191,9 @@ pub(crate) enum Entry {
         from: ModelId,
         to: ModelId,
         task: String,
+        /// What the member's work cost, as it accrues.
+        #[serde(default)]
+        spent: Spent,
     },
     /// The request spent its budget and stopped.
     OverBudget {
@@ -1488,7 +1513,13 @@ impl App {
     /// and whether it is still at it.
     pub(crate) fn sub_agent(&self) -> Option<SubAgent<'_>> {
         let i = self.sub_view?;
-        let Some(Entry::Delegating { from, to, task }) = self.transcript.get(i) else {
+        let Some(Entry::Delegating {
+            from,
+            to,
+            task,
+            spent,
+        }) = self.transcript.get(i)
+        else {
             return None;
         };
         let work: Vec<&Entry> = self.transcript[i + 1..]
@@ -1505,6 +1536,7 @@ impl App {
             from,
             to,
             task,
+            spent: *spent,
             work,
             working,
         })
@@ -1834,7 +1866,12 @@ impl App {
             Entry::Failed { command, excerpt } => format!("✗ {command}\n{excerpt}"),
             Entry::Escalating { from, to } => format!("↑ {from} → {to}"),
             Entry::GaveUp => "✗ the checks still fail after every model tried".into(),
-            Entry::Delegating { from, to, task } => format!("→ {from} → {to}: {task}"),
+            Entry::Delegating {
+                from,
+                to,
+                task,
+                spent,
+            } => format!("→ {from} → {to}: {task} ({spent})"),
             Entry::OverBudget { spent, budget } => {
                 format!("✗ budget of {budget} spent ({spent})")
             }
@@ -1990,6 +2027,20 @@ impl App {
                     self.member = None;
                     self.working_model = Some(model);
                 }
+                // The member's turns count for its handover too, live.
+                if self.member.is_some()
+                    && let Some(Entry::Delegating { spent, .. }) = self
+                        .transcript
+                        .iter_mut()
+                        .rev()
+                        .find(|e| matches!(e, Entry::Delegating { .. }))
+                {
+                    spent.usage += usage;
+                    match cost {
+                        Some(c) => spent.cost += c,
+                        None => spent.subscription |= subscription,
+                    }
+                }
                 if context.is_some() {
                     self.context = context;
                 }
@@ -2046,6 +2097,7 @@ impl App {
                     from,
                     to: to.clone(),
                     task,
+                    spent: Spent::default(),
                 });
                 // The sub-agent pane opens on it, the status line names it.
                 self.sub_view = Some(self.transcript.len() - 1);
@@ -2653,6 +2705,16 @@ mod tests {
             task: "read a.py".into(),
         }));
         app.on_agent(turn("strong"));
+        app.on_agent(AgentMessage::Event(Event::Turn {
+            model: id("strong"),
+            usage: Usage {
+                input: TokenCount(12_000),
+                output: TokenCount(300),
+            },
+            cost: Some(Usd(0.012)),
+            subscription: false,
+            context: None,
+        }));
         app.on_agent(AgentMessage::Event(Event::Said {
             model: id("strong"),
             text: "a.py prints 1.".into(),
@@ -2675,6 +2737,9 @@ mod tests {
         let sub = app.sub_agent().unwrap();
         assert_eq!(sub.to.as_str(), "strong");
         assert_eq!(sub.task, "read a.py");
+        // Its cost, counted apart; the answering model's turns are not in it.
+        assert_eq!(sub.spent.cost, Usd(0.012));
+        assert_eq!(sub.spent.to_string(), "$0.012 · 12.0k in · 300 out");
         assert_eq!(sub.work, [&Entry::Said("a.py prints 1.".into())]);
         let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
         app.on_key(ctrl_t);
