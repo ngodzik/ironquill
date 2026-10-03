@@ -289,6 +289,9 @@ pub(crate) struct App {
     quit: bool,
     /// The first Ctrl-C was pressed: a second one quits.
     quit_armed: bool,
+    /// The choices as last kept for new sessions, to keep them again as
+    /// soon as they change.
+    kept: Defaults,
     /// A one-line note in the status line, cleared by the next key.
     notice: Option<String>,
     session_id: String,
@@ -356,7 +359,7 @@ impl App {
             || root.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        Self {
+        let mut app = Self {
             settings,
             root,
             project,
@@ -380,6 +383,7 @@ impl App {
             cost_complete: true,
             quit: false,
             quit_armed: false,
+            kept: Defaults::default(),
             notice: None,
             session_id: sessions::new_id(),
             session_name: None,
@@ -399,7 +403,9 @@ impl App {
             working_model: None,
             context: None,
             docker: None,
-        }
+        };
+        app.kept = app.defaults();
+        app
     }
 
     // Read access for the view.
@@ -1622,14 +1628,38 @@ impl App {
     }
 
     /// The choices of this session, to keep as the defaults of the next.
+    /// The agents found on this machine are offered anyway: only those
+    /// picked are kept, so that another machine is not offered them.
     fn defaults(&self) -> Defaults {
         let ids = |models: &[ModelId]| models.iter().map(ToString::to_string).collect();
+        let picked = |m: &&ModelId| {
+            m.delegate().is_none()
+                || self.settings.team.contains(m)
+                || self.current_model() == Some(*m)
+        };
         Defaults {
             model: self.current_model().map(ToString::to_string),
-            models: ids(&self.settings.models),
+            models: self
+                .settings
+                .models
+                .iter()
+                .filter(picked)
+                .map(ToString::to_string)
+                .collect(),
             team: ids(&self.settings.team),
             budget: self.settings.budget.map(|b| b.0),
         }
+    }
+
+    /// The choices, when they changed since they were last kept: the model,
+    /// the models offered, the team and the budget carry over to the next
+    /// session without having to ask.
+    pub(crate) fn defaults_to_keep(&mut self) -> Option<Defaults> {
+        let now = self.defaults();
+        (now != self.kept).then(|| {
+            self.kept = now.clone();
+            now
+        })
     }
 
     /// The model `/claude` or `/codex` hands tasks to: the first offered
@@ -1729,8 +1759,11 @@ impl App {
         self.notice.as_deref()
     }
 
+    /// The conversation's name in the status line: only one given with
+    /// /name. The first message, which names it in the /resume list, is
+    /// not repeated there.
     pub(crate) fn session_label(&self) -> String {
-        self.name()
+        self.session_name.clone().unwrap_or_default()
     }
 
     pub(crate) fn report_info(&mut self, text: &str) {
@@ -2326,6 +2359,9 @@ mod tests {
 
         type_text(&mut app, "/defaults");
         let effect = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Every change is handed over once, to be kept.
+        assert!(app.defaults_to_keep().is_some());
+        assert_eq!(app.defaults_to_keep(), None);
         let Some(Effect::SaveDefaults(defaults)) = effect else {
             panic!("expected the defaults to be saved, got {effect:?}");
         };

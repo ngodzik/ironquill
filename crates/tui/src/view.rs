@@ -1228,8 +1228,10 @@ fn team_title(app: &App) -> Line<'static> {
         .filter(|m| *m != lead)
         .map(ToString::to_string)
         .collect();
-    if !team.is_empty() {
-        spans.push(Span::styled(" · team ", fg(DIM)));
+    spans.push(Span::styled(" · team ", fg(DIM)));
+    if team.is_empty() {
+        spans.push(Span::styled("none", fg(DIM)));
+    } else {
         spans.push(Span::raw(team.join(", ")));
     }
     spans.push(Span::raw(" "));

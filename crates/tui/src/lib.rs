@@ -174,6 +174,15 @@ where
             },
         };
 
+        // The model, the models offered, the team and the budget carry over
+        // to the next session as soon as they change.
+        if let Some(defaults) = app.defaults_to_keep()
+            && let Some(path) = Defaults::path()
+            && let Err(e) = defaults.save(&path)
+        {
+            app.report_error(format!("Could not keep your choices: {e}"));
+        }
+
         match effect {
             None => {}
             Some(Effect::Send { text, config }) => {

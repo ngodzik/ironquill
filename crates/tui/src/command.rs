@@ -212,8 +212,8 @@ Type a question or a change and press Enter. Changes are checked before they are
 /budget <dollars>    the most one request may cost (none: no limit); past it the
                      work stops and the model says where it is and asks what next
 /team                who answers and who it may hand tasks to
-/defaults            start every new session with the current model, list, team
-                     and budget
+/defaults            keep the current model, list, team and budget for new
+                     sessions; done by itself whenever they change
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation
 /codex <task>        the same with Codex, which runs commands in its sandbox, without network
 /context             edit what the next request sends: delete, shorten, annotate; :w applies
