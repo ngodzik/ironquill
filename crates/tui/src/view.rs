@@ -871,6 +871,22 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 width,
             );
         }
+        // A member's work, set apart by a bar in the colour of the handover,
+        // its replies under its name.
+        Entry::Member { model, entry } => {
+            let bar = || Span::styled("  ┃ ", fg(Color::Magenta));
+            if matches!(**entry, Entry::Said(_)) {
+                out.push(Line::from(vec![
+                    bar(),
+                    Span::styled(model.to_string(), fg(Color::Magenta)),
+                ]));
+            }
+            for line in entry_lines(entry, app, width.saturating_sub(4)) {
+                let mut spans = vec![bar()];
+                spans.extend(line.spans);
+                out.push(Line::from(spans));
+            }
+        }
         Entry::Delegating { from, to, task } => {
             out.push(action(
                 Color::Magenta,
@@ -1098,7 +1114,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     for (i, entry) in app.transcript().iter().enumerate() {
         let first = lines.len();
         let mut block = entry_lines(entry, app, width);
-        if matches!(entry, Entry::Said(_)) && block.len() > FOLD_AT && !app.is_expanded(i) {
+        if entry.is_reply() && block.len() > FOLD_AT && !app.is_expanded(i) {
             let hidden = block.len() - FOLD_SHOW;
             block.truncate(FOLD_SHOW);
             block.push(Line::styled(
@@ -1126,7 +1142,12 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             app.transcript().get(i + 1),
             Some(Entry::Passed | Entry::Failed { .. })
         );
-        if !next_is_result {
+        // The bar of a member's work runs on between its entries.
+        let member_goes_on = matches!(entry, Entry::Member { .. })
+            && matches!(app.transcript().get(i + 1), Some(Entry::Member { .. }));
+        if member_goes_on {
+            lines.push(Line::styled("  ┃", fg(Color::Magenta)));
+        } else if !next_is_result {
             lines.push(Line::default());
         }
     }

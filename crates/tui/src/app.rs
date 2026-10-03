@@ -164,6 +164,12 @@ pub(crate) enum Entry {
         spent: Usd,
         budget: Usd,
     },
+    /// What a model of the team did on a task handed to it, shown apart
+    /// from the model that answers.
+    Member {
+        model: ModelId,
+        entry: Box<Entry>,
+    },
     /// What one request cost, shown under it.
     Cost {
         usage: Usage,
@@ -177,6 +183,17 @@ pub(crate) enum Entry {
         #[serde(default)]
         context: Option<ContextUse>,
     },
+}
+
+impl Entry {
+    /// A model's reply, which folds when long.
+    pub(crate) fn is_reply(&self) -> bool {
+        match self {
+            Entry::Said(_) => true,
+            Entry::Member { entry, .. } => entry.is_reply(),
+            _ => false,
+        }
+    }
 }
 
 /// A single line of text being edited, with a cursor counted in characters.
@@ -291,6 +308,8 @@ pub(crate) struct App {
     quit: bool,
     /// The first Ctrl-C was pressed: a second one quits.
     quit_armed: bool,
+    /// The model of the team working on a task handed to it, if one is.
+    member: Option<ModelId>,
     /// The choices as last kept for new sessions, to keep them again as
     /// soon as they change.
     kept: Defaults,
@@ -385,6 +404,7 @@ impl App {
             cost_complete: true,
             quit: false,
             quit_armed: false,
+            member: None,
             kept: Defaults::default(),
             notice: None,
             session_id: sessions::new_id(),
@@ -806,7 +826,7 @@ impl App {
         self.transcript
             .iter()
             .enumerate()
-            .filter(|(_, e)| matches!(e, Entry::Said(_)))
+            .filter(|(_, e)| e.is_reply())
             .map(|(i, _)| i)
             .collect()
     }
@@ -1001,7 +1021,7 @@ impl App {
                             .find(|(_, first, last)| (*first..=*last).contains(&line))
                             .map(|(e, _, _)| *e);
                         if let Some(entry) = entry
-                            && matches!(self.transcript.get(entry), Some(Entry::Said(_)))
+                            && self.transcript.get(entry).is_some_and(Entry::is_reply)
                         {
                             self.toggle_fold(entry);
                         }
@@ -1714,48 +1734,62 @@ impl App {
 
     /// The conversation as plain text, as it reads on screen.
     pub(crate) fn transcript_text(&self) -> String {
-        let mut out: Vec<String> = Vec::new();
-        for entry in &self.transcript {
-            let text = match entry {
-                Entry::Welcome | Entry::Cost { .. } => continue,
-                Entry::Info(text) | Entry::Error(text) | Entry::Said(text) => text.clone(),
-                Entry::User(text) => format!("> {text}"),
-                Entry::Tool {
-                    name,
-                    path,
-                    outcome,
-                } => {
-                    let mut text = format!("● {name} {}", path.as_deref().unwrap_or_default());
-                    match outcome {
-                        Ok(ToolSummary::Changed { diff, .. }) => {
-                            for line in diff {
-                                text.push('\n');
-                                text.push_str(&match line {
-                                    DiffLine::Context(l) => format!("  {l}"),
-                                    DiffLine::Removed(l) => format!("- {l}"),
-                                    DiffLine::Added(l) => format!("+ {l}"),
-                                });
-                            }
+        self.transcript
+            .iter()
+            .filter_map(Self::entry_text)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// One entry as plain text, `None` for what is not part of the talk.
+    fn entry_text(entry: &Entry) -> Option<String> {
+        let text = match entry {
+            Entry::Welcome | Entry::Cost { .. } => return None,
+            Entry::Info(text) | Entry::Error(text) | Entry::Said(text) => text.clone(),
+            Entry::User(text) => format!("> {text}"),
+            Entry::Tool {
+                name,
+                path,
+                outcome,
+            } => {
+                let mut text = format!("● {name} {}", path.as_deref().unwrap_or_default());
+                match outcome {
+                    Ok(ToolSummary::Changed { diff, .. }) => {
+                        for line in diff {
+                            text.push('\n');
+                            text.push_str(&match line {
+                                DiffLine::Context(l) => format!("  {l}"),
+                                DiffLine::Removed(l) => format!("- {l}"),
+                                DiffLine::Added(l) => format!("+ {l}"),
+                            });
                         }
-                        Ok(ToolSummary::Ran { label, .. }) => text = format!("● {label}"),
-                        Ok(_) => {}
-                        Err(error) => text.push_str(&format!("  ✗ {error}")),
                     }
-                    text
+                    Ok(ToolSummary::Ran { label, .. }) => text = format!("● {label}"),
+                    Ok(_) => {}
+                    Err(error) => text.push_str(&format!("  ✗ {error}")),
                 }
-                Entry::Checks(commands) => format!("▸ {}", commands.join(", then ")),
-                Entry::Passed => "✓ checks passed".into(),
-                Entry::Failed { command, excerpt } => format!("✗ {command}\n{excerpt}"),
-                Entry::Escalating { from, to } => format!("↑ {from} → {to}"),
-                Entry::GaveUp => "✗ the checks still fail after every model tried".into(),
-                Entry::Delegating { from, to, task } => format!("→ {from} → {to}: {task}"),
-                Entry::OverBudget { spent, budget } => {
-                    format!("✗ budget of {budget} spent ({spent})")
+                text
+            }
+            Entry::Checks(commands) => format!("▸ {}", commands.join(", then ")),
+            Entry::Passed => "✓ checks passed".into(),
+            Entry::Failed { command, excerpt } => format!("✗ {command}\n{excerpt}"),
+            Entry::Escalating { from, to } => format!("↑ {from} → {to}"),
+            Entry::GaveUp => "✗ the checks still fail after every model tried".into(),
+            Entry::Delegating { from, to, task } => format!("→ {from} → {to}: {task}"),
+            Entry::OverBudget { spent, budget } => {
+                format!("✗ budget of {budget} spent ({spent})")
+            }
+            Entry::Member { model, entry } => {
+                let inner = Self::entry_text(entry).unwrap_or_default();
+                let mut text = format!("│ {model}");
+                for line in inner.lines() {
+                    text.push_str("\n│ ");
+                    text.push_str(line);
                 }
-            };
-            out.push(text);
-        }
-        out.join("\n\n")
+                text
+            }
+        };
+        Some(text)
     }
 
     /// Opens the conversation's context in the editor, in place of a file.
@@ -1886,12 +1920,16 @@ impl App {
         let entry = match event {
             // Tokens and cost go to the status line, not the transcript.
             Event::Turn {
+                model,
                 usage,
                 cost,
                 subscription,
                 context,
-                ..
             } => {
+                // The model that answers is back: the member is done.
+                if self.member.as_ref().is_some_and(|m| *m != model) {
+                    self.member = None;
+                }
                 if context.is_some() {
                     self.context = context;
                 }
@@ -1908,9 +1946,16 @@ impl App {
             Event::Saying {
                 text, new_block, ..
             } => {
-                match self.transcript.last_mut() {
+                let last = match self.transcript.last_mut() {
+                    Some(Entry::Member { entry, .. }) if self.member.is_some() => {
+                        Some(&mut **entry)
+                    }
+                    Some(entry) if self.member.is_none() => Some(entry),
+                    _ => None,
+                };
+                match last {
                     Some(Entry::Said(said)) if !new_block => said.push_str(&text),
-                    _ => self.transcript.push(Entry::Said(text)),
+                    _ => self.push_entry(Entry::Said(text)),
                 }
                 return;
             }
@@ -1936,8 +1981,31 @@ impl App {
                 self.working_model = Some(to.clone());
                 Entry::Escalating { from, to }
             }
-            Event::Delegating { from, to, task } => Entry::Delegating { from, to, task },
-            Event::OverBudget { spent, budget } => Entry::OverBudget { spent, budget },
+            Event::Delegating { from, to, task } => {
+                self.transcript.push(Entry::Delegating {
+                    from,
+                    to: to.clone(),
+                    task,
+                });
+                self.member = Some(to);
+                return;
+            }
+            Event::OverBudget { spent, budget } => {
+                self.member = None;
+                Entry::OverBudget { spent, budget }
+            }
+        };
+        self.push_entry(entry);
+    }
+
+    /// Adds an entry, set apart under the member's name while one works.
+    fn push_entry(&mut self, entry: Entry) {
+        let entry = match &self.member {
+            Some(model) => Entry::Member {
+                model: model.clone(),
+                entry: Box::new(entry),
+            },
+            None => entry,
         };
         self.transcript.push(entry);
     }
@@ -2489,6 +2557,43 @@ mod tests {
             app.file()
                 .is_some_and(|f| f.lines().iter().any(|l| l == "print(1)"))
         );
+    }
+
+    #[test]
+    fn a_members_work_is_set_apart_until_the_lead_is_back() {
+        let mut app = ready();
+        let id = |s: &str| ModelId::new(s).unwrap();
+        let turn = |model: &str| {
+            AgentMessage::Event(Event::Turn {
+                model: id(model),
+                usage: Usage::default(),
+                cost: None,
+                subscription: false,
+                context: None,
+            })
+        };
+        app.on_agent(AgentMessage::Event(Event::Delegating {
+            from: id("cheap"),
+            to: id("strong"),
+            task: "read a.py".into(),
+        }));
+        app.on_agent(turn("strong"));
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: id("strong"),
+            text: "a.py prints 1.".into(),
+        }));
+        app.on_agent(turn("cheap"));
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: id("cheap"),
+            text: "Done.".into(),
+        }));
+        let n = app.transcript.len();
+        assert!(matches!(
+            &app.transcript[n - 2],
+            Entry::Member { model, entry } if model.as_str() == "strong" && **entry == Entry::Said("a.py prints 1.".into())
+        ));
+        assert_eq!(app.transcript[n - 1], Entry::Said("Done.".into()));
+        assert!(app.transcript_text().contains("│ strong\n│ a.py prints 1."));
     }
 
     #[test]
