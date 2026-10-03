@@ -184,6 +184,9 @@ pub(crate) struct Editor {
     rows: RefCell<Vec<Option<usize>>>,
     highlighter: Rc<Highlighter>,
     clipboard: Rc<dyn Clipboard>,
+    /// Yanks go to the system clipboard without `"+`: the conversation is
+    /// opened only to copy from it.
+    copies_out: bool,
     row: usize,
     /// In characters, not bytes.
     col: usize,
@@ -267,6 +270,7 @@ impl Editor {
             rows: RefCell::new(Vec::new()),
             highlighter,
             clipboard: Rc::new(SystemClipboard),
+            copies_out: false,
             row: 0,
             col: 0,
             scroll: 0,
@@ -316,6 +320,25 @@ impl Editor {
         editor.styled = None;
         editor.message = None;
         editor.fold_all();
+        editor
+    }
+
+    /// The conversation as text, to select and copy from with Vim keys.
+    /// It is read only, and coloured as Markdown, which replies are.
+    pub(crate) fn transcript(text: &str, highlighter: Rc<Highlighter>) -> Self {
+        let mut editor = Self::open(Path::new("/"), PathBuf::from("<chat>"), highlighter);
+        editor.lines = text.lines().map(str::to_owned).collect();
+        if editor.lines.is_empty() {
+            editor.lines.push(String::new());
+        }
+        editor.read_only = true;
+        editor.copies_out = true;
+        editor.base = None;
+        editor.message = None;
+        editor.styled = editor
+            .highlighter
+            .highlight(Path::new("chat.md"), &editor.lines);
+        editor.row = editor.lines.len() - 1;
         editor
     }
 
@@ -1099,10 +1122,12 @@ impl Editor {
 
     // Registers.
 
-    /// Puts `text` in the named register (or the unnamed one), and in the
-    /// unnamed one too, as Vim does.
+    /// Puts `text` in the named register (or the unnamed one, or the system
+    /// clipboard for the conversation), and in the unnamed one too, as Vim
+    /// does.
     fn store(&mut self, text: Register, done: &str) {
-        match self.register.take() {
+        let register = self.register.take().or(self.copies_out.then_some('+'));
+        match register {
             Some(name @ ('+' | '*')) => match self.clipboard.copy(&text.to_text()) {
                 Ok(how) if done.is_empty() => {
                     self.say(&format!("Copied to the clipboard ({how})"));
@@ -1895,6 +1920,17 @@ mod tests {
         ed.changed_on_disk();
         assert_eq!(ed.lines(), ["mine!"]);
         assert!(ed.message().is_some_and(|(_, error)| error));
+    }
+
+    #[test]
+    fn the_conversation_is_read_only_and_yanks_to_the_clipboard() {
+        let clipboard = Rc::new(Memory::default());
+        let mut ed = Editor::transcript("> hi\n\nprint(1)", Rc::new(Highlighter::new()))
+            .with_clipboard(clipboard.clone());
+        keys(&mut ed, "ggx");
+        assert_eq!(ed.lines()[0], "> hi");
+        keys(&mut ed, "Gyy");
+        assert_eq!(clipboard.0.borrow().as_str(), "print(1)\n");
     }
 
     #[test]

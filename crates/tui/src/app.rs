@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use ironquill_agent::{AgentConfig, Event, Member, Outcome, Session, Verdict};
 use ironquill_core::{Agent, ContextUse, ModelId, TokenCount, Usage, Usd};
-use ironquill_tools::{Check, Container, ToolSummary};
+use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -1266,6 +1266,7 @@ impl App {
                 }
             }
             Command::Defaults => return Some(Effect::SaveDefaults(self.defaults())),
+            Command::Copy => self.open_transcript(),
             Command::Team => {
                 let text = self.describe_team();
                 self.info(text);
@@ -1669,6 +1670,69 @@ impl App {
             .into_iter()
             .find(|m| m.delegate().is_some_and(|(a, _)| a == agent))
             .unwrap_or_else(|| ModelId::agent(agent))
+    }
+
+    /// Opens the conversation as text in the editor, to select and copy
+    /// from. A file with unsaved edits stays open.
+    fn open_transcript(&mut self) {
+        if let Some(file) = self.file.as_mut().filter(|f| f.is_modified()) {
+            file.refuse_close();
+            self.unzoom();
+            self.focus_on(Focus::File);
+            return;
+        }
+        let text = self.transcript_text();
+        let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
+        self.unzoom();
+        self.file = Some(Editor::transcript(&text, highlighter));
+        self.focus_on(Focus::File);
+        self.info("The conversation as text: v or V selects, y copies to the clipboard, :q closes");
+    }
+
+    /// The conversation as plain text, as it reads on screen.
+    pub(crate) fn transcript_text(&self) -> String {
+        let mut out: Vec<String> = Vec::new();
+        for entry in &self.transcript {
+            let text = match entry {
+                Entry::Welcome | Entry::Cost { .. } => continue,
+                Entry::Info(text) | Entry::Error(text) | Entry::Said(text) => text.clone(),
+                Entry::User(text) => format!("> {text}"),
+                Entry::Tool {
+                    name,
+                    path,
+                    outcome,
+                } => {
+                    let mut text = format!("● {name} {}", path.as_deref().unwrap_or_default());
+                    match outcome {
+                        Ok(ToolSummary::Changed { diff, .. }) => {
+                            for line in diff {
+                                text.push('\n');
+                                text.push_str(&match line {
+                                    DiffLine::Context(l) => format!("  {l}"),
+                                    DiffLine::Removed(l) => format!("- {l}"),
+                                    DiffLine::Added(l) => format!("+ {l}"),
+                                });
+                            }
+                        }
+                        Ok(ToolSummary::Ran { label, .. }) => text = format!("● {label}"),
+                        Ok(_) => {}
+                        Err(error) => text.push_str(&format!("  ✗ {error}")),
+                    }
+                    text
+                }
+                Entry::Checks(commands) => format!("▸ {}", commands.join(", then ")),
+                Entry::Passed => "✓ checks passed".into(),
+                Entry::Failed { command, excerpt } => format!("✗ {command}\n{excerpt}"),
+                Entry::Escalating { from, to } => format!("↑ {from} → {to}"),
+                Entry::GaveUp => "✗ the checks still fail after every model tried".into(),
+                Entry::Delegating { from, to, task } => format!("→ {from} → {to}: {task}"),
+                Entry::OverBudget { spent, budget } => {
+                    format!("✗ budget of {budget} spent ({spent})")
+                }
+            };
+            out.push(text);
+        }
+        out.join("\n\n")
     }
 
     /// Opens the conversation's context in the editor, in place of a file.
@@ -2373,6 +2437,37 @@ mod tests {
                 team: vec!["anthropic/claude-sonnet".into()],
                 budget: Some(0.25),
             }
+        );
+    }
+
+    #[test]
+    fn copy_opens_the_conversation_as_text_to_select_from() {
+        let mut app = ready();
+        app.transcript.push(Entry::User("fix it".into()));
+        app.transcript
+            .push(Entry::Said("Here:\n```py\nprint(1)\n```".into()));
+        app.transcript.push(Entry::Tool {
+            name: "replace".into(),
+            path: Some("a.py".into()),
+            outcome: Ok(ToolSummary::Changed {
+                path: "a.py".into(),
+                created: false,
+                diff: vec![
+                    DiffLine::Removed("x = 1".into()),
+                    DiffLine::Added("x = 2".into()),
+                ],
+            }),
+        });
+        let text = app.transcript_text();
+        assert!(text.contains("> fix it\n\nHere:\n```py\nprint(1)\n```"));
+        assert!(text.ends_with("● replace a.py\n- x = 1\n+ x = 2"));
+
+        type_text(&mut app, "/copy");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::File);
+        assert!(
+            app.file()
+                .is_some_and(|f| f.lines().iter().any(|l| l == "print(1)"))
         );
     }
 

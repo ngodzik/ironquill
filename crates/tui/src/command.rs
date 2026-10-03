@@ -38,6 +38,8 @@ pub(crate) enum Command {
     Defaults,
     /// `/team` says who answers and who it may hand tasks to.
     Team,
+    /// `/copy` opens the conversation as text, to select and copy from.
+    Copy,
     /// `/claude-reset` ends Claude Code's session, `/codex-reset` Codex's.
     Reset(Agent),
     /// `:help`
@@ -81,6 +83,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "budget" => Ok(Command::Budget(rest_opt)),
         "defaults" => Ok(Command::Defaults),
         "team" => Ok(Command::Team),
+        "copy" | "chat" => Ok(Command::Copy),
         "context" | "ctx" => Ok(Command::Context),
         "claude-reset" => Ok(Command::Reset(Agent::ClaudeCode)),
         "codex-reset" => Ok(Command::Reset(Agent::Codex)),
@@ -102,6 +105,7 @@ pub(crate) const NAMES: &[&str] = &[
     "codex",
     "codex-reset",
     "context",
+    "copy",
     "cost",
     "defaults",
     "diff",
@@ -216,6 +220,8 @@ Type a question or a change and press Enter. Changes are checked before they are
                      sessions; done by itself whenever they change
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation
 /codex <task>        the same with Codex, which runs commands in its sandbox, without network
+/copy                the conversation as text in the editor: v or V selects,
+                     y copies to the clipboard, :q closes
 /context             edit what the next request sends: delete, shorten, annotate; :w applies
 /claude-reset        end Claude Code's session: its next request starts from nothing
 /codex-reset         end Codex's session
