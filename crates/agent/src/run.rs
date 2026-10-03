@@ -42,6 +42,11 @@ nothing else. Read a file before editing it, and edit existing files with `repla
 questions. When you are done, reply with a short report: what you found or changed, and anything \
 left to do.";
 
+/// For a member that cannot use tools: everything is in the task.
+const ANSWER_PROMPT: &str = "You are a careful software engineer. Another assistant asked you \
+the question below, with everything you need in it; you cannot read files or run anything. \
+Answer it directly and briefly.";
+
 /// The tool through which the first model hands a task to the team.
 const DELEGATE_TOOL: &str = "delegate";
 
@@ -719,7 +724,9 @@ fn identity(model: &ModelId, leads: bool, team: &[Member]) -> String {
         let names: Vec<String> = others.iter().map(|m| format!("`{}`", m.model)).collect();
         text.push_str(&format!(
             " The person gave you a team, {}, that you can hand tasks to with the `delegate` \
-             tool; you remain the one who answers.",
+             tool; you remain the one who answers. Before working on a request, check whether \
+             a member is better suited to it, from what the tool says each is good at, and \
+             hand it over when one is. When a member did the work, say which.",
             names.join(", ")
         ));
     }
@@ -735,9 +742,22 @@ fn delegate_spec(team: &[Member], lead: &ModelId) -> Option<ToolSpec> {
     }
     let list: String = members
         .iter()
-        .map(|m| match m.note.as_str() {
-            "" => format!("- {}\n", m.model),
-            note => format!("- {}: {note}\n", m.model),
+        .map(|m| {
+            let mut line = format!("- {}", m.model);
+            for part in [m.note.as_str(), m.about.as_str()] {
+                if !part.is_empty() {
+                    line.push_str(" — ");
+                    line.push_str(part);
+                }
+            }
+            if !m.tools {
+                line.push_str(
+                    " — It cannot use tools: it reads no file and changes nothing, so put \
+                     everything it needs in the task, such as a question with the code it is about.",
+                );
+            }
+            line.push('\n');
+            line
         })
         .collect();
     let ids: Vec<&str> = members.iter().map(|m| m.model.as_str()).collect();
@@ -746,10 +766,10 @@ fn delegate_spec(team: &[Member], lead: &ModelId) -> Option<ToolSpec> {
         description: format!(
             "Hand one task to another model of the team and get its report back. It works on \
              the same files with the same tools, but does not see this conversation: write a \
-             task that says everything it needs. Do simple things yourself; hand over what \
-             another model does better or more cheaply, such as a hard change to a stronger \
-             model or a long read to a cheaper one. Every request has a budget, so mind the \
-             prices.\nTeam:\n{list}"
+             task that says everything it needs. Choose by what each member is good at, as \
+             described below: hand over what another model does better or more cheaply, such \
+             as a hard change to a stronger model or a long read to a cheaper one, and do the \
+             rest yourself. Every request has a budget, so mind the prices.\nTeam:\n{list}"
         ),
         parameters: serde_json::json!({
             "type": "object",
@@ -777,15 +797,16 @@ async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     let Ok(args) = serde_json::from_str::<Args>(arguments) else {
         return Ok("error: expected {\"model\": ..., \"task\": ...}".into());
     };
-    let Some(to) = ctx
+    let Some(member) = ctx
         .config
         .team
         .iter()
-        .map(|m| m.model.clone())
-        .find(|m| m.as_str() == args.model && m != from)
+        .find(|m| m.model.as_str() == args.model && &m.model != from)
+        .cloned()
     else {
         return Ok(format!("error: {} is not in the team", args.model));
     };
+    let to = member.model;
     (ctx.observe)(Event::Delegating {
         from: from.clone(),
         to: to.clone(),
@@ -807,6 +828,8 @@ async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             directory: ctx.toolbox.workspace().root().to_owned(),
         };
         run_agent(ctx, &to, &request).await?.text
+    } else if !member.tools {
+        answer_only(ctx, &to, args.task).await?
     } else {
         let mut messages = vec![Message::system(MEMBER_PROMPT), Message::user(args.task)];
         let finished = converse(ctx, &to, &mut messages, false).await?;
@@ -837,6 +860,60 @@ async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     Ok(format!(
         "{to} reports:\n{report}\n\nFiles it changed: {changed}"
     ))
+}
+
+/// Asks a member that cannot use tools: one call, no tools, its answer as
+/// the report.
+async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    model: &ModelId,
+    task: String,
+) -> Result<String, AgentError> {
+    if ctx
+        .config
+        .budget
+        .is_some_and(|budget| ctx.ledger.cost.0 >= budget.0)
+    {
+        return Err(AgentError::OverBudget);
+    }
+    let request = ChatRequest {
+        model: model.clone(),
+        messages: vec![
+            Message::system(format!(
+                "{ANSWER_PROMPT}{}",
+                identity(model, false, &ctx.config.team)
+            )),
+            Message::user(task),
+        ],
+        tools: Vec::new(),
+    };
+    let response = ctx
+        .model
+        .complete(&request)
+        .await
+        .map_err(|e| AgentError::Model(Box::new(e)))?;
+    ctx.ledger.usage += response.usage;
+    match response.cost {
+        Some(cost) => ctx.ledger.cost += cost,
+        None => ctx.ledger.cost_complete = false,
+    }
+    (ctx.observe)(Event::Turn {
+        model: model.clone(),
+        usage: response.usage,
+        cost: response.cost,
+        subscription: false,
+        context: None,
+    });
+    let text = response.content.unwrap_or_default();
+    (ctx.observe)(Event::Said {
+        model: model.clone(),
+        text: text.clone(),
+    });
+    Ok(if text.is_empty() {
+        "(no report)".into()
+    } else {
+        text
+    })
 }
 
 async fn check<M, D, O: FnMut(Event)>(
@@ -1221,6 +1298,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_member_without_tools_only_answers() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            calls(
+                "delegate",
+                json!({"model": "tiny", "task": "Is 2 + 2 = 4?"}),
+            ),
+            says("Yes."),
+            says("tiny says yes."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .member(Member {
+                tools: false,
+                ..Member::new(ModelId::new("tiny").unwrap(), "")
+            })
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "ask tiny",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        let seen = model.seen.lock().unwrap();
+        assert!(seen[0].tools[4].description.contains("It cannot use tools"));
+        assert_eq!(seen[1].model.as_str(), "tiny");
+        assert!(seen[1].tools.is_empty());
+        assert!(matches!(
+            seen[2].messages.last(),
+            Some(Message::Tool { content, .. }) if content.starts_with("tiny reports:\nYes.")
+        ));
+    }
+
+    #[tokio::test]
     async fn the_first_model_hands_a_task_to_the_team() {
         let (dir, mut toolbox) = setup();
         let model = Scripted::new(vec![
@@ -1234,13 +1354,10 @@ mod tests {
         ]);
         let config = AgentConfig::builder()
             .tier(ModelId::new("cheap").unwrap())
+            .member(Member::new(ModelId::new("cheap").unwrap(), ""))
             .member(Member {
-                model: ModelId::new("cheap").unwrap(),
-                note: String::new(),
-            })
-            .member(Member {
-                model: ModelId::new("strong").unwrap(),
-                note: "$3/M in".into(),
+                about: "Good at hard changes.".into(),
+                ..Member::new(ModelId::new("strong").unwrap(), "$3/M in")
             })
             .build()
             .unwrap();
@@ -1274,7 +1391,11 @@ mod tests {
             delegate.parameters["properties"]["model"]["enum"],
             json!(["strong"])
         );
-        assert!(delegate.description.contains("- strong: $3/M in"));
+        assert!(
+            delegate
+                .description
+                .contains("- strong — $3/M in — Good at hard changes.\n")
+        );
         // The member works from the task alone, and cannot hand it on.
         assert_eq!(seen[1].model.as_str(), "strong");
         assert_eq!(

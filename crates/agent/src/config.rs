@@ -15,13 +15,31 @@ pub struct AgentConfig {
 }
 
 /// A model the first one may hand a task to, with what it should know to
-/// choose it, such as its price.
+/// choose it, such as its price and what it is good at.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Member {
     /// The model, or an agent such as `claude-code/opus`.
     pub model: ModelId,
-    /// A few words for the model choosing: price, context, strengths.
+    /// A few words on it, shown to the person too: price, context.
     pub note: String,
+    /// What it is good at, as its provider describes it, for the model
+    /// choosing.
+    pub about: String,
+    /// Whether it can call tools. One that cannot reads and edits nothing:
+    /// it only answers what the task itself says.
+    pub tools: bool,
+}
+
+impl Member {
+    /// A member that calls tools, known by `note` only.
+    pub fn new(model: ModelId, note: impl Into<String>) -> Self {
+        Self {
+            model,
+            note: note.into(),
+            about: String::new(),
+            tools: true,
+        }
+    }
 }
 
 impl AgentConfig {

@@ -1492,9 +1492,13 @@ impl App {
         self.settings
             .team
             .iter()
-            .map(|model| Member {
-                model: model.clone(),
-                note: self.note(model),
+            .map(|model| {
+                self.settings
+                    .catalog
+                    .iter()
+                    .find(|m| &m.model == model)
+                    .cloned()
+                    .unwrap_or_else(|| Member::new(model.clone(), self.note(model)))
             })
             .collect()
     }
@@ -1597,9 +1601,21 @@ impl App {
             self.info(format!("{model} leaves the team"));
         } else {
             self.settings.team.push(model.clone());
-            self.info(format!(
-                "{model} joins the team: {lead} answers you and may hand it tasks. /team shows the team, /defaults keeps it"
-            ));
+            let tools = self
+                .settings
+                .catalog
+                .iter()
+                .find(|m| m.model == model)
+                .is_none_or(|m| m.tools);
+            if tools {
+                self.info(format!(
+                    "{model} joins the team: {lead} answers you and may hand it tasks. /team shows the team"
+                ));
+            } else {
+                self.error(format!(
+                    "{model} joins the team, but the provider says it cannot use tools: it reads and changes no file, and only answers questions put to it in full"
+                ));
+            }
         }
     }
 
@@ -2373,10 +2389,7 @@ mod tests {
 
     #[test]
     fn the_picker_searches_the_catalog_and_builds_the_team() {
-        let member = |id: &str, note: &str| Member {
-            model: ModelId::new(id).unwrap(),
-            note: note.into(),
-        };
+        let member = |id: &str, note: &str| Member::new(ModelId::new(id).unwrap(), note);
         let mut app = App::new(
             Settings {
                 tiers: vec![ModelId::new("cheap").unwrap()],

@@ -252,6 +252,8 @@ async fn interface(
         .filter_map(|listed| {
             Some(Member {
                 note: note(&listed),
+                about: about(&listed),
+                tools: listed.tool_calling != Some(false),
                 model: ModelId::new(listed.id).ok()?,
             })
         })
@@ -316,8 +318,28 @@ fn note(listed: &Listed) -> String {
     price
         .into_iter()
         .chain(window)
+        .chain((listed.tool_calling == Some(false)).then(|| "no tools".to_owned()))
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+/// What the provider says a model is good at, with what it can do, for the
+/// model choosing whom to hand a task to.
+fn about(listed: &Listed) -> String {
+    let can: Vec<&str> = [
+        (listed.reasoning, "reasons"),
+        (listed.vision, "reads images"),
+    ]
+    .into_iter()
+    .filter_map(|(flag, what)| (flag == Some(true)).then_some(what))
+    .collect();
+    let description = listed.description.as_deref().unwrap_or_default().trim();
+    match (description.is_empty(), can.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("It {}.", can.join(", ")),
+        (false, true) => description.to_owned(),
+        (false, false) => format!("{description} It {}.", can.join(", ")),
+    }
 }
 
 fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {

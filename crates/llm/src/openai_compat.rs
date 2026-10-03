@@ -135,6 +135,14 @@ pub struct Listed {
     pub output_price: Option<f64>,
     /// The most it reads at once, in tokens, when listed.
     pub context_window: Option<u64>,
+    /// What the provider says it is good at.
+    pub description: Option<String>,
+    /// Whether it can call tools, when listed.
+    pub tool_calling: Option<bool>,
+    /// Whether it reasons before answering, when listed.
+    pub reasoning: Option<bool>,
+    /// Whether it reads images, when listed.
+    pub vision: Option<bool>,
 }
 
 fn parse_list(url: &str, body: &str) -> Result<Vec<Listed>, LlmError> {
@@ -148,6 +156,10 @@ fn parse_list(url: &str, body: &str) -> Result<Vec<Listed>, LlmError> {
             input_price: m.input_price,
             output_price: m.output_price,
             context_window: m.context_window,
+            description: m.description.filter(|d| !d.trim().is_empty()),
+            tool_calling: m.supports_tool_calling,
+            reasoning: m.supports_reasoning,
+            vision: m.supports_vision,
         })
         .collect())
 }
@@ -290,6 +302,14 @@ struct WireModel {
     input_price: Option<f64>,
     output_price: Option<f64>,
     context_window: Option<u64>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    supports_tool_calling: Option<bool>,
+    #[serde(default)]
+    supports_reasoning: Option<bool>,
+    #[serde(default)]
+    supports_vision: Option<bool>,
 }
 
 fn malformed(url: &str, reason: impl Into<String>) -> LlmError {
@@ -465,14 +485,18 @@ mod tests {
     #[test]
     fn the_model_list_reads_prices_and_windows() {
         let body = r#"{"data": [
-            {"id": "a/big", "input_price": 1.4e-7, "output_price": 2.8e-7, "context_window": 1000000},
+            {"id": "a/big", "input_price": 1.4e-7, "output_price": 2.8e-7, "context_window": 1000000,
+             "description": "Good at code.", "supports_tool_calling": false},
             {"id": "b/bare"}
         ]}"#;
         let list = parse_list(URL, body).unwrap();
         assert_eq!(list[0].id, "a/big");
         assert_eq!(list[0].input_price, Some(1.4e-7));
         assert_eq!(list[0].context_window, Some(1_000_000));
+        assert_eq!(list[0].description.as_deref(), Some("Good at code."));
+        assert_eq!(list[0].tool_calling, Some(false));
         assert_eq!(list[1].output_price, None);
+        assert_eq!(list[1].tool_calling, None);
         assert!(parse_list(URL, "nope").is_err());
     }
 
