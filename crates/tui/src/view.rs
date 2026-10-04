@@ -983,6 +983,27 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 out.push(Line::from(spans));
             }
         }
+        Entry::Step {
+            number,
+            of,
+            name,
+            model,
+            effort,
+        } => {
+            // Who works, plain to see: the coder in the accent colour, the
+            // planner in the colour of handovers, ironquill in grey.
+            let colour = match (model, name.starts_with("Coding")) {
+                (None, _) => Color::Gray,
+                (Some(_), true) => ACCENT,
+                (Some(_), false) => Color::Magenta,
+            };
+            let title = crate::app::step_title(*number, *of, name, model.as_ref(), *effort);
+            let rule = width.saturating_sub(title.chars().count() + 6);
+            out.push(Line::styled(
+                format!("━━ {title} {}", "━".repeat(rule.min(40))),
+                fg(colour).add_modifier(Modifier::BOLD),
+            ));
+        }
         Entry::Delegating { from, to, task, .. } => {
             out.push(action(
                 Color::Magenta,
@@ -1307,17 +1328,33 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
     };
     let glyph = SPINNER[app.spinner() % SPINNER.len()];
     let mut spans = vec![Span::styled(format!("{glyph} Working… "), fg(ACCENT))];
-    if let Some(model) = app.working_model() {
-        spans.push(Span::styled(format!("{model} "), fg(Color::Gray)));
+    if let Some(step) = app.step() {
+        spans.push(Span::styled(
+            format!("{} · ", step.to_lowercase()),
+            fg(Color::Gray),
+        ));
+    }
+    match app.working_model() {
+        Some(model) => spans.push(Span::styled(
+            format!("{model} "),
+            fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        None if app.step().is_some() => {
+            spans.push(Span::styled("ironquill ", fg(Color::Gray)));
+        }
+        None => {}
     }
     // The answering model's own cost so far, named when a sub-agent is the
     // one working, whose cost is in its pane.
     let spent = app.request_spent();
     if spent.usage.input.0 > 0 {
+        // In a pair every step counts toward it; with a sub-agent at work,
+        // its own cost is in its pane and this is the rest.
         let lead = app
             .current_model()
             .filter(|lead| app.working_model() != Some(*lead));
         let text = match lead {
+            _ if app.step().is_some() => format!("· request so far {spent} "),
             Some(lead) => format!("· {lead} so far {spent} "),
             None => format!("· {spent} "),
         };
@@ -1374,10 +1411,22 @@ fn team_title(app: &App) -> Line<'static> {
     let Some(lead) = app.current_model() else {
         return Line::default();
     };
-    let mut spans = vec![
-        Span::styled(" answers ", fg(DIM)),
-        Span::styled(lead.to_string(), fg(ACCENT)),
-    ];
+    let mut spans = Vec::new();
+    // While a step of a pair runs, who works comes first, so that nobody
+    // takes the model that usually answers for the one at work.
+    if let Some(step) = app.step() {
+        let who = app
+            .working_model()
+            .map_or_else(|| "ironquill".to_owned(), ToString::to_string);
+        spans.push(Span::styled(" now ", fg(DIM)));
+        spans.push(Span::styled(
+            who,
+            fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {} ·", step.to_lowercase()), fg(DIM)));
+    }
+    spans.push(Span::styled(" answers ", fg(DIM)));
+    spans.push(Span::styled(lead.to_string(), fg(ACCENT)));
     let team: Vec<String> = app
         .team()
         .iter()

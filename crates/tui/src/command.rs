@@ -42,7 +42,7 @@ pub(crate) enum Command {
     /// to the next level.
     Effort(Option<String>),
     /// `/pair <question>`: the best of the model that answers and its team
-    /// plans, the cheapest gathers and codes.
+    /// plans, the cheapest codes.
     Pair(Option<String>),
     /// `/planner <model>` picks the member that plans; alone, says which.
     Planner(Option<String>),
@@ -236,9 +236,10 @@ Type a question or a change and press Enter. Changes are checked before they are
                      work stops and the model says where it is and asks what next
 /team                who answers and who it may hand tasks to
 /pair <question>     in a pair, among the model that answers and its team: the
-                     best plans, thinking hard, from what the cheapest gathered;
-                     the cheapest codes it, thinking little, in a conversation of
-                     its own; the planner revises its plan if the checks fail
+                     best sees a map of the project and picks the code to read,
+                     ironquill reads it, the best plans from it, thinking hard;
+                     the cheapest codes it, thinking little, without the earlier
+                     conversation; the planner revises its plan if checks fail
 /planner <model>     the model that plans in a pair; by default the best scored,
                      or the dearest
 /effort <level>      how hard models think: low, medium, high (the default),

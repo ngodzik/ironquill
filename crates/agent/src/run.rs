@@ -49,17 +49,19 @@ const ANSWER_PROMPT: &str = "You are a careful software engineer. Another assist
 the question below, with everything you need in it; you cannot read files or run anything. \
 Answer it directly and briefly.";
 
-/// For the first model, gathering what a planner needs.
-const GATHER_PROMPT: &str = "A stronger model will plan the change the person asks for, but it \
-cannot read the project: you gather what it needs. Find the code that matters with `search`, \
-`outline`, and `read_file` with line ranges; read only what is needed. You cannot change files. \
-Then reply with a brief: the files and functions involved, the relevant code copied exactly with \
-its file and line numbers, and what the planner must know besides, such as conventions, tests and \
-constraints. Do not propose a solution. Keep it short: every line is paid for again.";
+/// For the planner, choosing what to read from the map of the project.
+const SCOUT_PROMPT: &str = "Before planning, say which code you need to see, from the map: one \
+line per excerpt, as `path:start-end`, at most 12 excerpts and about 600 lines in all. Reply with \
+those lines only, or `none` if the map is enough. ironquill reads them for you.";
+
+/// Excerpts the planner may ask for, and lines in all, so that it reads
+/// what matters rather than the project.
+const MAX_EXCERPTS: usize = 12;
+const MAX_EXCERPT_LINES: usize = 800;
 
 /// For the planner, which reads nothing itself.
-const PLAN_PROMPT: &str = "You are the architect of a change in a software project. Another \
-model gathered the code below and will implement your plan with tools; it follows instructions \
+const PLAN_PROMPT: &str = "You are the architect of a change in a software project. You see \
+the code you ask for, not the whole project. Another model will implement your plan with tools; it follows instructions \
 well but should not have to make design decisions. Write a precise plan: the files to change; for \
 each, the functions to add or change, with their signatures and exact behaviour; the edge cases; \
 the tests to add or adjust. Give short code where precision matters. If the brief lacks \
@@ -390,30 +392,56 @@ impl Session {
         };
         let planner = &pair.planner;
 
-        // The coder gathers, reading only.
-        ctx.effort = Some(pair.coder_effort);
-        let mut gathering = vec![
-            Message::system(GATHER_PROMPT),
-            Message::user(format!("{text}\n\n{context}")),
-        ];
-        converse(ctx, &coder, &mut gathering, Role::Gatherer).await?;
-        let brief = last_reply(&gathering).unwrap_or_default();
-
-        // The planner plans from the brief alone.
-        (ctx.observe)(Event::Delegating {
-            from: coder.clone(),
-            to: planner.clone(),
-            task: format!("Plan: {text}"),
+        // The planner sees the map of the project, a parser's work, and
+        // says which code it needs; ironquill reads it, no model does.
+        (ctx.observe)(Event::Step {
+            number: 1,
+            of: 4,
+            name: "Choosing the code to read".into(),
+            model: Some(planner.clone()),
+            effort: Some(pair.planner_effort),
         });
+        let root = ctx.toolbox.workspace().root().to_owned();
+        let map = ironquill_tools::project_map(&root);
         let mut planning = vec![
             Message::system(format!("{PLAN_PROMPT}{}", identity(planner, false, &[]))),
             Message::user(format!(
-                "The request:\n{text}\n\nWhat {coder} found in the project:\n{brief}{}",
+                "The request:\n{text}\n\nThe map of the project, its definitions with their \
+                 lines:\n{map}\n\n{context}\n\n{SCOUT_PROMPT}{}",
                 spent_so_far(ctx)
             )),
         ];
+        let wanted = ask_planner(ctx, planner, pair.planner_effort, &mut planning).await?;
+
+        (ctx.observe)(Event::Step {
+            number: 2,
+            of: 4,
+            name: "Reading the code asked for".into(),
+            model: None,
+            effort: None,
+        });
+        let excerpts = read_excerpts(ctx, &wanted);
+
+        (ctx.observe)(Event::Step {
+            number: 3,
+            of: 4,
+            name: "Planning".into(),
+            model: Some(planner.clone()),
+            effort: Some(pair.planner_effort),
+        });
+        planning.push(Message::user(format!(
+            "The code you asked for:\n{excerpts}\n\nNow write the plan.{}",
+            spent_so_far(ctx)
+        )));
         let mut plan = ask_planner(ctx, planner, pair.planner_effort, &mut planning).await?;
 
+        (ctx.observe)(Event::Step {
+            number: 4,
+            of: 4,
+            name: "Coding".into(),
+            model: Some(coder.clone()),
+            effort: Some(pair.coder_effort),
+        });
         // The coder implements it in a conversation of its own: the plan and
         // the request, not everything said before, which every call would
         // resend. The checks judge.
@@ -453,10 +481,12 @@ impl Session {
                     break;
                 }
                 let Some(f) = failure.as_ref() else { break };
-                (ctx.observe)(Event::Delegating {
-                    from: coder.clone(),
-                    to: planner.clone(),
-                    task: format!("Revise the plan: `{}` fails", f.command),
+                (ctx.observe)(Event::Step {
+                    number: 3,
+                    of: 4,
+                    name: format!("Revising the plan: `{}` fails", f.command),
+                    model: Some(planner.clone()),
+                    effort: Some(pair.planner_effort),
                 });
                 let changed = ctx.toolbox.changed().collect::<Vec<_>>().join(", ");
                 planning.push(Message::user(format!(
@@ -470,6 +500,13 @@ impl Session {
                     Err(e) => break 'work Err(e),
                 };
                 ctx.effort = Some(pair.coder_effort);
+                (ctx.observe)(Event::Step {
+                    number: 4,
+                    of: 4,
+                    name: "Coding the revised plan".into(),
+                    model: Some(coder.clone()),
+                    effort: Some(pair.coder_effort),
+                });
                 work.push(Message::user(format!(
                     "Revised plan by {planner}:\n{plan}\n\n{IMPLEMENT_PROMPT}{}",
                     spent_so_far(ctx)
@@ -937,6 +974,67 @@ fn within_budget<M, D, O>(
     }
 }
 
+/// The excerpts a planner asked for, as `path:start-end` lines.
+fn excerpt_requests(text: &str) -> Vec<(String, usize, usize)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line
+                .trim()
+                .trim_start_matches(['-', '*', ' '])
+                .trim_matches('`')
+                .trim();
+            let (path, range) = line.rsplit_once(':')?;
+            let (start, end) = range.trim().split_once('-')?;
+            let (start, end) = (start.trim().parse().ok()?, end.trim().parse().ok()?);
+            (!path.is_empty() && start >= 1 && end >= start)
+                .then(|| (path.trim().to_owned(), start, end))
+        })
+        .take(MAX_EXCERPTS)
+        .collect()
+}
+
+/// Reads what the planner asked for with the read tool, in the sandbox,
+/// shown as reads. No model is involved: the lines are copied as they are.
+fn read_excerpts<M, D, O: FnMut(Event)>(ctx: &mut Ctx<'_, M, D, O>, wanted: &str) -> String {
+    let mut out = Vec::new();
+    let mut lines = 0;
+    for (n, (path, start, end)) in excerpt_requests(wanted).into_iter().enumerate() {
+        let end = end.min(start + (MAX_EXCERPT_LINES.saturating_sub(lines)).max(1) - 1);
+        if lines >= MAX_EXCERPT_LINES {
+            out.push(format!(
+                "({path}:{start}-{end} not read: enough lines already)"
+            ));
+            continue;
+        }
+        let call = ironquill_core::ToolCall {
+            id: format!("excerpt-{n}"),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": path, "start": start, "end": end}).to_string(),
+        };
+        let result = ctx.toolbox.call(&call);
+        (ctx.observe)(Event::Tool {
+            name: call.name.clone(),
+            path: Some(path.clone()),
+            outcome: result
+                .as_ref()
+                .map(|o| o.summary.clone())
+                .map_err(ToString::to_string),
+        });
+        match result {
+            Ok(output) => {
+                lines += output.for_model.lines().count();
+                out.push(format!("{path}\n{}", output.for_model));
+            }
+            Err(e) => out.push(format!("{path}:{start}-{end}: {e}")),
+        }
+    }
+    if out.is_empty() {
+        "(nothing was asked for)".into()
+    } else {
+        out.join("\n\n")
+    }
+}
+
 /// The latest thing a model wrote in `messages`.
 fn last_reply(messages: &[Message]) -> Option<String> {
     messages.iter().rev().find_map(|m| match m {
@@ -1275,8 +1373,6 @@ enum Role {
     Lead,
     /// Working on a task: every tool, no team.
     Member,
-    /// Gathering what a planner needs: tools that only read.
-    Gatherer,
 }
 
 /// Lets the model call tools until it stops or runs out of turns. Returns
@@ -1288,11 +1384,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     role: Role,
 ) -> Result<bool, AgentError> {
     let leads = role == Role::Lead;
-    let mut tools = if role == Role::Gatherer {
-        ctx.toolbox.read_only_specs()
-    } else {
-        ctx.toolbox.specs()
-    };
+    let mut tools = ctx.toolbox.specs();
     if leads && let Some(spec) = delegate_spec(&ctx.config.team, model_id) {
         tools.push(spec);
     }
@@ -1377,13 +1469,6 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 messages.push(Message::Tool {
                     call_id: call.id.clone(),
                     content: report,
-                });
-                continue;
-            }
-            if role == Role::Gatherer && !Toolbox::reads_only(&call.name) {
-                messages.push(Message::Tool {
-                    call_id: call.id.clone(),
-                    content: "error: nothing may be changed now, only read".into(),
                 });
                 continue;
             }
@@ -1642,15 +1727,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pair_gathers_plans_then_codes() {
+    async fn the_planner_picks_the_code_to_read_then_the_cheap_model_codes() {
         let (dir, mut toolbox) = setup();
-        std::fs::write(dir.path().join("app.py"), "def f():\n    pass\n").unwrap();
+        std::fs::write(
+            dir.path().join("app.py"),
+            "def f():\n    pass\n\n\ndef g():\n    pass\n",
+        )
+        .unwrap();
         let model = Scripted::new(vec![
-            // The coder gathers, reading only: a write is refused.
-            calls("write_file", json!({"path": "early.txt", "content": "x"})),
-            calls("read_file", json!({"path": "app.py"})),
-            says("app.py:1 def f(): pass"),
-            // The planner plans from the brief.
+            // The planner sees the map and asks for lines.
+            says("- `app.py:1-2`"),
+            // It plans from them.
             says("Create done.txt containing ok."),
             // The coder implements.
             calls("write_file", json!({"path": "done.txt", "content": "ok"})),
@@ -1685,32 +1772,47 @@ mod tests {
                 model: ModelId::new("cheap").unwrap()
             }
         );
-        assert!(!dir.path().join("early.txt").exists());
         let seen = model.seen.lock().unwrap();
-        // Gathering: only tools that read, at the coder's effort.
-        let names: Vec<&str> = seen[0].tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(!names.contains(&"write_file") && !names.contains(&"delegate"));
-        assert!(names.contains(&"search"));
-        assert_eq!(seen[0].effort, Some(Effort::Low));
-        // Planning: the planner, no tools, its own effort, the brief and the cost.
-        assert_eq!(seen[3].model.as_str(), "strong");
-        assert!(seen[3].tools.is_empty());
-        assert_eq!(seen[3].effort, Some(Effort::Max));
-        let Some(Message::User(asked)) = seen[3].messages.last() else {
-            panic!("the planner gets the request and the brief");
+        // Choosing: the planner, no tools, its effort, the map of the project.
+        assert_eq!(seen[0].model.as_str(), "strong");
+        assert!(seen[0].tools.is_empty());
+        assert_eq!(seen[0].effort, Some(Effort::Max));
+        let Some(Message::User(asked)) = seen[0].messages.last() else {
+            panic!("the planner gets the request and the map");
         };
-        assert!(asked.contains("make done") && asked.contains("app.py:1 def f(): pass"));
+        assert!(asked.contains("make done") && asked.contains("L5    def g():"));
         assert!(asked.contains("so far, of a budget of $1.00"));
-        // Coding: the coder, every tool, the plan in its conversation.
-        assert_eq!(seen[4].model.as_str(), "cheap");
-        assert_eq!(seen[4].effort, Some(Effort::Low));
-        assert!(seen[4].messages.iter().any(|m| matches!(
-            m,
-            Message::Assistant { content: Some(t), .. } if t.starts_with("Plan by strong:")
-        )));
-        // A conversation of its own: instructions, the request, the plan.
-        assert_eq!(seen[4].messages.len(), 4);
-        assert!(!format!("{:?}", seen[4].messages).contains("an earlier"));
+        // Planning: the lines it asked for, read by ironquill, not the rest.
+        let Some(Message::User(code)) = seen[1].messages.last() else {
+            panic!("the planner gets the code it asked for");
+        };
+        assert!(code.contains("(lines 1 to 2 of 6)") && code.contains("def f():"));
+        assert!(!code.contains("def g():"));
+        // Coding: the cheap model, its own conversation, every tool.
+        assert_eq!(seen[2].model.as_str(), "cheap");
+        assert_eq!(seen[2].effort, Some(Effort::Low));
+        assert_eq!(seen[2].messages.len(), 4);
+        assert!(!format!("{:?}", seen[2].messages).contains("an earlier"));
+        assert!(seen[2].tools.iter().any(|t| t.name == "write_file"));
+        // Who works is announced at each step.
+        let steps: Vec<(u8, Option<&str>)> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Step { number, model, .. } => {
+                    Some((*number, model.as_ref().map(ModelId::as_str)))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                (1, Some("strong")),
+                (2, None),
+                (3, Some("strong")),
+                (4, Some("cheap"))
+            ]
+        );
         // The session keeps a short account of it.
         assert!(matches!(
             session.messages.last(),
@@ -1718,17 +1820,21 @@ mod tests {
                 if t.starts_with("(Worked in a pair: strong planned, cheap implemented.")
                     && t.contains("Files changed: done.txt")
         ));
-        assert!(events.iter().any(|e| matches!(
-            e,
-            Event::Delegating { to, .. } if to.as_str() == "strong"
-        )));
+    }
+
+    #[test]
+    fn excerpt_requests_are_read_from_loose_lines() {
+        assert_eq!(
+            excerpt_requests("Here:\n- `a.py:3-9`\n* b/c.rs:10-12\nnone\nd.py:9-3"),
+            [("a.py".to_owned(), 3, 9), ("b/c.rs".to_owned(), 10, 12)]
+        );
     }
 
     #[tokio::test]
     async fn the_planner_revises_its_plan_when_the_checks_fail() {
         let (dir, mut toolbox) = setup();
         let model = Scripted::new(vec![
-            says("nothing relevant"),
+            says("none"),
             says("Create notes.txt."),
             // Two rounds that miss done.txt.
             calls("write_file", json!({"path": "notes.txt", "content": "a"})),
@@ -1757,10 +1863,10 @@ mod tests {
         assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
         assert!(dir.path().join("done.txt").exists());
         let seen = model.seen.lock().unwrap();
-        // The planner's second call follows its own thread, with the failure.
+        // The planner's third call follows its own thread, with the failure.
         let revision = &seen[6];
         assert_eq!(revision.model.as_str(), "strong");
-        assert_eq!(revision.messages.len(), 4);
+        assert_eq!(revision.messages.len(), 6);
         assert!(matches!(
             revision.messages.last(),
             Some(Message::User(t)) if t.contains("test -f done.txt") && t.contains("Revise the plan")

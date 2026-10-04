@@ -619,6 +619,20 @@ fn show(event: Event) {
         Event::Failed { command, .. } => eprintln!("✗ {command} failed"),
         Event::Escalating { from, to } => eprintln!("↑ {from} gave up, escalating to {to}"),
         Event::Delegating { from, to, task } => eprintln!("→ {from} hands to {to}: {task}"),
+        Event::Step {
+            number,
+            of,
+            name,
+            model,
+            effort,
+        } => {
+            let who = match (model, effort) {
+                (Some(model), Some(effort)) => format!("{model} · effort {effort}"),
+                (Some(model), None) => model.to_string(),
+                (None, _) => "ironquill".to_owned(),
+            };
+            eprintln!("━━ {number}/{of} {name} · {who}");
+        }
         Event::Compacted {
             dropped,
             before,

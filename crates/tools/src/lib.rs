@@ -28,5 +28,6 @@ pub use docker::{Container, running_containers};
 pub use error::ToolError;
 pub use git::{diff_stat, is_clean, project_context, project_files, tracked_files};
 pub use gitview::{LineChanges, LineMark, committed_lines, file_status, line_changes};
+pub use outline::project_map;
 pub use toolbox::{ToolOutput, ToolSummary, Toolbox};
 pub use workspace::Workspace;

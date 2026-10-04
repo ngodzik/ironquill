@@ -209,6 +209,14 @@ pub(crate) enum Entry {
         spent: Usd,
         budget: Usd,
     },
+    /// A step of a request worked on in a pair: what, by whom.
+    Step {
+        number: u8,
+        of: u8,
+        name: String,
+        model: Option<ModelId>,
+        effort: Option<Effort>,
+    },
     /// What a model of the team did on a task handed to it, shown apart
     /// from the model that answers.
     Member {
@@ -355,6 +363,8 @@ pub(crate) struct App {
     quit_armed: bool,
     /// The model of the team working on a task handed to it, if one is.
     member: Option<ModelId>,
+    /// The step of a request in a pair being worked on.
+    step: Option<String>,
     /// The handover whose work the sub-agent pane shows, by its place in
     /// the transcript.
     sub_view: Option<usize>,
@@ -460,6 +470,7 @@ impl App {
             quit: false,
             quit_armed: false,
             member: None,
+            step: None,
             sub_view: None,
             sub_scroll: Cell::new(0),
             sub_max: Cell::new(0),
@@ -1207,6 +1218,7 @@ impl App {
                 // A new request: the last sub-agent's work leaves the screen,
                 // Ctrl-T brings it back.
                 self.sub_view = None;
+                self.step = None;
                 self.request_spent = Spent::default();
                 if self.focus == Focus::SubAgent {
                     self.focus = Focus::Chat;
@@ -1434,7 +1446,7 @@ impl App {
                 };
                 let planner_effort = self.settings.effort.max(Effort::High);
                 self.info(format!(
-                    "Pair: {planner} plans (effort {planner_effort}), {coder} gathers and codes (effort low), in a conversation of their own"
+                    "Pair: {planner} picks the code to read and plans (effort {planner_effort}), ironquill reads it, {coder} codes (effort low), without the earlier conversation"
                 ));
                 let pair = Pair {
                     planner,
@@ -1683,6 +1695,11 @@ impl App {
     /// Where the scores shown come from.
     pub(crate) fn credits(&self) -> Option<&str> {
         self.settings.credits.as_deref()
+    }
+
+    /// The step of a request in a pair being worked on, while it runs.
+    pub(crate) fn step(&self) -> Option<&str> {
+        self.step.as_deref().filter(|_| self.is_running())
     }
 
     /// Whether the project's own checks are found when checking.
@@ -2093,6 +2110,16 @@ impl App {
                 task,
                 spent,
             } => format!("→ {from} → {to}: {task} ({spent})"),
+            Entry::Step {
+                number,
+                of,
+                name,
+                model,
+                effort,
+            } => format!(
+                "━━ {} ━━",
+                step_title(*number, *of, name, model.as_ref(), *effort)
+            ),
             Entry::OverBudget { spent, budget } => {
                 format!("✗ budget of {budget} spent ({spent})")
             }
@@ -2334,6 +2361,23 @@ impl App {
                 self.member = Some(to);
                 return;
             }
+            Event::Step {
+                number,
+                of,
+                name,
+                model,
+                effort,
+            } => {
+                self.step = Some(name.clone());
+                self.working_model = model.clone();
+                Entry::Step {
+                    number,
+                    of,
+                    name,
+                    model,
+                    effort,
+                }
+            }
             Event::Compacted {
                 dropped,
                 before,
@@ -2405,6 +2449,22 @@ impl App {
     pub(crate) fn on_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
     }
+}
+
+/// `3/4 Planning · tensorx/glm-5.3 · effort high`, or `by ironquill`.
+pub(crate) fn step_title(
+    number: u8,
+    of: u8,
+    name: &str,
+    model: Option<&ModelId>,
+    effort: Option<Effort>,
+) -> String {
+    let who = match (model, effort) {
+        (Some(model), Some(effort)) => format!("{model} · effort {effort}"),
+        (Some(model), None) => model.to_string(),
+        (None, _) => "by ironquill, no model".to_owned(),
+    };
+    format!("{number}/{of} {name} · {who}")
 }
 
 /// The command that hands a task to `agent`.
@@ -3076,7 +3136,8 @@ mod tests {
         assert!(matches!(effect, Some(Effect::Send { ref text, .. }) if text == "add a feature"));
         assert!(app.transcript.iter().any(|e| matches!(
             e,
-            Entry::Info(t) if t.contains("smart plans (effort high), cheap gathers and codes (effort low)")
+            Entry::Info(t) if t.contains("smart picks the code to read and plans (effort high)")
+                && t.contains("cheap codes (effort low)")
         )));
         // The model that answers stays the one picked.
         assert_eq!(app.current_model(), Some(&id("smart")));
