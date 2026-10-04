@@ -52,6 +52,11 @@ impl Check {
         })
     }
 
+    /// The program the check runs.
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
     /// The command line, for display.
     pub fn command(&self) -> String {
         std::iter::once(self.program.as_str())
@@ -101,8 +106,30 @@ impl Check {
     }
 }
 
+/// `text` without the escape sequences that colour terminal output.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            // Parameters, then the letter that ends the sequence.
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Keeps the lines a reader would look at and drops the progress chatter.
 fn excerpt(text: &str) -> String {
+    // Colours are for a terminal; to a model they are tokens of noise.
+    let text = &plain(text);
     const NOISE: [&str; 7] = [
         "Compiling ",
         "Checking ",
@@ -143,6 +170,14 @@ mod tests {
         let check = Check::parse("  cargo   test -q ").unwrap();
         assert_eq!(check.command(), "cargo test -q");
         assert_eq!(Check::parse("   "), None);
+    }
+
+    #[test]
+    fn colours_are_dropped() {
+        assert_eq!(
+            plain("\u{1b}[31mFAIL\u{1b}[0m: \u{1b}[1;31mtest_add\u{1b}[0m"),
+            "FAIL: test_add"
+        );
     }
 
     #[test]

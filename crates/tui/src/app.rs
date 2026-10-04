@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ironquill_agent::{AgentConfig, Event, Member, Outcome, Session, Verdict};
-use ironquill_core::{Agent, ContextUse, ModelId, TokenCount, Usage, Usd};
+use ironquill_agent::{AgentConfig, Event, Member, Outcome, Pair, Session, Verdict};
+use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -73,6 +73,17 @@ pub struct Settings {
     pub catalog: Vec<Member>,
     /// Where scores in the notes come from, to credit it.
     pub credits: Option<String>,
+    /// How hard models think before answering.
+    pub effort: Effort,
+    /// The member of the team that plans in a pair; `None` picks
+    /// the best scored, or the dearest.
+    pub planner: Option<ModelId>,
+    /// Without checks set, find the project's own when checking: its test
+    /// runner, and tests a model has just written.
+    pub detect_checks: bool,
+    /// What the person should know at startup, such as a model given on the
+    /// command line in place of the one kept.
+    pub notes: Vec<String>,
 }
 
 /// Tokens and cost of one part of a request.
@@ -153,6 +164,8 @@ pub(crate) enum Effect {
     ForgetDelegate(Agent),
     /// Keep the current choices for every new session.
     SaveDefaults(Defaults),
+    /// Open the person's instructions for every model, creating the file.
+    OpenInstructions,
 }
 
 /// What the agent task sends back to the interface.
@@ -201,6 +214,14 @@ pub(crate) enum Entry {
         spent: Usd,
         budget: Usd,
     },
+    /// A step of a request worked on in a pair: what, by whom.
+    Step {
+        number: u8,
+        of: u8,
+        name: String,
+        model: Option<ModelId>,
+        effort: Option<Effort>,
+    },
     /// What a model of the team did on a task handed to it, shown apart
     /// from the model that answers.
     Member {
@@ -219,6 +240,10 @@ pub(crate) enum Entry {
         /// How full the context was on the request's last call.
         #[serde(default)]
         context: Option<ContextUse>,
+        /// The models that worked on it in turn, consecutive calls to the
+        /// same one together, with what each run cost.
+        #[serde(default)]
+        runs: Vec<(ModelId, Spent)>,
     },
 }
 
@@ -347,6 +372,8 @@ pub(crate) struct App {
     quit_armed: bool,
     /// The model of the team working on a task handed to it, if one is.
     member: Option<ModelId>,
+    /// The step of a request in a pair being worked on.
+    step: Option<String>,
     /// The handover whose work the sub-agent pane shows, by its place in
     /// the transcript.
     sub_view: Option<usize>,
@@ -357,6 +384,8 @@ pub(crate) struct App {
     sub_max: Cell<usize>,
     /// What the current request cost so far, without its sub-agents.
     request_spent: Spent,
+    /// The models of the current request in turn, with what each run cost.
+    runs: Vec<(ModelId, Spent)>,
     /// The choices as last kept for new sessions, to keep them again as
     /// soon as they change.
     kept: Defaults,
@@ -416,6 +445,7 @@ impl App {
         }
         settings.models = models;
         let mut transcript = vec![Entry::Welcome];
+        transcript.extend(settings.notes.drain(..).map(Entry::Info));
         if settings.tiers.is_empty() {
             transcript.push(Entry::Error(
                 "No model set. Choose one with /model <id>".into(),
@@ -452,10 +482,12 @@ impl App {
             quit: false,
             quit_armed: false,
             member: None,
+            step: None,
             sub_view: None,
             sub_scroll: Cell::new(0),
             sub_max: Cell::new(0),
             request_spent: Spent::default(),
+            runs: Vec::new(),
             kept: Defaults::default(),
             notice: None,
             session_id: sessions::new_id(),
@@ -1042,6 +1074,24 @@ impl App {
         }
     }
 
+    /// Opens a file in the editor, outside the project too.
+    pub(crate) fn open_path(&mut self, path: PathBuf) {
+        if self.file.as_ref().is_some_and(Editor::is_modified) {
+            if let Some(file) = &mut self.file {
+                file.refuse_close();
+            }
+            self.focus_on(Focus::File);
+            return;
+        }
+        let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
+        self.unzoom();
+        self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.focus_on(Focus::File);
+        self.info(
+            "Your instructions for every model: :w saves them, they count from the next request",
+        );
+    }
+
     fn open_selected(&mut self) {
         let Some(path) = self.tree.as_mut().and_then(FileTree::open) else {
             return;
@@ -1152,6 +1202,16 @@ impl App {
 
     /// Sends `text` to `tiers` rather than the configured models, as `/claude` does.
     fn submit_to(&mut self, text: String, tiers: Vec<ModelId>) -> Option<Effect> {
+        self.submit_with(text, tiers, None)
+    }
+
+    /// Sends a request, in a pair when `pair` says so.
+    fn submit_with(
+        &mut self,
+        text: String,
+        tiers: Vec<ModelId>,
+        pair: Option<Pair>,
+    ) -> Option<Effect> {
         if text.is_empty() {
             return None;
         }
@@ -1176,6 +1236,12 @@ impl App {
         if let Some(budget) = self.settings.budget {
             builder = builder.budget(budget);
         }
+        builder = builder
+            .effort(Some(self.settings.effort))
+            .detect_checks(self.settings.detect_checks);
+        if let Some(pair) = pair {
+            builder = builder.pair(pair);
+        }
         match builder.build() {
             Ok(config) => {
                 self.input.take();
@@ -1183,7 +1249,9 @@ impl App {
                 // A new request: the last sub-agent's work leaves the screen,
                 // Ctrl-T brings it back.
                 self.sub_view = None;
+                self.step = None;
                 self.request_spent = Spent::default();
+                self.runs.clear();
                 if self.focus == Focus::SubAgent {
                     self.focus = Focus::Chat;
                 }
@@ -1260,15 +1328,19 @@ impl App {
                 self.info(format!("Models: {chain}"));
             }
             Command::Check(None) => {
-                let list = if self.settings.checks.is_empty() {
-                    "none".to_owned()
-                } else {
+                let list = if !self.settings.checks.is_empty() {
                     self.settings
                         .checks
                         .iter()
                         .map(Check::command)
                         .collect::<Vec<_>>()
                         .join(", then ")
+                } else if self.settings.detect_checks {
+                    "the project's own, found when checking: pytest or unittest when \
+                     there are Python tests, npm test, cargo test"
+                        .to_owned()
+                } else {
+                    "none".to_owned()
                 };
                 self.info(format!("Checks: {list}"));
             }
@@ -1281,6 +1353,7 @@ impl App {
             },
             Command::NoCheck => {
                 self.settings.checks.clear();
+                self.settings.detect_checks = false;
                 self.info("Checks removed. Add one with /check before asking for a change");
             }
             Command::Rounds(None) => {
@@ -1381,7 +1454,65 @@ impl App {
                 }
             }
             Command::Defaults => return Some(Effect::SaveDefaults(self.defaults())),
+            Command::Effort(None) => {
+                let next = match self.settings.effort {
+                    Effort::Max => Effort::Low,
+                    effort => effort.step(1),
+                };
+                self.set_effort(next);
+            }
+            Command::Effort(Some(level)) => match level.parse() {
+                Ok(effort) => self.set_effort(effort),
+                Err(e) => self.error(e),
+            },
             Command::Copy => self.open_transcript(),
+            Command::Instructions => return Some(Effect::OpenInstructions),
+            Command::Pair(None) => {
+                self.error("Give it a question: /pair <what to do>");
+            }
+            Command::Pair(Some(text)) => {
+                let (coder, planner) = match self.pair_roles() {
+                    Ok(roles) => roles,
+                    Err(why) => {
+                        self.error(why);
+                        return None;
+                    }
+                };
+                let planner_effort = self.settings.effort.max(Effort::High);
+                self.info(format!(
+                    "Pair: {planner} picks the code to read and plans (effort {planner_effort}), ironquill reads it, {coder} codes (effort low), without the earlier conversation"
+                ));
+                let pair = Pair {
+                    planner,
+                    planner_effort,
+                    coder_effort: Effort::Low,
+                };
+                return self.submit_with(text, vec![coder], Some(pair));
+            }
+            Command::Planner(None) => match self.planner() {
+                Some(planner) => self.info(format!(
+                    "Planner: {planner}{}",
+                    if self.settings.planner.is_some() {
+                        ""
+                    } else {
+                        ", the best of the team; /planner <model> picks another"
+                    }
+                )),
+                None => self.info("No planner: put a model in the team first (Ctrl-E, Space)"),
+            },
+            Command::Planner(Some(id)) => match ModelId::new(id) {
+                Ok(model)
+                    if self.settings.team.contains(&model)
+                        || self.current_model() == Some(&model) =>
+                {
+                    self.info(format!("Planner: {model}"));
+                    self.settings.planner = Some(model);
+                }
+                Ok(model) => self.error(format!(
+                    "{model} is neither the model that answers nor in the team"
+                )),
+                Err(e) => self.error(e.to_string()),
+            },
             Command::Team => {
                 let text = self.describe_team();
                 self.info(text);
@@ -1414,6 +1545,7 @@ impl App {
                     seconds,
                     subscription: outcome.subscription,
                     context: outcome.context,
+                    runs: std::mem::take(&mut self.runs),
                 });
                 true
             }
@@ -1600,6 +1732,41 @@ impl App {
         self.settings.credits.as_deref()
     }
 
+    /// The step of a request in a pair being worked on, while it runs.
+    pub(crate) fn step(&self) -> Option<&str> {
+        self.step.as_deref().filter(|_| self.is_running())
+    }
+
+    /// The project's root directory.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether the project's own checks are found when checking.
+    pub(crate) fn detects_checks(&self) -> bool {
+        self.settings.detect_checks
+    }
+
+    /// How hard models think before answering.
+    pub(crate) fn effort(&self) -> Effort {
+        self.settings.effort
+    }
+
+    /// Sets the effort and says so.
+    fn set_effort(&mut self, effort: Effort) {
+        self.settings.effort = effort;
+        self.info(format!(
+            "Effort: {effort}. Models that reason think {} before answering",
+            match effort {
+                Effort::Low => "briefly",
+                Effort::Medium => "a while",
+                Effort::High => "carefully",
+                Effort::Xhigh => "longer",
+                Effort::Max => "as long as they can",
+            }
+        ));
+    }
+
     /// The most one request may cost.
     pub(crate) fn budget(&self) -> Option<Usd> {
         self.settings.budget
@@ -1656,6 +1823,84 @@ impl App {
             .find(|m| &m.model == model)
             .map(|m| m.note.clone())
             .unwrap_or_default()
+    }
+
+    /// Who plans and who codes in a pair, among the model that answers and
+    /// its team only. The planner comes first: the one picked with /planner,
+    /// or the best, by Artificial Analysis' score, else by price. The coder
+    /// is then the cheapest of the others that can use tools. Without one,
+    /// the reason, rather than roles the wrong way round.
+    pub(crate) fn pair_roles(&self) -> Result<(ModelId, ModelId), String> {
+        let mut models: Vec<Member> = self.members();
+        if let Some(lead) = self.current_model()
+            && !models.iter().any(|m| &m.model == lead)
+        {
+            models.push(self.member_of(lead));
+        }
+        if models.len() < 2 {
+            return Err(
+                "Working in a pair needs two models: the one that answers and one in the team (Ctrl-E, select a model, Space)"
+                    .into(),
+            );
+        }
+        // Scores compare models only when every one has one; otherwise a
+        // scored cheap model would beat an unscored strong one. Then price.
+        let scored = models.iter().all(|m| m.score.is_some());
+        let best = |m: &Member| {
+            let score = if scored { m.score.unwrap_or(-1.0) } else { 0.0 };
+            (score, m.price.unwrap_or(-1.0))
+        };
+        let planner = match self
+            .settings
+            .planner
+            .as_ref()
+            .filter(|chosen| models.iter().any(|m| &m.model == *chosen))
+        {
+            Some(chosen) => chosen.clone(),
+            None => models
+                .iter()
+                .max_by(|a, b| {
+                    best(a)
+                        .partial_cmp(&best(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|m| m.model.clone())
+                .expect("two models at least"),
+        };
+        let price = |m: &Member| m.price.unwrap_or(f64::MAX);
+        let coder = models
+            .iter()
+            .filter(|m| m.model != planner && m.tools)
+            .min_by(|a, b| price(a).total_cmp(&price(b)));
+        match coder {
+            Some(coder) => Ok((coder.model.clone(), planner)),
+            None => {
+                let without: Vec<String> = models
+                    .iter()
+                    .filter(|m| m.model != planner && !m.tools)
+                    .map(|m| m.model.to_string())
+                    .collect();
+                Err(format!(
+                    "{planner} would plan, but no other model can code: {} cannot use tools, says the provider. Put a model that can in the team (Ctrl-E, select it, Space): \"no tools\" marks those that cannot",
+                    without.join(", ")
+                ))
+            }
+        }
+    }
+
+    /// The member of the team that plans in a pair, as /pair would pick it.
+    pub(crate) fn planner(&self) -> Option<ModelId> {
+        self.pair_roles().ok().map(|(_, planner)| planner)
+    }
+
+    /// What is known of `model`: from the provider's list, or its name.
+    fn member_of(&self, model: &ModelId) -> Member {
+        self.settings
+            .catalog
+            .iter()
+            .find(|m| &m.model == model)
+            .cloned()
+            .unwrap_or_else(|| Member::new(model.clone(), self.note(model)))
     }
 
     /// The team as the agent gets it, with what tells its members apart.
@@ -1738,6 +1983,30 @@ impl App {
                     self.toggle_team(row.model.clone());
                 }
             }
+            // Delete takes a model off the list, and off the team: it is no
+            // longer offered. Never the one that answers.
+            KeyCode::Delete => {
+                if let Some(row) = rows.get(selected).filter(|r| r.offered) {
+                    let model = row.model.clone();
+                    if self.current_model() == Some(&model) {
+                        self.error(format!(
+                            "{model} answers: pick another with Enter before taking it off the list"
+                        ));
+                    } else {
+                        self.settings.models.retain(|m| m != &model);
+                        self.settings.team.retain(|m| m != &model);
+                        if self.settings.planner.as_ref() == Some(&model) {
+                            self.settings.planner = None;
+                        }
+                        self.info(format!("{model} is off the list"));
+                        let last = self.model_rows().len().saturating_sub(1);
+                        set(self, selected.min(last));
+                    }
+                }
+            }
+            // The effort, shown at the top of the list, beside the search.
+            KeyCode::Left => self.settings.effort = self.settings.effort.step(-1),
+            KeyCode::Right => self.settings.effort = self.settings.effort.step(1),
             KeyCode::Esc => self.model_picker = None,
             // Ctrl-E again closes it, as the shortcut that opened it.
             KeyCode::Char('e') if ctrl => self.model_picker = None,
@@ -1836,6 +2105,8 @@ impl App {
                 .collect(),
             team: ids(&self.settings.team),
             budget: self.settings.budget.map(|b| b.0),
+            effort: Some(self.settings.effort.to_string()),
+            planner: self.settings.planner.as_ref().map(ToString::to_string),
         }
     }
 
@@ -1925,6 +2196,16 @@ impl App {
                 task,
                 spent,
             } => format!("→ {from} → {to}: {task} ({spent})"),
+            Entry::Step {
+                number,
+                of,
+                name,
+                model,
+                effort,
+            } => format!(
+                "━━ {} ━━",
+                step_title(*number, *of, name, model.as_ref(), *effort)
+            ),
             Entry::OverBudget { spent, budget } => {
                 format!("✗ budget of {budget} spent ({spent})")
             }
@@ -2078,7 +2359,20 @@ impl App {
                 // The model that answers is back: the member is done.
                 if self.member.as_ref().is_some_and(|m| *m != model) {
                     self.member = None;
-                    self.working_model = Some(model);
+                    self.working_model = Some(model.clone());
+                }
+                // Who worked, in turn: a new run when the model changes.
+                let run = match self.runs.last_mut() {
+                    Some((last, spent)) if *last == model => spent,
+                    _ => {
+                        self.runs.push((model.clone(), Spent::default()));
+                        &mut self.runs.last_mut().expect("just pushed").1
+                    }
+                };
+                run.usage += usage;
+                match cost {
+                    Some(c) => run.cost += c,
+                    None => run.subscription |= subscription,
                 }
                 if self.member.is_none() {
                     self.request_spent.usage += usage;
@@ -2166,6 +2460,23 @@ impl App {
                 self.member = Some(to);
                 return;
             }
+            Event::Step {
+                number,
+                of,
+                name,
+                model,
+                effort,
+            } => {
+                self.step = Some(name.clone());
+                self.working_model = model.clone();
+                Entry::Step {
+                    number,
+                    of,
+                    name,
+                    model,
+                    effort,
+                }
+            }
             Event::Compacted {
                 dropped,
                 before,
@@ -2237,6 +2548,22 @@ impl App {
     pub(crate) fn on_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
     }
+}
+
+/// `3/4 Planning · tensorx/glm-5.3 · effort high`, or `by ironquill`.
+pub(crate) fn step_title(
+    number: u8,
+    of: u8,
+    name: &str,
+    model: Option<&ModelId>,
+    effort: Option<Effort>,
+) -> String {
+    let who = match (model, effort) {
+        (Some(model), Some(effort)) => format!("{model} · effort {effort}"),
+        (Some(model), None) => model.to_string(),
+        (None, _) => "by ironquill, no model".to_owned(),
+    };
+    format!("{number}/{of} {name} · {who}")
 }
 
 /// The command that hands a task to `agent`.
@@ -2712,6 +3039,8 @@ mod tests {
                 models: vec!["cheap".into(), "anthropic/claude-sonnet".into()],
                 team: vec!["anthropic/claude-sonnet".into()],
                 budget: Some(0.25),
+                effort: Some("high".into()),
+                planner: None,
             }
         );
     }
@@ -2822,6 +3151,183 @@ mod tests {
         assert!(app.sub_agent().is_none());
         app.on_key(ctrl_t);
         assert!(app.sub_agent().is_some());
+    }
+
+    #[test]
+    fn the_effort_is_high_and_easy_to_change() {
+        let mut app = ready();
+        assert_eq!(app.effort(), Effort::High);
+
+        // Alone, /effort goes to the next level, and round.
+        type_text(&mut app, "/effort");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.effort(), Effort::Xhigh);
+        type_text(&mut app, "/effort low");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.effort(), Effort::Low);
+        type_text(&mut app, "/effort extreme");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.effort(), Effort::Low);
+
+        // Left and right in the model picker.
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.effort(), Effort::High);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.effort(), Effort::Medium);
+        press(&mut app, KeyCode::Esc);
+
+        // Kept with the other choices.
+        assert_eq!(app.defaults().effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn a_pair_codes_with_the_cheapest_and_plans_with_the_best() {
+        let scored = |id: &str, score: Option<f64>, price: f64| Member {
+            score,
+            price: Some(price),
+            ..Member::new(ModelId::new(id).unwrap(), "")
+        };
+        // As in a real run: the model that answers is the dearest.
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("smart").unwrap()],
+                catalog: vec![
+                    scored("cheap", Some(40.0), 1e-7),
+                    scored("smart", Some(55.0), 2e-6),
+                    scored("dear", Some(50.0), 9e-6),
+                ],
+                rounds: 2,
+                max_turns: 30,
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        // Alone: nobody to pair with.
+        type_text(&mut app, "/pair add a feature");
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(matches!(app.transcript.last(), Some(Entry::Error(e)) if e.contains("two models")));
+
+        // The cheapest codes, the best scored plans, whoever answers.
+        app.settings.team = ["cheap", "dear"]
+            .iter()
+            .map(|m| ModelId::new(*m).unwrap())
+            .collect();
+        let id = |s: &str| ModelId::new(s).unwrap();
+        assert_eq!(app.pair_roles(), Ok((id("cheap"), id("smart"))));
+        // Without a score for every one, the dearest plans.
+        app.settings.catalog[1].score = None;
+        assert_eq!(app.pair_roles(), Ok((id("cheap"), id("dear"))));
+        // Picked by hand, among the model that answers and the team only.
+        type_text(&mut app, "/planner outsider");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.planner(), Some(id("dear")));
+        type_text(&mut app, "/planner smart");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pair_roles(), Ok((id("cheap"), id("smart"))));
+
+        // A real case: the only cheaper model cannot use tools. The best
+        // still plans, and ironquill says why nobody can code rather than
+        // swapping the roles.
+        let no_tools = Member {
+            tools: false,
+            ..scored("flash", None, 2e-7)
+        };
+        app.settings.catalog.push(no_tools);
+        app.settings.planner = None;
+        app.settings.team = vec![id("flash")];
+        let why = app.pair_roles().unwrap_err();
+        assert!(
+            why.contains("smart would plan") && why.contains("flash cannot use tools"),
+            "{why}"
+        );
+        app.settings.team = vec![id("cheap"), id("dear")];
+        app.settings.planner = Some(id("smart"));
+
+        type_text(&mut app, "/pair add a feature");
+        let effect = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(effect, Some(Effect::Send { ref text, .. }) if text == "add a feature"));
+        assert!(app.transcript.iter().any(|e| matches!(
+            e,
+            Entry::Info(t) if t.contains("smart picks the code to read and plans (effort high)")
+                && t.contains("cheap codes (effort low)")
+        )));
+        // The model that answers stays the one picked.
+        assert_eq!(app.current_model(), Some(&id("smart")));
+    }
+
+    #[test]
+    fn the_cost_line_shows_the_models_in_turn() {
+        let mut app = ready();
+        let id = |s: &str| ModelId::new(s).unwrap();
+        let turn = |model: &str, cost: f64| {
+            AgentMessage::Event(Event::Turn {
+                model: id(model),
+                usage: Usage {
+                    input: TokenCount(1_000),
+                    output: TokenCount(10),
+                },
+                cost: Some(Usd(cost)),
+                subscription: false,
+                context: None,
+            })
+        };
+        type_text(&mut app, "do it");
+        press(&mut app, KeyCode::Enter);
+        for (model, cost) in [
+            ("strong", 0.002),
+            ("strong", 0.004),
+            ("cheap", 0.01),
+            ("strong", 0.001),
+        ] {
+            app.on_agent(turn(model, cost));
+        }
+        app.on_agent(AgentMessage::Done(Ok(Outcome {
+            verdict: Verdict::Answered,
+            usage: Usage::default(),
+            cost: Usd(0.017),
+            cost_complete: true,
+            subscription: false,
+            context: None,
+            changed: vec![],
+        })));
+        let Some(Entry::Cost { runs, .. }) = app.transcript.last() else {
+            panic!("a cost line ends the request");
+        };
+        let chain: Vec<(&str, Usd)> = runs.iter().map(|(m, s)| (m.as_str(), s.cost)).collect();
+        assert_eq!(
+            chain,
+            [
+                ("strong", Usd(0.006)),
+                ("cheap", Usd(0.01)),
+                ("strong", Usd(0.001))
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_takes_a_model_off_the_list_but_not_the_one_that_answers() {
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("a").unwrap()],
+                models: vec![ModelId::new("a").unwrap(), ModelId::new("b").unwrap()],
+                team: vec![ModelId::new("b").unwrap()],
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.models().len(), 2, "the one that answers stays");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.models(), [ModelId::new("a").unwrap()]);
+        assert!(app.team().is_empty());
     }
 
     #[test]

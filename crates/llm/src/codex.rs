@@ -82,6 +82,11 @@ impl Codex {
         if !request.model.is_empty() {
             command.args(["-m", &request.model]);
         }
+        if let Some(effort) = request.effort {
+            command
+                .arg("-c")
+                .arg(format!("model_reasoning_effort=\"{effort}\""));
+        }
         // Last, so that a prompt starting with `-` is not read as a flag.
         command.arg("--").arg(&request.prompt);
         command
@@ -417,6 +422,7 @@ mod tests {
     fn the_command_line_sandboxes_codex_and_resumes_its_session() {
         let request = DelegateRequest {
             agent: ironquill_core::Agent::Codex,
+            effort: Some(ironquill_core::Effort::Low),
             model: "gpt-5.5".into(),
             prompt: "-fix it".into(),
             instructions: "be \"brief\"".into(),
@@ -437,6 +443,7 @@ mod tests {
             "approval_policy=\"never\"",
             "mcp_servers={}",
             "developer_instructions=\"be \\\"brief\\\"\"",
+            "model_reasoning_effort=\"low\"",
         ] {
             assert!(args.iter().any(|a| a == setting), "{setting} missing");
         }

@@ -6,6 +6,7 @@
 //! models = ["deepseek/deepseek-chat", "anthropic/claude-sonnet-4-5"]
 //! team = ["anthropic/claude-sonnet-4-5"]
 //! budget = 0.10
+//! effort = "high"
 //! ```
 //!
 //! Keys never go here: they come from the environment only.
@@ -32,6 +33,12 @@ pub struct Defaults {
     /// The most one request may cost, in dollars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<f64>,
+    /// How hard models think: low, medium, high, xhigh or max.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// The member of the team that plans in a pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner: Option<String>,
 }
 
 impl Defaults {
@@ -45,6 +52,24 @@ impl Defaults {
             None => PathBuf::from(std::env::var_os("HOME")?).join(".ironquill"),
         };
         Some(base.join("config.toml"))
+    }
+
+    /// The person's own instructions for every model, next to the defaults:
+    /// `~/.ironquill/instructions.md`. Never in a project.
+    pub fn instructions_path() -> Option<PathBuf> {
+        Self::path().map(|p| p.with_file_name("instructions.md"))
+    }
+
+    /// The person's instructions as they are now; `None` when there are none.
+    pub fn instructions() -> Option<String> {
+        let text = fs::read_to_string(Self::instructions_path()?).ok()?;
+        // The first lines, ironquill's own explanation, are not instructions.
+        let text: String = text
+            .lines()
+            .filter(|line| !line.starts_with("<!--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// Reads the defaults at `path`; none when the file does not exist.
@@ -92,6 +117,8 @@ mod tests {
             models: vec!["a/cheap".into(), "b/strong".into()],
             team: vec!["b/strong".into()],
             budget: Some(0.25),
+            effort: Some("max".into()),
+            planner: Some("b/strong".into()),
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));

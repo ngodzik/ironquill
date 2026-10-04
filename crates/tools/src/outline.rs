@@ -129,6 +129,13 @@ fn signature(node: Node, source: &str, depth: usize) -> String {
     )
 }
 
+/// The map of the whole project: its functions, classes and types, file by
+/// file, with their lines. Built by a parser, in an instant, for a model to
+/// see where things are without reading them.
+pub fn project_map(root: &Path) -> String {
+    outline_dir(root, root)
+}
+
 /// The map of every file of a known language under `dir`, skipping what
 /// git ignores, as `path` then its definitions.
 pub(crate) fn outline_dir(root: &Path, dir: &Path) -> String {

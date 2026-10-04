@@ -126,10 +126,16 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
 
     let room = usize::from(inner.width);
     let current = app.current_model();
+    // The effort sits at the right of the search line, ← → changing it.
+    let effort = format!("effort ← {} →", app.effort());
+    let typed = picker.filter.chars().count() + 8;
+    let gap = room.saturating_sub(typed + effort.chars().count());
     let mut lines = vec![Line::from(vec![
         Span::styled("search ", fg(DIM)),
         Span::raw(picker.filter.clone()),
         Span::styled("▏", fg(ACCENT)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(effort, fg(Color::Gray)),
     ])];
     let credits = app
         .credits()
@@ -977,6 +983,28 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 out.push(Line::from(spans));
             }
         }
+        Entry::Step {
+            number,
+            of,
+            name,
+            model,
+            effort,
+        } => {
+            // Who works, plain to see: the coder in the accent colour, the
+            // planner in the colour of handovers, ironquill in grey.
+            let coding = name.starts_with("Coding") || name.starts_with("Fixing");
+            let colour = match (model, coding) {
+                (None, _) => Color::Gray,
+                (Some(_), true) => ACCENT,
+                (Some(_), false) => Color::Magenta,
+            };
+            let title = crate::app::step_title(*number, *of, name, model.as_ref(), *effort);
+            let rule = width.saturating_sub(title.chars().count() + 6);
+            out.push(Line::styled(
+                format!("━━ {title} {}", "━".repeat(rule.min(40))),
+                fg(colour).add_modifier(Modifier::BOLD),
+            ));
+        }
         Entry::Delegating { from, to, task, .. } => {
             out.push(action(
                 Color::Magenta,
@@ -1022,15 +1050,39 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
             seconds,
             subscription,
             context,
+            runs,
         } => {
+            // When several models took turns: who, in order, and what each
+            // run cost, the total under it.
+            if runs.len() > 1 {
+                let chain: Vec<String> = runs
+                    .iter()
+                    .map(|(model, spent)| {
+                        if spent.subscription && spent.cost.0 == 0.0 {
+                            format!("{model} subscription")
+                        } else {
+                            format!("{model} {}", spent.cost)
+                        }
+                    })
+                    .collect();
+                push_wrapped(
+                    &mut out,
+                    Span::raw("  "),
+                    "    ",
+                    &chain.join(" → "),
+                    fg(Color::Gray),
+                    width,
+                );
+            }
             let cost = match (*subscription, cost.0 > 0.0, *complete) {
                 (true, false, _) => "subscription".to_owned(),
                 (true, true, _) => format!("{cost} + subscription"),
                 (false, _, true) => cost.to_string(),
                 (false, _, false) => format!("{cost} reported, part of the cost unknown"),
             };
+            let total = if runs.len() > 1 { "total " } else { "" };
             let mut text = format!(
-                "{cost} · {} in · {} out · {seconds}s",
+                "{total}{cost} · {} in · {} out · {seconds}s",
                 usage.input, usage.output
             );
             if let Some(context) = context {
@@ -1156,14 +1208,16 @@ fn diff_lines(out: &mut Vec<Line<'static>>, diff: &[DiffLine], created: bool, wi
 
 fn welcome(out: &mut Vec<Line<'static>>, app: &App, width: usize) {
     let inner = width.clamp(20, 64) - 2;
-    let checks = if app.checks().is_empty() {
-        "none, changes are kept as written (/check adds one)".to_owned()
-    } else {
+    let checks = if !app.checks().is_empty() {
         app.checks()
             .iter()
             .map(ironquill_tools::Check::command)
             .collect::<Vec<_>>()
             .join(", ")
+    } else if app.detects_checks() {
+        "the project's tests, found when checking".to_owned()
+    } else {
+        "none, changes are kept as written (/check adds one)".to_owned()
     };
     let rows: Vec<(String, Style)> = vec![
         (
@@ -1299,17 +1353,33 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
     };
     let glyph = SPINNER[app.spinner() % SPINNER.len()];
     let mut spans = vec![Span::styled(format!("{glyph} Working… "), fg(ACCENT))];
-    if let Some(model) = app.working_model() {
-        spans.push(Span::styled(format!("{model} "), fg(Color::Gray)));
+    if let Some(step) = app.step() {
+        spans.push(Span::styled(
+            format!("{} · ", step.to_lowercase()),
+            fg(Color::Gray),
+        ));
+    }
+    match app.working_model() {
+        Some(model) => spans.push(Span::styled(
+            format!("{model} "),
+            fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        None if app.step().is_some() => {
+            spans.push(Span::styled("ironquill ", fg(Color::Gray)));
+        }
+        None => {}
     }
     // The answering model's own cost so far, named when a sub-agent is the
     // one working, whose cost is in its pane.
     let spent = app.request_spent();
     if spent.usage.input.0 > 0 {
+        // In a pair every step counts toward it; with a sub-agent at work,
+        // its own cost is in its pane and this is the rest.
         let lead = app
             .current_model()
             .filter(|lead| app.working_model() != Some(*lead));
         let text = match lead {
+            _ if app.step().is_some() => format!("· request so far {spent} "),
             Some(lead) => format!("· {lead} so far {spent} "),
             None => format!("· {spent} "),
         };
@@ -1366,10 +1436,22 @@ fn team_title(app: &App) -> Line<'static> {
     let Some(lead) = app.current_model() else {
         return Line::default();
     };
-    let mut spans = vec![
-        Span::styled(" answers ", fg(DIM)),
-        Span::styled(lead.to_string(), fg(ACCENT)),
-    ];
+    let mut spans = Vec::new();
+    // While a step of a pair runs, who works comes first, so that nobody
+    // takes the model that usually answers for the one at work.
+    if let Some(step) = app.step() {
+        let who = app
+            .working_model()
+            .map_or_else(|| "ironquill".to_owned(), ToString::to_string);
+        spans.push(Span::styled(" now ", fg(DIM)));
+        spans.push(Span::styled(
+            who,
+            fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {} ·", step.to_lowercase()), fg(DIM)));
+    }
+    spans.push(Span::styled(" answers ", fg(DIM)));
+    spans.push(Span::styled(lead.to_string(), fg(ACCENT)));
     let team: Vec<String> = app
         .team()
         .iter()
@@ -1386,11 +1468,13 @@ fn team_title(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The budget, for the status line.
+/// The effort and the budget, for the status line.
 fn team_and_budget(app: &App) -> String {
-    app.budget()
+    let budget = app
+        .budget()
         .map(|b| format!(" · budget {b}"))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    format!(" · effort {}{budget}", app.effort())
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {

@@ -186,6 +186,10 @@ where
         match effect {
             None => {}
             Some(Effect::Send { text, config }) => {
+                // Read again each time: an edit counts from the next request.
+                let config = config
+                    .with_instructions(Defaults::instructions())
+                    .with_project_rules(ironquill_tools::project_instructions(app.root()));
                 task = Some(spawn_agent(
                     Arc::clone(&model),
                     Arc::clone(&delegate),
@@ -217,6 +221,22 @@ where
                 app.on_diff(&text);
             }
             Some(Effect::Save) => save(&store, &mut app, &conversation).await,
+            Some(Effect::OpenInstructions) => match Defaults::instructions_path() {
+                Some(path) => {
+                    if !path.exists() {
+                        let created = path
+                            .parent()
+                            .map_or(Ok(()), std::fs::create_dir_all)
+                            .and_then(|()| std::fs::write(&path, INSTRUCTIONS_TEMPLATE));
+                        if let Err(e) = created {
+                            app.report_error(format!("Could not create {}: {e}", path.display()));
+                            continue;
+                        }
+                    }
+                    app.open_path(path);
+                }
+                None => app.report_error("No home directory to keep instructions in".into()),
+            },
             Some(Effect::OpenContext) => {
                 let text = conversation.lock().await.session.to_text();
                 app.open_context(&text);
@@ -306,6 +326,11 @@ async fn save(store: &Option<Store>, app: &mut App, conversation: &Mutex<Convers
 }
 
 /// Loads a saved conversation into the screen and into the agent.
+/// What `/instructions` starts from when the file does not exist yet.
+const INSTRUCTIONS_TEMPLATE: &str = "<!-- Your own instructions for every model ironquill runs, in every project: \
+the one that answers, the planner and the coder of /pair, the team. Lines like this one are \
+left out. Saved with :w, they count from the next request. -->\n";
+
 async fn resume(
     store: &Option<Store>,
     app: &mut App,

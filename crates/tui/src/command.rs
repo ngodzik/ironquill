@@ -1,6 +1,6 @@
 //! The `:` commands.
 
-use ironquill_core::Agent;
+use ironquill_core::{Agent, Effort};
 
 /// A parsed `:` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +38,18 @@ pub(crate) enum Command {
     Defaults,
     /// `/team` says who answers and who it may hand tasks to.
     Team,
+    /// `/effort <level>` sets how hard models think; `/effort` alone goes
+    /// to the next level.
+    Effort(Option<String>),
+    /// `/pair <question>`: the best of the model that answers and its team
+    /// plans, the cheapest codes.
+    Pair(Option<String>),
+    /// `/planner <model>` picks the member that plans; alone, says which.
+    Planner(Option<String>),
     /// `/copy` opens the conversation as text, to select and copy from.
     Copy,
+    /// `/instructions` opens the person's instructions for every model.
+    Instructions,
     /// `/claude-reset` ends Claude Code's session, `/codex-reset` Codex's.
     Reset(Agent),
     /// `:help`
@@ -83,7 +93,11 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "budget" => Ok(Command::Budget(rest_opt)),
         "defaults" => Ok(Command::Defaults),
         "team" => Ok(Command::Team),
+        "effort" => Ok(Command::Effort(rest_opt)),
+        "pair" => Ok(Command::Pair(rest_opt)),
+        "planner" => Ok(Command::Planner(rest_opt)),
         "copy" | "chat" => Ok(Command::Copy),
+        "instructions" => Ok(Command::Instructions),
         "context" | "ctx" => Ok(Command::Context),
         "claude-reset" => Ok(Command::Reset(Agent::ClaudeCode)),
         "codex-reset" => Ok(Command::Reset(Agent::Codex)),
@@ -109,13 +123,17 @@ pub(crate) const NAMES: &[&str] = &[
     "cost",
     "defaults",
     "diff",
+    "effort",
     "escalate",
     "help",
+    "instructions",
     "keys",
     "model",
     "name",
     "new",
     "nocheck",
+    "pair",
+    "planner",
     "q",
     "quit",
     "rename",
@@ -195,7 +213,7 @@ pub(crate) fn candidates(line: &str, names: &[&str], models: &[String]) -> Vec<S
             .filter(|n| n.starts_with(line))
             .map(|n| (*n).to_owned())
             .collect(),
-        Some(("model" | "m" | "escalate", arg)) => {
+        Some(("model" | "m" | "escalate" | "planner", arg)) => {
             let command = &line[..line.len() - arg.len()];
             models
                 .iter()
@@ -203,6 +221,11 @@ pub(crate) fn candidates(line: &str, names: &[&str], models: &[String]) -> Vec<S
                 .map(|m| format!("{command}{m}"))
                 .collect()
         }
+        Some(("effort", arg)) => Effort::ALL
+            .iter()
+            .filter(|e| e.as_str().starts_with(arg))
+            .map(|e| format!("effort {e}"))
+            .collect(),
         Some(_) => Vec::new(),
     }
 }
@@ -211,15 +234,29 @@ pub(crate) const HELP: &str = "\
 Type a question or a change and press Enter. Changes are checked before they are kept.
 /model               pick the model that answers (Ctrl-E); /model <id> sets it.
                      In the list, type to search every model of the provider,
-                     Space puts the selected one in the team or takes it out:
+                     Space puts the selected one in the team or takes it out,
+                     Delete takes it off the list:
                      the model that answers may hand tasks to the team
 /budget <dollars>    the most one request may cost (none: no limit); past it the
                      work stops and the model says where it is and asks what next
 /team                who answers and who it may hand tasks to
+/pair <question>     in a pair, among the model that answers and its team: the
+                     best sees a map of the project and picks the code to read,
+                     ironquill reads it, the best plans from it, thinking hard;
+                     the cheapest codes it, thinking little, without the earlier
+                     conversation; the planner revises its plan if checks fail,
+                     then reviews the diff, and the coder fixes what it finds
+/planner <model>     the model that plans in a pair; by default the best scored,
+                     or the dearest
+/effort <level>      how hard models think: low, medium, high (the default),
+                     xhigh, max; /effort alone goes to the next. ← → in Ctrl-E too
 /defaults            keep the current model, list, team and budget for new
                      sessions; done by itself whenever they change
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation
 /codex <task>        the same with Codex, which runs commands in its sandbox, without network
+/instructions        your own instructions for every model, in every project, kept
+                     in ~/.ironquill/instructions.md; :w saves, the next request
+                     uses them
 /copy                the conversation as text in the editor: v or V selects,
                      y copies to the clipboard, :q closes
 /context             edit what the next request sends: delete, shorten, annotate; :w applies
@@ -272,6 +309,12 @@ mod tests {
             parse("name fix the parser"),
             Ok(Command::Name(Some("fix the parser".into())))
         );
+    }
+
+    #[test]
+    fn effort_levels_complete() {
+        assert_eq!(candidates("effort h", NAMES, &[]), ["effort high"]);
+        assert_eq!(candidates("effort ", NAMES, &[]).len(), 5);
     }
 
     #[test]

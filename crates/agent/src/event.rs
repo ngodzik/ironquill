@@ -1,4 +1,4 @@
-use ironquill_core::{ContextUse, ModelId, TokenCount, Usage, Usd};
+use ironquill_core::{ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::ToolSummary;
 
 /// Something that happened during a session, for whoever is watching.
@@ -75,6 +75,19 @@ pub enum Event {
         to: ModelId,
         /// The task, as the first model wrote it.
         task: String,
+    },
+    /// A step of a request worked on in a pair begins.
+    Step {
+        /// Its place, from 1.
+        number: u8,
+        /// How many steps there are.
+        of: u8,
+        /// What it does, such as `Planning`.
+        name: String,
+        /// The model doing it; `None` when ironquill does it itself.
+        model: Option<ModelId>,
+        /// How hard that model thinks.
+        effort: Option<Effort>,
     },
     /// Old tool results were dropped from the conversation to resend less.
     Compacted {

@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use ironquill_agent::{AgentConfig, Event, Member, Outcome, Verdict};
-use ironquill_core::{ChatModel, ChatRequest, Message, ModelId, Usd};
+use ironquill_core::{ChatModel, ChatRequest, Effort, Message, ModelId, Usd};
 use ironquill_llm::{
     Agents, ArtificialAnalysis, ClaudeCode, Codex, Listed, OpenAiCompatible, RANKINGS_SOURCE,
     Ranking, find_ranking,
@@ -42,6 +43,8 @@ struct Cli {
     api_key: Option<String>,
 
     /// Model tried first in the interface. Can be set later with `:model`.
+    /// Typed here, it wins over the one kept for new sessions; from
+    /// IRONQUILL_MODEL, only when none was kept.
     #[arg(long, env = "IRONQUILL_MODEL")]
     model: Option<String>,
 
@@ -59,6 +62,11 @@ struct Cli {
     /// Checks for the interface. Defaults as for `do`.
     #[arg(long = "check", value_name = "COMMAND")]
     checks: Vec<String>,
+
+    /// How hard models think before answering: low, medium, high, xhigh
+    /// or max. Defaults to the one kept for new sessions, or high.
+    #[arg(long, env = "IRONQUILL_EFFORT", global = true)]
+    effort: Option<Effort>,
 
     /// The most one request may cost, in dollars. Past it the work stops
     /// and the model says where it is. Defaults to the one kept with
@@ -124,7 +132,15 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    // A choice typed on the command line wins over the one kept for new
+    // sessions; one from the environment does not, so that a variable set
+    // long ago does not undo what was picked since.
+    let typed = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
     let api_key = cli.api_key.context("no API key: set IRONQUILL_API_KEY")?;
     let provider = OpenAiCompatible::new(cli.base_url, api_key);
 
@@ -139,11 +155,12 @@ async fn main() -> Result<()> {
             ironquill_tui::Start::New
         };
         let choices = Choices {
-            model: cli.model,
+            model: Pick::new(cli.model, typed("model")),
             escalate: cli.escalate,
             offered: cli.models,
             checks: cli.checks,
-            budget: cli.budget,
+            budget: Pick::new(cli.budget, typed("budget")),
+            effort: Pick::new(cli.effort, typed("effort")),
         };
         return interface(provider, choices, start).await;
     };
@@ -154,7 +171,9 @@ async fn main() -> Result<()> {
         .init();
 
     match command {
-        Command::Ask { prompt, model } => ask(&provider, &prompt, &model).await,
+        Command::Ask { prompt, model } => {
+            ask(&provider, &prompt, &model, cli.effort.unwrap_or_default()).await
+        }
         Command::Do {
             task,
             model,
@@ -170,9 +189,15 @@ async fn main() -> Result<()> {
             for model in escalate {
                 builder = builder.tier(ModelId::new(model)?);
             }
+            let detect = checks.is_empty();
             for check in checks_or_default(checks)? {
                 builder = builder.check(check);
             }
+            builder = builder
+                .detect_checks(detect)
+                .instructions(Defaults::instructions())
+                .project_rules(ironquill_tools::project_instructions(Path::new(".")));
+            builder = builder.effort(Some(cli.effort.unwrap_or_default()));
             run_task(&provider, &builder.build()?, &task).await
         }
     }
@@ -181,11 +206,41 @@ async fn main() -> Result<()> {
 /// What the command line chose for the interface; the rest comes from the
 /// defaults kept with /defaults.
 struct Choices {
-    model: Option<String>,
+    model: Pick<String>,
     escalate: Vec<String>,
     offered: Vec<String>,
     checks: Vec<String>,
-    budget: Option<f64>,
+    budget: Pick<f64>,
+    effort: Pick<Effort>,
+}
+
+/// A choice given at startup, and whether it was typed or came from the
+/// environment.
+struct Pick<T> {
+    typed: Option<T>,
+    from_env: Option<T>,
+}
+
+impl<T> Pick<T> {
+    fn new(value: Option<T>, typed: bool) -> Self {
+        if typed {
+            Self {
+                typed: value,
+                from_env: None,
+            }
+        } else {
+            Self {
+                typed: None,
+                from_env: value,
+            }
+        }
+    }
+
+    /// What was typed, else what was `kept` for new sessions, else what
+    /// the environment says.
+    fn or_kept(self, kept: Option<T>) -> Option<T> {
+        self.typed.or(kept).or(self.from_env)
+    }
 }
 
 async fn interface(
@@ -199,15 +254,27 @@ async fn interface(
         None => Defaults::default(),
     };
 
+    // A model typed at the command line replaces the one kept: say so, a
+    // command recalled from the history would hide it otherwise.
+    let mut notes = Vec::new();
+    if let (Some(typed), Some(kept)) = (&choices.model.typed, &defaults.model)
+        && typed != kept
+    {
+        notes.push(format!(
+            "Model {typed}, given with --model, in place of your choice kept for new sessions, \
+             {kept}. Start without --model to use it"
+        ));
+    }
     let mut tiers = Vec::new();
     for id in choices
         .model
-        .or(defaults.model)
+        .or_kept(defaults.model)
         .into_iter()
         .chain(choices.escalate)
     {
         tiers.push(ModelId::new(id)?);
     }
+    let detect_checks = choices.checks.is_empty();
     let checks = checks_or_default(choices.checks)?;
 
     let claude = ClaudeCode::find();
@@ -242,7 +309,7 @@ async fn interface(
         .collect::<Result<Vec<_>, _>>()?;
     let budget = choices
         .budget
-        .or(defaults.budget)
+        .or_kept(defaults.budget)
         .unwrap_or(Defaults::BUDGET);
     // The provider's list, to search and to price the team; without it the
     // interface still works, with less to show.
@@ -261,6 +328,8 @@ async fn interface(
                 note: note(&listed, ranking),
                 about: about(&listed, ranking),
                 tools: listed.tool_calling != Some(false),
+                score: ranking.and_then(|r| r.intelligence),
+                price: listed.input_price,
                 model: ModelId::new(listed.id).ok()?,
             })
         })
@@ -274,6 +343,16 @@ async fn interface(
         models,
         team,
         budget: (budget > 0.0).then_some(Usd(budget)),
+        effort: {
+            let kept = match defaults.effort.as_deref() {
+                Some(kept) => Some(kept.parse().map_err(anyhow::Error::msg)?),
+                None => None,
+            };
+            choices.effort.or_kept(kept).unwrap_or_default()
+        },
+        planner: defaults.planner.as_deref().map(ModelId::new).transpose()?,
+        detect_checks,
+        notes,
         catalog,
         credits: (!rankings.is_empty()).then(|| RANKINGS_SOURCE.to_owned()),
     };
@@ -438,30 +517,22 @@ fn about(listed: &Listed, ranking: Option<&Ranking>) -> String {
     about.trim().to_owned()
 }
 
+/// The checks given on the command line. Without any, the project's own are
+/// found each time they are needed: see [`ironquill_tools::detect_checks`].
 fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {
-    if lines.is_empty() {
-        if Path::new("Cargo.toml").exists() {
-            return Ok(["cargo check --all-targets", "cargo test"]
-                .into_iter()
-                .filter_map(Check::parse)
-                .collect());
-        }
-        // Nothing known to check this kind of project: changes are kept as
-        // written, as the verdict will say.
-        return Ok(Vec::new());
-    }
     lines
         .iter()
         .map(|line| Check::parse(line).with_context(|| format!("empty check: {line:?}")))
         .collect()
 }
 
-async fn ask(provider: &OpenAiCompatible, prompt: &str, model: &str) -> Result<()> {
+async fn ask(provider: &OpenAiCompatible, prompt: &str, model: &str, effort: Effort) -> Result<()> {
     let model = ModelId::new(model)?;
     let request = ChatRequest {
         model: model.clone(),
         messages: vec![Message::user(prompt)],
         tools: Vec::new(),
+        effort: Some(effort),
     };
 
     // The price list is fetched alongside the answer rather than before it, so
@@ -563,6 +634,20 @@ fn show(event: Event) {
         Event::Failed { command, .. } => eprintln!("✗ {command} failed"),
         Event::Escalating { from, to } => eprintln!("↑ {from} gave up, escalating to {to}"),
         Event::Delegating { from, to, task } => eprintln!("→ {from} hands to {to}: {task}"),
+        Event::Step {
+            number,
+            of,
+            name,
+            model,
+            effort,
+        } => {
+            let who = match (model, effort) {
+                (Some(model), Some(effort)) => format!("{model} · effort {effort}"),
+                (Some(model), None) => model.to_string(),
+                (None, _) => "ironquill".to_owned(),
+            };
+            eprintln!("━━ {number}/{of} {name} · {who}");
+        }
         Event::Compacted {
             dropped,
             before,

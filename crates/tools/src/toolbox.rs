@@ -208,6 +208,19 @@ impl Toolbox {
         ]
     }
 
+    /// The tools that only read: search, outline, read_file, list_dir.
+    pub fn read_only_specs(&self) -> Vec<ToolSpec> {
+        self.specs()
+            .into_iter()
+            .filter(|spec| Self::reads_only(&spec.name))
+            .collect()
+    }
+
+    /// Whether the tool named `name` changes nothing.
+    pub fn reads_only(name: &str) -> bool {
+        matches!(name, "search" | "outline" | "read_file" | "list_dir")
+    }
+
     /// Runs one call and returns what to tell the model.
     ///
     /// # Errors

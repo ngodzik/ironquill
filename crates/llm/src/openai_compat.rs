@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 
 use crate::error::LlmError;
 
+/// How many more times a request whose connection failed is tried.
+const CONNECT_RETRIES: u32 = 2;
+
 /// A provider that speaks the OpenAI compatible chat completions protocol.
 ///
 /// `base_url` is the prefix both `/chat/completions` and `/models` hang off,
@@ -99,6 +102,13 @@ impl ChatModel for OpenAiCompatible {
     async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
         let mut payload = wire_request(request);
+        // Only to models the list does not say cannot reason: a provider may
+        // refuse the field from one that cannot.
+        if let Some(effort) = request.effort
+            && self.known(&request.model).await.and_then(|k| k.reasoning) != Some(false)
+        {
+            payload["reasoning_effort"] = json!(effort.as_str());
+        }
         if self.is_requesty() {
             // Requesty marks what can be cached for providers that need it
             // and bills cache hits at a fraction of the price; it does so by
@@ -106,14 +116,27 @@ impl ChatModel for OpenAiCompatible {
             // resends the whole conversation, so most of it is a hit.
             payload["requesty"] = json!({"auto_cache": true});
         }
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|source| transport(&url, source))?;
+        // A connection that could not be made is tried again, twice, after a
+        // pause: the request never left, so it cannot be billed twice. Any
+        // other failure may have reached the provider and is reported.
+        let mut tries = 0;
+        let response = loop {
+            match self
+                .http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(response) => break response,
+                Err(e) if e.is_connect() && tries < CONNECT_RETRIES => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * u64::from(tries))).await;
+                }
+                Err(source) => return Err(transport(&url, source)),
+            }
+        };
         let body = read_body(&url, response).await?;
         parse_completion(&url, &body)
     }
@@ -132,6 +155,7 @@ impl ChatModel for OpenAiCompatible {
 struct Known {
     window: Option<u64>,
     pricing: Option<Pricing>,
+    reasoning: Option<bool>,
 }
 
 impl OpenAiCompatible {
@@ -215,6 +239,7 @@ fn parse_known(body: &str) -> HashMap<String, Known> {
                     let known = Known {
                         window: m.context_window,
                         pricing,
+                        reasoning: m.supports_reasoning,
                     };
                     (m.id, known)
                 })
@@ -483,6 +508,7 @@ mod tests {
                 description: "d".into(),
                 parameters: json!({"type": "object"}),
             }],
+            effort: None,
         };
         let body = wire_request(&request);
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");

@@ -69,6 +69,9 @@ impl ClaudeCode {
         if !request.model.is_empty() {
             command.args(["--model", &request.model]);
         }
+        if let Some(effort) = request.effort {
+            command.args(["--effort", effort.as_str()]);
+        }
         if let Some(session) = &request.resume {
             command.args(["--resume", session]);
         }
@@ -406,6 +409,7 @@ mod tests {
     fn the_command_line_hands_over_the_task_and_forbids_commands() {
         let request = DelegateRequest {
             agent: ironquill_core::Agent::ClaudeCode,
+            effort: Some(ironquill_core::Effort::Max),
             model: "opus".into(),
             prompt: "fix it".into(),
             instructions: "be brief".into(),
@@ -426,6 +430,7 @@ mod tests {
         assert_eq!(after("-p").as_deref(), Some("fix it"));
         assert_eq!(after("--disallowedTools").as_deref(), Some("Bash"));
         assert_eq!(after("--model").as_deref(), Some("opus"));
+        assert_eq!(after("--effort").as_deref(), Some("max"));
         assert_eq!(after("--resume").as_deref(), Some("s1"));
         assert_eq!(after("--output-format").as_deref(), Some("stream-json"));
         assert!(args.iter().any(|a| a == "--strict-mcp-config"));

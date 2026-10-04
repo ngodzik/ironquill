@@ -1,4 +1,4 @@
-use ironquill_core::{ModelId, Usd};
+use ironquill_core::{Effort, ModelId, Usd};
 use ironquill_tools::Check;
 
 use crate::error::AgentError;
@@ -13,6 +13,24 @@ pub struct AgentConfig {
     pub(crate) team: Vec<Member>,
     pub(crate) budget: Option<Usd>,
     pub(crate) compact_at: u64,
+    pub(crate) effort: Option<Effort>,
+    pub(crate) pair: Option<Pair>,
+    pub(crate) detect_checks: bool,
+    pub(crate) instructions: Option<String>,
+    pub(crate) project_rules: Option<String>,
+}
+
+/// Planning by a stronger model, coding by the first one, as an architect
+/// and an editor: the planner thinks hard on what the coder gathered, the
+/// coder does the reading and the writing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pair {
+    /// The model that plans; it reads nothing itself.
+    pub planner: ModelId,
+    /// How hard it thinks.
+    pub planner_effort: Effort,
+    /// How hard the first model thinks while it gathers and codes.
+    pub coder_effort: Effort,
 }
 
 /// A model the first one may hand a task to, with what it should know to
@@ -29,6 +47,12 @@ pub struct Member {
     /// Whether it can call tools. One that cannot reads and edits nothing:
     /// it only answers what the task itself says.
     pub tools: bool,
+    /// Its intelligence index from Artificial Analysis, out of 100, when
+    /// known: what picks a planner by default.
+    pub score: Option<f64>,
+    /// Dollars per input token, when known: what picks a planner when no
+    /// score is.
+    pub price: Option<f64>,
 }
 
 impl Member {
@@ -39,6 +63,8 @@ impl Member {
             note: note.into(),
             about: String::new(),
             tools: true,
+            score: None,
+            price: None,
         }
     }
 }
@@ -69,7 +95,26 @@ impl AgentConfig {
             team: Vec::new(),
             budget: None,
             compact_at: COMPACT_AT,
+            effort: Some(Effort::High),
+            pair: None,
+            detect_checks: false,
+            instructions: None,
+            project_rules: None,
         }
+    }
+
+    /// The project's own instructions for coding agents, from its
+    /// CLAUDE.md, AGENTS.md and rules, read again before each request.
+    pub fn with_project_rules(mut self, rules: Option<String>) -> Self {
+        self.project_rules = rules.filter(|r| !r.trim().is_empty());
+        self
+    }
+
+    /// The person's own instructions for every model, read again before each
+    /// request so that an edit counts at once; `None` or blank adds none.
+    pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions.filter(|i| !i.trim().is_empty());
+        self
     }
 }
 
@@ -87,6 +132,11 @@ pub struct AgentConfigBuilder {
     team: Vec<Member>,
     budget: Option<Usd>,
     compact_at: u64,
+    effort: Option<Effort>,
+    pair: Option<Pair>,
+    detect_checks: bool,
+    instructions: Option<String>,
+    project_rules: Option<String>,
 }
 
 impl AgentConfigBuilder {
@@ -141,6 +191,40 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// How hard models and agents should think. Defaults to
+    /// [`Effort::High`]; `None` leaves it to each provider.
+    pub fn effort(mut self, effort: Option<Effort>) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// Works on the request in a pair: `pair.planner` plans, the
+    /// first model gathers and codes. Escalation is not used then: when the
+    /// checks keep failing, the planner revises its plan instead.
+    pub fn pair(mut self, pair: Pair) -> Self {
+        self.pair = Some(pair);
+        self
+    }
+
+    /// Without checks added, finds the project's own each time they are
+    /// needed: its test runner, and the tests a model has just written.
+    pub fn detect_checks(mut self, detect: bool) -> Self {
+        self.detect_checks = detect;
+        self
+    }
+
+    /// The person's own instructions, given to every model with its own.
+    pub fn instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions.filter(|i| !i.trim().is_empty());
+        self
+    }
+
+    /// The project's own instructions for coding agents.
+    pub fn project_rules(mut self, rules: Option<String>) -> Self {
+        self.project_rules = rules.filter(|r| !r.trim().is_empty());
+        self
+    }
+
     /// Validates and builds.
     ///
     /// # Errors
@@ -165,6 +249,11 @@ impl AgentConfigBuilder {
             team: self.team,
             budget: self.budget,
             compact_at: self.compact_at,
+            effort: self.effort,
+            pair: self.pair,
+            detect_checks: self.detect_checks,
+            instructions: self.instructions,
+            project_rules: self.project_rules,
         })
     }
 }
