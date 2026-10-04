@@ -435,6 +435,9 @@ impl fmt::Display for ContextUse {
 pub struct DelegateRequest {
     /// The agent to hand the task to.
     pub agent: Agent,
+    /// Read and think only: the agent may not change any file, as when it
+    /// plans or reviews.
+    pub read_only: bool,
     /// How hard it should think; `None` leaves it to the agent.
     pub effort: Option<Effort>,
     /// The model the agent should use; empty for its own default.
@@ -490,7 +493,9 @@ pub struct DelegateReply {
     /// Tokens used, counting the context the agent read from its cache.
     pub usage: Usage,
     /// The agent's own estimate of what the tokens would cost at API prices.
-    /// Not a bill: the agent may run on a subscription.
+    /// Not a bill: the agent may run on a subscription. Claude Code's covers
+    /// its whole session, earlier requests included when it was resumed, so
+    /// it says what this request cost only for a session that began with it.
     pub estimate: Option<Usd>,
     /// How full its context was on its last call, when it said.
     pub context: Option<ContextUse>,

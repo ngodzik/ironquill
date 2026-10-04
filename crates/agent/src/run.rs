@@ -66,7 +66,30 @@ well but should not have to make design decisions. Write a precise plan: the fil
 each, the functions to add or change, with their signatures and exact behaviour; the edge cases; \
 the tests to add or adjust. Give short code where precision matters. If the brief lacks \
 something essential, say what the implementer must read first. Be concise: every word is paid \
-for. Write in the language of the request.";
+for. Write in the language of the request. If nothing needs to change, or no change to the code \
+can help, reply with `STOP` on the first line, then the reason, and nothing else.";
+
+/// For the planner, in every message where it decides: a way to end the
+/// work rather than go on for nothing.
+const STOP_RULE: &str = "If nothing needs to change, or no change to the code can help (for \
+instance the checks fail for a reason outside the code), reply with `STOP` on the first line, \
+then the reason, and nothing else.";
+
+/// For Claude Code or Codex when they plan or review: their tools that
+/// write are turned off.
+const AGENT_PLAN_PROMPT: &str = "You plan and review; another model writes the code. Your \
+tools that change files are turned off: do not try to edit anything. Read what you need, then \
+answer as asked: the lines to read, the plan, or the review.";
+
+/// How long an agent's session stays worth resuming: past it, the
+/// provider's prompt cache has expired, and resuming would write the whole
+/// session to the cache again, at its dearest rate. A new session is told
+/// the conversation instead.
+const THREAD_WARM_SECS: u64 = 5 * 60;
+
+/// The most of the earlier conversation an agent or a planner is told, in
+/// bytes, the latest kept.
+const CATCH_UP_BYTES: usize = 24_000;
 
 /// For the first model, once the plan is there.
 const IMPLEMENT_PROMPT: &str = "Implement the plan above, exactly. The code the planner read is \
@@ -241,6 +264,16 @@ struct Thread {
     session: String,
     /// The number of messages of the conversation the delegate knows about.
     seen: usize,
+    /// When it was last used, in seconds since 1970.
+    #[serde(default)]
+    used: u64,
+}
+
+/// Seconds since 1970, now.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl Default for Session {
@@ -336,7 +369,8 @@ impl Session {
         // picked, and is told what was said without it meanwhile.
         let agent = first.delegate().map(|(agent, _)| agent);
         if let Some(agent) = agent {
-            let thread = self.agents.get(&agent);
+            // A cold session starts afresh and is told the conversation.
+            let thread = self.warm(agent);
             let seen = thread.map_or(1, |t| t.seen);
             ctx.thread = thread.map(|t| t.session.clone());
             let request = self.messages.len() - 1;
@@ -344,8 +378,7 @@ impl Session {
         }
         let first_attempt = attempt(ctx, first, &mut self.messages, &mut failure, true).await;
         if let (Some(agent), Some(session)) = (agent, ctx.thread.take()) {
-            let seen = self.messages.len();
-            self.agents.insert(agent, Thread { session, seen });
+            self.keep_thread(agent, session);
         }
 
         match first_attempt? {
@@ -421,6 +454,19 @@ impl Session {
         });
         let root = ctx.toolbox.workspace().root().to_owned();
         let map = ironquill_tools::project_map(&root);
+        // An agent planner continues its warm session; any planner is told
+        // the conversation it has not seen, so that a follow-up makes sense.
+        let planner_agent = planner.delegate().map(|(agent, _)| agent);
+        let thread = planner_agent.and_then(|agent| self.warm(agent));
+        let mut planner_session = thread.map(|t| t.session.clone());
+        let seen = thread.map_or(1, |t| t.seen);
+        let request_at = self.messages.len() - 1;
+        let earlier = catch_up(&self.messages[seen.min(request_at)..request_at]);
+        let earlier = if earlier.trim().is_empty() {
+            String::new()
+        } else {
+            format!("The conversation so far:\n{earlier}\n")
+        };
         let mut planning = vec![
             Message::system(format!(
                 "{PLAN_PROMPT}{}",
@@ -434,12 +480,22 @@ impl Session {
                 )
             )),
             Message::user(format!(
-                "The request:\n{text}\n\nThe map of the project, its definitions with their \
-                 lines:\n{map}\n\n{context}\n\n{SCOUT_PROMPT}{}",
+                "{earlier}The request:\n{text}\n\nThe map of the project, its definitions with \
+                 their lines:\n{map}\n\n{context}\n\n{SCOUT_PROMPT} {STOP_RULE}{}",
                 spent_so_far(ctx)
             )),
         ];
-        let wanted = ask_planner(ctx, planner, pair.planner_effort, &mut planning).await?;
+        let wanted = ask_planner(
+            ctx,
+            planner,
+            pair.planner_effort,
+            &mut planning,
+            &mut planner_session,
+        )
+        .await?;
+        if stops(&wanted) {
+            return Ok(self.stop_pair(planner, planner_session, &wanted, ctx));
+        }
 
         (ctx.observe)(Event::Step {
             number: 2,
@@ -461,7 +517,17 @@ impl Session {
             "The code you asked for:\n{excerpts}\n\nNow write the plan.{}",
             spent_so_far(ctx)
         )));
-        let mut plan = ask_planner(ctx, planner, pair.planner_effort, &mut planning).await?;
+        let mut plan = ask_planner(
+            ctx,
+            planner,
+            pair.planner_effort,
+            &mut planning,
+            &mut planner_session,
+        )
+        .await?;
+        if stops(&plan) {
+            return Ok(self.stop_pair(planner, planner_session, &plan, ctx));
+        }
 
         (ctx.observe)(Event::Step {
             number: 4,
@@ -491,8 +557,11 @@ impl Session {
             Message::user(format!("{IMPLEMENT_PROMPT}{}", spent_so_far(ctx))),
         ];
         let mut failure = None;
+        // Why the pair ended early, for the account kept in the conversation.
+        let mut ended = String::new();
         let result: Result<Verdict, AgentError> = 'work: {
             for revision in 0..=MAX_REVISIONS {
+                let edits = ctx.toolbox.edits();
                 let step = match attempt(ctx, &coder, &mut work, &mut failure, false).await {
                     Ok(step) => step,
                     Err(e) => break 'work Err(e),
@@ -507,10 +576,20 @@ impl Session {
                     Attempt::Answered => break 'work Ok(Verdict::Answered),
                     Attempt::Failed => {}
                 }
+                let Some(f) = failure.as_ref() else { break };
+                // The coder changed nothing: another plan would not help,
+                // the checks fail without the code being touched.
+                if ctx.toolbox.edits() == edits {
+                    ended = format!(
+                        " {coder} made no change, and `{}` fails without any: it may fail for a \
+                         reason outside the code, which /check can set right.",
+                        f.command
+                    );
+                    break 'work Ok(nothing_or_gave_up(ctx.toolbox, failure.clone()));
+                }
                 if revision == MAX_REVISIONS {
                     break;
                 }
-                let Some(f) = failure.as_ref() else { break };
                 (ctx.observe)(Event::Step {
                     number: 3,
                     of: 6,
@@ -523,11 +602,19 @@ impl Session {
                     "{coder} followed the plan, but the checks fail.\n\n{}\n\nFiles it \
                      changed: {changed}\n\nRevise the plan: say what to change now, briefly. \
                      If you need to see code first, reply only with `path:start-end` lines, as \
-                     before, and ironquill will read them for you.{}",
+                     before, and ironquill will read them for you. {STOP_RULE}{}",
                     describe(f),
                     spent_so_far(ctx)
                 )));
-                plan = match ask_planner(ctx, planner, pair.planner_effort, &mut planning).await {
+                plan = match ask_planner(
+                    ctx,
+                    planner,
+                    pair.planner_effort,
+                    &mut planning,
+                    &mut planner_session,
+                )
+                .await
+                {
                     Ok(plan) => plan,
                     Err(e) => break 'work Err(e),
                 };
@@ -539,11 +626,22 @@ impl Session {
                          plan.{}",
                         spent_so_far(ctx)
                     )));
-                    plan = match ask_planner(ctx, planner, pair.planner_effort, &mut planning).await
+                    plan = match ask_planner(
+                        ctx,
+                        planner,
+                        pair.planner_effort,
+                        &mut planning,
+                        &mut planner_session,
+                    )
+                    .await
                     {
                         Ok(plan) => plan,
                         Err(e) => break 'work Err(e),
                     };
+                }
+                if stops(&plan) {
+                    ended = format!(" {planner} stopped: {}", plan.trim());
+                    break 'work Ok(nothing_or_gave_up(ctx.toolbox, failure.clone()));
                 }
                 ctx.effort = Some(pair.coder_effort);
                 (ctx.observe)(Event::Step {
@@ -582,14 +680,21 @@ impl Session {
                     "{REVIEW_PROMPT}\n\nThe request:\n{text}\n\nWhat changed:\n{diff}{}",
                     spent_so_far(ctx)
                 )));
-                let review =
-                    match ask_planner(ctx, planner, pair.planner_effort, &mut planning).await {
-                        Ok(review) => review,
-                        Err(e) => {
-                            result = Err(e);
-                            break;
-                        }
-                    };
+                let review = match ask_planner(
+                    ctx,
+                    planner,
+                    pair.planner_effort,
+                    &mut planning,
+                    &mut planner_session,
+                )
+                .await
+                {
+                    Ok(review) => review,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                };
                 if approves(&review) {
                     reviewed = " The review approved it.".into();
                     break;
@@ -646,11 +751,36 @@ impl Session {
             _ => String::new(),
         };
         self.note(format!(
-            "(Worked in a pair: {planner} planned, {coder} implemented.{ending}{reviewed}\n\nPlan:\n{plan}\n\n\
+            "(Worked in a pair: {planner} planned, {coder} implemented.{ended}{ending}{reviewed}\n\nPlan:\n{plan}\n\n\
              {coder}: {report}\nFiles changed: {})",
             if changed.is_empty() { "none" } else { &changed }
         ));
+        self.keep_planner(planner, planner_session);
         result
+    }
+
+    /// Ends a pair the planner stopped before any code: its reason goes to
+    /// the conversation, and its session is kept.
+    fn stop_pair<M, D, O>(
+        &mut self,
+        planner: &ModelId,
+        session: Option<String>,
+        reply: &str,
+        ctx: &Ctx<'_, M, D, O>,
+    ) -> Verdict {
+        self.keep_planner(planner, session);
+        self.note(format!(
+            "(Worked in a pair: {planner} stopped before any code: {})",
+            reply.trim()
+        ));
+        nothing_or_gave_up(ctx.toolbox, None)
+    }
+
+    /// Keeps an agent planner's session, to continue it next time.
+    fn keep_planner(&mut self, planner: &ModelId, session: Option<String>) {
+        if let (Some((agent, _)), Some(session)) = (planner.delegate(), session) {
+            self.keep_thread(agent, session);
+        }
     }
 
     /// Hands the word back to the person once the budget is spent: the first
@@ -752,6 +882,24 @@ impl Session {
     /// A rough size of what the next request will send, in tokens.
     pub fn approx_tokens(&self) -> u64 {
         crate::context::approx_tokens(&self.messages)
+    }
+
+    /// The session of `agent` worth resuming: one used in the last minutes,
+    /// whose cache still holds.
+    fn warm(&self, agent: Agent) -> Option<&Thread> {
+        self.agents
+            .get(&agent)
+            .filter(|t| now_secs().saturating_sub(t.used) <= THREAD_WARM_SECS)
+    }
+
+    /// Keeps the session `agent` ended in, as knowing everything said so far.
+    fn keep_thread(&mut self, agent: Agent, session: String) {
+        let thread = Thread {
+            session,
+            seen: self.messages.len(),
+            used: now_secs(),
+        };
+        self.agents.insert(agent, thread);
     }
 
     /// The session of `agent` its next request would continue, if any.
@@ -867,6 +1015,9 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     if let Some((agent, model)) = tier.delegate() {
         return attempt_delegated(ctx, tier, agent, model, messages, failure, may_answer).await;
     }
+    // The edits made when the checks last failed: with none since, running
+    // them again would only fail the same way.
+    let mut failed_at = None;
     for round in 0..ctx.config.rounds_per_tier {
         if round > 0
             && let Some(f) = failure.as_ref()
@@ -888,10 +1039,16 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         if checks_now(ctx).is_empty() {
             return Ok(Attempt::Unchecked);
         }
+        if failed_at == Some(ctx.toolbox.edits()) {
+            break;
+        }
 
         match check(ctx).await? {
             None => return Ok(Attempt::Passed),
-            Some(f) => *failure = Some(f),
+            Some(f) => {
+                *failure = Some(f);
+                failed_at = Some(ctx.toolbox.edits());
+            }
         }
 
         // A model that ran out of turns is going in circles; another round
@@ -939,6 +1096,7 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
         );
     }
 
+    let mut failed_at = None;
     for round in 0..ctx.config.rounds_per_tier {
         if round > 0
             && let Some(f) = failure.as_ref()
@@ -960,6 +1118,7 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
             ),
             resume: session.clone(),
             directory: root.clone(),
+            read_only: false,
         };
 
         let reply = run_agent(ctx, tier, &request).await?;
@@ -976,9 +1135,16 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
         if checks_now(ctx).is_empty() {
             return Ok(Attempt::Unchecked);
         }
+        // Nothing changed since the checks failed: they would fail again.
+        if failed_at == Some(ctx.toolbox.edits()) {
+            break;
+        }
         match check(ctx).await? {
             None => return Ok(Attempt::Passed),
-            Some(f) => *failure = Some(f),
+            Some(f) => {
+                *failure = Some(f);
+                failed_at = Some(ctx.toolbox.edits());
+            }
         }
     }
     Ok(Attempt::Failed)
@@ -992,8 +1158,9 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
     request: &DelegateRequest,
 ) -> Result<DelegateReply, AgentError> {
     let root = request.directory.clone();
-    // What was counted as it came, to add only the rest at the end.
-    let mut live_usage = Usage::default();
+    // What was counted as it came: for this request, that is the truth.
+    let mut live_calls = 0_u32;
+    let mut unpriced = false;
     let mut live_cost = Usd(0.0);
     let reply = {
         let Ctx {
@@ -1012,7 +1179,8 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
                     cost,
                     billed,
                 } => {
-                    live_usage += usage;
+                    live_calls += 1;
+                    unpriced |= billed && cost.is_none();
                     ledger.usage += usage;
                     let cost = cost.filter(|_| billed);
                     if let Some(cost) = cost {
@@ -1063,16 +1231,26 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
             .map_err(|e| AgentError::Model(Box::new(e)))?
     };
 
-    // The agent's own total settles it: what the messages did not count.
-    let rest = Usage {
-        input: TokenCount(reply.usage.input.0.saturating_sub(live_usage.input.0)),
-        output: TokenCount(reply.usage.output.0.saturating_sub(live_usage.output.0)),
-    };
-    let cost = if reply.billed {
-        let owed = reply.estimate.map_or(live_cost.0, |e| e.0.max(live_cost.0));
-        Some(Usd(owed - live_cost.0))
+    // The calls counted as they came are what this request used. The
+    // agent's own total covers its whole session, earlier requests included
+    // when it was resumed: it may only stand in for what could not be
+    // counted, and only for a session that began with this request.
+    let resumed = request.resume.is_some();
+    let rest = if live_calls > 0 {
+        Usage::default()
     } else {
+        reply.usage
+    };
+    let cost = if !reply.billed {
         ctx.ledger.subscription = true;
+        None
+    } else if live_calls > 0 && !unpriced {
+        Some(Usd(0.0))
+    } else if !resumed && let Some(estimate) = reply.estimate {
+        Some(Usd((estimate.0 - live_cost.0).max(0.0)))
+    } else {
+        // Part of it was not priced and the session's total cannot say.
+        ctx.ledger.cost_complete = false;
         None
     };
     ctx.ledger.usage += rest;
@@ -1137,6 +1315,34 @@ fn within_budget<M, D, O>(
         }
         _ => Ok(()),
     }
+}
+
+/// How a pair that ended early ends: an answer when no file changed, else
+/// a failure with the files as they are.
+fn nothing_or_gave_up(toolbox: &Toolbox, failure: Option<CheckFailure>) -> Verdict {
+    if toolbox.changed().next().is_none() {
+        Verdict::Answered
+    } else {
+        Verdict::GaveUp { failure }
+    }
+}
+
+/// Whether the planner chose to stop: `STOP` as the first word of its
+/// reply, alone or followed by its reason.
+fn stops(reply: &str) -> bool {
+    let first = reply
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default();
+    let first = first.trim().trim_start_matches(['*', '`', '#', ' ']);
+    if !first
+        .get(..4)
+        .is_some_and(|w| w.eq_ignore_ascii_case("stop"))
+    {
+        return false;
+    }
+    let after = &first[4..];
+    after.is_empty() || after.starts_with([' ', ':', '*', '`', '.', '-', '\u{2014}'])
 }
 
 /// Whether a review found nothing to change: it answered `OK`.
@@ -1245,9 +1451,12 @@ async fn ask_planner<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     planner: &ModelId,
     effort: Effort,
     planning: &mut Vec<Message>,
+    session: &mut Option<String>,
 ) -> Result<String, AgentError> {
     ctx.effort = Some(effort);
     if let Some((agent, model)) = planner.delegate() {
+        // One session for the whole pair, so that it knows the request, the
+        // code it read and the plan it wrote; and it may only read.
         let prompt = match planning.last() {
             Some(Message::User(text)) => text.clone(),
             _ => String::new(),
@@ -1257,11 +1466,17 @@ async fn ask_planner<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             effort: ctx.effort,
             model: model.to_owned(),
             prompt,
-            instructions: agent_instructions(PLAN_PROMPT, ctx.config),
-            resume: None,
+            instructions: agent_instructions(
+                &format!("{PLAN_PROMPT}\n\n{AGENT_PLAN_PROMPT}"),
+                ctx.config,
+            ),
+            resume: session.clone(),
             directory: ctx.toolbox.workspace().root().to_owned(),
+            read_only: true,
         };
-        let text = run_agent(ctx, planner, &request).await?.text;
+        let reply = run_agent(ctx, planner, &request).await?;
+        *session = Some(reply.session);
+        let text = reply.text;
         planning.push(Message::Assistant {
             content: Some(text.clone()),
             tool_calls: Vec::new(),
@@ -1453,6 +1668,7 @@ async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             ),
             resume: None,
             directory: ctx.toolbox.workspace().root().to_owned(),
+            read_only: false,
         };
         run_agent(ctx, &to, &request).await?.text
     } else if !member.tools {
@@ -1703,6 +1919,23 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
 /// the people's requests and the replies, with the tools named but not their
 /// results, which the delegate can read again itself.
 fn catch_up(messages: &[Message]) -> String {
+    let out = catch_up_all(messages);
+    if out.len() <= CATCH_UP_BYTES {
+        return out;
+    }
+    // The latest part, from the start of a line that is not blank.
+    let from = out.len() - CATCH_UP_BYTES;
+    let from = (from..out.len())
+        .find(|i| out.as_bytes()[i - 1] == b'\n' && out.as_bytes()[*i] != b'\n')
+        .or_else(|| (from..out.len()).find(|i| out.is_char_boundary(*i)))
+        .unwrap_or(out.len());
+    format!(
+        "(the earlier part of the conversation is left out)\n{}",
+        &out[from..]
+    )
+}
+
+fn catch_up_all(messages: &[Message]) -> String {
     let mut out = String::new();
     for message in messages {
         match message {
@@ -1878,42 +2111,6 @@ mod tests {
                 estimate: Some(Usd(0.09)),
                 context: None,
                 billed: false,
-            })
-        }
-    }
-
-    /// Claude Code on an API key: two messages counted as they end, then
-    /// its own total.
-    struct BilledClaude;
-
-    impl Delegate for BilledClaude {
-        type Error = Infallible;
-
-        async fn run(
-            &self,
-            _: &DelegateRequest,
-            on_event: &mut (dyn FnMut(DelegateEvent) + Send),
-        ) -> Result<DelegateReply, Infallible> {
-            for _ in 0..2 {
-                on_event(DelegateEvent::Usage {
-                    usage: Usage {
-                        input: TokenCount(10_000),
-                        output: TokenCount(100),
-                    },
-                    cost: Some(Usd(0.02)),
-                    billed: true,
-                });
-            }
-            Ok(DelegateReply {
-                text: "Done.".into(),
-                session: "s".into(),
-                usage: Usage {
-                    input: TokenCount(20_000),
-                    output: TokenCount(250),
-                },
-                estimate: Some(Usd(0.05)),
-                context: None,
-                billed: true,
             })
         }
     }
@@ -2609,43 +2806,375 @@ mod tests {
         assert_eq!(config.instructions, None);
     }
 
+    #[test]
+    fn stop_is_read_as_the_first_word_only() {
+        for reply in [
+            "STOP",
+            "STOP: pytest is not installed.",
+            "**Stop** — nothing to change.",
+            "\n`STOP`\nThe checks fail outside the code.",
+            "stop. The code already does it.",
+        ] {
+            assert!(stops(reply), "{reply}");
+        }
+        for reply in [
+            "Stopwatch first: add it.",
+            "1. Stop the server",
+            "Do not stop",
+        ] {
+            assert!(!stops(reply), "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_long_catch_up_keeps_its_latest_part() {
+        let messages: Vec<Message> = (0..2_000)
+            .map(|i| Message::user(format!("request {i} é")))
+            .collect();
+        let text = catch_up(&messages);
+        assert!(text.len() < CATCH_UP_BYTES + 100);
+        assert!(text.starts_with("(the earlier part of the conversation is left out)\nUser: "));
+        assert!(text.ends_with("User: request 1999 é\n\n"));
+    }
+
+    fn checks_run(events: &[Event]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::Checking { .. }))
+            .count()
+    }
+
     #[tokio::test]
-    async fn claude_code_on_a_key_costs_as_it_goes_and_settles_at_the_end() {
+    async fn the_checks_are_not_run_again_when_nothing_changed() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            calls("write_file", json!({"path": "notes.txt", "content": "a"})),
+            says("Done."),
+            says("I see no way to fix it."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .check(Check::parse("test -f done.txt").unwrap())
+            .rounds_per_tier(3)
+            .build()
+            .unwrap();
+        let mut events = Vec::new();
+        let outcome = run(&model, &NoDelegate, &mut toolbox, &config, "t", "", |e| {
+            events.push(e)
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome.verdict, Verdict::GaveUp { .. }));
+        assert_eq!(checks_run(&events), 1);
+        assert_eq!(model.seen.lock().unwrap().len(), 3);
+    }
+
+    async fn in_pair(model: &Scripted, session: &mut Session, toolbox: &mut Toolbox) -> Outcome {
+        session
+            .send(
+                model,
+                &NoDelegate,
+                toolbox,
+                &pair_config(),
+                "make done",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_planner_may_stop_before_any_code() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![says("STOP: pytest is not installed here.")]);
+        let mut session = Session::new();
+        let outcome = in_pair(&model, &mut session, &mut toolbox).await;
+
+        assert!(matches!(outcome.verdict, Verdict::Answered));
+        assert_eq!(model.seen.lock().unwrap().len(), 1);
+        assert!(matches!(
+            session.messages.last(),
+            Some(Message::Assistant { content: Some(t), .. })
+                if t.contains("stopped before any code: STOP: pytest")
+        ));
+        // It was told it may.
+        let seen = model.seen.lock().unwrap();
+        assert!(matches!(&seen[0].messages[1], Message::User(t) if t.contains(STOP_RULE)));
+    }
+
+    #[tokio::test]
+    async fn the_planner_may_stop_instead_of_revising() {
+        let (dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("none"),
+            says("Create notes.txt."),
+            calls("write_file", json!({"path": "notes.txt", "content": "a"})),
+            says("Done."),
+            calls("write_file", json!({"path": "notes.txt", "content": "b"})),
+            says("Done again."),
+            says("STOP\nThe check wants a file no plan of mine can make."),
+        ]);
+        let mut session = Session::new();
+        let outcome = in_pair(&model, &mut session, &mut toolbox).await;
+
+        assert!(matches!(outcome.verdict, Verdict::GaveUp { .. }));
+        assert!(!dir.path().join("done.txt").exists());
+        assert_eq!(model.seen.lock().unwrap().len(), 7);
+        assert!(matches!(
+            session.messages.last(),
+            Some(Message::Assistant { content: Some(t), .. }) if t.contains("strong stopped: STOP")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_pair_ends_when_the_coder_changes_nothing() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("none"),
+            says("Create done.txt."),
+            says("It is already there."),
+            says("Still nothing to do."),
+        ]);
+        let mut session = Session::new();
+        let mut events = Vec::new();
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "make done",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+
+        // No revised plan, no second check: nothing changed to judge.
+        assert!(matches!(outcome.verdict, Verdict::Answered));
+        assert_eq!(model.seen.lock().unwrap().len(), 4);
+        assert_eq!(checks_run(&events), 1);
+        assert!(matches!(
+            session.messages.last(),
+            Some(Message::Assistant { content: Some(t), .. }) if t.contains("cheap made no change")
+        ));
+    }
+
+    /// An agent that only answers, from a script, as a planner does.
+    struct PlanningAgent {
+        replies: Mutex<VecDeque<&'static str>>,
+        requests: Mutex<Vec<DelegateRequest>>,
+    }
+
+    impl PlanningAgent {
+        fn new(replies: Vec<&'static str>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Delegate for PlanningAgent {
+        type Error = Infallible;
+
+        async fn run(
+            &self,
+            request: &DelegateRequest,
+            _: &mut (dyn FnMut(DelegateEvent) + Send),
+        ) -> Result<DelegateReply, Infallible> {
+            let round = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                requests.len()
+            };
+            Ok(DelegateReply {
+                text: self.replies.lock().unwrap().pop_front().unwrap().into(),
+                session: format!("plan-{round}"),
+                usage: Usage::default(),
+                estimate: None,
+                context: None,
+                billed: false,
+            })
+        }
+    }
+
+    fn agent_pair_config() -> AgentConfig {
+        AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .member(Member::new(ModelId::new("claude-code/opus").unwrap(), ""))
+            .check(Check::parse("test -f done.txt").unwrap())
+            .pair(Pair {
+                planner: ModelId::new("claude-code/opus").unwrap(),
+                planner_effort: Effort::Max,
+                coder_effort: Effort::Low,
+            })
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_agent_plans_in_one_read_only_session_that_follows_the_conversation() {
+        let (_dir, mut toolbox) = setup();
+        let planner = PlanningAgent::new(vec![
+            "none",
+            "Create done.txt.",
+            "OK",
+            "none",
+            "Nothing else: STOP would be wrong, so create done.txt again.",
+            "OK",
+            "none",
+            "Write done.txt.",
+            "OK",
+        ]);
+        let model = Scripted::new(vec![
+            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
+            says("Created."),
+            calls("write_file", json!({"path": "done.txt", "content": "ok2"})),
+            says("Rewritten."),
+            calls("write_file", json!({"path": "done.txt", "content": "ok3"})),
+            says("Written."),
+        ]);
+        let mut session = Session::new();
+        let config = agent_pair_config();
+        let mut send = async |session: &mut Session, text: &str| {
+            session
+                .send(&model, &planner, &mut toolbox, &config, text, "", |_| {})
+                .await
+                .unwrap()
+        };
+
+        send(&mut session, "make done").await;
+        send(&mut session, "and again").await;
+        // Unused for a while: its cache is gone, a new session is cheaper.
+        session.agents.get_mut(&Agent::ClaudeCode).unwrap().used = 0;
+        send(&mut session, "once more").await;
+
+        let requests = planner.requests.lock().unwrap();
+        assert!(requests.iter().all(|r| r.read_only));
+        assert!(requests[0].instructions.contains(AGENT_PLAN_PROMPT));
+        let resumes: Vec<Option<&str>> = requests.iter().map(|r| r.resume.as_deref()).collect();
+        assert_eq!(
+            resumes,
+            [
+                None,
+                Some("plan-1"),
+                Some("plan-2"),
+                // Warm: the same session goes on.
+                Some("plan-3"),
+                Some("plan-4"),
+                Some("plan-5"),
+                // Cold: a new one, told the conversation so far.
+                None,
+                Some("plan-7"),
+                Some("plan-8"),
+            ]
+        );
+        assert!(!requests[0].prompt.contains("The conversation so far"));
+        // Warm, it knows what was said: nothing is repeated.
+        assert!(!requests[3].prompt.contains("The conversation so far"));
+        assert!(
+            requests[6]
+                .prompt
+                .starts_with("The conversation so far:\nUser: make done")
+        );
+        assert!(requests[6].prompt.contains("User: and again"));
+    }
+
+    /// Claude Code on an API key, for the cost tests: the calls it reports
+    /// as they end, its session's own total, and whether it was resumed.
+    struct KeyedClaude {
+        calls: Vec<Option<Usd>>,
+        estimate: Option<Usd>,
+    }
+
+    impl Delegate for KeyedClaude {
+        type Error = Infallible;
+
+        async fn run(
+            &self,
+            _: &DelegateRequest,
+            on_event: &mut (dyn FnMut(DelegateEvent) + Send),
+        ) -> Result<DelegateReply, Infallible> {
+            for cost in &self.calls {
+                on_event(DelegateEvent::Usage {
+                    usage: Usage {
+                        input: TokenCount(10_000),
+                        output: TokenCount(100),
+                    },
+                    cost: *cost,
+                    billed: true,
+                });
+            }
+            Ok(DelegateReply {
+                text: "Done.".into(),
+                session: "s".into(),
+                usage: Usage {
+                    input: TokenCount(900_000),
+                    output: TokenCount(9_000),
+                },
+                estimate: self.estimate,
+                context: None,
+                billed: true,
+            })
+        }
+    }
+
+    async fn keyed(claude: &KeyedClaude, session: &mut Session) -> Outcome {
         let (_dir, mut toolbox) = setup();
         let config = AgentConfig::builder()
             .tier(ModelId::new("claude-code/opus").unwrap())
             .build()
             .unwrap();
-        let mut costs = Vec::new();
-        let outcome = Session::new()
+        session
             .send(
                 &Scripted::new(vec![]),
-                &BilledClaude,
+                claude,
                 &mut toolbox,
                 &config,
                 "explain",
                 "",
-                |e| {
-                    if let Event::Turn {
-                        cost, subscription, ..
-                    } = e
-                    {
-                        costs.push((cost, subscription));
-                    }
-                },
+                |_| {},
             )
             .await
-            .unwrap();
+            .unwrap()
+    }
 
-        // Two messages as they ended, then the rest of its own total.
-        assert_eq!(costs.len(), 3);
-        assert!(costs.iter().all(|(_, subscription)| !subscription));
-        assert_eq!(costs[0].0, Some(Usd(0.02)));
-        assert!((costs[2].0.unwrap().0 - 0.01).abs() < 1e-12);
-        // Owed, counted once, in full.
-        assert!((outcome.cost.0 - 0.05).abs() < 1e-12);
-        assert_eq!(outcome.usage.output, TokenCount(250));
-        assert!(!outcome.subscription);
+    #[tokio::test]
+    async fn claude_code_on_a_key_costs_what_its_messages_cost() {
+        // Its own total covers the whole session, earlier requests
+        // included: the messages counted as they came are what counts.
+        let claude = KeyedClaude {
+            calls: vec![Some(Usd(0.02)), Some(Usd(0.02))],
+            estimate: Some(Usd(0.65)),
+        };
+        let mut session = Session::new();
+        let first = keyed(&claude, &mut session).await;
+        assert!((first.cost.0 - 0.04).abs() < 1e-12, "{:?}", first.cost);
+        assert!(first.cost_complete && !first.subscription);
+        assert_eq!(first.usage.output, TokenCount(200));
+        // Resumed, the same: no earlier request billed again.
+        let second = keyed(&claude, &mut session).await;
+        assert!((second.cost.0 - 0.04).abs() < 1e-12, "{:?}", second.cost);
+    }
+
+    #[tokio::test]
+    async fn what_could_not_be_priced_falls_back_on_a_new_sessions_total_only() {
+        let claude = KeyedClaude {
+            calls: vec![Some(Usd(0.02)), None],
+            estimate: Some(Usd(0.05)),
+        };
+        let mut session = Session::new();
+        // A new session's total covers this request alone: it fills the gap.
+        let new = keyed(&claude, &mut session).await;
+        assert!((new.cost.0 - 0.05).abs() < 1e-12, "{:?}", new.cost);
+        assert!(new.cost_complete);
+        // Resumed, its total cannot say: the cost is marked incomplete.
+        let resumed = keyed(&claude, &mut session).await;
+        assert!((resumed.cost.0 - 0.02).abs() < 1e-12, "{:?}", resumed.cost);
+        assert!(!resumed.cost_complete);
     }
 
     #[tokio::test]

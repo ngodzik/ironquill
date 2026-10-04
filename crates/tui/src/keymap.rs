@@ -71,6 +71,9 @@ pub enum Action {
     Submit,
     /// Move in the focused pane by this many lines; positive is down.
     Move(i32),
+    /// Show the message sent this many messages away from the one shown,
+    /// back when negative; past the latest, the draft.
+    Recall(i32),
     /// Move by half a screen; `true` is down.
     HalfPage(bool),
     /// Jump to the top of the focused pane.
@@ -149,7 +152,8 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("/", "a command: /help lists them"),
             ("Esc", "normal mode"),
             ("Ctrl-W / Ctrl-U", "delete a word / the line"),
-            ("Up Down PgUp PgDn", "scroll the conversation"),
+            ("Up Down", "the messages sent before, as in a shell"),
+            ("PgUp PgDn", "scroll the conversation"),
         ],
     ),
     (
@@ -271,6 +275,8 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
             KeyCode::Right => Some(Action::Right),
             KeyCode::Home => Some(Action::Home),
             KeyCode::End => Some(Action::End),
+            KeyCode::Up if mode == Mode::Insert => Some(Action::Recall(-1)),
+            KeyCode::Down if mode == Mode::Insert => Some(Action::Recall(1)),
             KeyCode::Up => Some(Action::Move(-1)),
             KeyCode::Down => Some(Action::Move(1)),
             KeyCode::PageUp => Some(Action::HalfPage(false)),

@@ -18,6 +18,10 @@ use crate::prices::{PriceTable, Tokens};
 /// run them, or work around them, itself.
 const DISALLOWED_TOOLS: &str = "Bash";
 
+/// Tools refused as well when Claude Code may only read: it plans or
+/// reviews, another model writes.
+const READ_ONLY_DISALLOWED: &str = "Bash Edit MultiEdit Write NotebookEdit";
+
 /// How much of Claude Code's error output is kept for the message.
 const STDERR_LIMIT: usize = 4_000;
 
@@ -67,7 +71,14 @@ impl ClaudeCode {
             // Edits inside the project need no approval; anything else that
             // would ask is refused, since nobody is there to answer.
             .args(["--permission-mode", "acceptEdits"])
-            .args(["--disallowedTools", DISALLOWED_TOOLS])
+            .args([
+                "--disallowedTools",
+                if request.read_only {
+                    READ_ONLY_DISALLOWED
+                } else {
+                    DISALLOWED_TOOLS
+                },
+            ])
             // No MCP server: the person's own connectors (mail, calendars)
             // have nothing to do with a task in this project.
             .arg("--strict-mcp-config")
@@ -520,6 +531,7 @@ mod tests {
             instructions: "be brief".into(),
             resume: Some("s1".into()),
             directory: PathBuf::from("/tmp"),
+            read_only: false,
         };
         let command = ClaudeCode::new("claude").command(&request);
         let args: Vec<String> = command
@@ -539,5 +551,19 @@ mod tests {
         assert_eq!(after("--resume").as_deref(), Some("s1"));
         assert_eq!(after("--output-format").as_deref(), Some("stream-json"));
         assert!(args.iter().any(|a| a == "--strict-mcp-config"));
+
+        // Planning or reviewing, it may not change a file either.
+        let read_only = DelegateRequest {
+            read_only: true,
+            ..request
+        };
+        let command = ClaudeCode::new("claude").command(&read_only);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        assert_eq!(args[at + 1], "Bash Edit MultiEdit Write NotebookEdit");
     }
 }
