@@ -992,7 +992,8 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
         } => {
             // Who works, plain to see: the coder in the accent colour, the
             // planner in the colour of handovers, ironquill in grey.
-            let colour = match (model, name.starts_with("Coding")) {
+            let coding = name.starts_with("Coding") || name.starts_with("Fixing");
+            let colour = match (model, coding) {
                 (None, _) => Color::Gray,
                 (Some(_), true) => ACCENT,
                 (Some(_), false) => Color::Magenta,

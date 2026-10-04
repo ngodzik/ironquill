@@ -244,7 +244,8 @@ Type a question or a change and press Enter. Changes are checked before they are
                      best sees a map of the project and picks the code to read,
                      ironquill reads it, the best plans from it, thinking hard;
                      the cheapest codes it, thinking little, without the earlier
-                     conversation; the planner revises its plan if checks fail
+                     conversation; the planner revises its plan if checks fail,
+                     then reviews the diff, and the coder fixes what it finds
 /planner <model>     the model that plans in a pair; by default the best scored,
                      or the dearest
 /effort <level>      how hard models think: low, medium, high (the default),

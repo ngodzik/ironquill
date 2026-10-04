@@ -70,6 +70,40 @@ pub async fn diff_stat(dir: &Path) -> Result<String, ToolError> {
     Ok(format!("{}\n{}", status.trim_end(), stat.trim_end()))
 }
 
+/// What changed in `paths` since the last commit, as a reviewer reads it:
+/// a diff for a file git knows, the whole text of a new one. Outside a
+/// repository, or when git fails, the files as they are now. At most
+/// `limit` bytes.
+pub async fn changes_text(dir: &Path, paths: &[String], limit: usize) -> String {
+    let mut out = String::new();
+    for path in paths {
+        let tracked = git(dir, &["ls-files", "--error-unmatch", "--", path])
+            .await
+            .is_ok();
+        let part = if tracked {
+            git(dir, &["diff", "--no-color", "HEAD", "--", path])
+                .await
+                .unwrap_or_default()
+        } else {
+            std::fs::read_to_string(dir.join(path))
+                .map(|text| format!("new file {path}:\n{text}"))
+                .unwrap_or_else(|_| format!("{path}: deleted or unreadable\n"))
+        };
+        out.push_str(&part);
+        out.push('\n');
+        if out.len() > limit {
+            let cut = (0..=limit)
+                .rev()
+                .find(|i| out.is_char_boundary(*i))
+                .unwrap_or(0);
+            out.truncate(cut);
+            out.push_str("\n(the rest of the changes was left out: too long)");
+            break;
+        }
+    }
+    out
+}
+
 /// The project's files, relative to `dir`, at most `limit` of them: the ones
 /// git tracks in a repository, otherwise every file found by walking the
 /// directory, skipping hidden directories and build output.

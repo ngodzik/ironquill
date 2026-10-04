@@ -75,6 +75,22 @@ simplest reading. You cannot run tests or commands: as soon as you stop calling 
 runs the project's checks and tells you how they went. When you are done, reply with one short \
 sentence.";
 
+/// For the planner, once the checks pass: the person will not review it.
+const REVIEW_PROMPT: &str = "The checks pass. Review the work before it goes to the person, who \
+will not review it. Check it against the request and your plan: every part of the request is \
+done and can be used, in the interface too when the request is about it; no code is left \
+unused; no module uses another's private helpers; the documentation says what changed in \
+behaviour or API; the new behaviour is tested; nothing unrelated changed. Reply with exactly `OK` \
+if nothing needs changing. Otherwise reply with a numbered list of concrete changes, each naming \
+the file and what to do, and nothing else.";
+
+/// How many rounds of fixes a review may ask for before the work is
+/// handed over with what is left said.
+const REVIEW_FIXES: usize = 2;
+
+/// The most of a diff a review reads, in bytes.
+const REVIEW_DIFF_BYTES: usize = 40_000;
+
 /// How many times the planner may revise its plan after the checks fail.
 const MAX_REVISIONS: usize = 2;
 
@@ -398,7 +414,7 @@ impl Session {
         // says which code it needs; ironquill reads it, no model does.
         (ctx.observe)(Event::Step {
             number: 1,
-            of: 4,
+            of: 6,
             name: "Choosing the code to read".into(),
             model: Some(planner.clone()),
             effort: Some(pair.planner_effort),
@@ -427,7 +443,7 @@ impl Session {
 
         (ctx.observe)(Event::Step {
             number: 2,
-            of: 4,
+            of: 6,
             name: "Reading the code asked for".into(),
             model: None,
             effort: None,
@@ -436,7 +452,7 @@ impl Session {
 
         (ctx.observe)(Event::Step {
             number: 3,
-            of: 4,
+            of: 6,
             name: "Planning".into(),
             model: Some(planner.clone()),
             effort: Some(pair.planner_effort),
@@ -449,7 +465,7 @@ impl Session {
 
         (ctx.observe)(Event::Step {
             number: 4,
-            of: 4,
+            of: 6,
             name: "Coding".into(),
             model: Some(coder.clone()),
             effort: Some(pair.coder_effort),
@@ -497,7 +513,7 @@ impl Session {
                 let Some(f) = failure.as_ref() else { break };
                 (ctx.observe)(Event::Step {
                     number: 3,
-                    of: 4,
+                    of: 6,
                     name: format!("Revising the plan: `{}` fails", f.command),
                     model: Some(planner.clone()),
                     effort: Some(pair.planner_effort),
@@ -532,7 +548,7 @@ impl Session {
                 ctx.effort = Some(pair.coder_effort);
                 (ctx.observe)(Event::Step {
                     number: 4,
-                    of: 4,
+                    of: 6,
                     name: "Coding the revised plan".into(),
                     model: Some(coder.clone()),
                     effort: Some(pair.coder_effort),
@@ -546,6 +562,75 @@ impl Session {
                 failure: failure.clone(),
             })
         };
+
+        // The planner reviews what was done, from the diff, and the coder
+        // fixes what it finds: nobody should have to review it after.
+        let mut result = result;
+        let mut reviewed = String::new();
+        if matches!(result, Ok(Verdict::Passed { .. } | Verdict::Unchecked)) {
+            for round in 0..=REVIEW_FIXES {
+                (ctx.observe)(Event::Step {
+                    number: 5,
+                    of: 6,
+                    name: "Reviewing the work".into(),
+                    model: Some(planner.clone()),
+                    effort: Some(pair.planner_effort),
+                });
+                let changed: Vec<String> = ctx.toolbox.changed().map(str::to_owned).collect();
+                let diff = ironquill_tools::changes_text(&root, &changed, REVIEW_DIFF_BYTES).await;
+                planning.push(Message::user(format!(
+                    "{REVIEW_PROMPT}\n\nThe request:\n{text}\n\nWhat changed:\n{diff}{}",
+                    spent_so_far(ctx)
+                )));
+                let review =
+                    match ask_planner(ctx, planner, pair.planner_effort, &mut planning).await {
+                        Ok(review) => review,
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    };
+                if approves(&review) {
+                    reviewed = " The review approved it.".into();
+                    break;
+                }
+                if round == REVIEW_FIXES {
+                    reviewed = format!(" The review still asks for:\n{review}");
+                    break;
+                }
+                (ctx.observe)(Event::Step {
+                    number: 6,
+                    of: 6,
+                    name: "Fixing what the review found".into(),
+                    model: Some(coder.clone()),
+                    effort: Some(pair.coder_effort),
+                });
+                ctx.effort = Some(pair.coder_effort);
+                work.push(Message::user(format!(
+                    "A review of your work by {planner} asks for these changes:\n{review}\n\n\
+                     Make them.{}",
+                    spent_so_far(ctx)
+                )));
+                let mut failed = None;
+                match attempt(ctx, &coder, &mut work, &mut failed, false).await {
+                    Ok(Attempt::Passed) => {
+                        result = Ok(Verdict::Passed {
+                            model: coder.clone(),
+                        })
+                    }
+                    Ok(Attempt::Unchecked | Attempt::Answered) => result = Ok(Verdict::Unchecked),
+                    Ok(Attempt::Failed) => {
+                        result = Ok(Verdict::GaveUp { failure: failed });
+                        reviewed = " The checks failed after the review's fixes.".into();
+                        break;
+                    }
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+        }
 
         // The conversation keeps what was decided and done, briefly.
         let changed = ctx.toolbox.changed().collect::<Vec<_>>().join(", ");
@@ -561,7 +646,7 @@ impl Session {
             _ => String::new(),
         };
         self.note(format!(
-            "(Worked in a pair: {planner} planned, {coder} implemented.{ending}\n\nPlan:\n{plan}\n\n\
+            "(Worked in a pair: {planner} planned, {coder} implemented.{ending}{reviewed}\n\nPlan:\n{plan}\n\n\
              {coder}: {report}\nFiles changed: {})",
             if changed.is_empty() { "none" } else { &changed }
         ));
@@ -1004,6 +1089,12 @@ fn within_budget<M, D, O>(
         }
         _ => Ok(()),
     }
+}
+
+/// Whether a review found nothing to change: it answered `OK`.
+fn approves(review: &str) -> bool {
+    let review = review.trim().trim_matches(['`', '*', '.', '!']).trim();
+    review.eq_ignore_ascii_case("ok")
 }
 
 /// Whether a planner's reply is a plan rather than only a list of code to
@@ -1812,6 +1903,8 @@ mod tests {
             // The coder implements.
             calls("write_file", json!({"path": "done.txt", "content": "ok"})),
             says("Created done.txt."),
+            // The review approves it.
+            says("OK"),
         ]);
         let mut session = Session::new();
         // A long conversation before: the coding step must not resend it.
@@ -1885,14 +1978,15 @@ mod tests {
                 (1, Some("strong")),
                 (2, None),
                 (3, Some("strong")),
-                (4, Some("cheap"))
+                (4, Some("cheap")),
+                (5, Some("strong"))
             ]
         );
         // The session keeps a short account of it.
         assert!(matches!(
             session.messages.last(),
             Some(Message::Assistant { content: Some(t), .. })
-                if t.starts_with("(Worked in a pair: strong planned, cheap implemented.")
+                if t.starts_with("(Worked in a pair: strong planned, cheap implemented. The review approved it.")
                     && t.contains("Files changed: done.txt")
         ));
     }
@@ -1903,6 +1997,67 @@ mod tests {
             excerpt_requests("Here:\n- `a.py:3-9`\n* b/c.rs:10-12\nnone\nd.py:9-3"),
             [("a.py".to_owned(), 3, 9), ("b/c.rs".to_owned(), 10, 12)]
         );
+    }
+
+    #[tokio::test]
+    async fn the_review_finds_what_the_tests_miss_and_the_coder_fixes_it() {
+        let (dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("none"),
+            says("Create done.txt and document it in README.md."),
+            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
+            says("Created done.txt."),
+            // The checks pass, but the README was forgotten.
+            says("1. README.md: say what done.txt is for."),
+            calls(
+                "write_file",
+                json!({"path": "README.md", "content": "done.txt marks it done."}),
+            ),
+            says("Documented."),
+            says("OK"),
+        ]);
+        let mut events = Vec::new();
+        let outcome = Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "make done",
+                "",
+                |e| {
+                    events.push(e);
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
+        assert!(dir.path().join("README.md").exists());
+        let seen = model.seen.lock().unwrap();
+        // The review reads the changes, not the project.
+        let Some(Message::User(review)) = seen[4].messages.last() else {
+            panic!("the planner reviews");
+        };
+        assert!(review.contains("The checks pass. Review the work"));
+        assert!(review.contains("done.txt") && review.contains("ok"));
+        // The coder gets what the review asks for.
+        assert!(matches!(
+            seen[5].messages.last(),
+            Some(Message::User(t)) if t.contains("1. README.md")
+        ));
+        let fixes = events
+            .iter()
+            .filter(|e| matches!(e, Event::Step { number: 6, .. }))
+            .count();
+        assert_eq!(fixes, 1);
+    }
+
+    #[test]
+    fn only_a_plain_ok_approves() {
+        assert!(approves("OK"));
+        assert!(approves(" `ok`.\n"));
+        assert!(!approves("OK, but README.md is missing the route."));
     }
 
     #[tokio::test]
@@ -1920,6 +2075,8 @@ mod tests {
             says("1. Wrong file: create done.txt containing ok instead."),
             calls("write_file", json!({"path": "done.txt", "content": "ok"})),
             says("Created done.txt."),
+            // The review approves it.
+            says("OK"),
         ]);
         let outcome = Session::new()
             .send(
@@ -1961,6 +2118,8 @@ mod tests {
             says("The check wants done.txt: create it."),
             calls("write_file", json!({"path": "done.txt", "content": "ok"})),
             says("Created done.txt."),
+            // The review approves it.
+            says("OK"),
         ]);
         let mut session = Session::new();
         let outcome = session
