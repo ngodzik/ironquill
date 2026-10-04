@@ -258,6 +258,49 @@ impl Entry {
     }
 }
 
+/// The messages sent before, gone through with Up and Down as in a shell.
+#[derive(Debug, Default)]
+struct History {
+    sent: Vec<String>,
+    /// The message shown, as an index in `sent`; `None` on the draft.
+    at: Option<usize>,
+    /// What was being typed before going back.
+    draft: String,
+}
+
+impl History {
+    /// Remembers a message sent, once when it is sent again in a row, and
+    /// goes back to a new draft.
+    fn push(&mut self, text: String) {
+        self.at = None;
+        self.draft.clear();
+        if self.sent.last() != Some(&text) {
+            self.sent.push(text);
+        }
+    }
+
+    /// The message `step` away from the one shown, back when negative; past
+    /// the latest, the draft `typing` was when going back. `None` when there
+    /// is nothing further that way.
+    fn recall(&mut self, step: i32, typing: &str) -> Option<String> {
+        let next = match self.at {
+            None if step < 0 && !self.sent.is_empty() => {
+                self.draft = typing.to_owned();
+                self.sent.len() - 1
+            }
+            None => return None,
+            Some(at) if step < 0 => at.checked_sub(1)?,
+            Some(at) if at + 1 < self.sent.len() => at + 1,
+            Some(_) => {
+                self.at = None;
+                return Some(std::mem::take(&mut self.draft));
+            }
+        };
+        self.at = Some(next);
+        Some(self.sent[next].clone())
+    }
+}
+
 /// A single line of text being edited, with a cursor counted in characters.
 #[derive(Debug, Default)]
 pub(crate) struct LineEditor {
@@ -347,6 +390,8 @@ pub(crate) struct App {
     focus: Focus,
     pending: Option<Pending>,
     input: LineEditor,
+    /// The messages sent before, for Up and Down in the message box.
+    history: History,
     command: LineEditor,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
@@ -465,6 +510,7 @@ impl App {
             focus: Focus::Chat,
             pending: None,
             input: LineEditor::default(),
+            history: History::default(),
             command: LineEditor::default(),
             transcript,
             scroll_back: Cell::new(0),
@@ -726,6 +772,9 @@ impl App {
                 return match self.mode {
                     Mode::Insert => {
                         let text = self.input.text().trim().to_owned();
+                        if !text.is_empty() {
+                            self.history.push(text.clone());
+                        }
                         // Slash commands as in other coding agents, colon
                         // commands as in Vim: both reach the same place.
                         if let Some(line) = text.strip_prefix('/') {
@@ -741,6 +790,11 @@ impl App {
                     }
                     Mode::Normal => None,
                 };
+            }
+            Action::Recall(step) => {
+                if let Some(text) = self.history.recall(step, self.input.text()) {
+                    self.input.set(text);
+                }
             }
             Action::Move(lines) if self.focus == Focus::Chat && self.mode == Mode::Normal => {
                 self.select_reply(lines);
@@ -1608,6 +1662,12 @@ impl App {
         self.cost = saved.cost;
         self.cost_complete = saved.cost_complete;
         self.transcript = saved.transcript;
+        self.history = History::default();
+        for entry in &self.transcript {
+            if let Entry::User(text) = entry {
+                self.history.push(text.clone());
+            }
+        }
         self.expanded.clear();
         self.selected_reply = None;
         self.transcript.push(Entry::Info(format!(
@@ -2633,6 +2693,29 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_go_through_the_messages_sent_before() {
+        let mut app = ready();
+        type_text(&mut app, "fix it");
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..2 {
+            type_text(&mut app, "/cost");
+            press(&mut app, KeyCode::Enter);
+        }
+        type_text(&mut app, "draft");
+        let mut recall = |code| {
+            press(&mut app, code);
+            app.input.text().to_owned()
+        };
+        // Sent twice in a row, it is there once.
+        assert_eq!(recall(KeyCode::Up), "/cost");
+        assert_eq!(recall(KeyCode::Up), "fix it");
+        assert_eq!(recall(KeyCode::Up), "fix it");
+        assert_eq!(recall(KeyCode::Down), "/cost");
+        assert_eq!(recall(KeyCode::Down), "draft");
+        assert_eq!(recall(KeyCode::Down), "draft");
+    }
+
+    #[test]
     fn enter_sends_the_message() {
         let mut app = ready();
         type_text(&mut app, "fix it");
@@ -2874,6 +2957,9 @@ mod tests {
                 .transcript()
                 .contains(&Entry::User("fix the parser please".into()))
         );
+        // Its messages can be sent again with Up.
+        press(&mut other, KeyCode::Up);
+        assert_eq!(other.input.text(), "fix the parser please");
     }
 
     #[test]
