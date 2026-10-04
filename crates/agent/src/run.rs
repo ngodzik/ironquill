@@ -992,15 +992,43 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
     request: &DelegateRequest,
 ) -> Result<DelegateReply, AgentError> {
     let root = request.directory.clone();
+    // What was counted as it came, to add only the rest at the end.
+    let mut live_usage = Usage::default();
+    let mut live_cost = Usd(0.0);
     let reply = {
         let Ctx {
             delegate,
             toolbox,
             observe,
+            ledger,
             ..
         } = &mut *ctx;
         let mut on_event = |event: DelegateEvent| {
             let event = match event {
+                // Each message of the agent counts at once, so that the
+                // cost moves while it works.
+                DelegateEvent::Usage {
+                    usage,
+                    cost,
+                    billed,
+                } => {
+                    live_usage += usage;
+                    ledger.usage += usage;
+                    let cost = cost.filter(|_| billed);
+                    if let Some(cost) = cost {
+                        live_cost += cost;
+                        ledger.cost += cost;
+                    } else {
+                        ledger.subscription = true;
+                    }
+                    Event::Turn {
+                        model: tier.clone(),
+                        usage,
+                        cost,
+                        subscription: !billed,
+                        context: None,
+                    }
+                }
                 DelegateEvent::TextStart => Event::Saying {
                     model: tier.clone(),
                     text: String::new(),
@@ -1035,16 +1063,36 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
             .map_err(|e| AgentError::Model(Box::new(e)))?
     };
 
-    ctx.ledger.usage += reply.usage;
-    ctx.ledger.subscription = true;
+    // The agent's own total settles it: what the messages did not count.
+    let rest = Usage {
+        input: TokenCount(reply.usage.input.0.saturating_sub(live_usage.input.0)),
+        output: TokenCount(reply.usage.output.0.saturating_sub(live_usage.output.0)),
+    };
+    let cost = if reply.billed {
+        let owed = reply.estimate.map_or(live_cost.0, |e| e.0.max(live_cost.0));
+        Some(Usd(owed - live_cost.0))
+    } else {
+        ctx.ledger.subscription = true;
+        None
+    };
+    ctx.ledger.usage += rest;
+    if let Some(cost) = cost {
+        ctx.ledger.cost += cost;
+    }
     ctx.ledger.context = reply.context.or(ctx.ledger.context);
-    (ctx.observe)(Event::Turn {
-        model: tier.clone(),
-        usage: reply.usage,
-        cost: None,
-        subscription: true,
-        context: reply.context,
-    });
+    // Nothing left to add when every call was counted as it came.
+    let left = rest.input.0 + rest.output.0 > 0
+        || cost.is_some_and(|c| c.0 > 0.0)
+        || reply.context.is_some();
+    if left {
+        (ctx.observe)(Event::Turn {
+            model: tier.clone(),
+            usage: rest,
+            cost,
+            subscription: !reply.billed,
+            context: reply.context,
+        });
+    }
     Ok(reply)
 }
 
@@ -1829,6 +1877,43 @@ mod tests {
                 },
                 estimate: Some(Usd(0.09)),
                 context: None,
+                billed: false,
+            })
+        }
+    }
+
+    /// Claude Code on an API key: two messages counted as they end, then
+    /// its own total.
+    struct BilledClaude;
+
+    impl Delegate for BilledClaude {
+        type Error = Infallible;
+
+        async fn run(
+            &self,
+            _: &DelegateRequest,
+            on_event: &mut (dyn FnMut(DelegateEvent) + Send),
+        ) -> Result<DelegateReply, Infallible> {
+            for _ in 0..2 {
+                on_event(DelegateEvent::Usage {
+                    usage: Usage {
+                        input: TokenCount(10_000),
+                        output: TokenCount(100),
+                    },
+                    cost: Some(Usd(0.02)),
+                    billed: true,
+                });
+            }
+            Ok(DelegateReply {
+                text: "Done.".into(),
+                session: "s".into(),
+                usage: Usage {
+                    input: TokenCount(20_000),
+                    output: TokenCount(250),
+                },
+                estimate: Some(Usd(0.05)),
+                context: None,
+                billed: true,
             })
         }
     }
@@ -2522,6 +2607,45 @@ mod tests {
             .unwrap()
             .with_instructions(Some("  \n".into()));
         assert_eq!(config.instructions, None);
+    }
+
+    #[tokio::test]
+    async fn claude_code_on_a_key_costs_as_it_goes_and_settles_at_the_end() {
+        let (_dir, mut toolbox) = setup();
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap();
+        let mut costs = Vec::new();
+        let outcome = Session::new()
+            .send(
+                &Scripted::new(vec![]),
+                &BilledClaude,
+                &mut toolbox,
+                &config,
+                "explain",
+                "",
+                |e| {
+                    if let Event::Turn {
+                        cost, subscription, ..
+                    } = e
+                    {
+                        costs.push((cost, subscription));
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        // Two messages as they ended, then the rest of its own total.
+        assert_eq!(costs.len(), 3);
+        assert!(costs.iter().all(|(_, subscription)| !subscription));
+        assert_eq!(costs[0].0, Some(Usd(0.02)));
+        assert!((costs[2].0.unwrap().0 - 0.01).abs() < 1e-12);
+        // Owed, counted once, in full.
+        assert!((outcome.cost.0 - 0.05).abs() < 1e-12);
+        assert_eq!(outcome.usage.output, TokenCount(250));
+        assert!(!outcome.subscription);
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use ironquill_core::{
     ContextUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount, Usage, Usd,
@@ -10,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::error::LlmError;
+use crate::prices::{PriceTable, Tokens};
 
 /// Tools Claude Code may not use when ironquill hands it a task. Commands are
 /// ironquill's to run: its checks judge the change, so the agent must not
@@ -28,6 +30,8 @@ const STDERR_LIMIT: usize = 4_000;
 #[derive(Debug, Clone)]
 pub struct ClaudeCode {
     program: PathBuf,
+    /// List prices, to say what each message costs as it comes.
+    prices: Option<Arc<PriceTable>>,
 }
 
 impl ClaudeCode {
@@ -35,7 +39,16 @@ impl ClaudeCode {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            prices: None,
         }
+    }
+
+    /// Prices each message as it comes with `prices`, as ccusage does
+    /// after the fact.
+    #[must_use]
+    pub fn with_prices(mut self, prices: Option<Arc<PriceTable>>) -> Self {
+        self.prices = prices;
+        self
     }
 
     /// Claude Code as found on the `PATH`, if it is installed.
@@ -119,7 +132,10 @@ impl Delegate for ClaudeCode {
             return Err(LlmError::Delegate("Claude Code gave no output".into()));
         };
 
-        let mut parser = StreamParser::default();
+        let mut parser = StreamParser {
+            prices: self.prices.clone(),
+            ..StreamParser::default()
+        };
         let read_events = async {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -163,6 +179,13 @@ struct StreamParser {
     error: Option<String>,
     /// Tokens sent on the latest call to the model: how full the context is.
     last_input: Option<u64>,
+    /// List prices, to price each message.
+    prices: Option<Arc<PriceTable>>,
+    /// Claude Code runs with an API key rather than a subscription.
+    billed: bool,
+    /// The model of the message being written, and its input so far.
+    model: String,
+    tokens: Tokens,
 }
 
 impl StreamParser {
@@ -171,6 +194,12 @@ impl StreamParser {
             return;
         };
         match event["type"].as_str() {
+            // How it is paid for: with a key, every token is owed.
+            Some("system") if event["subtype"] == "init" => {
+                self.billed = event["apiKeySource"]
+                    .as_str()
+                    .is_some_and(|source| source != "none");
+            }
             Some("stream_event") => self.stream_event(&event["event"], on_event),
             Some("assistant") => {
                 for block in blocks(&event["message"]["content"]) {
@@ -222,11 +251,38 @@ impl StreamParser {
                 self.streamed = false;
                 let usage = &event["message"]["usage"];
                 let count = |key: &str| usage[key].as_u64().unwrap_or(0);
-                let input = count("input_tokens")
-                    + count("cache_read_input_tokens")
-                    + count("cache_creation_input_tokens");
+                self.model = text(&event["message"]["model"]);
+                self.tokens = Tokens {
+                    input: count("input_tokens"),
+                    cache_read: count("cache_read_input_tokens"),
+                    cache_write: count("cache_creation_input_tokens"),
+                    output: count("output_tokens"),
+                };
+                let input = self.tokens.input + self.tokens.cache_read + self.tokens.cache_write;
                 if input > 0 {
                     self.last_input = Some(input);
+                }
+            }
+            // The end of a message: what it used, and what that costs.
+            Some("message_delta") => {
+                if let Some(output) = event["usage"]["output_tokens"].as_u64() {
+                    self.tokens.output = output;
+                }
+                let tokens = std::mem::take(&mut self.tokens);
+                let usage = Usage {
+                    input: TokenCount(tokens.input + tokens.cache_read + tokens.cache_write),
+                    output: TokenCount(tokens.output),
+                };
+                if usage.input.0 + usage.output.0 > 0 {
+                    let cost = self
+                        .prices
+                        .as_ref()
+                        .and_then(|prices| prices.cost(&self.model, tokens));
+                    on_event(DelegateEvent::Usage {
+                        usage,
+                        cost,
+                        billed: self.billed,
+                    });
                 }
             }
             Some("content_block_start") if event["content_block"]["type"] == "text" => {
@@ -261,6 +317,7 @@ impl StreamParser {
                 .filter(|c| c.is_finite() && *c >= 0.0)
                 .map(Usd),
             context: None,
+            billed: self.billed,
         };
         // The window of the model used, from the per-model breakdown.
         let window = event["modelUsage"]
@@ -371,6 +428,54 @@ mod tests {
                 window: TokenCount(1_000_000),
             })
         );
+    }
+
+    #[test]
+    fn each_message_is_counted_as_it_ends_and_priced_when_billed() {
+        let prices = PriceTable::parse(
+            r#"{"claude-opus-5-5": {"input_cost_per_token": 4e-6, "output_cost_per_token": 2e-5,
+                                   "cache_read_input_token_cost": 2e-7,
+                                   "cache_creation_input_token_cost": 5e-6}}"#,
+        )
+        .unwrap();
+        let mut parser = StreamParser {
+            prices: Some(Arc::new(prices)),
+            ..StreamParser::default()
+        };
+        let mut events = Vec::new();
+        for line in [
+            r#"{"type":"system","subtype":"init","apiKeySource":"ANTHROPIC_API_KEY"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":1000,"cache_read_input_tokens":100000,"cache_creation_input_tokens":2000,"output_tokens":1}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":500}}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s","total_cost_usd":0.05,"usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":100000,"cache_creation_input_tokens":2000}}"#,
+        ] {
+            parser.feed(line, &mut |e| events.push(e));
+        }
+        let [
+            DelegateEvent::Usage {
+                usage,
+                cost,
+                billed,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("one message, one usage: {events:?}");
+        };
+        assert_eq!(usage.input, TokenCount(103_000));
+        assert_eq!(usage.output, TokenCount(500));
+        assert!((cost.unwrap().0 - 0.044).abs() < 1e-12);
+        assert!(billed);
+        assert!(parser.finish().unwrap().billed);
+    }
+
+    #[test]
+    fn a_subscription_is_not_billed() {
+        let mut parser = StreamParser::default();
+        parser.feed(
+            r#"{"type":"system","subtype":"init","apiKeySource":"none"}"#,
+            &mut |_| {},
+        );
+        assert!(!parser.billed);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use ironquill_core::{Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount, Usage};
 use serde_json::{Value, json};
@@ -8,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::error::LlmError;
+use crate::prices::{PriceTable, Tokens};
 
 /// How much of Codex's error output is kept for the message.
 const STDERR_LIMIT: usize = 4_000;
@@ -22,6 +24,11 @@ const STDERR_LIMIT: usize = 4_000;
 #[derive(Debug, Clone)]
 pub struct Codex {
     program: PathBuf,
+    /// List prices, to say what each call costs as it comes.
+    prices: Option<Arc<PriceTable>>,
+    /// Codex signs in with an API key rather than ChatGPT: what it uses is
+    /// owed.
+    billed: bool,
 }
 
 impl Codex {
@@ -29,7 +36,36 @@ impl Codex {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            prices: None,
+            billed: false,
         }
+    }
+
+    /// Prices each call to its model as Codex logs it.
+    #[must_use]
+    pub fn with_prices(mut self, prices: Option<Arc<PriceTable>>) -> Self {
+        self.prices = prices;
+        self
+    }
+
+    /// Whether what Codex uses is owed, as when it signs in with an API key.
+    #[must_use]
+    pub fn billed(mut self, billed: bool) -> Self {
+        self.billed = billed;
+        self
+    }
+
+    /// Whether Codex is signed in with an API key, as `codex login status`
+    /// says; its credentials are never read.
+    pub fn uses_api_key(&self) -> bool {
+        std::process::Command::new(&self.program)
+            .args(["login", "status"])
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|out| {
+                let said = [out.stdout, out.stderr].concat();
+                String::from_utf8_lossy(&said).contains("API key")
+            })
     }
 
     /// Codex as found on the `PATH`, if it is installed.
@@ -101,6 +137,13 @@ impl Delegate for Codex {
         request: &DelegateRequest,
         on_event: &mut (dyn FnMut(DelegateEvent) + Send),
     ) -> Result<DelegateReply, LlmError> {
+        // Codex logs each call to its model in its session file, as ccusage
+        // reads it: followed while it works, from where it stood before.
+        let mut rollout = Rollout::default();
+        if let Some(session) = &request.resume {
+            rollout.find(session);
+            rollout.skip_to_end();
+        }
         let mut child = self
             .command(request)
             .spawn()
@@ -117,7 +160,9 @@ impl Delegate for Codex {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 parser.feed(&line, on_event);
+                self.follow(&mut rollout, parser.session.as_deref(), on_event);
             }
+            self.follow(&mut rollout, parser.session.as_deref(), on_event);
         };
         // Read the errors at the same time, so that a full pipe can never
         // block the agent.
@@ -129,19 +174,161 @@ impl Delegate for Codex {
         let ((), errors) = tokio::join!(read_events, read_errors);
         let status = child.wait().await.ok();
 
-        parser.finish().map_err(|reason| {
-            let errors: String = errors.trim().chars().take(STDERR_LIMIT).collect();
-            let detail = match (reason, errors.is_empty()) {
-                (Some(reason), _) => reason,
-                (None, false) => errors,
-                (None, true) => match status {
-                    Some(status) => format!("Codex stopped without a result ({status})"),
-                    None => "Codex stopped without a result".into(),
-                },
-            };
-            LlmError::Delegate(detail)
-        })
+        parser
+            .finish()
+            .map(|reply| DelegateReply {
+                billed: self.billed,
+                ..reply
+            })
+            .map_err(|reason| {
+                let errors: String = errors.trim().chars().take(STDERR_LIMIT).collect();
+                let detail = match (reason, errors.is_empty()) {
+                    (Some(reason), _) => reason,
+                    (None, false) => errors,
+                    (None, true) => match status {
+                        Some(status) => format!("Codex stopped without a result ({status})"),
+                        None => "Codex stopped without a result".into(),
+                    },
+                };
+                LlmError::Delegate(detail)
+            })
     }
+}
+
+impl Codex {
+    /// Reports the calls Codex logged since last time, priced.
+    fn follow(
+        &self,
+        rollout: &mut Rollout,
+        session: Option<&str>,
+        on_event: &mut (dyn FnMut(DelegateEvent) + Send),
+    ) {
+        if let Some(session) = session {
+            rollout.find(session);
+        }
+        for (model, tokens) in rollout.read_calls() {
+            let usage = Usage {
+                input: TokenCount(tokens.input + tokens.cache_read + tokens.cache_write),
+                output: TokenCount(tokens.output),
+            };
+            let cost = self
+                .prices
+                .as_ref()
+                .and_then(|prices| prices.cost(&model, tokens));
+            on_event(DelegateEvent::Usage {
+                usage,
+                cost,
+                billed: self.billed,
+            });
+        }
+    }
+}
+
+/// A Codex session file, `rollout-…-<session>.jsonl` under its sessions
+/// directory, read as it grows.
+#[derive(Debug, Default)]
+struct Rollout {
+    path: Option<PathBuf>,
+    /// Bytes already read.
+    offset: u64,
+    /// The model of the latest turn, which the calls after it use.
+    model: String,
+}
+
+impl Rollout {
+    /// Looks for the file of `session`, once found kept.
+    fn find(&mut self, session: &str) {
+        if self.path.is_none() {
+            self.path = sessions_dir().and_then(|dir| find_named(&dir, session));
+        }
+    }
+
+    fn skip_to_end(&mut self) {
+        if let Some(path) = &self.path {
+            self.offset = std::fs::metadata(path).map_or(0, |m| m.len());
+        }
+    }
+
+    /// The calls logged since the last read: model and tokens of each.
+    fn read_calls(&mut self) -> Vec<(String, Tokens)> {
+        let Some(path) = &self.path else {
+            return Vec::new();
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return Vec::new();
+        };
+        let start = usize::try_from(self.offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        // Whole lines only: the last may still be being written.
+        let Some(end) = bytes[start..].iter().rposition(|b| *b == b'\n') else {
+            return Vec::new();
+        };
+        let end = start + end + 1;
+        self.offset = end as u64;
+        let mut calls = Vec::new();
+        for line in String::from_utf8_lossy(&bytes[start..end]).lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let payload = &value["payload"];
+            if value["type"] == "turn_context" {
+                if let Some(model) = payload["model"].as_str() {
+                    self.model = model.to_owned();
+                }
+            } else if payload["type"] == "token_count" {
+                let usage = &payload["info"]["last_token_usage"];
+                let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+                let input = count("input_tokens");
+                let cached = count("cached_input_tokens");
+                if input + count("output_tokens") == 0 {
+                    continue;
+                }
+                calls.push((
+                    self.model.clone(),
+                    Tokens {
+                        input: input.saturating_sub(cached),
+                        cache_read: cached,
+                        cache_write: count("cache_write_input_tokens"),
+                        output: count("output_tokens"),
+                    },
+                ));
+            }
+        }
+        calls
+    }
+}
+
+/// Codex's sessions directory: `$CODEX_HOME/sessions`, or `~/.codex/sessions`.
+fn sessions_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))?;
+    Some(home.join("sessions"))
+}
+
+/// The file under `dir` whose name holds `session`, newest days first.
+fn find_named(dir: &Path, session: &str) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+    entries.reverse();
+    for path in entries {
+        if path.is_dir() {
+            if let Some(found) = find_named(&path, session) {
+                return Some(found);
+            }
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(session) && n.ends_with(".jsonl"))
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Turns the lines of `codex exec --json` into events, one line at a time.
@@ -249,6 +436,7 @@ impl StreamParser {
                 usage: self.usage,
                 estimate: None,
                 context: None,
+                billed: false,
             }),
             _ => Err(None),
         }
@@ -449,6 +637,63 @@ mod tests {
         }
         let model = args.iter().position(|a| a == "-m").unwrap();
         assert_eq!(args[model + 1], "gpt-5.5");
+    }
+
+    #[test]
+    fn calls_logged_by_codex_are_read_as_the_file_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026/10/04");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-2026-10-04T11-03-36-abc-123.jsonl");
+        // The shape Codex 0.160 writes, cut to the fields that matter.
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"high"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":14139,"cached_input_tokens":12288,"output_tokens":5}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            find_named(dir.path(), "abc-123").as_deref(),
+            Some(path.as_path())
+        );
+        let mut rollout = Rollout {
+            path: Some(path.clone()),
+            ..Rollout::default()
+        };
+        let calls = rollout.read_calls();
+        assert_eq!(
+            calls,
+            [(
+                "gpt-6.1-sol".to_owned(),
+                Tokens {
+                    input: 1_851,
+                    cache_read: 12_288,
+                    cache_write: 0,
+                    output: 5
+                }
+            )]
+        );
+        // Only what was added since, and only whole lines.
+        assert!(rollout.read_calls().is_empty());
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            br#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":7}}}}
+{"type":"event_msg","pay"#,
+        )
+        .unwrap();
+        let calls = rollout.read_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.output, 7);
     }
 
     #[test]
