@@ -41,6 +41,11 @@ pub(crate) enum Command {
     /// `/effort <level>` sets how hard models think; `/effort` alone goes
     /// to the next level.
     Effort(Option<String>),
+    /// `/pair <question>`: a member of the team plans, the model that
+    /// answers gathers and codes.
+    Pair(Option<String>),
+    /// `/planner <model>` picks the member that plans; alone, says which.
+    Planner(Option<String>),
     /// `/copy` opens the conversation as text, to select and copy from.
     Copy,
     /// `/claude-reset` ends Claude Code's session, `/codex-reset` Codex's.
@@ -87,6 +92,8 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "defaults" => Ok(Command::Defaults),
         "team" => Ok(Command::Team),
         "effort" => Ok(Command::Effort(rest_opt)),
+        "pair" => Ok(Command::Pair(rest_opt)),
+        "planner" => Ok(Command::Planner(rest_opt)),
         "copy" | "chat" => Ok(Command::Copy),
         "context" | "ctx" => Ok(Command::Context),
         "claude-reset" => Ok(Command::Reset(Agent::ClaudeCode)),
@@ -121,6 +128,8 @@ pub(crate) const NAMES: &[&str] = &[
     "name",
     "new",
     "nocheck",
+    "pair",
+    "planner",
     "q",
     "quit",
     "rename",
@@ -200,7 +209,7 @@ pub(crate) fn candidates(line: &str, names: &[&str], models: &[String]) -> Vec<S
             .filter(|n| n.starts_with(line))
             .map(|n| (*n).to_owned())
             .collect(),
-        Some(("model" | "m" | "escalate", arg)) => {
+        Some(("model" | "m" | "escalate" | "planner", arg)) => {
             let command = &line[..line.len() - arg.len()];
             models
                 .iter()
@@ -226,6 +235,11 @@ Type a question or a change and press Enter. Changes are checked before they are
 /budget <dollars>    the most one request may cost (none: no limit); past it the
                      work stops and the model says where it is and asks what next
 /team                who answers and who it may hand tasks to
+/pair <question>     in a pair: the model that answers gathers the code that
+                     matters, a member of the team plans from it (thinking hard),
+                     then the model that answers codes it (thinking little), and
+                     the planner revises its plan if the checks keep failing
+/planner <model>     the member that plans; by default the best scored, or dearest
 /effort <level>      how hard models think: low, medium, high (the default),
                      xhigh, max; /effort alone goes to the next. ← → in Ctrl-E too
 /defaults            keep the current model, list, team and budget for new

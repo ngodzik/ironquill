@@ -14,6 +14,20 @@ pub struct AgentConfig {
     pub(crate) budget: Option<Usd>,
     pub(crate) compact_at: u64,
     pub(crate) effort: Option<Effort>,
+    pub(crate) pair: Option<Pair>,
+}
+
+/// Planning by a stronger model, coding by the first one, as an architect
+/// and an editor: the planner thinks hard on what the coder gathered, the
+/// coder does the reading and the writing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pair {
+    /// The model that plans; it reads nothing itself.
+    pub planner: ModelId,
+    /// How hard it thinks.
+    pub planner_effort: Effort,
+    /// How hard the first model thinks while it gathers and codes.
+    pub coder_effort: Effort,
 }
 
 /// A model the first one may hand a task to, with what it should know to
@@ -30,6 +44,12 @@ pub struct Member {
     /// Whether it can call tools. One that cannot reads and edits nothing:
     /// it only answers what the task itself says.
     pub tools: bool,
+    /// Its intelligence index from Artificial Analysis, out of 100, when
+    /// known: what picks a planner by default.
+    pub score: Option<f64>,
+    /// Dollars per input token, when known: what picks a planner when no
+    /// score is.
+    pub price: Option<f64>,
 }
 
 impl Member {
@@ -40,6 +60,8 @@ impl Member {
             note: note.into(),
             about: String::new(),
             tools: true,
+            score: None,
+            price: None,
         }
     }
 }
@@ -71,6 +93,7 @@ impl AgentConfig {
             budget: None,
             compact_at: COMPACT_AT,
             effort: Some(Effort::High),
+            pair: None,
         }
     }
 }
@@ -90,6 +113,7 @@ pub struct AgentConfigBuilder {
     budget: Option<Usd>,
     compact_at: u64,
     effort: Option<Effort>,
+    pair: Option<Pair>,
 }
 
 impl AgentConfigBuilder {
@@ -151,6 +175,14 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// Works on the request in a pair: `pair.planner` plans, the
+    /// first model gathers and codes. Escalation is not used then: when the
+    /// checks keep failing, the planner revises its plan instead.
+    pub fn pair(mut self, pair: Pair) -> Self {
+        self.pair = Some(pair);
+        self
+    }
+
     /// Validates and builds.
     ///
     /// # Errors
@@ -176,6 +208,7 @@ impl AgentConfigBuilder {
             budget: self.budget,
             compact_at: self.compact_at,
             effort: self.effort,
+            pair: self.pair,
         })
     }
 }

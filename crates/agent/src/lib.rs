@@ -17,7 +17,7 @@ mod error;
 mod event;
 mod run;
 
-pub use config::{AgentConfig, AgentConfigBuilder, COMPACT_AT, Member};
+pub use config::{AgentConfig, AgentConfigBuilder, COMPACT_AT, Member, Pair};
 pub use error::AgentError;
 pub use event::Event;
 pub use run::{Outcome, Session, Verdict, run};

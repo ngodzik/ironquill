@@ -271,6 +271,8 @@ async fn interface(
                 note: note(&listed, ranking),
                 about: about(&listed, ranking),
                 tools: listed.tool_calling != Some(false),
+                score: ranking.and_then(|r| r.intelligence),
+                price: listed.input_price,
                 model: ModelId::new(listed.id).ok()?,
             })
         })
@@ -289,6 +291,7 @@ async fn interface(
             (None, Some(kept)) => kept.parse().map_err(anyhow::Error::msg)?,
             (None, None) => Effort::default(),
         },
+        planner: defaults.planner.as_deref().map(ModelId::new).transpose()?,
         catalog,
         credits: (!rankings.is_empty()).then(|| RANKINGS_SOURCE.to_owned()),
     };

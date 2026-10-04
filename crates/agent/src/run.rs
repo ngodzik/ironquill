@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use ironquill_core::{
     Agent, ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateReply,
-    DelegateRequest, Message, ModelId, Pricing, TokenCount, ToolSpec, Usage, Usd,
+    DelegateRequest, Effort, Message, ModelId, Pricing, TokenCount, ToolSpec, Usage, Usd,
 };
 use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox};
 
-use crate::config::{AgentConfig, Member};
+use crate::config::{AgentConfig, Member, Pair};
 use crate::delegate;
 use crate::error::AgentError;
 use crate::event::Event;
@@ -48,6 +48,31 @@ left to do.";
 const ANSWER_PROMPT: &str = "You are a careful software engineer. Another assistant asked you \
 the question below, with everything you need in it; you cannot read files or run anything. \
 Answer it directly and briefly.";
+
+/// For the first model, gathering what a planner needs.
+const GATHER_PROMPT: &str = "A stronger model will plan the change the person asks for, but it \
+cannot read the project: you gather what it needs. Find the code that matters with `search`, \
+`outline`, and `read_file` with line ranges; read only what is needed. You cannot change files. \
+Then reply with a brief: the files and functions involved, the relevant code copied exactly with \
+its file and line numbers, and what the planner must know besides, such as conventions, tests and \
+constraints. Do not propose a solution. Keep it short: every line is paid for again.";
+
+/// For the planner, which reads nothing itself.
+const PLAN_PROMPT: &str = "You are the architect of a change in a software project. Another \
+model gathered the code below and will implement your plan with tools; it follows instructions \
+well but should not have to make design decisions. Write a precise plan: the files to change; for \
+each, the functions to add or change, with their signatures and exact behaviour; the edge cases; \
+the tests to add or adjust. Give short code where precision matters. If the brief lacks \
+something essential, say what the implementer must read first. Be concise: every word is paid \
+for. Write in the language of the request.";
+
+/// For the first model, once the plan is there.
+const IMPLEMENT_PROMPT: &str = "Implement the plan above, exactly. Read only what you need. Where \
+the plan is unclear, choose the simplest reading. When you are done, reply with one short \
+sentence.";
+
+/// How many times the planner may revise its plan after the checks fail.
+const MAX_REVISIONS: usize = 2;
 
 /// The tool through which the first model hands a task to the team.
 const DELEGATE_TOOL: &str = "delegate";
@@ -159,6 +184,9 @@ struct Ctx<'a, M, D, O> {
     /// What the conversation said since the delegate last took part, put
     /// before its next request so that it does not miss it.
     catch_up: String,
+    /// How hard the model of the current step should think; the
+    /// configuration's, unless a step sets its own.
+    effort: Option<Effort>,
 }
 
 enum Attempt {
@@ -249,6 +277,7 @@ impl Session {
             observe,
             thread: None,
             catch_up: String::new(),
+            effort: config.effort,
         };
         let verdict = match self.work(&mut ctx, text, context).await {
             Err(AgentError::OverBudget) => {
@@ -275,6 +304,9 @@ impl Session {
         text: &str,
         context: &str,
     ) -> Result<Verdict, AgentError> {
+        if let Some(pair) = ctx.config.pair.clone() {
+            return self.work_in_pair(ctx, text, context, &pair).await;
+        }
         let Some(first) = ctx.config.tiers.first() else {
             return Err(AgentError::Config("at least one model is needed"));
         };
@@ -342,6 +374,96 @@ impl Session {
         Ok(Verdict::GaveUp { failure })
     }
 
+    /// Works on the request as an architect and an editor: the first model
+    /// gathers the code that matters, the planner writes a plan from it, the
+    /// first model implements it and the checks judge. When they keep
+    /// failing, the planner gets the failure and revises its plan.
+    async fn work_in_pair<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+        text: &str,
+        context: &str,
+        pair: &Pair,
+    ) -> Result<Verdict, AgentError> {
+        let Some(coder) = ctx.config.tiers.first().cloned() else {
+            return Err(AgentError::Config("at least one model is needed"));
+        };
+        let planner = &pair.planner;
+
+        // The coder gathers, reading only.
+        ctx.effort = Some(pair.coder_effort);
+        let mut gathering = vec![
+            Message::system(GATHER_PROMPT),
+            Message::user(format!("{text}\n\n{context}")),
+        ];
+        converse(ctx, &coder, &mut gathering, Role::Gatherer).await?;
+        let brief = last_reply(&gathering).unwrap_or_default();
+
+        // The planner plans from the brief alone.
+        (ctx.observe)(Event::Delegating {
+            from: coder.clone(),
+            to: planner.clone(),
+            task: format!("Plan: {text}"),
+        });
+        let mut planning = vec![
+            Message::system(format!("{PLAN_PROMPT}{}", identity(planner, false, &[]))),
+            Message::user(format!(
+                "The request:\n{text}\n\nWhat {coder} found in the project:\n{brief}{}",
+                spent_so_far(ctx)
+            )),
+        ];
+        let mut plan = ask_planner(ctx, planner, pair.planner_effort, &mut planning).await?;
+
+        // The coder implements it, the checks judge.
+        ctx.effort = Some(pair.coder_effort);
+        self.messages.push(Message::Assistant {
+            content: Some(format!("Plan by {planner}:\n{plan}")),
+            tool_calls: Vec::new(),
+        });
+        self.messages.push(Message::user(format!(
+            "{IMPLEMENT_PROMPT}{}",
+            spent_so_far(ctx)
+        )));
+        let mut failure = None;
+        for revision in 0..=MAX_REVISIONS {
+            match attempt(ctx, &coder, &mut self.messages, &mut failure, false).await? {
+                Attempt::Passed => return Ok(Verdict::Passed { model: coder }),
+                Attempt::Unchecked => return Ok(Verdict::Unchecked),
+                Attempt::Answered => return Ok(Verdict::Answered),
+                Attempt::Failed => {}
+            }
+            if revision == MAX_REVISIONS {
+                break;
+            }
+            let Some(f) = failure.as_ref() else { break };
+            (ctx.observe)(Event::Delegating {
+                from: coder.clone(),
+                to: planner.clone(),
+                task: format!("Revise the plan: `{}` fails", f.command),
+            });
+            let changed = ctx.toolbox.changed().collect::<Vec<_>>().join(", ");
+            planning.push(Message::user(format!(
+                "{coder} followed the plan, but the checks fail.\n\n{}\n\nFiles it changed: \
+                 {changed}\n\nRevise the plan: say what to change now, briefly.{}",
+                describe(f),
+                spent_so_far(ctx)
+            )));
+            plan = ask_planner(ctx, planner, pair.planner_effort, &mut planning).await?;
+            ctx.effort = Some(pair.coder_effort);
+            self.messages.push(Message::user(format!(
+                "Revised plan by {planner}:\n{plan}\n\n{IMPLEMENT_PROMPT}{}",
+                spent_so_far(ctx)
+            )));
+        }
+        let last = failure
+            .as_ref()
+            .map_or_else(String::new, |f| format!(" Last failure: `{}`.", f.command));
+        self.note(format!(
+            "(The checks still fail after {MAX_REVISIONS} revised plans.{last})"
+        ));
+        Ok(Verdict::GaveUp { failure })
+    }
+
     /// Hands the word back to the person once the budget is spent: the first
     /// model of the provider says where the work stopped and asks what to do.
     async fn explain_budget<M: ChatModel, D, O: FnMut(Event) + Send>(
@@ -367,7 +489,7 @@ impl Session {
             model: model.clone(),
             messages: self.messages.clone(),
             tools: Vec::new(),
-            effort: ctx.config.effort,
+            effort: ctx.effort,
         };
         // Saying where things stand may go a little past the budget, not far:
         // a conversation too long for that gets ironquill's own words.
@@ -497,6 +619,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         observe,
         thread: None,
         catch_up: String::new(),
+        effort: config.effort,
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -565,7 +688,8 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             )));
         }
 
-        let finished = converse(ctx, tier, messages, may_answer).await?;
+        let role = if may_answer { Role::Lead } else { Role::Member };
+        let finished = converse(ctx, tier, messages, role).await?;
 
         if may_answer && round == 0 && ctx.toolbox.changed().next().is_none() {
             return Ok(Attempt::Answered);
@@ -635,7 +759,7 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
         }
         let request = DelegateRequest {
             agent,
-            effort: ctx.config.effort,
+            effort: ctx.effort,
             model: model.to_owned(),
             prompt: prompt.clone(),
             instructions: match agent {
@@ -776,6 +900,98 @@ fn within_budget<M, D, O>(
     }
 }
 
+/// The latest thing a model wrote in `messages`.
+fn last_reply(messages: &[Message]) -> Option<String> {
+    messages.iter().rev().find_map(|m| match m {
+        Message::Assistant {
+            content: Some(text),
+            ..
+        } if !text.trim().is_empty() => Some(text.clone()),
+        _ => None,
+    })
+}
+
+/// A line saying what the request has cost so far, and its budget, so that
+/// each model knows where things stand when it gets a message.
+fn spent_so_far<M, D, O>(ctx: &Ctx<'_, M, D, O>) -> String {
+    match ctx.config.budget {
+        Some(budget) => format!(
+            "\n\n(This request has cost {} so far, of a budget of {budget}.)",
+            ctx.ledger.cost
+        ),
+        None => format!("\n\n(This request has cost {} so far.)", ctx.ledger.cost),
+    }
+}
+
+/// Asks the planner for its plan, or its revision: one call without tools,
+/// its conversation kept in `planning` so that it follows the thread. An
+/// agent such as Claude Code gets the latest message and reads what it
+/// wants itself.
+async fn ask_planner<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    planner: &ModelId,
+    effort: Effort,
+    planning: &mut Vec<Message>,
+) -> Result<String, AgentError> {
+    ctx.effort = Some(effort);
+    if let Some((agent, model)) = planner.delegate() {
+        let prompt = match planning.last() {
+            Some(Message::User(text)) => text.clone(),
+            _ => String::new(),
+        };
+        let request = DelegateRequest {
+            agent,
+            effort: ctx.effort,
+            model: model.to_owned(),
+            prompt,
+            instructions: PLAN_PROMPT.to_owned(),
+            resume: None,
+            directory: ctx.toolbox.workspace().root().to_owned(),
+        };
+        let text = run_agent(ctx, planner, &request).await?.text;
+        planning.push(Message::Assistant {
+            content: Some(text.clone()),
+            tool_calls: Vec::new(),
+        });
+        return Ok(text);
+    }
+    let request = ChatRequest {
+        model: planner.clone(),
+        messages: planning.clone(),
+        tools: Vec::new(),
+        effort: ctx.effort,
+    };
+    let pricing = ctx.model.pricing(planner).await;
+    within_budget(ctx, pricing, &request)?;
+    let response = ctx
+        .model
+        .complete(&request)
+        .await
+        .map_err(|e| AgentError::Model(Box::new(e)))?;
+    ctx.ledger.usage += response.usage;
+    match response.cost {
+        Some(cost) => ctx.ledger.cost += cost,
+        None => ctx.ledger.cost_complete = false,
+    }
+    (ctx.observe)(Event::Turn {
+        model: planner.clone(),
+        usage: response.usage,
+        cost: response.cost,
+        subscription: false,
+        context: None,
+    });
+    let text = response.content.unwrap_or_default();
+    (ctx.observe)(Event::Said {
+        model: planner.clone(),
+        text: text.clone(),
+    });
+    planning.push(Message::Assistant {
+        content: Some(text.clone()),
+        tool_calls: Vec::new(),
+    });
+    Ok(text)
+}
+
 /// Who the model is, added to its instructions on every call: models
 /// otherwise guess, and a conversation that went through several of them
 /// misleads them further.
@@ -883,7 +1099,7 @@ async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     let report = if let Some((agent, model)) = to.delegate() {
         let request = DelegateRequest {
             agent,
-            effort: ctx.config.effort,
+            effort: ctx.effort,
             model: model.to_owned(),
             prompt: args.task,
             instructions: match agent {
@@ -899,7 +1115,7 @@ async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         answer_only(ctx, &to, args.task).await?
     } else {
         let mut messages = vec![Message::system(MEMBER_PROMPT), Message::user(args.task)];
-        let finished = converse(ctx, &to, &mut messages, false).await?;
+        let finished = converse(ctx, &to, &mut messages, Role::Member).await?;
         let last = messages.iter().rev().find_map(|m| match m {
             Message::Assistant {
                 content: Some(text),
@@ -946,7 +1162,7 @@ async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
             Message::user(task),
         ],
         tools: Vec::new(),
-        effort: ctx.config.effort,
+        effort: ctx.effort,
     };
     let pricing = ctx.model.pricing(model).await;
     within_budget(ctx, pricing, &request)?;
@@ -1003,16 +1219,31 @@ async fn check<M, D, O: FnMut(Event)>(
     }
 }
 
+/// What a model may do in a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The model that answers: every tool, and the team.
+    Lead,
+    /// Working on a task: every tool, no team.
+    Member,
+    /// Gathering what a planner needs: tools that only read.
+    Gatherer,
+}
+
 /// Lets the model call tools until it stops or runs out of turns. Returns
-/// whether it stopped on its own. The model that `leads` the conversation
-/// may also hand tasks to the team.
+/// whether it stopped on its own. What it may call depends on its `role`.
 async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     ctx: &mut Ctx<'_, M, D, O>,
     model_id: &ModelId,
     messages: &mut Vec<Message>,
-    leads: bool,
+    role: Role,
 ) -> Result<bool, AgentError> {
-    let mut tools = ctx.toolbox.specs();
+    let leads = role == Role::Lead;
+    let mut tools = if role == Role::Gatherer {
+        ctx.toolbox.read_only_specs()
+    } else {
+        ctx.toolbox.specs()
+    };
     if leads && let Some(spec) = delegate_spec(&ctx.config.team, model_id) {
         tools.push(spec);
     }
@@ -1048,7 +1279,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             model: model_id.clone(),
             messages: sent,
             tools: tools.clone(),
-            effort: ctx.config.effort,
+            effort: ctx.effort,
         };
         within_budget(ctx, pricing, &request)?;
         let response = ctx
@@ -1091,6 +1322,13 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 messages.push(Message::Tool {
                     call_id: call.id.clone(),
                     content: report,
+                });
+                continue;
+            }
+            if role == Role::Gatherer && !Toolbox::reads_only(&call.name) {
+                messages.push(Message::Tool {
+                    call_id: call.id.clone(),
+                    content: "error: nothing may be changed now, only read".into(),
                 });
                 continue;
             }
@@ -1331,6 +1569,131 @@ mod tests {
             .check(Check::parse("test -f done.txt").unwrap())
             .build()
             .unwrap()
+    }
+
+    fn pair_config() -> AgentConfig {
+        AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .member(Member::new(ModelId::new("strong").unwrap(), ""))
+            .check(Check::parse("test -f done.txt").unwrap())
+            .budget(Usd(1.0))
+            .pair(Pair {
+                planner: ModelId::new("strong").unwrap(),
+                planner_effort: Effort::Max,
+                coder_effort: Effort::Low,
+            })
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pair_gathers_plans_then_codes() {
+        let (dir, mut toolbox) = setup();
+        std::fs::write(dir.path().join("app.py"), "def f():\n    pass\n").unwrap();
+        let model = Scripted::new(vec![
+            // The coder gathers, reading only: a write is refused.
+            calls("write_file", json!({"path": "early.txt", "content": "x"})),
+            calls("read_file", json!({"path": "app.py"})),
+            says("app.py:1 def f(): pass"),
+            // The planner plans from the brief.
+            says("Create done.txt containing ok."),
+            // The coder implements.
+            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
+            says("Created done.txt."),
+        ]);
+        let mut session = Session::new();
+        let mut events = Vec::new();
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "make done",
+                "",
+                |e| {
+                    events.push(e);
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Passed {
+                model: ModelId::new("cheap").unwrap()
+            }
+        );
+        assert!(!dir.path().join("early.txt").exists());
+        let seen = model.seen.lock().unwrap();
+        // Gathering: only tools that read, at the coder's effort.
+        let names: Vec<&str> = seen[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(!names.contains(&"write_file") && !names.contains(&"delegate"));
+        assert!(names.contains(&"search"));
+        assert_eq!(seen[0].effort, Some(Effort::Low));
+        // Planning: the planner, no tools, its own effort, the brief and the cost.
+        assert_eq!(seen[3].model.as_str(), "strong");
+        assert!(seen[3].tools.is_empty());
+        assert_eq!(seen[3].effort, Some(Effort::Max));
+        let Some(Message::User(asked)) = seen[3].messages.last() else {
+            panic!("the planner gets the request and the brief");
+        };
+        assert!(asked.contains("make done") && asked.contains("app.py:1 def f(): pass"));
+        assert!(asked.contains("so far, of a budget of $1.00"));
+        // Coding: the coder, every tool, the plan in its conversation.
+        assert_eq!(seen[4].model.as_str(), "cheap");
+        assert_eq!(seen[4].effort, Some(Effort::Low));
+        assert!(seen[4].messages.iter().any(|m| matches!(
+            m,
+            Message::Assistant { content: Some(t), .. } if t.starts_with("Plan by strong:")
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Delegating { to, .. } if to.as_str() == "strong"
+        )));
+    }
+
+    #[tokio::test]
+    async fn the_planner_revises_its_plan_when_the_checks_fail() {
+        let (dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("nothing relevant"),
+            says("Create notes.txt."),
+            // Two rounds that miss done.txt.
+            calls("write_file", json!({"path": "notes.txt", "content": "a"})),
+            says("Done."),
+            calls("write_file", json!({"path": "notes.txt", "content": "b"})),
+            says("Done again."),
+            // The revision, then the fix.
+            says("The check wants done.txt: create it."),
+            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
+            says("Created done.txt."),
+        ]);
+        let mut session = Session::new();
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "make done",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
+        assert!(dir.path().join("done.txt").exists());
+        let seen = model.seen.lock().unwrap();
+        // The planner's second call follows its own thread, with the failure.
+        let revision = &seen[6];
+        assert_eq!(revision.model.as_str(), "strong");
+        assert_eq!(revision.messages.len(), 4);
+        assert!(matches!(
+            revision.messages.last(),
+            Some(Message::User(t)) if t.contains("test -f done.txt") && t.contains("Revise the plan")
+        ));
     }
 
     #[tokio::test]

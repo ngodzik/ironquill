@@ -36,6 +36,9 @@ pub struct Defaults {
     /// How hard models think: low, medium, high, xhigh or max.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The member of the team that plans in a pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner: Option<String>,
 }
 
 impl Defaults {
@@ -97,6 +100,7 @@ mod tests {
             team: vec!["b/strong".into()],
             budget: Some(0.25),
             effort: Some("max".into()),
+            planner: Some("b/strong".into()),
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));

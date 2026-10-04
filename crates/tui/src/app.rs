@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ironquill_agent::{AgentConfig, Event, Member, Outcome, Session, Verdict};
+use ironquill_agent::{AgentConfig, Event, Member, Outcome, Pair, Session, Verdict};
 use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use ratatui::crossterm::event::{
@@ -75,6 +75,9 @@ pub struct Settings {
     pub credits: Option<String>,
     /// How hard models think before answering.
     pub effort: Effort,
+    /// The member of the team that plans in a pair; `None` picks
+    /// the best scored, or the dearest.
+    pub planner: Option<ModelId>,
 }
 
 /// Tokens and cost of one part of a request.
@@ -1154,6 +1157,16 @@ impl App {
 
     /// Sends `text` to `tiers` rather than the configured models, as `/claude` does.
     fn submit_to(&mut self, text: String, tiers: Vec<ModelId>) -> Option<Effect> {
+        self.submit_with(text, tiers, None)
+    }
+
+    /// Sends a request, in a pair when `pair` says so.
+    fn submit_with(
+        &mut self,
+        text: String,
+        tiers: Vec<ModelId>,
+        pair: Option<Pair>,
+    ) -> Option<Effect> {
         if text.is_empty() {
             return None;
         }
@@ -1179,6 +1192,9 @@ impl App {
             builder = builder.budget(budget);
         }
         builder = builder.effort(Some(self.settings.effort));
+        if let Some(pair) = pair {
+            builder = builder.pair(pair);
+        }
         match builder.build() {
             Ok(config) => {
                 self.input.take();
@@ -1396,6 +1412,52 @@ impl App {
                 Err(e) => self.error(e),
             },
             Command::Copy => self.open_transcript(),
+            Command::Pair(None) => {
+                self.error("Give it a question: /pair <what to do>");
+            }
+            Command::Pair(Some(text)) => {
+                let Some(planner) = self.planner() else {
+                    self.error(
+                        "Working in a pair needs a planner in the team besides the model that answers: Ctrl-E, select a model, Space",
+                    );
+                    return None;
+                };
+                let coder = self
+                    .current_model()
+                    .map_or_else(|| "no model".to_owned(), ToString::to_string);
+                let planner_effort = self.settings.effort.max(Effort::High);
+                self.info(format!(
+                    "Pair: {coder} gathers and codes (effort low), {planner} plans (effort {planner_effort})"
+                ));
+                let pair = Pair {
+                    planner,
+                    planner_effort,
+                    coder_effort: Effort::Low,
+                };
+                let tiers = self.settings.tiers.clone();
+                return self.submit_with(text, tiers, Some(pair));
+            }
+            Command::Planner(None) => match self.planner() {
+                Some(planner) => self.info(format!(
+                    "Planner: {planner}{}",
+                    if self.settings.planner.is_some() {
+                        ""
+                    } else {
+                        ", the best of the team; /planner <model> picks another"
+                    }
+                )),
+                None => self.info("No planner: put a model in the team first (Ctrl-E, Space)"),
+            },
+            Command::Planner(Some(id)) => match ModelId::new(id) {
+                Ok(model) if self.settings.team.contains(&model) => {
+                    self.info(format!("Planner: {model}"));
+                    self.settings.planner = Some(model);
+                }
+                Ok(model) => self.error(format!(
+                    "{model} is not in the team: the planner is one of its members"
+                )),
+                Err(e) => self.error(e.to_string()),
+            },
             Command::Team => {
                 let text = self.describe_team();
                 self.info(text);
@@ -1692,6 +1754,32 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The member of the team that plans in a pair: the one picked
+    /// with /planner, or the best scored, or the dearest. Never the model
+    /// that answers, never one outside the team.
+    pub(crate) fn planner(&self) -> Option<ModelId> {
+        let lead = self.current_model();
+        let candidates: Vec<Member> = self
+            .members()
+            .into_iter()
+            .filter(|m| Some(&m.model) != lead)
+            .collect();
+        if let Some(chosen) = &self.settings.planner
+            && candidates.iter().any(|m| &m.model == chosen)
+        {
+            return Some(chosen.clone());
+        }
+        let key = |m: &Member| (m.score.unwrap_or(-1.0), m.price.unwrap_or(-1.0));
+        candidates
+            .into_iter()
+            .max_by(|a, b| {
+                key(a)
+                    .partial_cmp(&key(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|m| m.model)
+    }
+
     /// The team as the agent gets it, with what tells its members apart.
     fn members(&self) -> Vec<Member> {
         self.settings
@@ -1874,6 +1962,7 @@ impl App {
             team: ids(&self.settings.team),
             budget: self.settings.budget.map(|b| b.0),
             effort: Some(self.settings.effort.to_string()),
+            planner: self.settings.planner.as_ref().map(ToString::to_string),
         }
     }
 
@@ -2751,6 +2840,7 @@ mod tests {
                 team: vec!["anthropic/claude-sonnet".into()],
                 budget: Some(0.25),
                 effort: Some("high".into()),
+                planner: None,
             }
         );
     }
@@ -2890,6 +2980,65 @@ mod tests {
 
         // Kept with the other choices.
         assert_eq!(app.defaults().effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn a_pair_takes_its_planner_from_the_team() {
+        let scored = |id: &str, score: Option<f64>, price: f64| Member {
+            score,
+            price: Some(price),
+            ..Member::new(ModelId::new(id).unwrap(), "")
+        };
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                catalog: vec![
+                    scored("cheap", Some(40.0), 1e-7),
+                    scored("smart", Some(55.0), 1e-6),
+                    scored("dear", None, 9e-6),
+                ],
+                rounds: 2,
+                max_turns: 30,
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        // No team: nobody to plan.
+        type_text(&mut app, "/pair add a feature");
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(matches!(app.transcript.last(), Some(Entry::Error(e)) if e.contains("planner")));
+
+        // The best scored member plans, never the model that answers.
+        app.settings.team = ["cheap", "smart", "dear"]
+            .iter()
+            .map(|m| ModelId::new(*m).unwrap())
+            .collect();
+        assert_eq!(app.planner().unwrap().as_str(), "smart");
+        // Without scores, the dearest.
+        app.settings.catalog[1].score = None;
+        assert_eq!(app.planner().unwrap().as_str(), "dear");
+        // Picked by hand, from the team only.
+        type_text(&mut app, "/planner outsider");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.planner().unwrap().as_str(), "dear");
+        type_text(&mut app, "/planner smart");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.planner().unwrap().as_str(), "smart");
+
+        type_text(&mut app, "/pair add a feature");
+        let effect = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(effect, Some(Effect::Send { ref text, .. }) if text == "add a feature"),
+            "{effect:?} {:?}",
+            &app.transcript[app.transcript.len().saturating_sub(3)..]
+        );
+        assert!(app.transcript.iter().any(|e| matches!(
+            e,
+            Entry::Info(t) if t.contains("smart plans (effort high)") && t.contains("cheap gathers and codes (effort low)")
+        )));
     }
 
     #[test]
