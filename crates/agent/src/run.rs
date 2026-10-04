@@ -406,7 +406,17 @@ impl Session {
         let root = ctx.toolbox.workspace().root().to_owned();
         let map = ironquill_tools::project_map(&root);
         let mut planning = vec![
-            Message::system(format!("{PLAN_PROMPT}{}", identity(planner, false, &[]))),
+            Message::system(format!(
+                "{PLAN_PROMPT}{}",
+                identity(
+                    planner,
+                    false,
+                    &AgentConfig {
+                        team: Vec::new(),
+                        ..ctx.config.clone()
+                    }
+                )
+            )),
             Message::user(format!(
                 "The request:\n{text}\n\nThe map of the project, its definitions with their \
                  lines:\n{map}\n\n{context}\n\n{SCOUT_PROMPT}{}",
@@ -856,11 +866,13 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
             effort: ctx.effort,
             model: model.to_owned(),
             prompt: prompt.clone(),
-            instructions: match agent {
-                Agent::ClaudeCode => DELEGATE_PROMPT,
-                Agent::Codex => CODEX_PROMPT,
-            }
-            .to_owned(),
+            instructions: agent_instructions(
+                match agent {
+                    Agent::ClaudeCode => DELEGATE_PROMPT,
+                    Agent::Codex => CODEX_PROMPT,
+                },
+                ctx.config,
+            ),
             resume: session.clone(),
             directory: root.clone(),
         };
@@ -1106,7 +1118,7 @@ async fn ask_planner<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             effort: ctx.effort,
             model: model.to_owned(),
             prompt,
-            instructions: PLAN_PROMPT.to_owned(),
+            instructions: agent_instructions(PLAN_PROMPT, ctx.config),
             resume: None,
             directory: ctx.toolbox.workspace().root().to_owned(),
         };
@@ -1157,7 +1169,8 @@ async fn ask_planner<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
 /// Who the model is, added to its instructions on every call: models
 /// otherwise guess, and a conversation that went through several of them
 /// misleads them further.
-fn identity(model: &ModelId, leads: bool, team: &[Member]) -> String {
+fn identity(model: &ModelId, leads: bool, config: &AgentConfig) -> String {
+    let team = &config.team;
     let mut text = format!(
         "\n\nYou are the model `{model}`, used through ironquill, a coding agent in the \
          person's terminal. When asked which model you are, say `{model}`. Earlier replies in \
@@ -1174,7 +1187,35 @@ fn identity(model: &ModelId, leads: bool, team: &[Member]) -> String {
             names.join(", ")
         ));
     }
+    if let Some(rules) = &config.project_rules {
+        text.push_str(&format!(
+            "\n\nThe project's own instructions for coding agents, from its files; follow \
+             them, and those scoped to some files only for those files:\n{}",
+            rules.trim()
+        ));
+    }
+    if let Some(instructions) = &config.instructions {
+        text.push_str(&person_says(instructions));
+    }
     text
+}
+
+/// The person's own instructions, as added to a model's.
+fn person_says(instructions: &str) -> String {
+    format!(
+        "\n\nThe person's own instructions, for every project; they come before the \
+         general ones above when the two differ:\n{}",
+        instructions.trim()
+    )
+}
+
+/// Instructions for an agent such as Claude Code: `base`, and the person's
+/// own when there are some.
+fn agent_instructions(base: &str, config: &AgentConfig) -> String {
+    match &config.instructions {
+        Some(instructions) => format!("{base}{}", person_says(instructions)),
+        None => base.to_owned(),
+    }
 }
 
 /// The `delegate` tool, offering the team to `lead`; `None` when nobody
@@ -1264,11 +1305,13 @@ async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             effort: ctx.effort,
             model: model.to_owned(),
             prompt: args.task,
-            instructions: match agent {
-                Agent::ClaudeCode => DELEGATE_PROMPT,
-                Agent::Codex => CODEX_PROMPT,
-            }
-            .to_owned(),
+            instructions: agent_instructions(
+                match agent {
+                    Agent::ClaudeCode => DELEGATE_PROMPT,
+                    Agent::Codex => CODEX_PROMPT,
+                },
+                ctx.config,
+            ),
             resume: None,
             directory: ctx.toolbox.workspace().root().to_owned(),
         };
@@ -1319,7 +1362,7 @@ async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
         messages: vec![
             Message::system(format!(
                 "{ANSWER_PROMPT}{}",
-                identity(model, false, &ctx.config.team)
+                identity(model, false, ctx.config)
             )),
             Message::user(task),
         ],
@@ -1416,7 +1459,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         tools.push(spec);
     }
     let window = ctx.model.context_window(model_id).await;
-    let identity = identity(model_id, leads, &ctx.config.team);
+    let identity = identity(model_id, leads, ctx.config);
     let pricing = ctx.model.pricing(model_id).await;
     let compact_at = window.map_or(ctx.config.compact_at, |w| ctx.config.compact_at.min(w / 2));
     for _ in 0..ctx.config.max_turns {
@@ -2280,6 +2323,46 @@ mod tests {
             Event::Checking { commands } if commands == &["python3 -B -m unittest discover -s tests"]
         )));
         assert!(events.iter().any(|e| matches!(e, Event::Failed { .. })));
+    }
+
+    #[tokio::test]
+    async fn every_model_gets_the_persons_and_the_projects_instructions() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![says("Hi.")]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap()
+            .with_instructions(Some("Answer in French.".into()))
+            .with_project_rules(Some("## CLAUDE.md\nUse tabs.".into()));
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "hello",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let seen = model.seen.lock().unwrap();
+        let Message::System(system) = &seen[0].messages[0] else {
+            panic!("instructions come first");
+        };
+        assert!(system.contains("The project's own instructions") && system.contains("Use tabs."));
+        assert!(
+            system.contains("The person's own instructions")
+                && system.contains("Answer in French.")
+        );
+        // Blank instructions add nothing.
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap()
+            .with_instructions(Some("  \n".into()));
+        assert_eq!(config.instructions, None);
     }
 
     #[tokio::test]

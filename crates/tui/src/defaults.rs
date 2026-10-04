@@ -54,6 +54,24 @@ impl Defaults {
         Some(base.join("config.toml"))
     }
 
+    /// The person's own instructions for every model, next to the defaults:
+    /// `~/.ironquill/instructions.md`. Never in a project.
+    pub fn instructions_path() -> Option<PathBuf> {
+        Self::path().map(|p| p.with_file_name("instructions.md"))
+    }
+
+    /// The person's instructions as they are now; `None` when there are none.
+    pub fn instructions() -> Option<String> {
+        let text = fs::read_to_string(Self::instructions_path()?).ok()?;
+        // The first lines, ironquill's own explanation, are not instructions.
+        let text: String = text
+            .lines()
+            .filter(|line| !line.starts_with("<!--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.trim().is_empty()).then_some(text)
+    }
+
     /// Reads the defaults at `path`; none when the file does not exist.
     ///
     /// # Errors

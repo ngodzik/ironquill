@@ -48,6 +48,8 @@ pub(crate) enum Command {
     Planner(Option<String>),
     /// `/copy` opens the conversation as text, to select and copy from.
     Copy,
+    /// `/instructions` opens the person's instructions for every model.
+    Instructions,
     /// `/claude-reset` ends Claude Code's session, `/codex-reset` Codex's.
     Reset(Agent),
     /// `:help`
@@ -95,6 +97,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "pair" => Ok(Command::Pair(rest_opt)),
         "planner" => Ok(Command::Planner(rest_opt)),
         "copy" | "chat" => Ok(Command::Copy),
+        "instructions" => Ok(Command::Instructions),
         "context" | "ctx" => Ok(Command::Context),
         "claude-reset" => Ok(Command::Reset(Agent::ClaudeCode)),
         "codex-reset" => Ok(Command::Reset(Agent::Codex)),
@@ -123,6 +126,7 @@ pub(crate) const NAMES: &[&str] = &[
     "effort",
     "escalate",
     "help",
+    "instructions",
     "keys",
     "model",
     "name",
@@ -249,6 +253,9 @@ Type a question or a change and press Enter. Changes are checked before they are
                      sessions; done by itself whenever they change
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation
 /codex <task>        the same with Codex, which runs commands in its sandbox, without network
+/instructions        your own instructions for every model, in every project, kept
+                     in ~/.ironquill/instructions.md; :w saves, the next request
+                     uses them
 /copy                the conversation as text in the editor: v or V selects,
                      y copies to the clipboard, :q closes
 /context             edit what the next request sends: delete, shorten, annotate; :w applies

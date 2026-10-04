@@ -193,7 +193,10 @@ async fn main() -> Result<()> {
             for check in checks_or_default(checks)? {
                 builder = builder.check(check);
             }
-            builder = builder.detect_checks(detect);
+            builder = builder
+                .detect_checks(detect)
+                .instructions(Defaults::instructions())
+                .project_rules(ironquill_tools::project_instructions(Path::new(".")));
             builder = builder.effort(Some(cli.effort.unwrap_or_default()));
             run_task(&provider, &builder.build()?, &task).await
         }

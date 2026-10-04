@@ -164,6 +164,8 @@ pub(crate) enum Effect {
     ForgetDelegate(Agent),
     /// Keep the current choices for every new session.
     SaveDefaults(Defaults),
+    /// Open the person's instructions for every model, creating the file.
+    OpenInstructions,
 }
 
 /// What the agent task sends back to the interface.
@@ -1072,6 +1074,24 @@ impl App {
         }
     }
 
+    /// Opens a file in the editor, outside the project too.
+    pub(crate) fn open_path(&mut self, path: PathBuf) {
+        if self.file.as_ref().is_some_and(Editor::is_modified) {
+            if let Some(file) = &mut self.file {
+                file.refuse_close();
+            }
+            self.focus_on(Focus::File);
+            return;
+        }
+        let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
+        self.unzoom();
+        self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.focus_on(Focus::File);
+        self.info(
+            "Your instructions for every model: :w saves them, they count from the next request",
+        );
+    }
+
     fn open_selected(&mut self) {
         let Some(path) = self.tree.as_mut().and_then(FileTree::open) else {
             return;
@@ -1446,15 +1466,17 @@ impl App {
                 Err(e) => self.error(e),
             },
             Command::Copy => self.open_transcript(),
+            Command::Instructions => return Some(Effect::OpenInstructions),
             Command::Pair(None) => {
                 self.error("Give it a question: /pair <what to do>");
             }
             Command::Pair(Some(text)) => {
-                let Some((coder, planner)) = self.pair_roles() else {
-                    self.error(
-                        "Working in a pair needs two models: the one that answers and one in the team (Ctrl-E, select a model, Space)",
-                    );
-                    return None;
+                let (coder, planner) = match self.pair_roles() {
+                    Ok(roles) => roles,
+                    Err(why) => {
+                        self.error(why);
+                        return None;
+                    }
                 };
                 let planner_effort = self.settings.effort.max(Effort::High);
                 self.info(format!(
@@ -1715,6 +1737,11 @@ impl App {
         self.step.as_deref().filter(|_| self.is_running())
     }
 
+    /// The project's root directory.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Whether the project's own checks are found when checking.
     pub(crate) fn detects_checks(&self) -> bool {
         self.settings.detect_checks
@@ -1798,47 +1825,72 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Who codes and who plans in a pair, among the model that answers and
-    /// its team only: the cheapest that can use tools codes, the planner
-    /// picked with /planner or the best of the others plans. `None` without
-    /// two models.
-    pub(crate) fn pair_roles(&self) -> Option<(ModelId, ModelId)> {
+    /// Who plans and who codes in a pair, among the model that answers and
+    /// its team only. The planner comes first: the one picked with /planner,
+    /// or the best, by Artificial Analysis' score, else by price. The coder
+    /// is then the cheapest of the others that can use tools. Without one,
+    /// the reason, rather than roles the wrong way round.
+    pub(crate) fn pair_roles(&self) -> Result<(ModelId, ModelId), String> {
         let mut models: Vec<Member> = self.members();
         if let Some(lead) = self.current_model()
             && !models.iter().any(|m| &m.model == lead)
         {
             models.push(self.member_of(lead));
         }
+        if models.len() < 2 {
+            return Err(
+                "Working in a pair needs two models: the one that answers and one in the team (Ctrl-E, select a model, Space)"
+                    .into(),
+            );
+        }
+        // Scores compare models only when every one has one; otherwise a
+        // scored cheap model would beat an unscored strong one. Then price.
+        let scored = models.iter().all(|m| m.score.is_some());
+        let best = |m: &Member| {
+            let score = if scored { m.score.unwrap_or(-1.0) } else { 0.0 };
+            (score, m.price.unwrap_or(-1.0))
+        };
+        let planner = match self
+            .settings
+            .planner
+            .as_ref()
+            .filter(|chosen| models.iter().any(|m| &m.model == *chosen))
+        {
+            Some(chosen) => chosen.clone(),
+            None => models
+                .iter()
+                .max_by(|a, b| {
+                    best(a)
+                        .partial_cmp(&best(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|m| m.model.clone())
+                .expect("two models at least"),
+        };
         let price = |m: &Member| m.price.unwrap_or(f64::MAX);
-        let chosen = self.settings.planner.as_ref();
         let coder = models
             .iter()
-            .filter(|m| m.tools && Some(&m.model) != chosen)
-            .min_by(|a, b| price(a).total_cmp(&price(b)))?
-            .model
-            .clone();
-        let others: Vec<&Member> = models.iter().filter(|m| m.model != coder).collect();
-        if let Some(chosen) = chosen
-            && others.iter().any(|m| &m.model == chosen)
-        {
-            return Some((coder, chosen.clone()));
+            .filter(|m| m.model != planner && m.tools)
+            .min_by(|a, b| price(a).total_cmp(&price(b)));
+        match coder {
+            Some(coder) => Ok((coder.model.clone(), planner)),
+            None => {
+                let without: Vec<String> = models
+                    .iter()
+                    .filter(|m| m.model != planner && !m.tools)
+                    .map(|m| m.model.to_string())
+                    .collect();
+                Err(format!(
+                    "{planner} would plan, but no other model can code: {} cannot use tools, says the provider. Put a model that can in the team (Ctrl-E, select it, Space): \"no tools\" marks those that cannot",
+                    without.join(", ")
+                ))
+            }
         }
-        let key = |m: &Member| (m.score.unwrap_or(-1.0), m.price.unwrap_or(-1.0));
-        let planner = others
-            .into_iter()
-            .max_by(|a, b| {
-                key(a)
-                    .partial_cmp(&key(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })?
-            .model
-            .clone();
-        Some((coder, planner))
     }
 
     /// The member of the team that plans in a pair, as /pair would pick it.
     pub(crate) fn planner(&self) -> Option<ModelId> {
-        self.pair_roles().map(|(_, planner)| planner)
+        self.pair_roles().ok().map(|(_, planner)| planner)
     }
 
     /// What is known of `model`: from the provider's list, or its name.
@@ -3144,7 +3196,7 @@ mod tests {
                 catalog: vec![
                     scored("cheap", Some(40.0), 1e-7),
                     scored("smart", Some(55.0), 2e-6),
-                    scored("dear", None, 9e-6),
+                    scored("dear", Some(50.0), 9e-6),
                 ],
                 rounds: 2,
                 max_turns: 30,
@@ -3166,17 +3218,35 @@ mod tests {
             .map(|m| ModelId::new(*m).unwrap())
             .collect();
         let id = |s: &str| ModelId::new(s).unwrap();
-        assert_eq!(app.pair_roles(), Some((id("cheap"), id("smart"))));
-        // Without scores, the dearest plans.
+        assert_eq!(app.pair_roles(), Ok((id("cheap"), id("smart"))));
+        // Without a score for every one, the dearest plans.
         app.settings.catalog[1].score = None;
-        assert_eq!(app.pair_roles(), Some((id("cheap"), id("dear"))));
+        assert_eq!(app.pair_roles(), Ok((id("cheap"), id("dear"))));
         // Picked by hand, among the model that answers and the team only.
         type_text(&mut app, "/planner outsider");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.planner(), Some(id("dear")));
         type_text(&mut app, "/planner smart");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.pair_roles(), Some((id("cheap"), id("smart"))));
+        assert_eq!(app.pair_roles(), Ok((id("cheap"), id("smart"))));
+
+        // A real case: the only cheaper model cannot use tools. The best
+        // still plans, and ironquill says why nobody can code rather than
+        // swapping the roles.
+        let no_tools = Member {
+            tools: false,
+            ..scored("flash", None, 2e-7)
+        };
+        app.settings.catalog.push(no_tools);
+        app.settings.planner = None;
+        app.settings.team = vec![id("flash")];
+        let why = app.pair_roles().unwrap_err();
+        assert!(
+            why.contains("smart would plan") && why.contains("flash cannot use tools"),
+            "{why}"
+        );
+        app.settings.team = vec![id("cheap"), id("dear")];
+        app.settings.planner = Some(id("smart"));
 
         type_text(&mut app, "/pair add a feature");
         let effect = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

@@ -16,6 +16,8 @@ pub struct AgentConfig {
     pub(crate) effort: Option<Effort>,
     pub(crate) pair: Option<Pair>,
     pub(crate) detect_checks: bool,
+    pub(crate) instructions: Option<String>,
+    pub(crate) project_rules: Option<String>,
 }
 
 /// Planning by a stronger model, coding by the first one, as an architect
@@ -96,7 +98,23 @@ impl AgentConfig {
             effort: Some(Effort::High),
             pair: None,
             detect_checks: false,
+            instructions: None,
+            project_rules: None,
         }
+    }
+
+    /// The project's own instructions for coding agents, from its
+    /// CLAUDE.md, AGENTS.md and rules, read again before each request.
+    pub fn with_project_rules(mut self, rules: Option<String>) -> Self {
+        self.project_rules = rules.filter(|r| !r.trim().is_empty());
+        self
+    }
+
+    /// The person's own instructions for every model, read again before each
+    /// request so that an edit counts at once; `None` or blank adds none.
+    pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions.filter(|i| !i.trim().is_empty());
+        self
     }
 }
 
@@ -117,6 +135,8 @@ pub struct AgentConfigBuilder {
     effort: Option<Effort>,
     pair: Option<Pair>,
     detect_checks: bool,
+    instructions: Option<String>,
+    project_rules: Option<String>,
 }
 
 impl AgentConfigBuilder {
@@ -193,6 +213,18 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// The person's own instructions, given to every model with its own.
+    pub fn instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions.filter(|i| !i.trim().is_empty());
+        self
+    }
+
+    /// The project's own instructions for coding agents.
+    pub fn project_rules(mut self, rules: Option<String>) -> Self {
+        self.project_rules = rules.filter(|r| !r.trim().is_empty());
+        self
+    }
+
     /// Validates and builds.
     ///
     /// # Errors
@@ -220,6 +252,8 @@ impl AgentConfigBuilder {
             effort: self.effort,
             pair: self.pair,
             detect_checks: self.detect_checks,
+            instructions: self.instructions,
+            project_rules: self.project_rules,
         })
     }
 }
