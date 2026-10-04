@@ -457,6 +457,18 @@ pub enum DelegateEvent {
     TextStart,
     /// More text of the current block.
     Text(String),
+    /// One call of the agent to its model ended: what it used, as it
+    /// happens, and what that costs at the model's prices when they are
+    /// known.
+    Usage {
+        /// Tokens of that call, the context read from the cache included.
+        usage: Usage,
+        /// Its cost at the model's list prices, cache rates included.
+        cost: Option<Usd>,
+        /// Whether the agent bills by use, with an API key, rather than a
+        /// subscription: the cost is then owed.
+        billed: bool,
+    },
     /// A tool call finished.
     Tool {
         /// The agent's name for the tool, such as `Read` or `Edit`.
@@ -482,6 +494,9 @@ pub struct DelegateReply {
     pub estimate: Option<Usd>,
     /// How full its context was on its last call, when it said.
     pub context: Option<ContextUse>,
+    /// Whether the agent billed by use, with an API key, rather than a
+    /// subscription: `estimate` is then owed.
+    pub billed: bool,
 }
 
 /// A model's answer and what it cost.

@@ -277,7 +277,10 @@ async fn interface(
     let detect_checks = choices.checks.is_empty();
     let checks = checks_or_default(choices.checks)?;
 
-    let claude = ClaudeCode::find();
+    let claude = match ClaudeCode::find() {
+        Some(claude) => Some(claude.with_prices(prices().await)),
+        None => None,
+    };
     let codex = Codex::find();
     let mut models: Vec<ModelId> = Vec::new();
     for id in choices.offered.iter().chain(&defaults.models) {
@@ -371,6 +374,13 @@ async fn interface(
     )
     .await?;
     Ok(())
+}
+
+/// List prices for Claude Code's messages, from LiteLLM's list kept a week
+/// next to the defaults, as ccusage prices them.
+async fn prices() -> Option<Arc<ironquill_llm::PriceTable>> {
+    let kept = Defaults::path()?.with_file_name("prices.json");
+    ironquill_llm::load_prices(&kept).await.map(Arc::new)
 }
 
 /// The scores kept from Artificial Analysis, and when they were fetched.
@@ -561,7 +571,8 @@ async fn run_task(provider: &OpenAiCompatible, config: &AgentConfig, task: &str)
     let context = ironquill_tools::project_context(workspace.root(), FILE_LIST_LIMIT).await;
 
     let mut toolbox = Toolbox::new(workspace);
-    let agents = Agents::find();
+    let mut agents = Agents::find();
+    agents.claude = agents.claude.with_prices(prices().await);
     let outcome = ironquill_agent::run(
         provider,
         &agents,

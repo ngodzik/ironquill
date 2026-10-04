@@ -249,6 +249,7 @@ impl StreamParser {
                 usage: self.usage,
                 estimate: None,
                 context: None,
+                billed: false,
             }),
             _ => Err(None),
         }
