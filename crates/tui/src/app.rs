@@ -1843,19 +1843,41 @@ impl App {
                     .into(),
             );
         }
-        // Scores compare models only when every one has one; otherwise a
-        // scored cheap model would beat an unscored strong one. Then price.
-        let scored = models.iter().all(|m| m.score.is_some());
+        // An agent such as Claude Code or Codex has no price or score
+        // here, its work being on a subscription; it is among the strongest
+        // there are, so it plans before any model of the provider. Then
+        // scores, when every model has one: otherwise a scored cheap model
+        // would beat an unscored strong one. Then price.
+        let scored = models
+            .iter()
+            .filter(|m| m.model.delegate().is_none())
+            .all(|m| m.score.is_some());
         let best = |m: &Member| {
+            let agent = if m.model.delegate().is_some() {
+                1.0
+            } else {
+                0.0
+            };
             let score = if scored { m.score.unwrap_or(-1.0) } else { 0.0 };
-            (score, m.price.unwrap_or(-1.0))
+            (agent, score, m.price.unwrap_or(-1.0))
         };
-        let planner = match self
+        let chosen = self
             .settings
             .planner
             .as_ref()
-            .filter(|chosen| models.iter().any(|m| &m.model == *chosen))
-        {
+            .filter(|chosen| models.iter().any(|m| &m.model == *chosen));
+        // Nothing to tell them apart, the provider's list not read: better
+        // ask than pick at random.
+        let known = models
+            .iter()
+            .any(|m| m.price.is_some() || m.score.is_some() || m.model.delegate().is_some());
+        if chosen.is_none() && !known {
+            return Err(
+                "The provider's prices are unknown, so the best model cannot be told: pick the one that plans with /planner <model>"
+                    .into(),
+            );
+        }
+        let planner = match chosen {
             Some(chosen) => chosen.clone(),
             None => models
                 .iter()
@@ -1868,10 +1890,17 @@ impl App {
                 .expect("two models at least"),
         };
         let price = |m: &Member| m.price.unwrap_or(f64::MAX);
+        // The coder is a model of the provider when there is one: an agent
+        // codes only when nothing else can.
         let coder = models
             .iter()
             .filter(|m| m.model != planner && m.tools)
-            .min_by(|a, b| price(a).total_cmp(&price(b)));
+            .min_by(|a, b| {
+                let agent = |m: &Member| m.model.delegate().is_some();
+                agent(a)
+                    .cmp(&agent(b))
+                    .then_with(|| price(a).total_cmp(&price(b)))
+            });
         match coder {
             Some(coder) => Ok((coder.model.clone(), planner)),
             None => {
@@ -3229,6 +3258,20 @@ mod tests {
         type_text(&mut app, "/planner smart");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.pair_roles(), Ok((id("cheap"), id("smart"))));
+
+        // Without any price known, it asks rather than guesses.
+        let catalog = std::mem::take(&mut app.settings.catalog);
+        app.settings.planner = None;
+        assert!(app.pair_roles().unwrap_err().contains("/planner"));
+        app.settings.catalog = catalog;
+
+        // Claude Code plans before any model of the provider, though it has
+        // no price here; a model of the provider codes.
+        app.settings.team = vec![id("claude-code/opus"), id("cheap")];
+        app.settings.planner = None;
+        assert_eq!(app.pair_roles(), Ok((id("cheap"), id("claude-code/opus"))));
+        app.settings.team = vec![id("cheap"), id("dear")];
+        app.settings.planner = Some(id("smart"));
 
         // A real case: the only cheaper model cannot use tools. The best
         // still plans, and ironquill says why nobody can code rather than
