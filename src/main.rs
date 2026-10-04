@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use ironquill_agent::{AgentConfig, Event, Member, Outcome, Verdict};
 use ironquill_core::{ChatModel, ChatRequest, Effort, Message, ModelId, Usd};
 use ironquill_llm::{
@@ -42,6 +43,8 @@ struct Cli {
     api_key: Option<String>,
 
     /// Model tried first in the interface. Can be set later with `:model`.
+    /// Typed here, it wins over the one kept for new sessions; from
+    /// IRONQUILL_MODEL, only when none was kept.
     #[arg(long, env = "IRONQUILL_MODEL")]
     model: Option<String>,
 
@@ -129,7 +132,15 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    // A choice typed on the command line wins over the one kept for new
+    // sessions; one from the environment does not, so that a variable set
+    // long ago does not undo what was picked since.
+    let typed = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
     let api_key = cli.api_key.context("no API key: set IRONQUILL_API_KEY")?;
     let provider = OpenAiCompatible::new(cli.base_url, api_key);
 
@@ -144,12 +155,12 @@ async fn main() -> Result<()> {
             ironquill_tui::Start::New
         };
         let choices = Choices {
-            model: cli.model,
+            model: Pick::new(cli.model, typed("model")),
             escalate: cli.escalate,
             offered: cli.models,
             checks: cli.checks,
-            budget: cli.budget,
-            effort: cli.effort,
+            budget: Pick::new(cli.budget, typed("budget")),
+            effort: Pick::new(cli.effort, typed("effort")),
         };
         return interface(provider, choices, start).await;
     };
@@ -192,12 +203,41 @@ async fn main() -> Result<()> {
 /// What the command line chose for the interface; the rest comes from the
 /// defaults kept with /defaults.
 struct Choices {
-    model: Option<String>,
+    model: Pick<String>,
     escalate: Vec<String>,
     offered: Vec<String>,
     checks: Vec<String>,
-    budget: Option<f64>,
-    effort: Option<Effort>,
+    budget: Pick<f64>,
+    effort: Pick<Effort>,
+}
+
+/// A choice given at startup, and whether it was typed or came from the
+/// environment.
+struct Pick<T> {
+    typed: Option<T>,
+    from_env: Option<T>,
+}
+
+impl<T> Pick<T> {
+    fn new(value: Option<T>, typed: bool) -> Self {
+        if typed {
+            Self {
+                typed: value,
+                from_env: None,
+            }
+        } else {
+            Self {
+                typed: None,
+                from_env: value,
+            }
+        }
+    }
+
+    /// What was typed, else what was `kept` for new sessions, else what
+    /// the environment says.
+    fn or_kept(self, kept: Option<T>) -> Option<T> {
+        self.typed.or(kept).or(self.from_env)
+    }
 }
 
 async fn interface(
@@ -214,7 +254,7 @@ async fn interface(
     let mut tiers = Vec::new();
     for id in choices
         .model
-        .or(defaults.model)
+        .or_kept(defaults.model)
         .into_iter()
         .chain(choices.escalate)
     {
@@ -255,7 +295,7 @@ async fn interface(
         .collect::<Result<Vec<_>, _>>()?;
     let budget = choices
         .budget
-        .or(defaults.budget)
+        .or_kept(defaults.budget)
         .unwrap_or(Defaults::BUDGET);
     // The provider's list, to search and to price the team; without it the
     // interface still works, with less to show.
@@ -289,10 +329,12 @@ async fn interface(
         models,
         team,
         budget: (budget > 0.0).then_some(Usd(budget)),
-        effort: match (choices.effort, defaults.effort.as_deref()) {
-            (Some(effort), _) => effort,
-            (None, Some(kept)) => kept.parse().map_err(anyhow::Error::msg)?,
-            (None, None) => Effort::default(),
+        effort: {
+            let kept = match defaults.effort.as_deref() {
+                Some(kept) => Some(kept.parse().map_err(anyhow::Error::msg)?),
+                None => None,
+            };
+            choices.effort.or_kept(kept).unwrap_or_default()
         },
         planner: defaults.planner.as_deref().map(ModelId::new).transpose()?,
         detect_checks,
