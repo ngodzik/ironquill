@@ -414,54 +414,91 @@ impl Session {
         ];
         let mut plan = ask_planner(ctx, planner, pair.planner_effort, &mut planning).await?;
 
-        // The coder implements it, the checks judge.
+        // The coder implements it in a conversation of its own: the plan and
+        // the request, not everything said before, which every call would
+        // resend. The checks judge.
         ctx.effort = Some(pair.coder_effort);
-        self.messages.push(Message::Assistant {
-            content: Some(format!("Plan by {planner}:\n{plan}")),
-            tool_calls: Vec::new(),
-        });
-        self.messages.push(Message::user(format!(
-            "{IMPLEMENT_PROMPT}{}",
-            spent_so_far(ctx)
-        )));
+        let system = self
+            .messages
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Message::system(CHAT_PROMPT));
+        let mut work = vec![
+            system,
+            Message::user(text),
+            Message::Assistant {
+                content: Some(format!("Plan by {planner}:\n{plan}")),
+                tool_calls: Vec::new(),
+            },
+            Message::user(format!("{IMPLEMENT_PROMPT}{}", spent_so_far(ctx))),
+        ];
         let mut failure = None;
-        for revision in 0..=MAX_REVISIONS {
-            match attempt(ctx, &coder, &mut self.messages, &mut failure, false).await? {
-                Attempt::Passed => return Ok(Verdict::Passed { model: coder }),
-                Attempt::Unchecked => return Ok(Verdict::Unchecked),
-                Attempt::Answered => return Ok(Verdict::Answered),
-                Attempt::Failed => {}
+        let result: Result<Verdict, AgentError> = 'work: {
+            for revision in 0..=MAX_REVISIONS {
+                let step = match attempt(ctx, &coder, &mut work, &mut failure, false).await {
+                    Ok(step) => step,
+                    Err(e) => break 'work Err(e),
+                };
+                match step {
+                    Attempt::Passed => {
+                        break 'work Ok(Verdict::Passed {
+                            model: coder.clone(),
+                        });
+                    }
+                    Attempt::Unchecked => break 'work Ok(Verdict::Unchecked),
+                    Attempt::Answered => break 'work Ok(Verdict::Answered),
+                    Attempt::Failed => {}
+                }
+                if revision == MAX_REVISIONS {
+                    break;
+                }
+                let Some(f) = failure.as_ref() else { break };
+                (ctx.observe)(Event::Delegating {
+                    from: coder.clone(),
+                    to: planner.clone(),
+                    task: format!("Revise the plan: `{}` fails", f.command),
+                });
+                let changed = ctx.toolbox.changed().collect::<Vec<_>>().join(", ");
+                planning.push(Message::user(format!(
+                    "{coder} followed the plan, but the checks fail.\n\n{}\n\nFiles it \
+                     changed: {changed}\n\nRevise the plan: say what to change now, briefly.{}",
+                    describe(f),
+                    spent_so_far(ctx)
+                )));
+                plan = match ask_planner(ctx, planner, pair.planner_effort, &mut planning).await {
+                    Ok(plan) => plan,
+                    Err(e) => break 'work Err(e),
+                };
+                ctx.effort = Some(pair.coder_effort);
+                work.push(Message::user(format!(
+                    "Revised plan by {planner}:\n{plan}\n\n{IMPLEMENT_PROMPT}{}",
+                    spent_so_far(ctx)
+                )));
             }
-            if revision == MAX_REVISIONS {
-                break;
-            }
-            let Some(f) = failure.as_ref() else { break };
-            (ctx.observe)(Event::Delegating {
-                from: coder.clone(),
-                to: planner.clone(),
-                task: format!("Revise the plan: `{}` fails", f.command),
-            });
-            let changed = ctx.toolbox.changed().collect::<Vec<_>>().join(", ");
-            planning.push(Message::user(format!(
-                "{coder} followed the plan, but the checks fail.\n\n{}\n\nFiles it changed: \
-                 {changed}\n\nRevise the plan: say what to change now, briefly.{}",
-                describe(f),
-                spent_so_far(ctx)
-            )));
-            plan = ask_planner(ctx, planner, pair.planner_effort, &mut planning).await?;
-            ctx.effort = Some(pair.coder_effort);
-            self.messages.push(Message::user(format!(
-                "Revised plan by {planner}:\n{plan}\n\n{IMPLEMENT_PROMPT}{}",
-                spent_so_far(ctx)
-            )));
-        }
-        let last = failure
-            .as_ref()
-            .map_or_else(String::new, |f| format!(" Last failure: `{}`.", f.command));
+            Ok(Verdict::GaveUp {
+                failure: failure.clone(),
+            })
+        };
+
+        // The conversation keeps what was decided and done, briefly.
+        let changed = ctx.toolbox.changed().collect::<Vec<_>>().join(", ");
+        let report = last_reply(&work).unwrap_or_default();
+        let ending = match &result {
+            Ok(Verdict::GaveUp { failure }) => format!(
+                " The checks still fail after {MAX_REVISIONS} revised plans{}.",
+                failure
+                    .as_ref()
+                    .map_or_else(String::new, |f| format!(": `{}`", f.command))
+            ),
+            Err(AgentError::OverBudget) => " The budget ran out before the end.".to_owned(),
+            _ => String::new(),
+        };
         self.note(format!(
-            "(The checks still fail after {MAX_REVISIONS} revised plans.{last})"
+            "(Worked in a pair: {planner} planned, {coder} implemented.{ending}\n\nPlan:\n{plan}\n\n\
+             {coder}: {report}\nFiles changed: {})",
+            if changed.is_empty() { "none" } else { &changed }
         ));
-        Ok(Verdict::GaveUp { failure })
+        result
     }
 
     /// Hands the word back to the person once the budget is spent: the first
@@ -491,10 +528,10 @@ impl Session {
             tools: Vec::new(),
             effort: ctx.effort,
         };
-        // Saying where things stand may go a little past the budget, not far:
+        // Saying where things stand may cost a tenth of the budget, no more:
         // a conversation too long for that gets ironquill's own words.
         let likely = likely_cost(ctx.model.pricing(model).await, &request);
-        if spent.0 + likely.0 > budget.0 * 1.25 {
+        if likely.0 > budget.0 * 0.1 {
             self.messages.pop();
             let text = format!(
                 "The budget of {budget} for this request is reached, {spent} spent: the work \
@@ -1268,18 +1305,24 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         if before > compact_at {
             // Down to half the threshold, so that the next calls only add
             // to it: each compaction makes the provider's cache start over.
+            let mut compacted = messages.clone();
             let mut dropped = 0;
             for keep in (1..=KEEP_RESULTS).rev() {
-                dropped += crate::context::compact(messages, keep);
-                if crate::context::approx_tokens(messages) <= compact_at / 2 {
+                dropped += crate::context::compact(&mut compacted, keep);
+                if crate::context::approx_tokens(&compacted) <= compact_at / 2 {
                     break;
                 }
             }
-            if dropped > 0 {
+            // Only when it is worth it: a fifth less at least. A conversation
+            // long with words rather than tool results gains little, and
+            // would lose its cache on every call.
+            let after = crate::context::approx_tokens(&compacted);
+            if dropped > 0 && after * 5 <= before * 4 {
+                *messages = compacted;
                 (ctx.observe)(Event::Compacted {
                     dropped,
                     before: TokenCount(before),
-                    after: TokenCount(crate::context::approx_tokens(messages)),
+                    after: TokenCount(after),
                 });
             }
         }
@@ -1614,6 +1657,12 @@ mod tests {
             says("Created done.txt."),
         ]);
         let mut session = Session::new();
+        // A long conversation before: the coding step must not resend it.
+        session.messages.push(Message::user("an earlier question"));
+        session.messages.push(Message::Assistant {
+            content: Some("an earlier answer".into()),
+            tool_calls: vec![],
+        });
         let mut events = Vec::new();
         let outcome = session
             .send(
@@ -1659,6 +1708,16 @@ mod tests {
             m,
             Message::Assistant { content: Some(t), .. } if t.starts_with("Plan by strong:")
         )));
+        // A conversation of its own: instructions, the request, the plan.
+        assert_eq!(seen[4].messages.len(), 4);
+        assert!(!format!("{:?}", seen[4].messages).contains("an earlier"));
+        // The session keeps a short account of it.
+        assert!(matches!(
+            session.messages.last(),
+            Some(Message::Assistant { content: Some(t), .. })
+                if t.starts_with("(Worked in a pair: strong planned, cheap implemented.")
+                    && t.contains("Files changed: done.txt")
+        ));
         assert!(events.iter().any(|e| matches!(
             e,
             Event::Delegating { to, .. } if to.as_str() == "strong"

@@ -41,8 +41,8 @@ pub(crate) enum Command {
     /// `/effort <level>` sets how hard models think; `/effort` alone goes
     /// to the next level.
     Effort(Option<String>),
-    /// `/pair <question>`: a member of the team plans, the model that
-    /// answers gathers and codes.
+    /// `/pair <question>`: the best of the model that answers and its team
+    /// plans, the cheapest gathers and codes.
     Pair(Option<String>),
     /// `/planner <model>` picks the member that plans; alone, says which.
     Planner(Option<String>),
@@ -235,11 +235,12 @@ Type a question or a change and press Enter. Changes are checked before they are
 /budget <dollars>    the most one request may cost (none: no limit); past it the
                      work stops and the model says where it is and asks what next
 /team                who answers and who it may hand tasks to
-/pair <question>     in a pair: the model that answers gathers the code that
-                     matters, a member of the team plans from it (thinking hard),
-                     then the model that answers codes it (thinking little), and
-                     the planner revises its plan if the checks keep failing
-/planner <model>     the member that plans; by default the best scored, or dearest
+/pair <question>     in a pair, among the model that answers and its team: the
+                     best plans, thinking hard, from what the cheapest gathered;
+                     the cheapest codes it, thinking little, in a conversation of
+                     its own; the planner revises its plan if the checks fail
+/planner <model>     the model that plans in a pair; by default the best scored,
+                     or the dearest
 /effort <level>      how hard models think: low, medium, high (the default),
                      xhigh, max; /effort alone goes to the next. ← → in Ctrl-E too
 /defaults            keep the current model, list, team and budget for new

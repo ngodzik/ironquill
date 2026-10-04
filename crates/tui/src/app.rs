@@ -1426,26 +1426,22 @@ impl App {
                 self.error("Give it a question: /pair <what to do>");
             }
             Command::Pair(Some(text)) => {
-                let Some(planner) = self.planner() else {
+                let Some((coder, planner)) = self.pair_roles() else {
                     self.error(
-                        "Working in a pair needs a planner in the team besides the model that answers: Ctrl-E, select a model, Space",
+                        "Working in a pair needs two models: the one that answers and one in the team (Ctrl-E, select a model, Space)",
                     );
                     return None;
                 };
-                let coder = self
-                    .current_model()
-                    .map_or_else(|| "no model".to_owned(), ToString::to_string);
                 let planner_effort = self.settings.effort.max(Effort::High);
                 self.info(format!(
-                    "Pair: {coder} gathers and codes (effort low), {planner} plans (effort {planner_effort})"
+                    "Pair: {planner} plans (effort {planner_effort}), {coder} gathers and codes (effort low), in a conversation of their own"
                 ));
                 let pair = Pair {
                     planner,
                     planner_effort,
                     coder_effort: Effort::Low,
                 };
-                let tiers = self.settings.tiers.clone();
-                return self.submit_with(text, tiers, Some(pair));
+                return self.submit_with(text, vec![coder], Some(pair));
             }
             Command::Planner(None) => match self.planner() {
                 Some(planner) => self.info(format!(
@@ -1459,12 +1455,15 @@ impl App {
                 None => self.info("No planner: put a model in the team first (Ctrl-E, Space)"),
             },
             Command::Planner(Some(id)) => match ModelId::new(id) {
-                Ok(model) if self.settings.team.contains(&model) => {
+                Ok(model)
+                    if self.settings.team.contains(&model)
+                        || self.current_model() == Some(&model) =>
+                {
                     self.info(format!("Planner: {model}"));
                     self.settings.planner = Some(model);
                 }
                 Ok(model) => self.error(format!(
-                    "{model} is not in the team: the planner is one of its members"
+                    "{model} is neither the model that answers nor in the team"
                 )),
                 Err(e) => self.error(e.to_string()),
             },
@@ -1769,30 +1768,57 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// The member of the team that plans in a pair: the one picked
-    /// with /planner, or the best scored, or the dearest. Never the model
-    /// that answers, never one outside the team.
-    pub(crate) fn planner(&self) -> Option<ModelId> {
-        let lead = self.current_model();
-        let candidates: Vec<Member> = self
-            .members()
-            .into_iter()
-            .filter(|m| Some(&m.model) != lead)
-            .collect();
-        if let Some(chosen) = &self.settings.planner
-            && candidates.iter().any(|m| &m.model == chosen)
+    /// Who codes and who plans in a pair, among the model that answers and
+    /// its team only: the cheapest that can use tools codes, the planner
+    /// picked with /planner or the best of the others plans. `None` without
+    /// two models.
+    pub(crate) fn pair_roles(&self) -> Option<(ModelId, ModelId)> {
+        let mut models: Vec<Member> = self.members();
+        if let Some(lead) = self.current_model()
+            && !models.iter().any(|m| &m.model == lead)
         {
-            return Some(chosen.clone());
+            models.push(self.member_of(lead));
+        }
+        let price = |m: &Member| m.price.unwrap_or(f64::MAX);
+        let chosen = self.settings.planner.as_ref();
+        let coder = models
+            .iter()
+            .filter(|m| m.tools && Some(&m.model) != chosen)
+            .min_by(|a, b| price(a).total_cmp(&price(b)))?
+            .model
+            .clone();
+        let others: Vec<&Member> = models.iter().filter(|m| m.model != coder).collect();
+        if let Some(chosen) = chosen
+            && others.iter().any(|m| &m.model == chosen)
+        {
+            return Some((coder, chosen.clone()));
         }
         let key = |m: &Member| (m.score.unwrap_or(-1.0), m.price.unwrap_or(-1.0));
-        candidates
+        let planner = others
             .into_iter()
             .max_by(|a, b| {
                 key(a)
                     .partial_cmp(&key(b))
                     .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|m| m.model)
+            })?
+            .model
+            .clone();
+        Some((coder, planner))
+    }
+
+    /// The member of the team that plans in a pair, as /pair would pick it.
+    pub(crate) fn planner(&self) -> Option<ModelId> {
+        self.pair_roles().map(|(_, planner)| planner)
+    }
+
+    /// What is known of `model`: from the provider's list, or its name.
+    fn member_of(&self, model: &ModelId) -> Member {
+        self.settings
+            .catalog
+            .iter()
+            .find(|m| &m.model == model)
+            .cloned()
+            .unwrap_or_else(|| Member::new(model.clone(), self.note(model)))
     }
 
     /// The team as the agent gets it, with what tells its members apart.
@@ -2998,18 +3024,19 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_takes_its_planner_from_the_team() {
+    fn a_pair_codes_with_the_cheapest_and_plans_with_the_best() {
         let scored = |id: &str, score: Option<f64>, price: f64| Member {
             score,
             price: Some(price),
             ..Member::new(ModelId::new(id).unwrap(), "")
         };
+        // As in a real run: the model that answers is the dearest.
         let mut app = App::new(
             Settings {
-                tiers: vec![ModelId::new("cheap").unwrap()],
+                tiers: vec![ModelId::new("smart").unwrap()],
                 catalog: vec![
                     scored("cheap", Some(40.0), 1e-7),
-                    scored("smart", Some(55.0), 1e-6),
+                    scored("smart", Some(55.0), 2e-6),
                     scored("dear", None, 9e-6),
                 ],
                 rounds: 2,
@@ -3018,42 +3045,41 @@ mod tests {
             },
             PathBuf::from("/p"),
         );
-        // No team: nobody to plan.
+        // Alone: nobody to pair with.
         type_text(&mut app, "/pair add a feature");
         assert!(
             app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .is_none()
         );
-        assert!(matches!(app.transcript.last(), Some(Entry::Error(e)) if e.contains("planner")));
+        assert!(matches!(app.transcript.last(), Some(Entry::Error(e)) if e.contains("two models")));
 
-        // The best scored member plans, never the model that answers.
-        app.settings.team = ["cheap", "smart", "dear"]
+        // The cheapest codes, the best scored plans, whoever answers.
+        app.settings.team = ["cheap", "dear"]
             .iter()
             .map(|m| ModelId::new(*m).unwrap())
             .collect();
-        assert_eq!(app.planner().unwrap().as_str(), "smart");
-        // Without scores, the dearest.
+        let id = |s: &str| ModelId::new(s).unwrap();
+        assert_eq!(app.pair_roles(), Some((id("cheap"), id("smart"))));
+        // Without scores, the dearest plans.
         app.settings.catalog[1].score = None;
-        assert_eq!(app.planner().unwrap().as_str(), "dear");
-        // Picked by hand, from the team only.
+        assert_eq!(app.pair_roles(), Some((id("cheap"), id("dear"))));
+        // Picked by hand, among the model that answers and the team only.
         type_text(&mut app, "/planner outsider");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.planner().unwrap().as_str(), "dear");
+        assert_eq!(app.planner(), Some(id("dear")));
         type_text(&mut app, "/planner smart");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.planner().unwrap().as_str(), "smart");
+        assert_eq!(app.pair_roles(), Some((id("cheap"), id("smart"))));
 
         type_text(&mut app, "/pair add a feature");
         let effect = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(
-            matches!(effect, Some(Effect::Send { ref text, .. }) if text == "add a feature"),
-            "{effect:?} {:?}",
-            &app.transcript[app.transcript.len().saturating_sub(3)..]
-        );
+        assert!(matches!(effect, Some(Effect::Send { ref text, .. }) if text == "add a feature"));
         assert!(app.transcript.iter().any(|e| matches!(
             e,
-            Entry::Info(t) if t.contains("smart plans (effort high)") && t.contains("cheap gathers and codes (effort low)")
+            Entry::Info(t) if t.contains("smart plans (effort high), cheap gathers and codes (effort low)")
         )));
+        // The model that answers stays the one picked.
+        assert_eq!(app.current_model(), Some(&id("smart")));
     }
 
     #[test]
