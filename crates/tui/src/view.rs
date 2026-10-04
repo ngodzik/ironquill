@@ -1162,14 +1162,16 @@ fn diff_lines(out: &mut Vec<Line<'static>>, diff: &[DiffLine], created: bool, wi
 
 fn welcome(out: &mut Vec<Line<'static>>, app: &App, width: usize) {
     let inner = width.clamp(20, 64) - 2;
-    let checks = if app.checks().is_empty() {
-        "none, changes are kept as written (/check adds one)".to_owned()
-    } else {
+    let checks = if !app.checks().is_empty() {
         app.checks()
             .iter()
             .map(ironquill_tools::Check::command)
             .collect::<Vec<_>>()
             .join(", ")
+    } else if app.detects_checks() {
+        "the project's tests, found when checking".to_owned()
+    } else {
+        "none, changes are kept as written (/check adds one)".to_owned()
     };
     let rows: Vec<(String, Style)> = vec![
         (

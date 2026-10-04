@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 mod check;
+mod detect;
 mod diff;
 mod docker;
 mod error;
@@ -21,6 +22,7 @@ mod toolbox;
 mod workspace;
 
 pub use check::{Check, CheckFailure, CheckReport};
+pub use detect::detect_checks;
 pub use diff::{DiffLine, line_diff};
 pub use docker::{Container, running_containers};
 pub use error::ToolError;

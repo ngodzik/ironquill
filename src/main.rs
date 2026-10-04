@@ -178,9 +178,11 @@ async fn main() -> Result<()> {
             for model in escalate {
                 builder = builder.tier(ModelId::new(model)?);
             }
+            let detect = checks.is_empty();
             for check in checks_or_default(checks)? {
                 builder = builder.check(check);
             }
+            builder = builder.detect_checks(detect);
             builder = builder.effort(Some(cli.effort.unwrap_or_default()));
             run_task(&provider, &builder.build()?, &task).await
         }
@@ -218,6 +220,7 @@ async fn interface(
     {
         tiers.push(ModelId::new(id)?);
     }
+    let detect_checks = choices.checks.is_empty();
     let checks = checks_or_default(choices.checks)?;
 
     let claude = ClaudeCode::find();
@@ -292,6 +295,7 @@ async fn interface(
             (None, None) => Effort::default(),
         },
         planner: defaults.planner.as_deref().map(ModelId::new).transpose()?,
+        detect_checks,
         catalog,
         credits: (!rankings.is_empty()).then(|| RANKINGS_SOURCE.to_owned()),
     };
@@ -456,18 +460,9 @@ fn about(listed: &Listed, ranking: Option<&Ranking>) -> String {
     about.trim().to_owned()
 }
 
+/// The checks given on the command line. Without any, the project's own are
+/// found each time they are needed: see [`ironquill_tools::detect_checks`].
 fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {
-    if lines.is_empty() {
-        if Path::new("Cargo.toml").exists() {
-            return Ok(["cargo check --all-targets", "cargo test"]
-                .into_iter()
-                .filter_map(Check::parse)
-                .collect());
-        }
-        // Nothing known to check this kind of project: changes are kept as
-        // written, as the verdict will say.
-        return Ok(Vec::new());
-    }
     lines
         .iter()
         .map(|line| Check::parse(line).with_context(|| format!("empty check: {line:?}")))

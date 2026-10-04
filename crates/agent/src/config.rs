@@ -15,6 +15,7 @@ pub struct AgentConfig {
     pub(crate) compact_at: u64,
     pub(crate) effort: Option<Effort>,
     pub(crate) pair: Option<Pair>,
+    pub(crate) detect_checks: bool,
 }
 
 /// Planning by a stronger model, coding by the first one, as an architect
@@ -94,6 +95,7 @@ impl AgentConfig {
             compact_at: COMPACT_AT,
             effort: Some(Effort::High),
             pair: None,
+            detect_checks: false,
         }
     }
 }
@@ -114,6 +116,7 @@ pub struct AgentConfigBuilder {
     compact_at: u64,
     effort: Option<Effort>,
     pair: Option<Pair>,
+    detect_checks: bool,
 }
 
 impl AgentConfigBuilder {
@@ -183,6 +186,13 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// Without checks added, finds the project's own each time they are
+    /// needed: its test runner, and the tests a model has just written.
+    pub fn detect_checks(mut self, detect: bool) -> Self {
+        self.detect_checks = detect;
+        self
+    }
+
     /// Validates and builds.
     ///
     /// # Errors
@@ -209,6 +219,7 @@ impl AgentConfigBuilder {
             compact_at: self.compact_at,
             effort: self.effort,
             pair: self.pair,
+            detect_checks: self.detect_checks,
         })
     }
 }

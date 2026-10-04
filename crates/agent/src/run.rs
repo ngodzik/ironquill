@@ -696,7 +696,7 @@ async fn attempt<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         }
         // With nothing to judge the change there is nothing to retry or
         // escalate on: the model's word is all there is.
-        if ctx.config.checks.is_empty() {
+        if checks_now(ctx).is_empty() {
             return Ok(Attempt::Unchecked);
         }
 
@@ -782,7 +782,7 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
         if may_answer && round == 0 && ctx.toolbox.changed().next().is_none() {
             return Ok(Attempt::Answered);
         }
-        if ctx.config.checks.is_empty() {
+        if checks_now(ctx).is_empty() {
             return Ok(Attempt::Unchecked);
         }
         match check(ctx).await? {
@@ -1195,13 +1195,25 @@ async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
     })
 }
 
+/// The checks to run now: the ones configured, or, when there are none and
+/// the configuration says to look, the project's own as they are now, so
+/// that tests just written are run too.
+fn checks_now<M, D, O>(ctx: &Ctx<'_, M, D, O>) -> Vec<Check> {
+    if ctx.config.checks.is_empty() && ctx.config.detect_checks {
+        ironquill_tools::detect_checks(ctx.toolbox.workspace().root())
+    } else {
+        ctx.config.checks.clone()
+    }
+}
+
 async fn check<M, D, O: FnMut(Event)>(
     ctx: &mut Ctx<'_, M, D, O>,
 ) -> Result<Option<CheckFailure>, AgentError> {
+    let checks = checks_now(ctx);
     (ctx.observe)(Event::Checking {
-        commands: ctx.config.checks.iter().map(Check::command).collect(),
+        commands: checks.iter().map(Check::command).collect(),
     });
-    match Check::run_all(&ctx.config.checks, ctx.toolbox.workspace().root())
+    match Check::run_all(&checks, ctx.toolbox.workspace().root())
         .await
         .map_err(AgentError::Check)?
     {
@@ -1968,6 +1980,68 @@ mod tests {
             Some(Message::Tool { content, .. })
                 if content == "strong reports:\nCreated done.txt.\n\nFiles it changed: done.txt"
         ));
+    }
+
+    #[tokio::test]
+    async fn tests_a_model_writes_are_found_and_run() {
+        let python = std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|dir| dir.join("python3").is_file())
+        });
+        if !python {
+            return;
+        }
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            calls(
+                "write_file",
+                json!({"path": "calc.py", "content": "def add(a, b):\n    return a - b\n"}),
+            ),
+            calls(
+                "write_file",
+                json!({
+                    "path": "tests/test_calc.py",
+                    "content": "import unittest\nfrom calc import add\n\n\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n"
+                }),
+            ),
+            says("Added add and its test."),
+            // The test the model wrote fails: it hears so and fixes the code.
+            calls(
+                "replace",
+                json!({"path": "calc.py", "old": "a - b", "new": "a + b"}),
+            ),
+            says("Fixed."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .detect_checks(true)
+            .build()
+            .unwrap();
+        let mut events = Vec::new();
+        let outcome = Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "add add()",
+                "",
+                |e| {
+                    events.push(e);
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome.verdict, Verdict::Passed { .. }),
+            "{:?}",
+            outcome.verdict
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Checking { commands } if commands == &["python3 -B -m unittest discover -s tests"]
+        )));
+        assert!(events.iter().any(|e| matches!(e, Event::Failed { .. })));
     }
 
     #[tokio::test]

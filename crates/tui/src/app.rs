@@ -78,6 +78,9 @@ pub struct Settings {
     /// The member of the team that plans in a pair; `None` picks
     /// the best scored, or the dearest.
     pub planner: Option<ModelId>,
+    /// Without checks set, find the project's own when checking: its test
+    /// runner, and tests a model has just written.
+    pub detect_checks: bool,
 }
 
 /// Tokens and cost of one part of a request.
@@ -1191,7 +1194,9 @@ impl App {
         if let Some(budget) = self.settings.budget {
             builder = builder.budget(budget);
         }
-        builder = builder.effort(Some(self.settings.effort));
+        builder = builder
+            .effort(Some(self.settings.effort))
+            .detect_checks(self.settings.detect_checks);
         if let Some(pair) = pair {
             builder = builder.pair(pair);
         }
@@ -1279,15 +1284,19 @@ impl App {
                 self.info(format!("Models: {chain}"));
             }
             Command::Check(None) => {
-                let list = if self.settings.checks.is_empty() {
-                    "none".to_owned()
-                } else {
+                let list = if !self.settings.checks.is_empty() {
                     self.settings
                         .checks
                         .iter()
                         .map(Check::command)
                         .collect::<Vec<_>>()
                         .join(", then ")
+                } else if self.settings.detect_checks {
+                    "the project's own, found when checking: pytest or unittest when \
+                     there are Python tests, npm test, cargo test"
+                        .to_owned()
+                } else {
+                    "none".to_owned()
                 };
                 self.info(format!("Checks: {list}"));
             }
@@ -1300,6 +1309,7 @@ impl App {
             },
             Command::NoCheck => {
                 self.settings.checks.clear();
+                self.settings.detect_checks = false;
                 self.info("Checks removed. Add one with /check before asking for a change");
             }
             Command::Rounds(None) => {
@@ -1674,6 +1684,11 @@ impl App {
     /// Where the scores shown come from.
     pub(crate) fn credits(&self) -> Option<&str> {
         self.settings.credits.as_deref()
+    }
+
+    /// Whether the project's own checks are found when checking.
+    pub(crate) fn detects_checks(&self) -> bool {
+        self.settings.detect_checks
     }
 
     /// How hard models think before answering.

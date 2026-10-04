@@ -23,7 +23,7 @@ The interface follows my editor habits: Vim-like modes, a leader key, files open
 
 ## What it does today
 
-- A conversation in the terminal: questions get answers, requests for changes get edits shown as diffs, then the checks (`cargo check` and `cargo test` in a Rust project, any command with `/check`)
+- A conversation in the terminal: questions get answers, requests for changes get edits shown as diffs, then the checks: the project's own, found each time they run, so that tests a model has just written are run too (`pytest` or `unittest` when there are Python tests, `npm test`, `cargo check` and `cargo test`), or any command given with `/check`
 - Escalation from a cheap model to stronger ones when the checks keep failing
 - A team: the model that answers may hand a task to another model you picked, a stronger one for a hard change, a cheaper one for a long read, and gets its report back. Ctrl-E searches every model of the provider, with its prices and context; Space puts one in the team
 - Scores for every model from [Artificial Analysis](https://artificialanalysis.ai/), with your own free key in `ARTIFICIAL_ANALYSIS_API_KEY`: a coding index and an intelligence index, shown next to the prices and given to the model that hands out tasks. They are kept in `~/.ironquill/rankings.json` and fetched again only when a month old, or when a model you picked is missing
