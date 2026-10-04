@@ -99,6 +99,9 @@ const SUMMARY_PROMPT: &str = "You keep the summary of a conversation between a p
      person wants and decided, what was done and which files changed, what failed or is left \
      to do, and what was learned about the project. Leave out greetings and the details of \
      tool calls. At most 400 words. Reply with the summary only.";
+/// At most this much of the first request is kept when the conversation is
+/// cut and has no summary.
+const FIRST_REQUEST_BYTES: usize = 4_000;
 const CATCH_UP_BYTES: usize = 24_000;
 
 /// For the first model, once the plan is there.
@@ -395,14 +398,34 @@ impl Session {
         if config.pair.is_none() && !models().any(|m| m.delegate().is_some()) {
             return;
         }
-        let covers = self
-            .summary
-            .as_ref()
-            .map_or(1, |s| s.covers.min(self.messages.len()));
-        let since = catch_up_all(&self.messages[covers..]);
-        if since.len() < SUMMARY_AFTER_BYTES {
-            return;
+        if self.unsummarized(self.messages.len()).len() >= SUMMARY_AFTER_BYTES {
+            self.update_summary(ctx, self.messages.len()).await;
         }
+    }
+
+    /// What the conversation said before message `to` that its summary does
+    /// not cover.
+    fn unsummarized(&self, to: usize) -> String {
+        let covers = self.summary.as_ref().map_or(1, |s| s.covers);
+        catch_up_all(&self.messages[covers.min(to)..to])
+    }
+
+    /// Updates the summary to cover the messages before `to`, with the
+    /// cheapest model of the team with a known price, at a low effort.
+    /// Returns whether it did.
+    async fn update_summary<M: ChatModel, D, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+        to: usize,
+    ) -> bool {
+        let config = ctx.config;
+        let models = || {
+            config
+                .tiers
+                .iter()
+                .chain(config.team.iter().map(|m| &m.model))
+        };
+        let since = self.unsummarized(to);
         let reference = Usage {
             input: TokenCount(10_000),
             output: TokenCount(1_000),
@@ -420,7 +443,7 @@ impl Session {
             }
         }
         let Some((model, pricing)) = cheapest else {
-            return;
+            return false;
         };
         let previous = self.summary.as_ref().map_or("(none yet)", |s| &s.text);
         let request = ChatRequest {
@@ -437,7 +460,7 @@ impl Session {
             effort: Some(Effort::Low),
         };
         if within_budget(ctx, Some(pricing), &request).is_err() {
-            return;
+            return false;
         }
         (ctx.observe)(Event::Step {
             number: 0,
@@ -447,7 +470,7 @@ impl Session {
             effort: Some(Effort::Low),
         });
         let Ok(response) = ctx.model.complete(&request).await else {
-            return;
+            return false;
         };
         ctx.ledger.usage += response.usage;
         match response.cost {
@@ -462,17 +485,26 @@ impl Session {
             context: None,
         });
         let text = response.content.unwrap_or_default().trim().to_owned();
-        if !text.is_empty() {
-            self.summary = Some(Summary {
-                text,
-                covers: self.messages.len(),
-            });
+        if text.is_empty() {
+            return false;
         }
+        self.summary = Some(Summary { text, covers: to });
+        true
     }
 
     /// What a model starting afresh is told of the conversation before
-    /// message `to`: its summary, when there is one, and what was said since.
-    fn recap(&self, to: usize) -> String {
+    /// message `to`: its summary and what was said since. When what the
+    /// summary leaves out would be cut, the summary is brought up to date
+    /// first, so that the start of the conversation is never lost; failing
+    /// that, the first request is kept with the latest part.
+    async fn recap<M: ChatModel, D, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+        to: usize,
+    ) -> String {
+        if self.unsummarized(to).len() > CATCH_UP_BYTES {
+            self.update_summary(ctx, to).await;
+        }
         match &self.summary {
             Some(summary) if summary.covers <= to => {
                 let since = catch_up(&self.messages[summary.covers..to]);
@@ -486,7 +518,24 @@ impl Session {
                     summary.text
                 )
             }
-            _ => catch_up(&self.messages[1.min(to)..to]),
+            _ => {
+                let all = catch_up_all(&self.messages[1.min(to)..to]);
+                if all.len() <= CATCH_UP_BYTES {
+                    return all;
+                }
+                // What the conversation is about, then where it is now.
+                let first = self.messages[1.min(to)..to].iter().find_map(|m| match m {
+                    Message::User(text) => Some(text.as_str()),
+                    _ => None,
+                });
+                let first = first.map_or_else(String::new, |text| {
+                    format!(
+                        "The first request:\n{}\n\n",
+                        head(text, FIRST_REQUEST_BYTES)
+                    )
+                });
+                format!("{first}{}", latest(&all, CATCH_UP_BYTES))
+            }
         }
     }
 
@@ -510,13 +559,13 @@ impl Session {
         let agent = first.delegate().map(|(agent, _)| agent);
         if let Some(agent) = agent {
             // A cold session starts afresh and is told the conversation.
-            let thread = self.warm(agent);
-            ctx.thread = thread.map(|t| t.session.clone());
+            let thread = self.warm(agent).map(|t| (t.session.clone(), t.seen));
             let request = self.messages.len() - 1;
-            ctx.catch_up = match thread {
-                Some(t) => catch_up(&self.messages[t.seen.min(request)..request]),
-                None => self.recap(request),
+            ctx.catch_up = match &thread {
+                Some((_, seen)) => catch_up(&self.messages[(*seen).min(request)..request]),
+                None => self.recap(ctx, request).await,
             };
+            ctx.thread = thread.map(|(session, _)| session);
         }
         let first_attempt = attempt(ctx, first, &mut self.messages, &mut failure, true).await;
         if let (Some(agent), Some(session)) = (agent, ctx.thread.take()) {
@@ -599,13 +648,15 @@ impl Session {
         // An agent planner continues its warm session; any planner is told
         // the conversation it has not seen, so that a follow-up makes sense.
         let planner_agent = planner.delegate().map(|(agent, _)| agent);
-        let thread = planner_agent.and_then(|agent| self.warm(agent));
-        let mut planner_session = thread.map(|t| t.session.clone());
+        let thread = planner_agent
+            .and_then(|agent| self.warm(agent))
+            .map(|t| (t.session.clone(), t.seen));
         let request_at = self.messages.len() - 1;
-        let earlier = match thread {
-            Some(t) => catch_up(&self.messages[t.seen.min(request_at)..request_at]),
-            None => self.recap(request_at),
+        let earlier = match &thread {
+            Some((_, seen)) => catch_up(&self.messages[(*seen).min(request_at)..request_at]),
+            None => self.recap(ctx, request_at).await,
         };
+        let mut planner_session = thread.map(|(session, _)| session);
         let earlier = if earlier.trim().is_empty() {
             String::new()
         } else {
@@ -2086,6 +2137,15 @@ fn latest(out: &str, bytes: usize) -> String {
     )
 }
 
+/// The first `bytes` of `text` at most, cut at a character.
+fn head(text: &str, bytes: usize) -> &str {
+    let mut end = text.len().min(bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn catch_up_all(messages: &[Message]) -> String {
     let mut out = String::new();
     for message in messages {
@@ -3314,6 +3374,70 @@ mod tests {
             .unwrap();
         assert_eq!(model.seen.lock().unwrap().len(), 1);
         assert!(session.summary.is_none());
+    }
+
+    /// A long chat with `model` alone, then a request to Claude Code, which
+    /// starts a new session; returns what Claude was sent.
+    async fn long_chat_then_claude(model: &Scripted) -> String {
+        let (_dir, mut toolbox) = setup();
+        let claude = FakeClaude {
+            writes_on_round: 1,
+            requests: Mutex::new(Vec::new()),
+        };
+        let alone = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        let with_claude = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .member(Member::new(ModelId::new("cheap").unwrap(), ""))
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let first = format!("The topic is the parser. {}", "Some detail. ".repeat(3_000));
+        session
+            .send(model, &claude, &mut toolbox, &alone, &first, "", |_| {})
+            .await
+            .unwrap();
+        // Nobody would have started from a summary: none was written.
+        assert!(session.summary.is_none());
+        session
+            .send(
+                model,
+                &claude,
+                &mut toolbox,
+                &with_claude,
+                "now fix it",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        claude.requests.lock().unwrap()[0].prompt.clone()
+    }
+
+    #[tokio::test]
+    async fn a_conversation_too_long_to_send_is_summarized_before_a_new_session() {
+        let model = Scripted::new(vec![says("Sure."), says("The person works on the parser.")])
+            .priced(1e-6, 4e-6);
+        let prompt = long_chat_then_claude(&model).await;
+        assert!(
+            prompt
+                .contains("A summary of the conversation so far:\nThe person works on the parser.")
+        );
+        assert!(!prompt.contains("Some detail."));
+        assert!(prompt.ends_with("now fix it"));
+    }
+
+    #[tokio::test]
+    async fn without_a_summary_the_first_request_is_kept_with_the_latest_part() {
+        // No price known: no model writes a summary.
+        let model = Scripted::new(vec![says("Sure.")]);
+        let prompt = long_chat_then_claude(&model).await;
+        assert!(prompt.contains("The first request:\nThe topic is the parser."));
+        assert!(prompt.contains("(the earlier part of the conversation is left out)"));
+        assert!(prompt.contains("Assistant: Sure."));
+        assert!(prompt.len() < CATCH_UP_BYTES + FIRST_REQUEST_BYTES + 500);
     }
 
     /// Claude Code on an API key, for the cost tests: the calls it reports
