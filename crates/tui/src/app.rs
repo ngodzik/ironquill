@@ -2652,6 +2652,10 @@ pub(crate) fn step_title(
         (Some(model), None) => model.to_string(),
         (None, _) => "by ironquill, no model".to_owned(),
     };
+    // A step outside the numbered ones, such as the summary at the end.
+    if of == 0 {
+        return format!("{name} · {who}");
+    }
     format!("{number}/{of} {name} · {who}")
 }
 

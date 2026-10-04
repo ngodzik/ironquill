@@ -76,11 +76,12 @@ pub enum Event {
         /// The task, as the first model wrote it.
         task: String,
     },
-    /// A step of a request worked on in a pair begins.
+    /// A step of a request worked on in a pair begins, or one outside the
+    /// numbered steps, such as the summary written at the end.
     Step {
-        /// Its place, from 1.
+        /// Its place, from 1; 0 outside the numbered steps.
         number: u8,
-        /// How many steps there are.
+        /// How many steps there are; 0 outside the numbered steps.
         of: u8,
         /// What it does, such as `Planning`.
         name: String,
