@@ -277,11 +277,19 @@ async fn interface(
     let detect_checks = choices.checks.is_empty();
     let checks = checks_or_default(choices.checks)?;
 
-    let claude = match ClaudeCode::find() {
-        Some(claude) => Some(claude.with_prices(prices().await)),
-        None => None,
-    };
+    let claude = ClaudeCode::find();
     let codex = Codex::find();
+    // Prices for the agents' calls, fetched only when one is installed.
+    let prices = if claude.is_some() || codex.is_some() {
+        prices().await
+    } else {
+        None
+    };
+    let claude = claude.map(|c| c.with_prices(prices.clone()));
+    let codex = codex.map(|c| {
+        let billed = c.uses_api_key();
+        c.with_prices(prices.clone()).billed(billed)
+    });
     let mut models: Vec<ModelId> = Vec::new();
     for id in choices.offered.iter().chain(&defaults.models) {
         let id = ModelId::new(id.trim())?;
@@ -572,7 +580,10 @@ async fn run_task(provider: &OpenAiCompatible, config: &AgentConfig, task: &str)
 
     let mut toolbox = Toolbox::new(workspace);
     let mut agents = Agents::find();
-    agents.claude = agents.claude.with_prices(prices().await);
+    let prices = prices().await;
+    agents.claude = agents.claude.with_prices(prices.clone());
+    let billed = agents.codex.uses_api_key();
+    agents.codex = agents.codex.with_prices(prices).billed(billed);
     let outcome = ironquill_agent::run(
         provider,
         &agents,

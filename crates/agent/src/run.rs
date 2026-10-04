@@ -1080,13 +1080,19 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
         ctx.ledger.cost += cost;
     }
     ctx.ledger.context = reply.context.or(ctx.ledger.context);
-    (ctx.observe)(Event::Turn {
-        model: tier.clone(),
-        usage: rest,
-        cost,
-        subscription: !reply.billed,
-        context: reply.context,
-    });
+    // Nothing left to add when every call was counted as it came.
+    let left = rest.input.0 + rest.output.0 > 0
+        || cost.is_some_and(|c| c.0 > 0.0)
+        || reply.context.is_some();
+    if left {
+        (ctx.observe)(Event::Turn {
+            model: tier.clone(),
+            usage: rest,
+            cost,
+            subscription: !reply.billed,
+            context: reply.context,
+        });
+    }
     Ok(reply)
 }
 
