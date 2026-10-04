@@ -36,7 +36,7 @@ The interface follows my editor habits: Vim-like modes, a leader key, files open
 - Tasks handed to [Claude Code](https://code.claude.com/docs/en/overview) or [Codex](https://github.com/openai/codex) as sub-agents, through the `claude` or `codex` command installed and signed in on the machine: pick a `claude-code/...` or `codex/...` model with Ctrl-E, or send one task with `/claude <task>` or `/codex <task>`. Each keeps its own session for the whole conversation, across model switches and restarts (`/claude-reset` and `/codex-reset` end them), and is told what was said without it since it last took part; what it does shows live, and ironquill still runs the checks on what it changed. Claude Code may not run commands; Codex needs them to read and edit, so it runs them in its own sandbox, writing inside the project only and without network
 - Reading little: models find code with `search` (as ripgrep, skipping what git ignores) and `outline` (the functions, classes and types of a file or directory, parsed with tree-sitter for Rust, Python, TypeScript and JavaScript), then read a range of lines rather than whole files
 - Compaction: past 40k tokens, or half the model's context, the results of old tool calls are dropped all at once, down to half that, so the conversation is resent shorter and the provider's cache can take over again
-- Claude Code's cost as it works: each message it ends is priced with LiteLLM's public price list, as ccusage does, kept a week in `~/.ironquill/prices.json`; on an API key the cost is owed, shows live and counts against the budget, and Claude Code's own total settles it at the end; on a subscription it shows as such
+- Claude Code's cost as it works: each message it ends is priced with [LiteLLM](https://github.com/BerriAI/litellm)'s public price list (see [Data from others](#data-from-others)), as ccusage does, kept a week in `~/.ironquill/prices.json`; on an API key the cost is owed, shows live and counts against the budget, and Claude Code's own total settles it at the end; on a subscription it shows as such
 - Cost, tokens and how full the context is, per request and for the whole conversation
 - The context in your hands: `/context` opens what the next request will send in the Vim editor, to delete passages, shorten tool results or add notes; `:w` applies it. Long replies fold, and Ctrl-Z gives the conversation the whole screen
 - `/copy` opens the conversation as text in the editor, to select with `v` or `V` and copy with `y` to the system clipboard; Shift and the mouse select on screen in most terminals
@@ -69,6 +69,14 @@ cargo install --path .              # builds the ironquill binary into ~/.cargo/
 scripts/check.sh                    # what CI runs: formatting, lints, docs, tests, dependency audit
 git config core.hooksPath .githooks # run those checks before every commit
 ```
+
+## Data from others
+
+ironquill ships none of the data below. Each install fetches it for its own use, keeps a copy on the machine, and says where it comes from.
+
+- **Model prices** for Claude Code's messages come from [LiteLLM](https://github.com/BerriAI/litellm)'s public list, [`model_prices_and_context_window.json`](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json), under the MIT licence. They are list prices: an estimate of what a message costs, not a bill. [ccusage](https://github.com/ccusage/ccusage) prices Claude Code's usage from the same list.
+- **Model scores** come from [Artificial Analysis](https://artificialanalysis.ai/)' free API, with your own key, under their terms, which ask that they be credited; the model picker does so wherever scores show.
+- **Model lists, prices, context windows and descriptions** for the provider's models come from the provider itself, such as Requesty's `/v1/models`.
 
 ## License
 
