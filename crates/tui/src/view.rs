@@ -1049,15 +1049,39 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
             seconds,
             subscription,
             context,
+            runs,
         } => {
+            // When several models took turns: who, in order, and what each
+            // run cost, the total under it.
+            if runs.len() > 1 {
+                let chain: Vec<String> = runs
+                    .iter()
+                    .map(|(model, spent)| {
+                        if spent.subscription && spent.cost.0 == 0.0 {
+                            format!("{model} subscription")
+                        } else {
+                            format!("{model} {}", spent.cost)
+                        }
+                    })
+                    .collect();
+                push_wrapped(
+                    &mut out,
+                    Span::raw("  "),
+                    "    ",
+                    &chain.join(" → "),
+                    fg(Color::Gray),
+                    width,
+                );
+            }
             let cost = match (*subscription, cost.0 > 0.0, *complete) {
                 (true, false, _) => "subscription".to_owned(),
                 (true, true, _) => format!("{cost} + subscription"),
                 (false, _, true) => cost.to_string(),
                 (false, _, false) => format!("{cost} reported, part of the cost unknown"),
             };
+            let total = if runs.len() > 1 { "total " } else { "" };
             let mut text = format!(
-                "{cost} · {} in · {} out · {seconds}s",
+                "{total}{cost} · {} in · {} out · {seconds}s",
                 usage.input, usage.output
             );
             if let Some(context) = context {

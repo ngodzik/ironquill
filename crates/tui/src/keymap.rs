@@ -122,7 +122,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "Anywhere",
         &[
             ("Ctrl-Q", "back to typing a message (Ctrl-G too)"),
-            ("Ctrl-E", "pick the model"),
+            (
+                "Ctrl-E",
+                "the models: type to search, Enter answers, Space team, ← → effort, Delete off the list",
+            ),
             ("Ctrl-A", "go to the file tree, opening it if hidden"),
             ("Ctrl-B", "show or hide the file tree"),
             (

@@ -81,6 +81,9 @@ pub struct Settings {
     /// Without checks set, find the project's own when checking: its test
     /// runner, and tests a model has just written.
     pub detect_checks: bool,
+    /// What the person should know at startup, such as a model given on the
+    /// command line in place of the one kept.
+    pub notes: Vec<String>,
 }
 
 /// Tokens and cost of one part of a request.
@@ -235,6 +238,10 @@ pub(crate) enum Entry {
         /// How full the context was on the request's last call.
         #[serde(default)]
         context: Option<ContextUse>,
+        /// The models that worked on it in turn, consecutive calls to the
+        /// same one together, with what each run cost.
+        #[serde(default)]
+        runs: Vec<(ModelId, Spent)>,
     },
 }
 
@@ -375,6 +382,8 @@ pub(crate) struct App {
     sub_max: Cell<usize>,
     /// What the current request cost so far, without its sub-agents.
     request_spent: Spent,
+    /// The models of the current request in turn, with what each run cost.
+    runs: Vec<(ModelId, Spent)>,
     /// The choices as last kept for new sessions, to keep them again as
     /// soon as they change.
     kept: Defaults,
@@ -434,6 +443,7 @@ impl App {
         }
         settings.models = models;
         let mut transcript = vec![Entry::Welcome];
+        transcript.extend(settings.notes.drain(..).map(Entry::Info));
         if settings.tiers.is_empty() {
             transcript.push(Entry::Error(
                 "No model set. Choose one with /model <id>".into(),
@@ -475,6 +485,7 @@ impl App {
             sub_scroll: Cell::new(0),
             sub_max: Cell::new(0),
             request_spent: Spent::default(),
+            runs: Vec::new(),
             kept: Defaults::default(),
             notice: None,
             session_id: sessions::new_id(),
@@ -1220,6 +1231,7 @@ impl App {
                 self.sub_view = None;
                 self.step = None;
                 self.request_spent = Spent::default();
+                self.runs.clear();
                 if self.focus == Focus::SubAgent {
                     self.focus = Focus::Chat;
                 }
@@ -1511,6 +1523,7 @@ impl App {
                     seconds,
                     subscription: outcome.subscription,
                     context: outcome.context,
+                    runs: std::mem::take(&mut self.runs),
                 });
                 true
             }
@@ -1918,6 +1931,27 @@ impl App {
                     self.toggle_team(row.model.clone());
                 }
             }
+            // Delete takes a model off the list, and off the team: it is no
+            // longer offered. Never the one that answers.
+            KeyCode::Delete => {
+                if let Some(row) = rows.get(selected).filter(|r| r.offered) {
+                    let model = row.model.clone();
+                    if self.current_model() == Some(&model) {
+                        self.error(format!(
+                            "{model} answers: pick another with Enter before taking it off the list"
+                        ));
+                    } else {
+                        self.settings.models.retain(|m| m != &model);
+                        self.settings.team.retain(|m| m != &model);
+                        if self.settings.planner.as_ref() == Some(&model) {
+                            self.settings.planner = None;
+                        }
+                        self.info(format!("{model} is off the list"));
+                        let last = self.model_rows().len().saturating_sub(1);
+                        set(self, selected.min(last));
+                    }
+                }
+            }
             // The effort, shown at the top of the list, beside the search.
             KeyCode::Left => self.settings.effort = self.settings.effort.step(-1),
             KeyCode::Right => self.settings.effort = self.settings.effort.step(1),
@@ -2273,7 +2307,20 @@ impl App {
                 // The model that answers is back: the member is done.
                 if self.member.as_ref().is_some_and(|m| *m != model) {
                     self.member = None;
-                    self.working_model = Some(model);
+                    self.working_model = Some(model.clone());
+                }
+                // Who worked, in turn: a new run when the model changes.
+                let run = match self.runs.last_mut() {
+                    Some((last, spent)) if *last == model => spent,
+                    _ => {
+                        self.runs.push((model.clone(), Spent::default()));
+                        &mut self.runs.last_mut().expect("just pushed").1
+                    }
+                };
+                run.usage += usage;
+                match cost {
+                    Some(c) => run.cost += c,
+                    None => run.subscription |= subscription,
                 }
                 if self.member.is_none() {
                     self.request_spent.usage += usage;
@@ -3141,6 +3188,76 @@ mod tests {
         )));
         // The model that answers stays the one picked.
         assert_eq!(app.current_model(), Some(&id("smart")));
+    }
+
+    #[test]
+    fn the_cost_line_shows_the_models_in_turn() {
+        let mut app = ready();
+        let id = |s: &str| ModelId::new(s).unwrap();
+        let turn = |model: &str, cost: f64| {
+            AgentMessage::Event(Event::Turn {
+                model: id(model),
+                usage: Usage {
+                    input: TokenCount(1_000),
+                    output: TokenCount(10),
+                },
+                cost: Some(Usd(cost)),
+                subscription: false,
+                context: None,
+            })
+        };
+        type_text(&mut app, "do it");
+        press(&mut app, KeyCode::Enter);
+        for (model, cost) in [
+            ("strong", 0.002),
+            ("strong", 0.004),
+            ("cheap", 0.01),
+            ("strong", 0.001),
+        ] {
+            app.on_agent(turn(model, cost));
+        }
+        app.on_agent(AgentMessage::Done(Ok(Outcome {
+            verdict: Verdict::Answered,
+            usage: Usage::default(),
+            cost: Usd(0.017),
+            cost_complete: true,
+            subscription: false,
+            context: None,
+            changed: vec![],
+        })));
+        let Some(Entry::Cost { runs, .. }) = app.transcript.last() else {
+            panic!("a cost line ends the request");
+        };
+        let chain: Vec<(&str, Usd)> = runs.iter().map(|(m, s)| (m.as_str(), s.cost)).collect();
+        assert_eq!(
+            chain,
+            [
+                ("strong", Usd(0.006)),
+                ("cheap", Usd(0.01)),
+                ("strong", Usd(0.001))
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_takes_a_model_off_the_list_but_not_the_one_that_answers() {
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("a").unwrap()],
+                models: vec![ModelId::new("a").unwrap(), ModelId::new("b").unwrap()],
+                team: vec![ModelId::new("b").unwrap()],
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.models().len(), 2, "the one that answers stays");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.models(), [ModelId::new("a").unwrap()]);
+        assert!(app.team().is_empty());
     }
 
     #[test]

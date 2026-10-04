@@ -251,6 +251,17 @@ async fn interface(
         None => Defaults::default(),
     };
 
+    // A model typed at the command line replaces the one kept: say so, a
+    // command recalled from the history would hide it otherwise.
+    let mut notes = Vec::new();
+    if let (Some(typed), Some(kept)) = (&choices.model.typed, &defaults.model)
+        && typed != kept
+    {
+        notes.push(format!(
+            "Model {typed}, given with --model, in place of your choice kept for new sessions, \
+             {kept}. Start without --model to use it"
+        ));
+    }
     let mut tiers = Vec::new();
     for id in choices
         .model
@@ -338,6 +349,7 @@ async fn interface(
         },
         planner: defaults.planner.as_deref().map(ModelId::new).transpose()?,
         detect_checks,
+        notes,
         catalog,
         credits: (!rankings.is_empty()).then(|| RANKINGS_SOURCE.to_owned()),
     };

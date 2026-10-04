@@ -69,8 +69,10 @@ something essential, say what the implementer must read first. Be concise: every
 for. Write in the language of the request.";
 
 /// For the first model, once the plan is there.
-const IMPLEMENT_PROMPT: &str = "Implement the plan above, exactly. Read only what you need. Where \
-the plan is unclear, choose the simplest reading. When you are done, reply with one short \
+const IMPLEMENT_PROMPT: &str = "Implement the plan above, exactly. The code the planner read is \
+above too: do not read it again, read only what is missing. Where the plan is unclear, choose the \
+simplest reading. You cannot run tests or commands: as soon as you stop calling tools, ironquill \
+runs the project's checks and tells you how they went. When you are done, reply with one short \
 sentence.";
 
 /// How many times the planner may revise its plan after the checks fail.
@@ -453,7 +455,9 @@ impl Session {
             .unwrap_or_else(|| Message::system(CHAT_PROMPT));
         let mut work = vec![
             system,
-            Message::user(text),
+            Message::user(format!(
+                "{text}\n\nThe code the planner read, as it is now:\n{excerpts}"
+            )),
             Message::Assistant {
                 content: Some(format!("Plan by {planner}:\n{plan}")),
                 tool_calls: Vec::new(),
@@ -491,7 +495,9 @@ impl Session {
                 let changed = ctx.toolbox.changed().collect::<Vec<_>>().join(", ");
                 planning.push(Message::user(format!(
                     "{coder} followed the plan, but the checks fail.\n\n{}\n\nFiles it \
-                     changed: {changed}\n\nRevise the plan: say what to change now, briefly.{}",
+                     changed: {changed}\n\nRevise the plan: say what to change now, briefly. \
+                     If you need to see code first, reply only with `path:start-end` lines, as \
+                     before, and ironquill will read them for you.{}",
                     describe(f),
                     spent_so_far(ctx)
                 )));
@@ -499,6 +505,20 @@ impl Session {
                     Ok(plan) => plan,
                     Err(e) => break 'work Err(e),
                 };
+                // It asked to see code: ironquill reads it, then it revises.
+                if !looks_like_a_plan(&plan) && !excerpt_requests(&plan).is_empty() {
+                    let excerpts = read_excerpts(ctx, &plan);
+                    planning.push(Message::user(format!(
+                        "The code you asked for, as it is now:\n{excerpts}\n\nNow revise the \
+                         plan.{}",
+                        spent_so_far(ctx)
+                    )));
+                    plan = match ask_planner(ctx, planner, pair.planner_effort, &mut planning).await
+                    {
+                        Ok(plan) => plan,
+                        Err(e) => break 'work Err(e),
+                    };
+                }
                 ctx.effort = Some(pair.coder_effort);
                 (ctx.observe)(Event::Step {
                     number: 4,
@@ -972,6 +992,13 @@ fn within_budget<M, D, O>(
         }
         _ => Ok(()),
     }
+}
+
+/// Whether a planner's reply is a plan rather than only a list of code to
+/// see: most of its lines are something else than `path:start-end`.
+fn looks_like_a_plan(reply: &str) -> bool {
+    let lines = reply.lines().filter(|l| !l.trim().is_empty()).count();
+    lines > excerpt_requests(reply).len() * 2 + 1
 }
 
 /// The excerpts a planner asked for, as `path:start-end` lines.
@@ -1794,6 +1821,11 @@ mod tests {
         assert_eq!(seen[2].messages.len(), 4);
         assert!(!format!("{:?}", seen[2].messages).contains("an earlier"));
         assert!(seen[2].tools.iter().any(|t| t.name == "write_file"));
+        // It gets the code the planner read, so as not to read it again.
+        assert!(matches!(
+            &seen[2].messages[1],
+            Message::User(t) if t.starts_with("make done") && t.contains("def f():")
+        ));
         // Who works is announced at each step.
         let steps: Vec<(u8, Option<&str>)> = events
             .iter()
@@ -1828,6 +1860,47 @@ mod tests {
             excerpt_requests("Here:\n- `a.py:3-9`\n* b/c.rs:10-12\nnone\nd.py:9-3"),
             [("a.py".to_owned(), 3, 9), ("b/c.rs".to_owned(), 10, 12)]
         );
+    }
+
+    #[tokio::test]
+    async fn the_planner_may_look_at_code_before_revising() {
+        let (dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("none"),
+            says("Create notes.txt."),
+            calls("write_file", json!({"path": "notes.txt", "content": "a"})),
+            says("Done."),
+            calls("write_file", json!({"path": "notes.txt", "content": "b"})),
+            says("Done again."),
+            // Asked to revise, it wants to see what was written first.
+            says("notes.txt:1-1"),
+            says("1. Wrong file: create done.txt containing ok instead."),
+            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
+            says("Created done.txt."),
+        ]);
+        let outcome = Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "make done",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
+        assert!(dir.path().join("done.txt").exists());
+        let seen = model.seen.lock().unwrap();
+        // ironquill read what it asked for, then it revised.
+        assert_eq!(seen[7].model.as_str(), "strong");
+        assert!(matches!(
+            seen[7].messages.last(),
+            Some(Message::User(t)) if t.contains("(lines 1 to 1 of 1)") && t.contains("Now revise")
+        ));
+        assert_eq!(seen[8].model.as_str(), "cheap");
     }
 
     #[tokio::test]

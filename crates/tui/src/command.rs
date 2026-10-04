@@ -230,7 +230,8 @@ pub(crate) const HELP: &str = "\
 Type a question or a change and press Enter. Changes are checked before they are kept.
 /model               pick the model that answers (Ctrl-E); /model <id> sets it.
                      In the list, type to search every model of the provider,
-                     Space puts the selected one in the team or takes it out:
+                     Space puts the selected one in the team or takes it out,
+                     Delete takes it off the list:
                      the model that answers may hand tasks to the team
 /budget <dollars>    the most one request may cost (none: no limit); past it the
                      work stops and the model says where it is and asks what next
