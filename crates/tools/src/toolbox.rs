@@ -63,6 +63,9 @@ pub struct ToolOutput {
 pub struct Toolbox {
     workspace: Workspace,
     changed: BTreeSet<String>,
+    /// Edits made so far, by these tools or by an agent: whether anything
+    /// was done since a given moment.
+    edits: u64,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +111,7 @@ impl Toolbox {
         Self {
             workspace,
             changed: BTreeSet::new(),
+            edits: 0,
         }
     }
 
@@ -348,6 +352,7 @@ impl Toolbox {
         for_model: &str,
     ) -> ToolOutput {
         self.changed.insert(path.clone());
+        self.edits += 1;
         ToolOutput {
             for_model: for_model.into(),
             summary: ToolSummary::Changed {
@@ -363,6 +368,13 @@ impl Toolbox {
     /// count it.
     pub fn mark_changed(&mut self, path: impl Into<String>) {
         self.changed.insert(path.into());
+        self.edits += 1;
+    }
+
+    /// How many edits were made so far: compared with an earlier count, it
+    /// says whether anything changed since.
+    pub fn edits(&self) -> u64 {
+        self.edits
     }
 
     /// Forgets which files were changed, so that the next calls are counted
@@ -437,6 +449,10 @@ mod tests {
 
         assert_eq!(read, "fn b() {}");
         assert_eq!(tools.changed().collect::<Vec<_>>(), ["src/a.rs"]);
+        // Each edit counts, even to a file already changed.
+        assert_eq!(tools.edits(), 2);
+        tools.mark_changed("src/a.rs");
+        assert_eq!(tools.edits(), 3);
         assert_eq!(
             tools
                 .call(&call("list_dir", json!({"path": "."})))

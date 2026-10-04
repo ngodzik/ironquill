@@ -17,6 +17,8 @@ const EXCERPT_LINES: usize = 60;
 pub struct Check {
     program: String,
     args: Vec<String>,
+    /// Where it runs, relative to the project: empty for the project itself.
+    dir: String,
 }
 
 /// A check that did not pass, with the part of its output worth reading.
@@ -49,7 +51,27 @@ impl Check {
         Some(Self {
             program,
             args: words.collect(),
+            dir: String::new(),
         })
+    }
+
+    /// A check that runs `program` with `args`, which may hold spaces.
+    pub(crate) fn new(program: String, args: Vec<String>) -> Self {
+        Self {
+            program,
+            args,
+            dir: String::new(),
+        }
+    }
+
+    /// The same check, run in `dir`, a directory of the project such as the
+    /// `backend` of a repository that holds more than one.
+    #[must_use]
+    pub fn in_dir(self, dir: impl Into<String>) -> Self {
+        Self {
+            dir: dir.into(),
+            ..self
+        }
     }
 
     /// The program the check runs.
@@ -57,12 +79,18 @@ impl Check {
         &self.program
     }
 
-    /// The command line, for display.
+    /// The command line, for display, with the directory it runs in when
+    /// that is not the project's.
     pub fn command(&self) -> String {
-        std::iter::once(self.program.as_str())
+        let line = std::iter::once(self.program.as_str())
             .chain(self.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" ");
+        if self.dir.is_empty() {
+            line
+        } else {
+            format!("{line} (in {}/)", self.dir)
+        }
     }
 
     /// Runs every check in `checks`, in order, in `dir`, stopping at the first
@@ -84,7 +112,7 @@ impl Check {
     async fn run(&self, dir: &Path) -> Result<Option<CheckFailure>, ToolError> {
         let output = Command::new(&self.program)
             .args(&self.args)
-            .current_dir(dir)
+            .current_dir(dir.join(&self.dir))
             .output()
             .await
             .map_err(|source| ToolError::Spawn {
@@ -192,6 +220,18 @@ mod tests {
         assert!(out.starts_with("error[E0425]"));
         assert!(!out.contains("Compiling"));
         assert!(out.ends_with("[41 more lines cut]"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_may_run_in_a_directory_of_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("backend")).unwrap();
+        std::fs::write(dir.path().join("backend/here"), "").unwrap();
+        let check = Check::parse("test -f here").unwrap().in_dir("backend");
+        assert_eq!(check.command(), "test -f here (in backend/)");
+        let report = Check::run_all(&[check], dir.path()).await.unwrap();
+        assert_eq!(report, CheckReport::Passed);
     }
 
     #[cfg(unix)]

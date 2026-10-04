@@ -96,7 +96,12 @@ impl Codex {
         }
         command
             .arg("--json")
-            .args(["-c", "sandbox_mode=\"workspace-write\""])
+            .arg("-c")
+            .arg(if request.read_only {
+                "sandbox_mode=\"read-only\""
+            } else {
+                "sandbox_mode=\"workspace-write\""
+            })
             .args(["-c", "sandbox_workspace_write.network_access=false"])
             .args(["-c", "approval_policy=\"never\""])
             // No MCP server: the person's own connectors (mail, calendars)
@@ -616,6 +621,7 @@ mod tests {
             instructions: "be \"brief\"".into(),
             resume: Some("s1".into()),
             directory: PathBuf::from("/tmp"),
+            read_only: false,
         };
         let command = Codex::new("codex").command(&request);
         let args: Vec<String> = command
@@ -637,6 +643,20 @@ mod tests {
         }
         let model = args.iter().position(|a| a == "-m").unwrap();
         assert_eq!(args[model + 1], "gpt-5.5");
+
+        // Planning or reviewing, it may only read.
+        let read_only = DelegateRequest {
+            read_only: true,
+            ..request
+        };
+        let args: Vec<String> = Codex::new("codex")
+            .command(&read_only)
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|a| a == "sandbox_mode=\"read-only\""));
+        assert!(!args.iter().any(|a| a == "sandbox_mode=\"workspace-write\""));
     }
 
     #[test]
