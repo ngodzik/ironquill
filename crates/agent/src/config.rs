@@ -1,4 +1,4 @@
-use ironquill_core::{ModelId, Usd};
+use ironquill_core::{Effort, ModelId, Usd};
 use ironquill_tools::Check;
 
 use crate::error::AgentError;
@@ -13,6 +13,7 @@ pub struct AgentConfig {
     pub(crate) team: Vec<Member>,
     pub(crate) budget: Option<Usd>,
     pub(crate) compact_at: u64,
+    pub(crate) effort: Option<Effort>,
 }
 
 /// A model the first one may hand a task to, with what it should know to
@@ -69,6 +70,7 @@ impl AgentConfig {
             team: Vec::new(),
             budget: None,
             compact_at: COMPACT_AT,
+            effort: Some(Effort::High),
         }
     }
 }
@@ -87,6 +89,7 @@ pub struct AgentConfigBuilder {
     team: Vec<Member>,
     budget: Option<Usd>,
     compact_at: u64,
+    effort: Option<Effort>,
 }
 
 impl AgentConfigBuilder {
@@ -141,6 +144,13 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// How hard models and agents should think. Defaults to
+    /// [`Effort::High`]; `None` leaves it to each provider.
+    pub fn effort(mut self, effort: Option<Effort>) -> Self {
+        self.effort = effort;
+        self
+    }
+
     /// Validates and builds.
     ///
     /// # Errors
@@ -165,6 +175,7 @@ impl AgentConfigBuilder {
             team: self.team,
             budget: self.budget,
             compact_at: self.compact_at,
+            effort: self.effort,
         })
     }
 }

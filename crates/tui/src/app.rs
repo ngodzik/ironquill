@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ironquill_agent::{AgentConfig, Event, Member, Outcome, Session, Verdict};
-use ironquill_core::{Agent, ContextUse, ModelId, TokenCount, Usage, Usd};
+use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -73,6 +73,8 @@ pub struct Settings {
     pub catalog: Vec<Member>,
     /// Where scores in the notes come from, to credit it.
     pub credits: Option<String>,
+    /// How hard models think before answering.
+    pub effort: Effort,
 }
 
 /// Tokens and cost of one part of a request.
@@ -1176,6 +1178,7 @@ impl App {
         if let Some(budget) = self.settings.budget {
             builder = builder.budget(budget);
         }
+        builder = builder.effort(Some(self.settings.effort));
         match builder.build() {
             Ok(config) => {
                 self.input.take();
@@ -1381,6 +1384,17 @@ impl App {
                 }
             }
             Command::Defaults => return Some(Effect::SaveDefaults(self.defaults())),
+            Command::Effort(None) => {
+                let next = match self.settings.effort {
+                    Effort::Max => Effort::Low,
+                    effort => effort.step(1),
+                };
+                self.set_effort(next);
+            }
+            Command::Effort(Some(level)) => match level.parse() {
+                Ok(effort) => self.set_effort(effort),
+                Err(e) => self.error(e),
+            },
             Command::Copy => self.open_transcript(),
             Command::Team => {
                 let text = self.describe_team();
@@ -1600,6 +1614,26 @@ impl App {
         self.settings.credits.as_deref()
     }
 
+    /// How hard models think before answering.
+    pub(crate) fn effort(&self) -> Effort {
+        self.settings.effort
+    }
+
+    /// Sets the effort and says so.
+    fn set_effort(&mut self, effort: Effort) {
+        self.settings.effort = effort;
+        self.info(format!(
+            "Effort: {effort}. Models that reason think {} before answering",
+            match effort {
+                Effort::Low => "briefly",
+                Effort::Medium => "a while",
+                Effort::High => "carefully",
+                Effort::Xhigh => "longer",
+                Effort::Max => "as long as they can",
+            }
+        ));
+    }
+
     /// The most one request may cost.
     pub(crate) fn budget(&self) -> Option<Usd> {
         self.settings.budget
@@ -1738,6 +1772,9 @@ impl App {
                     self.toggle_team(row.model.clone());
                 }
             }
+            // The effort, shown at the top of the list, beside the search.
+            KeyCode::Left => self.settings.effort = self.settings.effort.step(-1),
+            KeyCode::Right => self.settings.effort = self.settings.effort.step(1),
             KeyCode::Esc => self.model_picker = None,
             // Ctrl-E again closes it, as the shortcut that opened it.
             KeyCode::Char('e') if ctrl => self.model_picker = None,
@@ -1836,6 +1873,7 @@ impl App {
                 .collect(),
             team: ids(&self.settings.team),
             budget: self.settings.budget.map(|b| b.0),
+            effort: Some(self.settings.effort.to_string()),
         }
     }
 
@@ -2712,6 +2750,7 @@ mod tests {
                 models: vec!["cheap".into(), "anthropic/claude-sonnet".into()],
                 team: vec!["anthropic/claude-sonnet".into()],
                 budget: Some(0.25),
+                effort: Some("high".into()),
             }
         );
     }
@@ -2822,6 +2861,35 @@ mod tests {
         assert!(app.sub_agent().is_none());
         app.on_key(ctrl_t);
         assert!(app.sub_agent().is_some());
+    }
+
+    #[test]
+    fn the_effort_is_high_and_easy_to_change() {
+        let mut app = ready();
+        assert_eq!(app.effort(), Effort::High);
+
+        // Alone, /effort goes to the next level, and round.
+        type_text(&mut app, "/effort");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.effort(), Effort::Xhigh);
+        type_text(&mut app, "/effort low");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.effort(), Effort::Low);
+        type_text(&mut app, "/effort extreme");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.effort(), Effort::Low);
+
+        // Left and right in the model picker.
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.effort(), Effort::High);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.effort(), Effort::Medium);
+        press(&mut app, KeyCode::Esc);
+
+        // Kept with the other choices.
+        assert_eq!(app.defaults().effort.as_deref(), Some("medium"));
     }
 
     #[test]

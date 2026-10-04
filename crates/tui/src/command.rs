@@ -1,6 +1,6 @@
 //! The `:` commands.
 
-use ironquill_core::Agent;
+use ironquill_core::{Agent, Effort};
 
 /// A parsed `:` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +38,9 @@ pub(crate) enum Command {
     Defaults,
     /// `/team` says who answers and who it may hand tasks to.
     Team,
+    /// `/effort <level>` sets how hard models think; `/effort` alone goes
+    /// to the next level.
+    Effort(Option<String>),
     /// `/copy` opens the conversation as text, to select and copy from.
     Copy,
     /// `/claude-reset` ends Claude Code's session, `/codex-reset` Codex's.
@@ -83,6 +86,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "budget" => Ok(Command::Budget(rest_opt)),
         "defaults" => Ok(Command::Defaults),
         "team" => Ok(Command::Team),
+        "effort" => Ok(Command::Effort(rest_opt)),
         "copy" | "chat" => Ok(Command::Copy),
         "context" | "ctx" => Ok(Command::Context),
         "claude-reset" => Ok(Command::Reset(Agent::ClaudeCode)),
@@ -109,6 +113,7 @@ pub(crate) const NAMES: &[&str] = &[
     "cost",
     "defaults",
     "diff",
+    "effort",
     "escalate",
     "help",
     "keys",
@@ -203,6 +208,11 @@ pub(crate) fn candidates(line: &str, names: &[&str], models: &[String]) -> Vec<S
                 .map(|m| format!("{command}{m}"))
                 .collect()
         }
+        Some(("effort", arg)) => Effort::ALL
+            .iter()
+            .filter(|e| e.as_str().starts_with(arg))
+            .map(|e| format!("effort {e}"))
+            .collect(),
         Some(_) => Vec::new(),
     }
 }
@@ -216,6 +226,8 @@ Type a question or a change and press Enter. Changes are checked before they are
 /budget <dollars>    the most one request may cost (none: no limit); past it the
                      work stops and the model says where it is and asks what next
 /team                who answers and who it may hand tasks to
+/effort <level>      how hard models think: low, medium, high (the default),
+                     xhigh, max; /effort alone goes to the next. ← → in Ctrl-E too
 /defaults            keep the current model, list, team and budget for new
                      sessions; done by itself whenever they change
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation
@@ -272,6 +284,12 @@ mod tests {
             parse("name fix the parser"),
             Ok(Command::Name(Some("fix the parser".into())))
         );
+    }
+
+    #[test]
+    fn effort_levels_complete() {
+        assert_eq!(candidates("effort h", NAMES, &[]), ["effort high"]);
+        assert_eq!(candidates("effort ", NAMES, &[]).len(), 5);
     }
 
     #[test]

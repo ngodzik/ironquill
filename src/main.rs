@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use ironquill_agent::{AgentConfig, Event, Member, Outcome, Verdict};
-use ironquill_core::{ChatModel, ChatRequest, Message, ModelId, Usd};
+use ironquill_core::{ChatModel, ChatRequest, Effort, Message, ModelId, Usd};
 use ironquill_llm::{
     Agents, ArtificialAnalysis, ClaudeCode, Codex, Listed, OpenAiCompatible, RANKINGS_SOURCE,
     Ranking, find_ranking,
@@ -59,6 +59,11 @@ struct Cli {
     /// Checks for the interface. Defaults as for `do`.
     #[arg(long = "check", value_name = "COMMAND")]
     checks: Vec<String>,
+
+    /// How hard models think before answering: low, medium, high, xhigh
+    /// or max. Defaults to the one kept for new sessions, or high.
+    #[arg(long, env = "IRONQUILL_EFFORT", global = true)]
+    effort: Option<Effort>,
 
     /// The most one request may cost, in dollars. Past it the work stops
     /// and the model says where it is. Defaults to the one kept with
@@ -144,6 +149,7 @@ async fn main() -> Result<()> {
             offered: cli.models,
             checks: cli.checks,
             budget: cli.budget,
+            effort: cli.effort,
         };
         return interface(provider, choices, start).await;
     };
@@ -154,7 +160,9 @@ async fn main() -> Result<()> {
         .init();
 
     match command {
-        Command::Ask { prompt, model } => ask(&provider, &prompt, &model).await,
+        Command::Ask { prompt, model } => {
+            ask(&provider, &prompt, &model, cli.effort.unwrap_or_default()).await
+        }
         Command::Do {
             task,
             model,
@@ -173,6 +181,7 @@ async fn main() -> Result<()> {
             for check in checks_or_default(checks)? {
                 builder = builder.check(check);
             }
+            builder = builder.effort(Some(cli.effort.unwrap_or_default()));
             run_task(&provider, &builder.build()?, &task).await
         }
     }
@@ -186,6 +195,7 @@ struct Choices {
     offered: Vec<String>,
     checks: Vec<String>,
     budget: Option<f64>,
+    effort: Option<Effort>,
 }
 
 async fn interface(
@@ -274,6 +284,11 @@ async fn interface(
         models,
         team,
         budget: (budget > 0.0).then_some(Usd(budget)),
+        effort: match (choices.effort, defaults.effort.as_deref()) {
+            (Some(effort), _) => effort,
+            (None, Some(kept)) => kept.parse().map_err(anyhow::Error::msg)?,
+            (None, None) => Effort::default(),
+        },
         catalog,
         credits: (!rankings.is_empty()).then(|| RANKINGS_SOURCE.to_owned()),
     };
@@ -456,12 +471,13 @@ fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {
         .collect()
 }
 
-async fn ask(provider: &OpenAiCompatible, prompt: &str, model: &str) -> Result<()> {
+async fn ask(provider: &OpenAiCompatible, prompt: &str, model: &str, effort: Effort) -> Result<()> {
     let model = ModelId::new(model)?;
     let request = ChatRequest {
         model: model.clone(),
         messages: vec![Message::user(prompt)],
         tools: Vec::new(),
+        effort: Some(effort),
     };
 
     // The price list is fetched alongside the answer rather than before it, so

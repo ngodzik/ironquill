@@ -367,6 +367,7 @@ impl Session {
             model: model.clone(),
             messages: self.messages.clone(),
             tools: Vec::new(),
+            effort: ctx.config.effort,
         };
         // Saying where things stand may go a little past the budget, not far:
         // a conversation too long for that gets ironquill's own words.
@@ -634,6 +635,7 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
         }
         let request = DelegateRequest {
             agent,
+            effort: ctx.config.effort,
             model: model.to_owned(),
             prompt: prompt.clone(),
             instructions: match agent {
@@ -881,6 +883,7 @@ async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     let report = if let Some((agent, model)) = to.delegate() {
         let request = DelegateRequest {
             agent,
+            effort: ctx.config.effort,
             model: model.to_owned(),
             prompt: args.task,
             instructions: match agent {
@@ -943,6 +946,7 @@ async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
             Message::user(task),
         ],
         tools: Vec::new(),
+        effort: ctx.config.effort,
     };
     let pricing = ctx.model.pricing(model).await;
     within_budget(ctx, pricing, &request)?;
@@ -1044,6 +1048,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             model: model_id.clone(),
             messages: sent,
             tools: tools.clone(),
+            effort: ctx.config.effort,
         };
         within_budget(ctx, pricing, &request)?;
         let response = ctx

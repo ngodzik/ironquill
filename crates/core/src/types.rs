@@ -321,6 +321,79 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     /// The tools the model may call. Empty means none.
     pub tools: Vec<ToolSpec>,
+    /// How hard the model should think, for models that reason; `None`
+    /// leaves it to the provider.
+    pub effort: Option<Effort>,
+}
+
+/// How much a model reasons before it answers. The same five levels are
+/// understood by Requesty, Claude Code and Codex.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    /// Quick answers.
+    Low,
+    /// Between the two.
+    Medium,
+    /// Careful work, the default.
+    #[default]
+    High,
+    /// More than high, on the models that have it.
+    Xhigh,
+    /// As much as the model can.
+    Max,
+}
+
+impl Effort {
+    /// Every level, from the least to the most.
+    pub const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+
+    /// The level as the providers spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// The level `steps` away, staying within the levels.
+    ///
+    /// ```
+    /// use ironquill_core::Effort;
+    ///
+    /// assert_eq!(Effort::High.step(1), Effort::Xhigh);
+    /// assert_eq!(Effort::Low.step(-1), Effort::Low);
+    /// ```
+    pub fn step(self, steps: i32) -> Self {
+        let at = Self::ALL.iter().position(|e| *e == self).unwrap_or(0) as i32;
+        let last = Self::ALL.len() as i32 - 1;
+        Self::ALL[(at + steps).clamp(0, last) as usize]
+    }
+}
+
+impl fmt::Display for Effort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Effort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|e| e.as_str() == s.trim().to_ascii_lowercase())
+            .ok_or_else(|| {
+                let levels: Vec<&str> = Self::ALL.iter().map(|e| e.as_str()).collect();
+                format!("an effort is one of {}, got {s:?}", levels.join(", "))
+            })
+    }
 }
 
 /// How full a model's context was on a request.
@@ -362,6 +435,8 @@ impl fmt::Display for ContextUse {
 pub struct DelegateRequest {
     /// The agent to hand the task to.
     pub agent: Agent,
+    /// How hard it should think; `None` leaves it to the agent.
+    pub effort: Option<Effort>,
     /// The model the agent should use; empty for its own default.
     pub model: String,
     /// What to do.

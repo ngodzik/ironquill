@@ -99,6 +99,13 @@ impl ChatModel for OpenAiCompatible {
     async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
         let mut payload = wire_request(request);
+        // Only to models the list does not say cannot reason: a provider may
+        // refuse the field from one that cannot.
+        if let Some(effort) = request.effort
+            && self.known(&request.model).await.and_then(|k| k.reasoning) != Some(false)
+        {
+            payload["reasoning_effort"] = json!(effort.as_str());
+        }
         if self.is_requesty() {
             // Requesty marks what can be cached for providers that need it
             // and bills cache hits at a fraction of the price; it does so by
@@ -132,6 +139,7 @@ impl ChatModel for OpenAiCompatible {
 struct Known {
     window: Option<u64>,
     pricing: Option<Pricing>,
+    reasoning: Option<bool>,
 }
 
 impl OpenAiCompatible {
@@ -215,6 +223,7 @@ fn parse_known(body: &str) -> HashMap<String, Known> {
                     let known = Known {
                         window: m.context_window,
                         pricing,
+                        reasoning: m.supports_reasoning,
                     };
                     (m.id, known)
                 })
@@ -483,6 +492,7 @@ mod tests {
                 description: "d".into(),
                 parameters: json!({"type": "object"}),
             }],
+            effort: None,
         };
         let body = wire_request(&request);
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");

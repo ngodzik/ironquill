@@ -126,10 +126,16 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
 
     let room = usize::from(inner.width);
     let current = app.current_model();
+    // The effort sits at the right of the search line, ← → changing it.
+    let effort = format!("effort ← {} →", app.effort());
+    let typed = picker.filter.chars().count() + 8;
+    let gap = room.saturating_sub(typed + effort.chars().count());
     let mut lines = vec![Line::from(vec![
         Span::styled("search ", fg(DIM)),
         Span::raw(picker.filter.clone()),
         Span::styled("▏", fg(ACCENT)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(effort, fg(Color::Gray)),
     ])];
     let credits = app
         .credits()
@@ -1386,11 +1392,13 @@ fn team_title(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The budget, for the status line.
+/// The effort and the budget, for the status line.
 fn team_and_budget(app: &App) -> String {
-    app.budget()
+    let budget = app
+        .budget()
         .map(|b| format!(" · budget {b}"))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    format!(" · effort {}{budget}", app.effort())
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
