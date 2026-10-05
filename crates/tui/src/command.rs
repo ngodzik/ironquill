@@ -38,8 +38,8 @@ pub(crate) enum Command {
     Defaults,
     /// `/team` says who answers and who it may hand tasks to.
     Team,
-    /// `/effort <level>` sets how hard models think; `/effort` alone goes
-    /// to the next level.
+    /// `/effort <level>` sets how hard models think; `/effort` alone shows
+    /// it.
     Effort(Option<String>),
     /// `/pair <question>`: the best of the model that answers and its team
     /// plans, the cheapest codes.
@@ -249,7 +249,7 @@ Type a question or a change and press Enter. Changes are checked before they are
 /planner <model>     the model that plans in a pair; by default the best scored,
                      or the dearest
 /effort <level>      how hard models think: low, medium, high (the default),
-                     xhigh, max; /effort alone goes to the next. ← → in Ctrl-E too
+                     xhigh, max; /effort alone shows it. ← → in Ctrl-E too
 /defaults            keep the current model, list, team and budget for new
                      sessions; done by itself whenever they change
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation

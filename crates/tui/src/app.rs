@@ -125,6 +125,8 @@ pub(crate) struct ModelPicker {
     /// What was typed to search the provider's models.
     pub(crate) filter: String,
     pub(crate) selected: usize,
+    /// The effort when it opened, to say so when ← → changed it.
+    pub(crate) effort_at_open: Effort,
 }
 
 /// One row of the model picker.
@@ -1508,13 +1510,10 @@ impl App {
                 }
             }
             Command::Defaults => return Some(Effect::SaveDefaults(self.defaults())),
-            Command::Effort(None) => {
-                let next = match self.settings.effort {
-                    Effort::Max => Effort::Low,
-                    effort => effort.step(1),
-                };
-                self.set_effort(next);
-            }
+            Command::Effort(None) => self.info(format!(
+                "Effort: {}. /effort <level> changes it: low, medium, high, xhigh, max",
+                self.settings.effort
+            )),
             Command::Effort(Some(level)) => match level.parse() {
                 Ok(effort) => self.set_effort(effort),
                 Err(e) => self.error(e),
@@ -1532,14 +1531,18 @@ impl App {
                         return None;
                     }
                 };
-                let planner_effort = self.settings.effort.max(Effort::High);
+                // High at most for the planner: past it, a step can think for
+                // minutes for little more. A coder thinking less rereads
+                // everything and stops before writing.
+                let planner_effort = self.settings.effort.min(Effort::High);
+                let coder_effort = Effort::High;
                 self.info(format!(
-                    "Pair: {planner} picks the code to read and plans (effort {planner_effort}), ironquill reads it, {coder} codes (effort low), without the earlier conversation"
+                    "Pair: {planner} picks the code to read and plans (effort {planner_effort}), ironquill reads it, {coder} codes (effort {coder_effort}), without the earlier conversation"
                 ));
                 let pair = Pair {
                     planner,
                     planner_effort,
-                    coder_effort: Effort::Low,
+                    coder_effort,
                 };
                 return self.submit_with(text, vec![coder], Some(pair));
             }
@@ -2030,7 +2033,18 @@ impl App {
         self.model_picker = Some(ModelPicker {
             filter: String::new(),
             selected,
+            effort_at_open: self.settings.effort,
         });
+    }
+
+    /// Closes the model picker, saying the effort when ← → changed it there:
+    /// a higher one costs more on every call after.
+    fn close_model_picker(&mut self) {
+        if let Some(picker) = self.model_picker.take()
+            && picker.effort_at_open != self.settings.effort
+        {
+            self.set_effort(self.settings.effort);
+        }
     }
 
     /// Keys while the model picker is open. Returns whether the key was for it.
@@ -2054,7 +2068,7 @@ impl App {
             KeyCode::Up => set(self, selected.saturating_sub(1)),
             KeyCode::Down => set(self, (selected + 1).min(last)),
             KeyCode::Enter => {
-                self.model_picker = None;
+                self.close_model_picker();
                 if let Some(row) = rows.get(selected) {
                     let model = row.model.clone();
                     self.use_model(model.clone());
@@ -2096,9 +2110,9 @@ impl App {
             // The effort, shown at the top of the list, beside the search.
             KeyCode::Left => self.settings.effort = self.settings.effort.step(-1),
             KeyCode::Right => self.settings.effort = self.settings.effort.step(1),
-            KeyCode::Esc => self.model_picker = None,
+            KeyCode::Esc => self.close_model_picker(),
             // Ctrl-E again closes it, as the shortcut that opened it.
-            KeyCode::Char('e') if ctrl => self.model_picker = None,
+            KeyCode::Char('e') if ctrl => self.close_model_picker(),
             KeyCode::Backspace => {
                 if let Some(p) = &mut self.model_picker {
                     p.filter.pop();
@@ -3277,10 +3291,13 @@ mod tests {
         let mut app = ready();
         assert_eq!(app.effort(), Effort::High);
 
-        // Alone, /effort goes to the next level, and round.
+        // Alone, /effort only shows it.
         type_text(&mut app, "/effort");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.effort(), Effort::Xhigh);
+        assert_eq!(app.effort(), Effort::High);
+        assert!(
+            matches!(app.transcript.last(), Some(Entry::Info(t)) if t.starts_with("Effort: high."))
+        );
         type_text(&mut app, "/effort low");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.effort(), Effort::Low);
@@ -3296,6 +3313,10 @@ mod tests {
         press(&mut app, KeyCode::Left);
         assert_eq!(app.effort(), Effort::Medium);
         press(&mut app, KeyCode::Esc);
+        // Closing the picker says what it changed.
+        assert!(
+            matches!(app.transcript.last(), Some(Entry::Info(t)) if t.starts_with("Effort: medium."))
+        );
 
         // Kept with the other choices.
         assert_eq!(app.defaults().effort.as_deref(), Some("medium"));
@@ -3387,7 +3408,7 @@ mod tests {
         assert!(app.transcript.iter().any(|e| matches!(
             e,
             Entry::Info(t) if t.contains("smart picks the code to read and plans (effort high)")
-                && t.contains("cheap codes (effort low)")
+                && t.contains("cheap codes (effort high)")
         )));
         // The model that answers stays the one picked.
         assert_eq!(app.current_model(), Some(&id("smart")));

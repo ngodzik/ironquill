@@ -1984,6 +1984,10 @@ mod tests {
                 std::process::Command::new("git")
                     .args(args)
                     .current_dir(dir.path())
+                    // Run from a git hook, these would point at the outer repository.
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_INDEX_FILE")
+                    .env_remove("GIT_WORK_TREE")
                     .output()
                     .unwrap()
                     .status

@@ -1,4 +1,4 @@
-use ironquill_core::TokenCount;
+use ironquill_core::{Effort, TokenCount};
 use ironquill_tools::{Container, DiffLine, LineMark, ToolSummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -135,7 +135,15 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
         Span::raw(picker.filter.clone()),
         Span::styled("▏", fg(ACCENT)),
         Span::raw(" ".repeat(gap)),
-        Span::styled(effort, fg(Color::Gray)),
+        // Past high, every call costs more and takes longer: plain to see.
+        Span::styled(
+            effort,
+            if app.effort() > Effort::High {
+                fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                fg(Color::Gray)
+            },
+        ),
     ])];
     let credits = app
         .credits()
