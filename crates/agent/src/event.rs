@@ -132,6 +132,18 @@ pub enum Event {
         /// That line.
         text: String,
     },
+    /// The provider's cache had expired: the conversation goes on from its
+    /// summary, with the latest exchanges as they were.
+    Restarted {
+        /// The model the conversation is sent to.
+        model: ModelId,
+        /// How long it was left unused.
+        idle_secs: u64,
+        /// About how many tokens it held before.
+        before: TokenCount,
+        /// And after.
+        after: TokenCount,
+    },
     /// Old tool results were dropped from the conversation to resend less.
     Compacted {
         /// Results dropped.

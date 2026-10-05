@@ -680,6 +680,14 @@ fn show(event: Event) {
             eprintln!("· before any change, `{command}` {first}");
         }
         Event::PairEnded { text } => eprintln!("■ {text}"),
+        Event::Restarted {
+            model,
+            before,
+            after,
+            ..
+        } => eprintln!(
+            "⇣ {model}'s cache expired: restarted from the summary, {before} → {after} tokens"
+        ),
         Event::Notice { model, text } => eprintln!("· {model}: {text}"),
         Event::Denied {
             model,

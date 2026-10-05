@@ -2695,6 +2695,17 @@ impl App {
                 ))
             }
             Event::PairEnded { text } => Entry::Ended(text),
+            Event::Restarted {
+                model,
+                idle_secs,
+                before,
+                after,
+            } => Entry::Info(format!(
+                "{model}'s prompt cache had expired ({} unused): the conversation goes on from \
+                 its summary and the latest exchanges, about {before} → {after} tokens. /context \
+                 shows it",
+                sessions::ago(0, idle_secs).trim_end_matches(" ago")
+            )),
             Event::Notice { model, text } => Entry::Info(format!("{model}: {text}")),
             Event::Denied {
                 model,

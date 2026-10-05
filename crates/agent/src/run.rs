@@ -102,6 +102,24 @@ const SUMMARY_PROMPT: &str = "You keep the summary of a conversation between a p
      person wants and decided, what was done and which files changed, what failed or is left \
      to do, and what was learned about the project. Leave out greetings and the details of \
      tool calls. At most 400 words. Reply with the summary only.";
+/// Tokens of history past which a conversation whose cache expired starts
+/// again from its summary.
+const RESTART_TOKENS: u64 = 20_000;
+
+/// The requests kept as they were, with what followed, when a conversation
+/// starts again from its summary.
+const KEEP_EXCHANGES: usize = 2;
+
+/// How long a provider keeps a prompt cache unused, as measured: Sference
+/// for half an hour at least, most for five minutes, some not at all.
+fn cache_lifetime(model: &ModelId) -> u64 {
+    let lasting = model
+        .as_str()
+        .split('/')
+        .any(|part| part.eq_ignore_ascii_case("sference"));
+    if lasting { 30 * 60 } else { THREAD_WARM_SECS }
+}
+
 /// At most this much of the first request is kept when the conversation is
 /// cut and has no summary.
 const FIRST_REQUEST_BYTES: usize = 4_000;
@@ -315,6 +333,9 @@ pub struct Session {
     /// shows as they work.
     #[serde(default)]
     windows: BTreeMap<String, u64>,
+    /// When the conversation was last sent, in seconds since 1970.
+    #[serde(default)]
+    last_used: u64,
 }
 
 /// A summary of the conversation and how far it goes.
@@ -359,6 +380,7 @@ impl Session {
             planners: BTreeMap::new(),
             summary: None,
             windows: BTreeMap::new(),
+            last_used: 0,
         }
     }
 
@@ -405,6 +427,7 @@ impl Session {
             failing_before: Vec::new(),
             windows: std::mem::take(&mut self.windows),
         };
+        self.restart_if_cold(&mut ctx).await;
         let verdict = match self.work(&mut ctx, text, context).await {
             Err(AgentError::OverBudget) => {
                 let budget = config.budget.unwrap_or_default();
@@ -424,6 +447,7 @@ impl Session {
             self.summarize(&mut ctx).await;
         }
         self.windows = std::mem::take(&mut ctx.windows);
+        self.last_used = now_secs();
         Ok(ctx.ledger.outcome(verdict, ctx.toolbox))
     }
 
@@ -443,8 +467,10 @@ impl Session {
                 .iter()
                 .chain(config.team.iter().map(|m| &m.model))
         };
-        // Only an agent or a pair's planner ever starts afresh from it.
-        if config.pair.is_none() && !models().any(|m| m.delegate().is_some()) {
+        // Only an agent or a pair's planner starts afresh from it, or the
+        // conversation itself once long enough to start again from it.
+        let long = crate::context::approx_tokens(&self.messages) >= RESTART_TOKENS / 2;
+        if config.pair.is_none() && !long && !models().any(|m| m.delegate().is_some()) {
             return;
         }
         if self.unsummarized(self.messages.len()).len() >= SUMMARY_AFTER_BYTES {
@@ -540,6 +566,86 @@ impl Session {
         }
         self.summary = Some(Summary { text, covers: to });
         true
+    }
+
+    /// Starts the conversation again from its summary when the provider's
+    /// prompt cache has expired since it was last sent: the whole history
+    /// would be written to the cache again, at its dearest rate. Only for a
+    /// provider's model answering in the conversation, a long history, and
+    /// a fifth saved at least; the latest exchanges are kept as they were.
+    async fn restart_if_cold<M: ChatModel, D, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+    ) {
+        let Some(first) = ctx.config.tiers.first() else {
+            return;
+        };
+        if ctx.config.pair.is_some() || first.delegate().is_some() || self.last_used == 0 {
+            return;
+        }
+        let idle = now_secs().saturating_sub(self.last_used);
+        let before = crate::context::approx_tokens(&self.messages);
+        if idle <= cache_lifetime(first) || before < RESTART_TOKENS {
+            return;
+        }
+        // The latest exchanges stay as they were, from a request on.
+        let request = self.messages.len() - 1;
+        let requests: Vec<usize> = (1..request)
+            .filter(|i| matches!(self.messages[*i], Message::User(_)))
+            .collect();
+        let Some(&cut) = requests.iter().rev().nth(KEEP_EXCHANGES - 1) else {
+            return;
+        };
+        if cut <= 1 {
+            return;
+        }
+        // A summary that goes past the cut tells some of the latest
+        // exchanges twice, which costs less than writing it again.
+        let covered = self.summary.as_ref().is_some_and(|s| s.covers >= cut);
+        if !covered && !self.update_summary(ctx, cut).await {
+            return;
+        }
+        let Some(summary) = self.summary.clone() else {
+            return;
+        };
+        let mut restarted = vec![
+            self.messages[0].clone(),
+            Message::user(format!(
+                "(The conversation so far, in short; the latest exchanges follow as they \
+                 were.)\n{}",
+                summary.text
+            )),
+            Message::Assistant {
+                content: Some("Noted: I go on from this summary.".into()),
+                tool_calls: Vec::new(),
+            },
+        ];
+        restarted.extend_from_slice(&self.messages[cut..]);
+        let after = crate::context::approx_tokens(&restarted);
+        if after * 5 > before * 4 {
+            return;
+        }
+        // What the agents saw moves with what it became.
+        let kept = restarted.len() - (self.messages.len() - cut);
+        for thread in self.agents.values_mut().chain(self.planners.values_mut()) {
+            thread.seen = if thread.seen >= cut {
+                thread.seen - cut + kept
+            } else {
+                1
+            };
+        }
+        self.messages = restarted;
+        // It covers what it covered, where that now is.
+        self.summary = Some(Summary {
+            text: summary.text,
+            covers: summary.covers.max(cut) - cut + kept,
+        });
+        (ctx.observe)(Event::Restarted {
+            model: first.clone(),
+            idle_secs: idle,
+            before: TokenCount(before),
+            after: TokenCount(after),
+        });
     }
 
     /// What a model starting afresh is told of the conversation before
@@ -4089,8 +4195,6 @@ mod tests {
             .send(model, &claude, &mut toolbox, &alone, &first, "", |_| {})
             .await
             .unwrap();
-        // Nobody would have started from a summary: none was written.
-        assert!(session.summary.is_none());
         session
             .send(
                 model,
@@ -4330,6 +4434,87 @@ mod tests {
             model.seen.lock().unwrap()[1].messages.last(),
             Some(Message::Tool { content, .. }) if content.contains("Nobody is there to approve it")
         ));
+    }
+
+    #[tokio::test]
+    async fn a_conversation_whose_cache_expired_goes_on_from_its_summary() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("First answer."),
+            // Long enough to start again from: a summary is kept.
+            says("Second answer."),
+            says("The person asks about the parser."),
+            says("Third answer."),
+            says("The person asks about the parser, three times."),
+            // After the pause, the answer, from the summary.
+            says("Fourth answer."),
+        ])
+        .priced(1e-6, 4e-6);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let long = "the parser ".repeat(3_000);
+        for i in 1..=3 {
+            let text = format!("question {i}: {long}");
+            session
+                .send(
+                    &model,
+                    &NoDelegate,
+                    &mut toolbox,
+                    &config,
+                    &text,
+                    "",
+                    |_| {},
+                )
+                .await
+                .unwrap();
+        }
+        // An hour later: its cache is gone.
+        session.last_used -= 3_600;
+        let mut events = Vec::new();
+        session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "question 4",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Restarted { idle_secs, before, after, .. }
+                if *idle_secs >= 3_600 && after.0 * 5 <= before.0 * 4
+        )));
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen.len(), 6);
+        // The answer is sent the summary and the latest exchanges.
+        let sent = &seen[5].messages;
+        assert!(matches!(
+            &sent[1],
+            Message::User(t) if t.ends_with("The person asks about the parser, three times.")
+        ));
+        assert!(matches!(&sent[3], Message::User(t) if t.starts_with("question 2")));
+        assert!(matches!(sent.last(), Some(Message::User(t)) if t == "question 4"));
+        assert!(!format!("{sent:?}").contains("question 1"));
+    }
+
+    #[test]
+    fn caches_last_as_long_as_their_provider_keeps_them() {
+        assert_eq!(
+            cache_lifetime(&ModelId::new("sference/glm-5.3-flash").unwrap()),
+            30 * 60
+        );
+        assert_eq!(
+            cache_lifetime(&ModelId::new("lyceum/glm-5.3-flash").unwrap()),
+            5 * 60
+        );
     }
 
     /// Claude Code on an API key, for the cost tests: the calls it reports
