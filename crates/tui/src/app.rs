@@ -1469,12 +1469,15 @@ impl App {
                 self.info(format!("Named: {name}"));
                 return Some(Effect::Save);
             }
-            Command::Resume => {
+            Command::Resume(id) => {
                 if self.is_running() {
                     self.error("Still working on the last message: stop it with Ctrl-C first");
                     return None;
                 }
-                return Some(Effect::ListSessions);
+                return Some(match id {
+                    Some(id) => Effect::Resume(id),
+                    None => Effect::ListSessions,
+                });
             }
             Command::Usage(window) => match window.as_deref() {
                 None => {
@@ -1716,8 +1719,8 @@ impl App {
         self.expanded.clear();
         self.selected_reply = None;
         self.transcript.push(Entry::Info(format!(
-            "Resumed \"{}\": the conversation continues where it stopped",
-            saved.name
+            "Resumed \"{}\" ({}): the conversation continues where it stopped",
+            saved.name, self.session_id
         )));
         self.scroll_back.set(0);
         self.picker = None;

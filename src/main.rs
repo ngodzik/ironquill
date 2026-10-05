@@ -78,9 +78,10 @@ struct Cli {
     #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
     continue_last: bool,
 
-    /// Pick a saved conversation of this project to continue.
-    #[arg(short = 'r', long)]
-    resume: bool,
+    /// Continue a saved conversation of this project: pick it, or give its
+    /// id or the start of it.
+    #[arg(short = 'r', long, num_args = 0..=1, value_name = "ID")]
+    resume: Option<Option<String>>,
 
     /// Without a subcommand, ironquill opens its terminal interface.
     #[command(subcommand)]
@@ -149,8 +150,11 @@ async fn main() -> Result<()> {
         // interface owns it would tear the screen.
         let start = if cli.continue_last {
             ironquill_tui::Start::Continue
-        } else if cli.resume {
-            ironquill_tui::Start::Pick
+        } else if let Some(resume) = cli.resume {
+            match resume {
+                Some(id) => ironquill_tui::Start::Id(id),
+                None => ironquill_tui::Start::Pick,
+            }
         } else {
             ironquill_tui::Start::New
         };

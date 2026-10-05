@@ -47,7 +47,7 @@ pub use app::Settings;
 pub use defaults::Defaults;
 
 /// How the interface starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Start {
     /// A new conversation.
     #[default]
@@ -56,6 +56,8 @@ pub enum Start {
     Continue,
     /// The list of saved conversations, to pick one.
     Pick,
+    /// The conversation with this id, or whose id starts so.
+    Id(String),
 }
 pub use error::TuiError;
 
@@ -127,6 +129,7 @@ where
             None => app.report_error("No saved conversation for this project yet".into()),
         },
         Start::Pick => app.show_picker(store.as_ref().map(Store::list).unwrap_or_default()),
+        Start::Id(id) => resume(&store, &mut app, &conversation, &workspace, &id).await,
     }
     let mut keys = EventStream::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentMessage>();
@@ -356,7 +359,7 @@ async fn resume(
     let Some(store) = store else {
         return;
     };
-    match store.load(id) {
+    match store.find(id).and_then(|id| store.load(&id)) {
         Ok(saved) => {
             *conversation.lock().await = Conversation {
                 session: saved.session.clone(),

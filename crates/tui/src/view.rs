@@ -277,12 +277,14 @@ fn render_picker(frame: &mut Frame, app: &App) {
         .skip(first)
         .take(rows)
         .map(|(i, item)| {
+            // The id, for /resume <id> and ironquill -r <id>.
             let details = format!(
-                "{} · {} request{} · {}",
+                "{} · {} request{} · {} · {}",
                 sessions::ago(item.updated, now),
                 item.requests,
                 if item.requests == 1 { "" } else { "s" },
-                item.cost
+                item.cost,
+                item.id
             );
             let name_room = room.saturating_sub(details.chars().count() + 3);
             let name: String = item.name.chars().take(name_room).collect();

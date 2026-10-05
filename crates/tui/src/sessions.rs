@@ -96,6 +96,30 @@ impl Store {
         found
     }
 
+    /// The id of the conversation whose id is `id` or starts with it.
+    pub(crate) fn find(&self, id: &str) -> Result<String, String> {
+        // An id names a file in this directory: nothing that could leave it.
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!("{id:?} is not a conversation id"));
+        }
+        let found: Vec<String> = self
+            .list()
+            .into_iter()
+            .map(|s| s.id)
+            .filter(|s| s.starts_with(id))
+            .collect();
+        match found.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err(format!(
+                "No saved conversation of this project has the id {id}"
+            )),
+            many => Err(format!(
+                "{} conversations have an id starting with {id}: give more of it",
+                many.len()
+            )),
+        }
+    }
+
     pub(crate) fn load(&self, id: &str) -> Result<Saved, String> {
         let path = self.dir.join(format!("{id}.json"));
         let bytes = fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
@@ -168,6 +192,43 @@ mod tests {
             session: Session::new(),
             usage_log: UsageLog::default(),
         }
+    }
+
+    #[test]
+    fn a_conversation_is_found_by_the_start_of_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().to_owned());
+        for (id, at) in [
+            ("1759600000-0a1b2", 1),
+            ("1759600000-0c3d4", 2),
+            ("1759700000-00001", 3),
+        ] {
+            store.save(&saved(id, "x", at)).unwrap();
+        }
+        assert_eq!(store.find("17597").as_deref(), Ok("1759700000-00001"));
+        assert_eq!(
+            store.find("1759600000-0c").as_deref(),
+            Ok("1759600000-0c3d4")
+        );
+        assert!(
+            store
+                .find("1759600000")
+                .unwrap_err()
+                .starts_with("2 conversations")
+        );
+        assert!(
+            store
+                .find("9")
+                .unwrap_err()
+                .starts_with("No saved conversation")
+        );
+        // Nothing that could name a file elsewhere.
+        assert!(
+            store
+                .find("../secret")
+                .unwrap_err()
+                .ends_with("is not a conversation id")
+        );
     }
 
     #[test]

@@ -23,8 +23,9 @@ pub(crate) enum Command {
     Clear,
     /// `/name <title>` names the conversation; `/name` alone shows the name.
     Name(Option<String>),
-    /// `/resume` lists saved conversations to pick one.
-    Resume,
+    /// `/resume` lists saved conversations to pick one; `/resume <id>`
+    /// continues the one with that id, or whose id starts so.
+    Resume(Option<String>),
     /// `/cost` shows what the conversation has cost so far.
     Cost,
     /// `/usage` shows or hides the usage pane; `/usage 6h` sets its window.
@@ -88,7 +89,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "diff" => Ok(Command::Diff),
         "clear" | "new" => Ok(Command::Clear),
         "name" | "rename" => Ok(Command::Name(rest_opt)),
-        "resume" => Ok(Command::Resume),
+        "resume" => Ok(Command::Resume(rest_opt)),
         "cost" => Ok(Command::Cost),
         "usage" => Ok(Command::Usage(rest_opt)),
         "claude" | "cc" => Ok(Command::Delegate(Agent::ClaudeCode, rest_opt)),
@@ -274,7 +275,8 @@ Type a question or a change and press Enter. Changes are checked before they are
 /diff                what changed since the last commit
 /clear               start a new conversation
 /name <title>        name this conversation (it is saved after every request)
-/resume              pick a saved conversation to continue (ironquill -c: the last one)
+/resume [id]         continue a saved conversation: pick it, or give its id or
+                     the start of it (ironquill -c: the last one, -r <id>)
 /cost                what this conversation has cost
 /usage [1h|6h|24h]   a pane of cost per model, context and cache rebuilds over time
 /q                   quit
