@@ -670,6 +670,11 @@ fn show(event: Event) {
             };
             eprintln!("━━ {number}/{of} {name} · {who}");
         }
+        Event::Tried { command, outcome } => {
+            let first = outcome.lines().next().unwrap_or_default();
+            eprintln!("· before any change, `{command}` {first}");
+        }
+        Event::PairEnded { text } => eprintln!("■ {text}"),
         Event::Compacted {
             dropped,
             before,

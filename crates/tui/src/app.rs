@@ -183,6 +183,8 @@ pub(crate) enum AgentMessage {
 pub(crate) enum Entry {
     Welcome,
     Info(String),
+    /// How a pair ended, who did what and what changed, in one line.
+    Ended(String),
     Error(String),
     User(String),
     Said(String),
@@ -2263,7 +2265,9 @@ impl App {
     fn entry_text(entry: &Entry) -> Option<String> {
         let text = match entry {
             Entry::Welcome | Entry::Cost { .. } => return None,
-            Entry::Info(text) | Entry::Error(text) | Entry::Said(text) => text.clone(),
+            Entry::Info(text) | Entry::Ended(text) | Entry::Error(text) | Entry::Said(text) => {
+                text.clone()
+            }
             Entry::User(text) => format!("> {text}"),
             Entry::Tool {
                 name,
@@ -2596,6 +2600,15 @@ impl App {
                 self.member = None;
                 Entry::OverBudget { spent, budget }
             }
+            Event::Tried { command, outcome } => {
+                // The first lines say it; the rest is for the planner.
+                let short: Vec<&str> = outcome.lines().take(3).collect();
+                Entry::Info(format!(
+                    "Before any change, `{command}` {}",
+                    short.join(" ")
+                ))
+            }
+            Event::PairEnded { text } => Entry::Ended(text),
         };
         self.push_entry(entry);
     }

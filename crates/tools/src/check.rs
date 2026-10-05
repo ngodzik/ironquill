@@ -79,6 +79,21 @@ impl Check {
         &self.program
     }
 
+    /// The check as a planner names it: `Check: <command>`, or
+    /// `Check in <dir>: <command>`.
+    pub fn line(&self) -> String {
+        let command = Self {
+            dir: String::new(),
+            ..self.clone()
+        }
+        .command();
+        if self.dir.is_empty() {
+            format!("Check: {command}")
+        } else {
+            format!("Check in {}: {command}", self.dir)
+        }
+    }
+
     /// The command line, for display, with the directory it runs in when
     /// that is not the project's.
     pub fn command(&self) -> String {
@@ -132,6 +147,82 @@ impl Check {
             excerpt: excerpt(&text),
         }))
     }
+}
+
+/// How a check went when tried before any change: whether it can judge one,
+/// and how the project stood.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trial {
+    /// It passes already.
+    Passed,
+    /// It fails already, before any change: the environment, most likely,
+    /// or what the request is about.
+    Failed(CheckFailure),
+    /// It cannot judge a change: why, for the planner.
+    Unusable(String),
+}
+
+impl Check {
+    /// Runs the check once, before any change, to see whether it can judge
+    /// one: it must start, in a directory that exists, and find tests to run.
+    pub async fn try_out(&self, root: &Path) -> Trial {
+        let dir = root.join(&self.dir);
+        if !dir.is_dir() {
+            return Trial::Unusable(format!("there is no directory {}", self.dir));
+        }
+        let output = match Command::new(&self.program)
+            .args(&self.args)
+            .current_dir(&dir)
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => return Trial::Unusable(format!("it cannot start: {e}")),
+        };
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if finds_no_tests(output.status.code(), &plain(&text)) {
+            return Trial::Unusable("it finds no tests to run".into());
+        }
+        if output.status.success() {
+            Trial::Passed
+        } else {
+            Trial::Failed(CheckFailure {
+                command: self.command(),
+                excerpt: excerpt(&text),
+            })
+        }
+    }
+}
+
+/// Whether a test runner's output says it found nothing to run, whatever
+/// its exit status: such a check would judge nothing.
+fn finds_no_tests(code: Option<i32>, text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // pytest's own status for "no tests collected".
+    if code == Some(5) && lower.contains("no tests ran") {
+        return true;
+    }
+    const NOTHING: [&str; 5] = [
+        "ran 0 tests",
+        "no tests found",
+        "no test files found",
+        "[no test files]",
+        "no test specified",
+    ];
+    if NOTHING.iter().any(|n| lower.contains(n)) {
+        return true;
+    }
+    // cargo test: every test binary ran none.
+    let counts: Vec<&str> = lower
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("running "))
+        .filter_map(|rest| rest.strip_suffix(" tests").or(rest.strip_suffix(" test")))
+        .collect();
+    !counts.is_empty() && counts.iter().all(|n| *n == "0")
 }
 
 /// `text` without the escape sequences that colour terminal output.
@@ -232,6 +323,48 @@ mod tests {
         assert_eq!(check.command(), "test -f here (in backend/)");
         let report = Check::run_all(&[check], dir.path()).await.unwrap();
         assert_eq!(report, CheckReport::Passed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_is_tried_before_it_judges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let trial = |line: &str| Check::parse(line).unwrap();
+        assert_eq!(trial("true").try_out(root).await, Trial::Passed);
+        assert!(matches!(
+            trial("false").try_out(root).await,
+            Trial::Failed(_)
+        ));
+        assert!(matches!(
+            trial("no-such-program-here").try_out(root).await,
+            Trial::Unusable(why) if why.starts_with("it cannot start")
+        ));
+        assert!(matches!(
+            trial("true").in_dir("backend").try_out(root).await,
+            Trial::Unusable(why) if why == "there is no directory backend"
+        ));
+        assert!(matches!(
+            trial("echo Ran 0 tests in 0.000s").try_out(root).await,
+            Trial::Unusable(why) if why == "it finds no tests to run"
+        ));
+    }
+
+    #[test]
+    fn runners_that_found_nothing_are_recognised() {
+        assert!(finds_no_tests(
+            Some(5),
+            "collected 0 items\n\nno tests ran in 0.01s"
+        ));
+        assert!(finds_no_tests(
+            Some(0),
+            "running 0 tests\n\ntest result: ok. 0 passed"
+        ));
+        assert!(!finds_no_tests(
+            Some(0),
+            "running 0 tests\nrunning 3 tests\ntest result: ok. 3 passed"
+        ));
+        assert!(!finds_no_tests(Some(1), "FAILED tests/test_a.py::test_x"));
     }
 
     #[cfg(unix)]

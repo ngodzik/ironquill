@@ -90,6 +90,19 @@ pub enum Event {
         /// How hard that model thinks.
         effort: Option<Effort>,
     },
+    /// A check was tried before any change, to see whether it can judge one.
+    Tried {
+        /// The command.
+        command: String,
+        /// What it did: passes, fails already, or cannot judge, and why.
+        outcome: String,
+    },
+    /// A pair ended: who did what, how it ended, what judged it, and the
+    /// files changed, in one line.
+    PairEnded {
+        /// That line.
+        text: String,
+    },
     /// Old tool results were dropped from the conversation to resend less.
     Compacted {
         /// Results dropped.

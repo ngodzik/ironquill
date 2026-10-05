@@ -22,7 +22,7 @@ mod search;
 mod toolbox;
 mod workspace;
 
-pub use check::{Check, CheckFailure, CheckReport};
+pub use check::{Check, CheckFailure, CheckReport, Trial};
 pub use detect::detect_checks;
 pub use diff::{DiffLine, line_diff};
 pub use docker::{Container, running_containers};

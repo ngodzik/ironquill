@@ -262,8 +262,9 @@ Type a question or a change and press Enter. Changes are checked before they are
 /context             edit what the next request sends: delete, shorten, annotate; :w applies
 /claude-reset        end Claude Code's session: its next request starts from nothing
 /codex-reset         end Codex's session
-/escalate <id> ...   stronger models used only when the checks keep failing (empty: none)
-/check <command>     add a check, run without a shell; /check alone lists them
+/escalate <id> ...   stronger models for `ironquill do`, when the checks keep failing
+/check <command>     a check offered to /pair's planner, run without a shell;
+                     /check alone lists them. A request in the chat runs none
 /nocheck             remove every check
 /rounds <n>          tries per model before handing over
 /diff                what changed since the last commit

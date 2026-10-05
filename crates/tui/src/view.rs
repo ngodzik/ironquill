@@ -901,6 +901,16 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     match entry {
         Entry::Welcome => welcome(&mut out, app, width),
+        Entry::Ended(text) => {
+            push_wrapped(
+                &mut out,
+                Span::styled("■ ", fg(Color::Magenta)),
+                "  ",
+                text,
+                fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                width,
+            );
+        }
         Entry::Info(text) => {
             push_wrapped(
                 &mut out,
