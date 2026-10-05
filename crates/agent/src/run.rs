@@ -1595,6 +1595,10 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
                         outcome: report.outcome,
                     }
                 }
+                DelegateEvent::Notice(text) => Event::Notice {
+                    model: tier.clone(),
+                    text,
+                },
                 DelegateEvent::Denied {
                     name,
                     input,

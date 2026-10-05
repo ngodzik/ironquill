@@ -90,6 +90,13 @@ pub enum Event {
         /// How hard that model thinks.
         effort: Option<Effort>,
     },
+    /// Something about how an agent works the person should know.
+    Notice {
+        /// The agent.
+        model: ModelId,
+        /// What.
+        text: String,
+    },
     /// An agent's safety checks refused one of its calls: the person may
     /// approve it in their next message.
     Denied {

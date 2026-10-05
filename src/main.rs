@@ -675,6 +675,7 @@ fn show(event: Event) {
             eprintln!("· before any change, `{command}` {first}");
         }
         Event::PairEnded { text } => eprintln!("■ {text}"),
+        Event::Notice { model, text } => eprintln!("· {model}: {text}"),
         Event::Denied {
             model,
             action,

@@ -481,6 +481,9 @@ pub enum DelegateEvent {
         /// What it returned, or the error it reported.
         output: Result<String, String>,
     },
+    /// Something the person should know about how the agent works, such
+    /// as a mode it could not use.
+    Notice(String),
     /// The agent's own safety checks refused a call, such as a command that
     /// cannot be undone: the person may approve it in their next message.
     Denied {

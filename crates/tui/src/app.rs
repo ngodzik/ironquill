@@ -2652,6 +2652,7 @@ impl App {
                 ))
             }
             Event::PairEnded { text } => Entry::Ended(text),
+            Event::Notice { model, text } => Entry::Info(format!("{model}: {text}")),
             Event::Denied {
                 model,
                 action,
