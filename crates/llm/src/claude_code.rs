@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -13,13 +13,8 @@ use tokio::process::Command;
 use crate::error::LlmError;
 use crate::prices::{PriceTable, Tokens};
 
-/// Tools Claude Code may not use when ironquill hands it a task. Commands are
-/// ironquill's to run: its checks judge the change, so the agent must not
-/// run them, or work around them, itself.
-const DISALLOWED_TOOLS: &str = "Bash";
-
-/// Tools refused as well when Claude Code may only read: it plans or
-/// reviews, another model writes.
+/// Tools refused when Claude Code may only read: it plans or reviews,
+/// another model writes.
 const READ_ONLY_DISALLOWED: &str = "Bash Edit MultiEdit Write NotebookEdit";
 
 /// How much of Claude Code's error output is kept for the message.
@@ -68,17 +63,12 @@ impl ClaudeCode {
             .args(["--output-format", "stream-json", "--verbose"])
             // Text arrives as it is written, not one message at a time.
             .arg("--include-partial-messages")
-            // Edits inside the project need no approval; anything else that
-            // would ask is refused, since nobody is there to answer.
-            .args(["--permission-mode", "acceptEdits"])
-            .args([
-                "--disallowedTools",
-                if request.read_only {
-                    READ_ONLY_DISALLOWED
-                } else {
-                    DISALLOWED_TOOLS
-                },
-            ])
+            // Its own classifier lets safe actions run and refuses what
+            // cannot be undone or leaves the machine; nobody is there to
+            // answer a prompt, so what would ask is refused too, and shown,
+            // for the person to approve in their next message.
+            .args(["--permission-mode", "auto"])
+            .args(["--permission-prompts", "none"])
             // No MCP server: the person's own connectors (mail, calendars)
             // have nothing to do with a task in this project.
             .arg("--strict-mcp-config")
@@ -90,6 +80,9 @@ impl ClaudeCode {
             .stderr(Stdio::piped())
             // A stopped request stops the agent too.
             .kill_on_drop(true);
+        if request.read_only {
+            command.args(["--disallowedTools", READ_ONLY_DISALLOWED]);
+        }
         if !request.model.is_empty() {
             command.args(["--model", &request.model]);
         }
@@ -183,6 +176,8 @@ impl Delegate for ClaudeCode {
 struct StreamParser {
     /// Tool calls waiting for their result, by call id.
     pending: HashMap<String, (String, Value)>,
+    /// The calls refused so far, by call id, so that each is told once.
+    denied: HashSet<String>,
     /// Whether the text of the current message is arriving in pieces, in which
     /// case the complete message must not show it a second time.
     streamed: bool,
@@ -210,6 +205,9 @@ impl StreamParser {
                 self.billed = event["apiKeySource"]
                     .as_str()
                     .is_some_and(|source| source != "none");
+            }
+            Some("system") if event["subtype"] == "permission_denied" => {
+                self.deny(&event, on_event);
             }
             Some("stream_event") => self.stream_event(&event["event"], on_event),
             Some("assistant") => {
@@ -251,7 +249,13 @@ impl StreamParser {
                     });
                 }
             }
-            Some("result") => self.result(&event),
+            Some("result") => {
+                // Refusals not told as they happened.
+                for denial in event["permission_denials"].as_array().into_iter().flatten() {
+                    self.deny(denial, on_event);
+                }
+                self.result(&event);
+            }
             _ => {}
         }
     }
@@ -305,6 +309,38 @@ impl StreamParser {
             }
             _ => {}
         }
+    }
+
+    /// Tells a refused call once, whichever way Claude Code reported it.
+    fn deny(&mut self, denial: &Value, on_event: &mut (dyn FnMut(DelegateEvent) + Send)) {
+        let id = text(&denial["tool_use_id"]);
+        if !id.is_empty() && !self.denied.insert(id.clone()) {
+            return;
+        }
+        // The call it refused, when its arguments came with the message.
+        let pending = self.pending.get(&id).cloned();
+        let name = [&denial["tool_name"], &denial["tool"]]
+            .into_iter()
+            .find_map(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| pending.as_ref().map(|(name, _)| name.clone()))
+            .unwrap_or_default();
+        let input = [&denial["tool_input"], &denial["input"]]
+            .into_iter()
+            .find(|v| !v.is_null())
+            .cloned()
+            .or_else(|| pending.map(|(_, input)| input))
+            .unwrap_or(Value::Null);
+        let reason = ["reason", "message", "decision_reason", "description"]
+            .into_iter()
+            .find_map(|key| denial[key].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        on_event(DelegateEvent::Denied {
+            name,
+            input,
+            reason,
+        });
     }
 
     fn result(&mut self, event: &Value) {
@@ -522,7 +558,36 @@ mod tests {
     }
 
     #[test]
-    fn the_command_line_hands_over_the_task_and_forbids_commands() {
+    fn refused_calls_are_told_once_whichever_way_they_come() {
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git push origin main"}}]}}"#,
+            r#"{"type":"system","subtype":"permission_denied","tool_use_id":"t1","tool_name":"Bash","reason":"Pushing needs the person's approval."}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"rm -rf build"}}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s","permission_denials":[{"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"git push origin main"}},{"tool_name":"Bash","tool_use_id":"t2","tool_input":{"command":"rm -rf build"}}]}"#,
+        ];
+        let mut parser = StreamParser::default();
+        let mut denied = Vec::new();
+        for line in lines {
+            parser.feed(line, &mut |e| {
+                if let DelegateEvent::Denied { input, reason, .. } = e {
+                    denied.push((input["command"].as_str().unwrap().to_owned(), reason));
+                }
+            });
+        }
+        assert_eq!(
+            denied,
+            [
+                (
+                    "git push origin main".to_owned(),
+                    "Pushing needs the person's approval.".to_owned()
+                ),
+                ("rm -rf build".to_owned(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_command_line_hands_over_the_task_with_its_own_safety_checks() {
         let request = DelegateRequest {
             agent: ironquill_core::Agent::ClaudeCode,
             effort: Some(ironquill_core::Effort::Max),
@@ -545,7 +610,10 @@ mod tests {
                 .map(|i| args[i + 1].clone())
         };
         assert_eq!(after("-p").as_deref(), Some("fix it"));
-        assert_eq!(after("--disallowedTools").as_deref(), Some("Bash"));
+        // Its auto mode judges each action; nobody answers prompts.
+        assert_eq!(after("--permission-mode").as_deref(), Some("auto"));
+        assert_eq!(after("--permission-prompts").as_deref(), Some("none"));
+        assert_eq!(after("--disallowedTools"), None);
         assert_eq!(after("--model").as_deref(), Some("opus"));
         assert_eq!(after("--effort").as_deref(), Some("max"));
         assert_eq!(after("--resume").as_deref(), Some("s1"));

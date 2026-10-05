@@ -55,6 +55,65 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     if app.keys_open().is_some() {
         render_keys(frame, app);
     }
+    if app.approval().is_some() {
+        render_approval(frame, app);
+    }
+}
+
+/// A command held for the person, over everything else, until they answer.
+fn render_approval(frame: &mut Frame, app: &App) {
+    let Some(approval) = app.approval() else {
+        return;
+    };
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
+    let inner_width = usize::from(width.saturating_sub(2));
+    let mut lines = vec![
+        Line::styled(
+            format!(" {} wants to run:", approval.model),
+            fg(Color::Gray),
+        ),
+        Line::default(),
+    ];
+    for row in wrap_plain(&approval.command, inner_width.saturating_sub(2)) {
+        lines.push(Line::styled(
+            format!(" {row}"),
+            fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::default());
+    for reason in &approval.reasons {
+        lines.push(Line::styled(format!(" · {reason}"), fg(Color::Gray)));
+    }
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = pane_block(" Run this command? ".into(), true)
+        .title_bottom(Line::styled(" y: run it · n: refuse ", fg(ACCENT)).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `text` cut into rows of `width` characters at most.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(10);
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            rows.push(String::new());
+        }
+        for chunk in chars.chunks(width) {
+            rows.push(chunk.iter().collect());
+        }
+    }
+    rows
 }
 
 /// Every shortcut (Ctrl-S), over everything else, grouped by where it works.
@@ -120,7 +179,9 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
         height,
     );
     frame.render_widget(Clear, area);
-    let block = pane_block(" Model ".into(), true);
+    let block = pane_block(" Model ".into(), true).title_bottom(
+        Line::styled(" Enter: choose · Space: team · Esc: close ", fg(DIM)).centered(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -197,7 +258,8 @@ fn render_picker(frame: &mut Frame, app: &App) {
         height,
     );
     frame.render_widget(Clear, area);
-    let block = pane_block(" Resume a conversation ".into(), true);
+    let block = pane_block(" Resume a conversation ".into(), true)
+        .title_bottom(Line::styled(" Enter: choose · Esc: close ", fg(DIM)).centered());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -901,6 +963,16 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     match entry {
         Entry::Welcome => welcome(&mut out, app, width),
+        Entry::Refused(text) => {
+            push_wrapped(
+                &mut out,
+                Span::styled("⊘ ", fg(Color::Yellow)),
+                "  ",
+                text,
+                fg(Color::Yellow),
+                width,
+            );
+        }
         Entry::Ended(text) => {
             push_wrapped(
                 &mut out,

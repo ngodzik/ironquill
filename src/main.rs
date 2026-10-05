@@ -675,6 +675,17 @@ fn show(event: Event) {
             eprintln!("· before any change, `{command}` {first}");
         }
         Event::PairEnded { text } => eprintln!("■ {text}"),
+        Event::Denied {
+            model,
+            action,
+            reason,
+        } => eprintln!("⊘ {model}'s safety checks refused: {action} {reason}"),
+        Event::Held {
+            command, reasons, ..
+        } => eprintln!(
+            "⊘ refused, nobody to approve it: {command} ({})",
+            reasons.join("; ")
+        ),
         Event::Compacted {
             dropped,
             before,

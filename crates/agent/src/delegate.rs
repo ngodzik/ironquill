@@ -14,6 +14,16 @@ pub(crate) struct ToolReport {
     pub(crate) changed: Option<String>,
 }
 
+/// What an agent wanted to do with a call, in a few words: the command for
+/// a shell, the path for a file, else the tool and its arguments.
+pub(crate) fn action(name: &str, input: &Value) -> String {
+    let field = |key: &str| input[key].as_str().map(str::to_owned);
+    field("command")
+        .or_else(|| field("file_path").map(|p| format!("{name} {p}")))
+        .or_else(|| field("path").map(|p| format!("{name} {p}")))
+        .unwrap_or_else(|| format!("{name} {input}"))
+}
+
 /// Translates one of an agent's tool calls: `Read`, `Edit`, `MultiEdit`,
 /// `Write` and `Delete` map onto ironquill's own summaries, any other tool is
 /// shown by name with what it was given. Codex's changes come in these

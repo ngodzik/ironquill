@@ -90,6 +90,26 @@ pub enum Event {
         /// How hard that model thinks.
         effort: Option<Effort>,
     },
+    /// An agent's safety checks refused one of its calls: the person may
+    /// approve it in their next message.
+    Denied {
+        /// The agent.
+        model: ModelId,
+        /// What it wanted to do, such as the command.
+        action: String,
+        /// Why it was refused, when the agent says.
+        reason: String,
+    },
+    /// A command a model wanted to run was put to the person, who said yes
+    /// or no, or could not be asked.
+    Held {
+        /// The command.
+        command: String,
+        /// Why it was held.
+        reasons: Vec<String>,
+        /// Whether it ran.
+        approved: bool,
+    },
     /// A check was tried before any change, to see whether it can judge one.
     Tried {
         /// The command.

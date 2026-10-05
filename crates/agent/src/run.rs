@@ -4,9 +4,9 @@ use ironquill_core::{
     Agent, ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateReply,
     DelegateRequest, Effort, Message, ModelId, Pricing, TokenCount, ToolSpec, Usage, Usd,
 };
-use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox, Trial};
+use ironquill_tools::{Check, CheckFailure, CheckReport, ToolSummary, Toolbox, Trial};
 
-use crate::config::{AgentConfig, Member, Pair};
+use crate::config::{AgentConfig, Approval, Member, Pair};
 use crate::delegate;
 use crate::error::AgentError;
 use crate::event::Event;
@@ -17,28 +17,33 @@ const TASK_PROMPT: &str = "You are a careful software engineer working in a proj
 Make the smallest change that completes the task. Read a file before editing it. \
 Edit existing files with `replace`, not `write_file`. \
 Find code with `search` and `outline`, then read only the lines you need. \
-You cannot run commands: when you stop calling tools, the project's checks run automatically \
-and you will be shown any failure. Do not ask questions; when you are done, reply with one \
-short sentence saying what you changed.";
+You may run commands with `run_command`; nobody is there to approve one that cannot be undone, \
+so such commands are refused. When you stop calling tools, the project's checks run \
+automatically and you will be shown any failure. Do not ask questions; when you are done, reply \
+with one short sentence saying what you changed.";
 
 /// For a task handed to an agent such as Claude Code. It gets the task alone,
 /// not ironquill's conversation, and works in its own session.
-const DELEGATE_PROMPT: &str = "This task was handed to you by ironquill, which runs the project's \
-checks after you finish and sends you any failure. You cannot run shell commands; do not try to \
-work around that. Make the smallest change that completes the task, reading files before editing \
-them. When you are done, end with a short report: what you changed and why, and anything left to \
-do. Write the report in the language the task is written in.";
+const DELEGATE_PROMPT: &str = "This task was handed to you by ironquill. Do what it asks and \
+nothing else: no fix or improvement nobody asked for, however tempting; mention it in your \
+report instead. Make the smallest change that completes the task, reading files before editing \
+them. A command that cannot be undone or reaches outside the machine may be refused: do the \
+rest, and say what you wanted to run and why, so that the person can approve it in their next \
+message. When ironquill runs checks after you, it sends you any failure. When you are done, end \
+with a short report: what you changed and why, and anything left to do. Write the report in the \
+language the task is written in.";
 
 /// Codex reads and edits through commands, in a sandbox without network.
-const CODEX_PROMPT: &str = "This task was handed to you by ironquill, which runs the project's \
-checks after you finish and sends you any failure. Use commands to read the project and make your \
-changes, not to install anything. Make the smallest change that completes the task. When you are \
-done, end with a short report: what you changed and why, and anything left to do. Write the report \
-in the language the task is written in.";
+const CODEX_PROMPT: &str = "This task was handed to you by ironquill. Do what it asks and \
+nothing else: no fix or improvement nobody asked for; mention it in your report instead. Use \
+commands to read the project and make your changes, not to install anything. Make the smallest \
+change that completes the task. When ironquill runs checks after you, it sends you any failure. \
+When you are done, end with a short report: what you changed and why, and anything left to do. \
+Write the report in the language the task is written in.";
 
 /// For a model of the team the first model handed a task to.
 const MEMBER_PROMPT: &str = "You are a careful software engineer. Another assistant handed you one \
-task in a project, which you work on through tools; you cannot run commands. Do the task and \
+task in a project, which you work on through tools, commands included. Do the task and \
 nothing else. Find code with `search` and `outline`, then read only the lines you need: every \
 line read is paid for again on each later turn. Read a file before editing it, and edit existing files with `replace`. Do not ask \
 questions. When you are done, reply with a short report: what you found or changed, and anything \
@@ -152,18 +157,18 @@ const DELEGATE_TOOL: &str = "delegate";
 
 /// For a conversation with a person.
 const CHAT_PROMPT: &str = "You are a careful software engineer helping a person with the project \
-in the current directory. You can read and edit its files through tools; you cannot run commands. \
+in the current directory. You can read and edit its files, and run commands, through tools. A \
+command that cannot be undone or reaches outside the machine is put to the person first. \
 Reply in the language the person writes in. Talk normally and answer questions directly. \
-Only change files when the person asks for a change. \
+Only change files when the person asks for a change, and only what they asked for. \
 If you need to ask the person something, ask it and end your reply there: do not call any tool \
 in that reply, and do not act on a guess of the answer. They will reply in their next message. \
 The project's files are listed below: use the list instead of listing directories, and do not \
 try to read binary files. To find code, use `search` and `outline` first, then read only the \
 lines you need with `read_file` and a range: every line read is paid for again on each later \
 turn. When you change files, make the smallest change that does the job, \
-read a file before editing it, and edit existing files with `replace`. When you stop calling \
-tools after changing files, the project's checks run automatically and you will be shown any \
-failure. Be brief. You may use Markdown.";
+read a file before editing it, and edit existing files with `replace`. No check runs on its own: \
+run the project's tests yourself when they matter to the change. Be brief. You may use Markdown.";
 
 /// How a request ended.
 #[derive(Debug, Clone, PartialEq)]
@@ -1590,13 +1595,33 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
                         outcome: report.outcome,
                     }
                 }
+                DelegateEvent::Denied {
+                    name,
+                    input,
+                    reason,
+                } => Event::Denied {
+                    model: tier.clone(),
+                    action: delegate::action(&name, &input),
+                    reason,
+                },
             };
             observe(event);
         };
-        delegate
+        // Its commands say nothing of the files they change: the project
+        // before and after does.
+        let before = (!request.read_only).then(|| ironquill_tools::Snapshot::take(&root));
+        let reply = delegate
             .run(request, &mut on_event)
             .await
-            .map_err(|e| AgentError::Model(Box::new(e)))?
+            .map_err(|e| AgentError::Model(Box::new(e)))?;
+        if let Some(before) = before {
+            for path in before.changed(&root) {
+                if !toolbox.changed().any(|p| p == path) {
+                    toolbox.mark_changed(path);
+                }
+            }
+        }
+        reply
     };
 
     // The calls counted as they came are what this request used. The
@@ -2467,6 +2492,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
 ) -> Result<bool, AgentError> {
     let leads = role == Role::Lead;
     let mut tools = ctx.toolbox.specs();
+    tools.push(command_spec());
     if leads && let Some(spec) = delegate_spec(&ctx.config.team, model_id) {
         tools.push(spec);
     }
@@ -2554,6 +2580,14 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 });
                 continue;
             }
+            if call.name == COMMAND_TOOL {
+                let content = command(ctx, model_id, &call.arguments).await;
+                messages.push(Message::Tool {
+                    call_id: call.id.clone(),
+                    content,
+                });
+                continue;
+            }
             let result = ctx.toolbox.call(call);
             (ctx.observe)(Event::Tool {
                 name: call.name.clone(),
@@ -2570,6 +2604,119 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         }
     }
     Ok(false)
+}
+
+/// The tool through which a model runs a shell command.
+const COMMAND_TOOL: &str = "run_command";
+
+fn command_spec() -> ToolSpec {
+    ToolSpec {
+        name: COMMAND_TOOL.into(),
+        description: "Run a shell command in the project's directory, for two minutes at most, \
+                      and get its output. Use it for git, the project's own tools and tests. A \
+                      command that cannot be undone, reaches another machine, or whose effect \
+                      cannot be read from it (eval, `$(...)`, `sh -c`, a script you wrote) is put \
+                      to the person first; if they refuse, do not reach the same result another \
+                      way: say what you wanted to run and why."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The command line, run with sh."}
+            },
+            "required": ["command"]
+        }),
+    }
+}
+
+/// Runs a command a model asked for: at once when nothing in it is held,
+/// without the environment's secrets; else only once the person approved
+/// it, with them. Returns what the model is told.
+async fn command<M, D, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    model: &ModelId,
+    arguments: &str,
+) -> String {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        command: String,
+    }
+    let command = match serde_json::from_str::<Args>(arguments) {
+        Ok(args) => args.command,
+        Err(e) => return format!("error: the arguments are not valid: {e}"),
+    };
+    let root = ctx.toolbox.workspace().root().to_owned();
+    let written: Vec<String> = ctx.toolbox.changed().map(str::to_owned).collect();
+    let reasons = ironquill_tools::assess(&command, &root, &written);
+    let approved = if reasons.is_empty() {
+        false
+    } else {
+        let approval = Approval {
+            model: model.clone(),
+            command: command.clone(),
+            reasons: reasons.clone(),
+        };
+        let approved = match &ctx.config.approver {
+            Some(approver) => approver.ask(approval).await,
+            None => false,
+        };
+        (ctx.observe)(Event::Held {
+            command: command.clone(),
+            reasons: reasons.clone(),
+            approved,
+        });
+        if !approved {
+            let asked = if ctx.config.approver.is_some() {
+                "The person was asked and refused it"
+            } else {
+                "Nobody is there to approve it, so it was refused"
+            };
+            (ctx.observe)(Event::Tool {
+                name: COMMAND_TOOL.into(),
+                path: None,
+                outcome: Err(format!("refused: {command}")),
+            });
+            return format!(
+                "refused: {}. {asked}. Do not reach the same result another way: go on with the \
+                 rest, and say what you wanted to run and why.",
+                reasons.join("; ")
+            );
+        }
+        true
+    };
+    let before = ironquill_tools::Snapshot::take(&root);
+    let result = ironquill_tools::run_command(&command, &root, approved).await;
+    for path in before.changed(&root) {
+        if !ctx.toolbox.changed().any(|p| p == path) {
+            ctx.toolbox.mark_changed(path);
+        }
+    }
+    let (outcome, content) = match result {
+        Ok(out) => {
+            let status = match (out.timed_out, out.status) {
+                (true, _) => "stopped: it ran out of time".to_owned(),
+                (false, Some(0)) => "exit status 0".to_owned(),
+                (false, Some(code)) => format!("exit status {code}"),
+                (false, None) => "stopped by a signal".to_owned(),
+            };
+            let label = format!("Run({command})");
+            let lines = out.output.lines().count();
+            (
+                Ok(ToolSummary::Ran { label, lines }),
+                format!("{status}\n{}", out.output),
+            )
+        }
+        Err(e) => (
+            Err(format!("cannot start the shell: {e}")),
+            format!("error: cannot start the shell: {e}"),
+        ),
+    };
+    (ctx.observe)(Event::Tool {
+        name: COMMAND_TOOL.into(),
+        path: None,
+        outcome,
+    });
+    content
 }
 
 /// What these messages said, as text for a delegate that did not see them:
@@ -2667,9 +2814,11 @@ fn path_argument(arguments: &str) -> Option<String> {
 mod tests {
     use std::collections::VecDeque;
     use std::convert::Infallible;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use ironquill_core::{ChatResponse, DelegateReply, ToolCall};
+
+    use crate::config::Approver;
     use ironquill_tools::{ToolSummary, Workspace};
     use serde_json::json;
 
@@ -4042,6 +4191,111 @@ mod tests {
         assert_eq!(checks_run(&events), 0);
         assert!(dir.path().join("notes.txt").exists());
         assert_eq!(model.seen.lock().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_model_runs_commands_and_what_cannot_be_undone_waits_for_the_person() {
+        let (dir, mut toolbox) = setup();
+        std::fs::write(dir.path().join("old.txt"), "x").unwrap();
+        let model = Scripted::new(vec![
+            calls(
+                "run_command",
+                json!({"command": "echo made > new.txt && echo done"}),
+            ),
+            calls("run_command", json!({"command": "rm old.txt"})),
+            calls("run_command", json!({"command": "rm old.txt"})),
+            says("Made new.txt and removed old.txt."),
+        ]);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let answers = Arc::new(Mutex::new(VecDeque::from([false, true])));
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap()
+            .with_approver({
+                let asked = Arc::clone(&asked);
+                let answers = Arc::clone(&answers);
+                Approver::new(move |approval: Approval| {
+                    asked.lock().unwrap().push(approval);
+                    let answer = answers.lock().unwrap().pop_front().unwrap();
+                    async move { answer }
+                })
+            });
+        let mut events = Vec::new();
+        let outcome = Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "tidy up",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+
+        // What the command wrote counts as changed.
+        assert_eq!(outcome.changed, ["new.txt", "old.txt"]);
+        let seen = model.seen.lock().unwrap();
+        assert!(matches!(
+            seen[1].messages.last(),
+            Some(Message::Tool { content, .. }) if content == "exit status 0\ndone\n"
+        ));
+        // Asked once and refused: the model is told not to work around it.
+        assert!(matches!(
+            seen[2].messages.last(),
+            Some(Message::Tool { content, .. })
+                if content.starts_with("refused: it deletes files. The person was asked and refused it")
+        ));
+        // Asked again and approved: it ran.
+        assert!(!dir.path().join("old.txt").exists());
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0].command, "rm old.txt");
+        assert_eq!(asked[0].reasons, ["it deletes files"]);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Held { approved, .. } => Some(*approved),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn without_anybody_to_ask_a_held_command_is_refused() {
+        let (dir, mut toolbox) = setup();
+        std::fs::write(dir.path().join("old.txt"), "x").unwrap();
+        let model = Scripted::new(vec![
+            calls("run_command", json!({"command": "rm old.txt"})),
+            says("I could not remove it."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        run(
+            &model,
+            &NoDelegate,
+            &mut toolbox,
+            &config,
+            "tidy",
+            "",
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(dir.path().join("old.txt").exists());
+        assert!(matches!(
+            model.seen.lock().unwrap()[1].messages.last(),
+            Some(Message::Tool { content, .. }) if content.contains("Nobody is there to approve it")
+        ));
     }
 
     /// Claude Code on an API key, for the cost tests: the calls it reports

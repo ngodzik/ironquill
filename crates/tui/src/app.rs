@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ironquill_agent::{AgentConfig, Event, Member, Outcome, Pair, Session, Verdict};
+use ironquill_agent::{AgentConfig, Approval, Event, Member, Outcome, Pair, Session, Verdict};
 use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
+use tokio::sync::oneshot;
 
 use crate::command::{self, Command};
 use crate::defaults::Defaults;
@@ -174,6 +175,8 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 pub(crate) enum AgentMessage {
     Event(Event),
+    /// A command held for the person, and where to send their answer.
+    Approve(Approval, oneshot::Sender<bool>),
     Done(Result<Outcome, String>),
 }
 
@@ -185,6 +188,8 @@ pub(crate) enum Entry {
     Info(String),
     /// How a pair ended, who did what and what changed, in one line.
     Ended(String),
+    /// Something held back by a safety check: what, and why.
+    Refused(String),
     Error(String),
     User(String),
     Said(String),
@@ -396,6 +401,8 @@ pub(crate) struct App {
     input: LineEditor,
     /// The messages sent before, for Up and Down in the message box.
     history: History,
+    /// A command held for the person, and where their answer goes.
+    approval: Option<(Approval, oneshot::Sender<bool>)>,
     command: LineEditor,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
@@ -515,6 +522,7 @@ impl App {
             pending: None,
             input: LineEditor::default(),
             history: History::default(),
+            approval: None,
             command: LineEditor::default(),
             transcript,
             scroll_back: Cell::new(0),
@@ -682,6 +690,9 @@ impl App {
             // their mind.
             self.quit_armed = false;
             self.notice = None;
+            if self.approval_key(key) {
+                return None;
+            }
             if let Some(effect) = self.picker_key(key) {
                 return effect;
             }
@@ -1588,6 +1599,13 @@ impl App {
                 self.on_event(event);
                 false
             }
+            AgentMessage::Approve(approval, answer) => {
+                // One at a time: the agent waits for the answer.
+                if let Some((_, earlier)) = self.approval.replace((approval, answer)) {
+                    let _ = earlier.send(false);
+                }
+                false
+            }
             AgentMessage::Done(Ok(outcome)) => {
                 let seconds = self
                     .running_since
@@ -2039,6 +2057,29 @@ impl App {
         });
     }
 
+    /// Keys while a held command waits for the person: `y` runs it, `n` or
+    /// Esc refuses it. Returns whether the key was for it.
+    fn approval_key(&mut self, key: KeyEvent) -> bool {
+        if self.approval.is_none() {
+            return false;
+        }
+        let answer = match key.code {
+            KeyCode::Char('y' | 'Y') => true,
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => false,
+            _ => return true,
+        };
+        if let Some((_, sender)) = self.approval.take() {
+            // The agent may have been stopped meanwhile.
+            let _ = sender.send(answer);
+        }
+        true
+    }
+
+    /// The command waiting for the person's answer, if any.
+    pub(crate) fn approval(&self) -> Option<&Approval> {
+        self.approval.as_ref().map(|(approval, _)| approval)
+    }
+
     /// Closes the model picker, saying the effort when ← → changed it there:
     /// a higher one costs more on every call after.
     fn close_model_picker(&mut self) {
@@ -2265,9 +2306,11 @@ impl App {
     fn entry_text(entry: &Entry) -> Option<String> {
         let text = match entry {
             Entry::Welcome | Entry::Cost { .. } => return None,
-            Entry::Info(text) | Entry::Ended(text) | Entry::Error(text) | Entry::Said(text) => {
-                text.clone()
-            }
+            Entry::Info(text)
+            | Entry::Ended(text)
+            | Entry::Refused(text)
+            | Entry::Error(text)
+            | Entry::Said(text) => text.clone(),
             Entry::User(text) => format!("> {text}"),
             Entry::Tool {
                 name,
@@ -2609,6 +2652,29 @@ impl App {
                 ))
             }
             Event::PairEnded { text } => Entry::Ended(text),
+            Event::Denied {
+                model,
+                action,
+                reason,
+            } => Entry::Refused(format!(
+                "{model}'s safety checks refused: {action}{}. To allow it, say so in your next message",
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", first_sentence(&reason))
+                }
+            )),
+            Event::Held {
+                command,
+                reasons,
+                approved,
+            } => {
+                if approved {
+                    Entry::Info(format!("Approved: {command}"))
+                } else {
+                    Entry::Refused(format!("Refused: {command} ({})", reasons.join("; ")))
+                }
+            }
         };
         self.push_entry(entry);
     }
@@ -2654,6 +2720,8 @@ impl App {
 
     pub(crate) fn on_cancelled(&mut self) {
         self.running_since = None;
+        // Its answer would reach nobody.
+        self.approval = None;
         self.info("Stopped. Files already edited stay edited: /diff shows them");
     }
 
@@ -2664,6 +2732,12 @@ impl App {
     pub(crate) fn on_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
     }
+}
+
+/// The first sentence of `text`, for a line: an agent's reasons run long.
+fn first_sentence(text: &str) -> &str {
+    let text = text.trim();
+    text.find(". ").map_or(text, |end| &text[..end])
 }
 
 /// `3/4 Planning · tensorx/glm-5.3 · effort high`, or `by ironquill`.
@@ -2721,6 +2795,31 @@ mod tests {
             },
             PathBuf::from("/p"),
         )
+    }
+
+    #[test]
+    fn a_held_command_waits_for_yes_or_no() {
+        let mut app = ready();
+        let approval = || Approval {
+            model: ModelId::new("cheap").unwrap(),
+            command: "git push origin main".into(),
+            reasons: vec!["it sends commits to another repository".into()],
+        };
+        let (answer, mut answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(approval(), answer));
+        assert_eq!(app.approval().unwrap().command, "git push origin main");
+        // Other keys wait for the answer, and type nothing.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.approval().is_some());
+        assert_eq!(app.input().text(), "");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.approval().is_none());
+        assert_eq!(answered.try_recv(), Ok(true));
+
+        let (answer, mut answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(approval(), answer));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(answered.try_recv(), Ok(false));
     }
 
     #[test]

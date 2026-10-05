@@ -1,3 +1,8 @@
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use ironquill_core::{Effort, ModelId, Usd};
 use ironquill_tools::Check;
 
@@ -18,6 +23,47 @@ pub struct AgentConfig {
     pub(crate) detect_checks: bool,
     pub(crate) instructions: Option<String>,
     pub(crate) project_rules: Option<String>,
+    pub(crate) approver: Option<Approver>,
+}
+
+/// A command a model wants to run, put to the person first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approval {
+    /// The model that wants it.
+    pub model: ModelId,
+    /// The command, as it would run.
+    pub command: String,
+    /// What it does that cannot be undone, leaves the machine or cannot be
+    /// read from the command.
+    pub reasons: Vec<String>,
+}
+
+type Ask = dyn Fn(Approval) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync;
+
+/// Asks the person whether a held command may run. Without one, held
+/// commands are refused, as when nobody is there to answer.
+#[derive(Clone)]
+pub struct Approver(Arc<Ask>);
+
+impl Approver {
+    /// An approver that answers with `ask`.
+    pub fn new<F, Fut>(ask: F) -> Self
+    where
+        F: Fn(Approval) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        Self(Arc::new(move |approval| Box::pin(ask(approval))))
+    }
+
+    pub(crate) async fn ask(&self, approval: Approval) -> bool {
+        (self.0)(approval).await
+    }
+}
+
+impl fmt::Debug for Approver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Approver")
+    }
 }
 
 /// Planning by a stronger model, coding by the first one, as an architect
@@ -114,6 +160,13 @@ impl AgentConfig {
     /// request so that an edit counts at once; `None` or blank adds none.
     pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
         self.instructions = instructions.filter(|i| !i.trim().is_empty());
+        self
+    }
+
+    /// Who is asked before a held command runs: the person, through the
+    /// interface.
+    pub fn with_approver(mut self, approver: Approver) -> Self {
+        self.approver = Some(approver);
         self
     }
 }
@@ -252,6 +305,7 @@ impl AgentConfigBuilder {
             effort: self.effort,
             pair: self.pair,
             detect_checks: self.detect_checks,
+            approver: None,
             instructions: self.instructions,
             project_rules: self.project_rules,
         })

@@ -481,6 +481,16 @@ pub enum DelegateEvent {
         /// What it returned, or the error it reported.
         output: Result<String, String>,
     },
+    /// The agent's own safety checks refused a call, such as a command that
+    /// cannot be undone: the person may approve it in their next message.
+    Denied {
+        /// The agent's name for the tool, such as `Bash`.
+        name: String,
+        /// The arguments it was called with.
+        input: serde_json::Value,
+        /// Why, when the agent says.
+        reason: String,
+    },
 }
 
 /// How a delegated task ended.

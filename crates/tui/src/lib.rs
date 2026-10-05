@@ -29,14 +29,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use ironquill_agent::{AgentConfig, Session};
+use ironquill_agent::{AgentConfig, Approver, Session};
 use ironquill_core::{ChatModel, Delegate};
 use ironquill_tools::{Toolbox, Workspace};
 use ratatui::crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyEventKind,
 };
 use ratatui::crossterm::execute;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::app::{AgentMessage, App, Effect};
@@ -187,9 +187,23 @@ where
             None => {}
             Some(Effect::Send { text, config }) => {
                 // Read again each time: an edit counts from the next request.
+                // A held command is put to the person in a window; the agent
+                // waits for the answer.
+                let asks = tx.clone();
+                let approver = Approver::new(move |approval| {
+                    let asks = asks.clone();
+                    async move {
+                        let (answer, answered) = oneshot::channel();
+                        if asks.send(AgentMessage::Approve(approval, answer)).is_err() {
+                            return false;
+                        }
+                        answered.await.unwrap_or(false)
+                    }
+                });
                 let config = config
                     .with_instructions(Defaults::instructions())
-                    .with_project_rules(ironquill_tools::project_instructions(app.root()));
+                    .with_project_rules(ironquill_tools::project_instructions(app.root()))
+                    .with_approver(approver);
                 task = Some(spawn_agent(
                     Arc::clone(&model),
                     Arc::clone(&delegate),
