@@ -16,6 +16,7 @@ use ironquill_core::{Usage, Usd};
 use serde::{Deserialize, Serialize};
 
 use crate::app::Entry;
+use crate::usage::UsageLog;
 
 /// A whole conversation as written to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +33,9 @@ pub(crate) struct Saved {
     pub(crate) cost_complete: bool,
     pub(crate) transcript: Vec<Entry>,
     pub(crate) session: Session,
+    /// The calls of the last day, for the usage pane.
+    #[serde(default)]
+    pub(crate) usage_log: UsageLog,
 }
 
 /// What the resume list shows of a conversation. Read from the same file:
@@ -90,6 +94,30 @@ impl Store {
             .collect();
         found.sort_by_key(|s| std::cmp::Reverse(s.updated));
         found
+    }
+
+    /// The id of the conversation whose id is `id` or starts with it.
+    pub(crate) fn find(&self, id: &str) -> Result<String, String> {
+        // An id names a file in this directory: nothing that could leave it.
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!("{id:?} is not a conversation id"));
+        }
+        let found: Vec<String> = self
+            .list()
+            .into_iter()
+            .map(|s| s.id)
+            .filter(|s| s.starts_with(id))
+            .collect();
+        match found.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err(format!(
+                "No saved conversation of this project has the id {id}"
+            )),
+            many => Err(format!(
+                "{} conversations have an id starting with {id}: give more of it",
+                many.len()
+            )),
+        }
     }
 
     pub(crate) fn load(&self, id: &str) -> Result<Saved, String> {
@@ -162,7 +190,45 @@ mod tests {
             cost_complete: true,
             transcript: vec![Entry::User("hello".into())],
             session: Session::new(),
+            usage_log: UsageLog::default(),
         }
+    }
+
+    #[test]
+    fn a_conversation_is_found_by_the_start_of_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().to_owned());
+        for (id, at) in [
+            ("1759600000-0a1b2", 1),
+            ("1759600000-0c3d4", 2),
+            ("1759700000-00001", 3),
+        ] {
+            store.save(&saved(id, "x", at)).unwrap();
+        }
+        assert_eq!(store.find("17597").as_deref(), Ok("1759700000-00001"));
+        assert_eq!(
+            store.find("1759600000-0c").as_deref(),
+            Ok("1759600000-0c3d4")
+        );
+        assert!(
+            store
+                .find("1759600000")
+                .unwrap_err()
+                .starts_with("2 conversations")
+        );
+        assert!(
+            store
+                .find("9")
+                .unwrap_err()
+                .starts_with("No saved conversation")
+        );
+        // Nothing that could name a file elsewhere.
+        assert!(
+            store
+                .find("../secret")
+                .unwrap_err()
+                .ends_with("is not a conversation id")
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use ironquill_core::{
-    ChatModel, ChatRequest, ChatResponse, Message, ModelId, Pricing, TokenCount, ToolCall,
-    ToolSpec, Usage, Usd,
+    CacheUse, ChatModel, ChatRequest, ChatResponse, Message, ModelId, Pricing, TokenCount,
+    ToolCall, ToolSpec, Usage, Usd,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -359,9 +359,37 @@ struct WireFunction {
 struct WireUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// OpenAI's way of telling what came from the cache.
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptDetails>,
+    /// Anthropic's, when a gateway passes it through.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
     /// Requesty reports the cost of the call in dollars. Other endpoints
     /// leave it out.
     cost: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct WirePromptDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+impl WireUsage {
+    /// What the call read from the cache and wrote to it, when told.
+    fn cache(&self) -> Option<CacheUse> {
+        let read = self
+            .cache_read_input_tokens
+            .or_else(|| self.prompt_tokens_details.as_ref()?.cached_tokens);
+        let written = self.cache_creation_input_tokens.map(TokenCount);
+        (read.is_some() || written.is_some()).then(|| CacheUse {
+            read: TokenCount(read.unwrap_or(0)),
+            written,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -404,7 +432,7 @@ fn parse_completion(url: &str, body: &str) -> Result<ChatResponse, LlmError> {
         .ok_or_else(|| malformed(url, "no choices in the answer"))?;
     // A missing usage block is reported as zero rather than refused: the answer
     // is still worth showing, and the status line says the cost is unknown.
-    let (usage, cost) = wire.usage.map_or((Usage::default(), None), |u| {
+    let (usage, cost, cache) = wire.usage.map_or((Usage::default(), None, None), |u| {
         let usage = Usage {
             input: TokenCount(u.prompt_tokens),
             output: TokenCount(u.completion_tokens),
@@ -412,6 +440,7 @@ fn parse_completion(url: &str, body: &str) -> Result<ChatResponse, LlmError> {
         (
             usage,
             u.cost.filter(|c| c.is_finite() && *c >= 0.0).map(Usd),
+            u.cache(),
         )
     });
     let tool_calls = choice
@@ -429,6 +458,7 @@ fn parse_completion(url: &str, body: &str) -> Result<ChatResponse, LlmError> {
         tool_calls,
         usage,
         cost,
+        cache,
     })
 }
 

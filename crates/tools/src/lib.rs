@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 mod check;
+mod command;
 mod detect;
 mod diff;
 mod docker;
@@ -19,10 +20,12 @@ mod gitview;
 mod outline;
 mod rules;
 mod search;
+mod snapshot;
 mod toolbox;
 mod workspace;
 
-pub use check::{Check, CheckFailure, CheckReport};
+pub use check::{Check, CheckFailure, CheckReport, Trial};
+pub use command::{CommandOutput, assess, run_command};
 pub use detect::detect_checks;
 pub use diff::{DiffLine, line_diff};
 pub use docker::{Container, running_containers};
@@ -31,5 +34,6 @@ pub use git::{changes_text, diff_stat, is_clean, project_context, project_files,
 pub use gitview::{LineChanges, LineMark, committed_lines, file_status, line_changes};
 pub use outline::project_map;
 pub use rules::project_instructions;
+pub use snapshot::Snapshot;
 pub use toolbox::{ToolOutput, ToolSummary, Toolbox};
 pub use workspace::Workspace;

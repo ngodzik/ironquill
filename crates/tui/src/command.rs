@@ -23,10 +23,13 @@ pub(crate) enum Command {
     Clear,
     /// `/name <title>` names the conversation; `/name` alone shows the name.
     Name(Option<String>),
-    /// `/resume` lists saved conversations to pick one.
-    Resume,
+    /// `/resume` lists saved conversations to pick one; `/resume <id>`
+    /// continues the one with that id, or whose id starts so.
+    Resume(Option<String>),
     /// `/cost` shows what the conversation has cost so far.
     Cost,
+    /// `/usage` shows or hides the usage pane; `/usage 6h` sets its window.
+    Usage(Option<String>),
     /// `/claude <task>` hands one task to Claude Code, `/codex <task>` to Codex.
     Delegate(Agent, Option<String>),
     /// `/context` opens the conversation's context in the editor.
@@ -38,8 +41,8 @@ pub(crate) enum Command {
     Defaults,
     /// `/team` says who answers and who it may hand tasks to.
     Team,
-    /// `/effort <level>` sets how hard models think; `/effort` alone goes
-    /// to the next level.
+    /// `/effort <level>` sets how hard models think; `/effort` alone shows
+    /// it.
     Effort(Option<String>),
     /// `/pair <question>`: the best of the model that answers and its team
     /// plans, the cheapest codes.
@@ -86,8 +89,9 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "diff" => Ok(Command::Diff),
         "clear" | "new" => Ok(Command::Clear),
         "name" | "rename" => Ok(Command::Name(rest_opt)),
-        "resume" => Ok(Command::Resume),
+        "resume" => Ok(Command::Resume(rest_opt)),
         "cost" => Ok(Command::Cost),
+        "usage" => Ok(Command::Usage(rest_opt)),
         "claude" | "cc" => Ok(Command::Delegate(Agent::ClaudeCode, rest_opt)),
         "codex" | "cx" => Ok(Command::Delegate(Agent::Codex, rest_opt)),
         "budget" => Ok(Command::Budget(rest_opt)),
@@ -121,6 +125,7 @@ pub(crate) const NAMES: &[&str] = &[
     "context",
     "copy",
     "cost",
+    "usage",
     "defaults",
     "diff",
     "effort",
@@ -249,7 +254,7 @@ Type a question or a change and press Enter. Changes are checked before they are
 /planner <model>     the model that plans in a pair; by default the best scored,
                      or the dearest
 /effort <level>      how hard models think: low, medium, high (the default),
-                     xhigh, max; /effort alone goes to the next. ← → in Ctrl-E too
+                     xhigh, max; /effort alone shows it. ← → in Ctrl-E too
 /defaults            keep the current model, list, team and budget for new
                      sessions; done by itself whenever they change
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation
@@ -262,15 +267,18 @@ Type a question or a change and press Enter. Changes are checked before they are
 /context             edit what the next request sends: delete, shorten, annotate; :w applies
 /claude-reset        end Claude Code's session: its next request starts from nothing
 /codex-reset         end Codex's session
-/escalate <id> ...   stronger models used only when the checks keep failing (empty: none)
-/check <command>     add a check, run without a shell; /check alone lists them
+/escalate <id> ...   stronger models for `ironquill do`, when the checks keep failing
+/check <command>     a check offered to /pair's planner, run without a shell;
+                     /check alone lists them. A request in the chat runs none
 /nocheck             remove every check
 /rounds <n>          tries per model before handing over
 /diff                what changed since the last commit
 /clear               start a new conversation
 /name <title>        name this conversation (it is saved after every request)
-/resume              pick a saved conversation to continue (ironquill -c: the last one)
+/resume [id]         continue a saved conversation: pick it, or give its id or
+                     the start of it (ironquill -c: the last one, -r <id>)
 /cost                what this conversation has cost
+/usage [1h|6h|24h]   a pane of cost per model, context and cache rebuilds over time
 /q                   quit
 Files: Ctrl-B, or Esc then ,n, shows the file tree. Arrows move, → or Enter opens,
   ← closes a folder, q hides the pane. Files the agent changed are marked ●.

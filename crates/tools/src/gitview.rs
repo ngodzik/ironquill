@@ -147,6 +147,10 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(root)
+        // The repository of the directory given, whatever started ironquill.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -189,6 +193,10 @@ mod tests {
             let ok = Command::new("git")
                 .args(args)
                 .current_dir(dir.path())
+                // Run from a git hook, these would point at the outer repository.
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()

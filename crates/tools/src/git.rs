@@ -9,6 +9,10 @@ async fn git(dir: &Path, args: &[&str]) -> Result<String, ToolError> {
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
+        // The repository of the directory given, whatever started ironquill.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
         .output()
         .await
         .map_err(|source| ToolError::Spawn {

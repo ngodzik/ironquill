@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use ironquill_core::{Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount, Usage};
+use ironquill_core::{
+    CacheUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount, Usage,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
@@ -224,6 +226,11 @@ impl Codex {
                 usage,
                 cost,
                 billed: self.billed,
+                // Codex logs what it read from the cache, not what it wrote.
+                cache: Some(CacheUse {
+                    read: TokenCount(tokens.cache_read),
+                    written: None,
+                }),
             });
         }
     }

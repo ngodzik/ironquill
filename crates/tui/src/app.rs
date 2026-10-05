@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ironquill_agent::{AgentConfig, Event, Member, Outcome, Pair, Session, Verdict};
+use ironquill_agent::{AgentConfig, Approval, Event, Member, Outcome, Pair, Session, Verdict};
 use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
+use tokio::sync::oneshot;
 
 use crate::command::{self, Command};
 use crate::defaults::Defaults;
@@ -19,6 +20,7 @@ use crate::highlight::Highlighter;
 use crate::keymap::{self, Action, Focus, Mode, Pending};
 use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
+use crate::usage::{Sample, UsageLog};
 
 /// Lines moved by one turn of the mouse wheel.
 const WHEEL_LINES: i32 = 3;
@@ -125,6 +127,8 @@ pub(crate) struct ModelPicker {
     /// What was typed to search the provider's models.
     pub(crate) filter: String,
     pub(crate) selected: usize,
+    /// The effort when it opened, to say so when ← → changed it.
+    pub(crate) effort_at_open: Effort,
 }
 
 /// One row of the model picker.
@@ -172,6 +176,8 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 pub(crate) enum AgentMessage {
     Event(Event),
+    /// A command held for the person, and where to send their answer.
+    Approve(Approval, oneshot::Sender<bool>),
     Done(Result<Outcome, String>),
 }
 
@@ -181,6 +187,10 @@ pub(crate) enum AgentMessage {
 pub(crate) enum Entry {
     Welcome,
     Info(String),
+    /// How a pair ended, who did what and what changed, in one line.
+    Ended(String),
+    /// Something held back by a safety check: what, and why.
+    Refused(String),
     Error(String),
     User(String),
     Said(String),
@@ -392,6 +402,12 @@ pub(crate) struct App {
     input: LineEditor,
     /// The messages sent before, for Up and Down in the message box.
     history: History,
+    /// Each call to a model of the last day, for the usage pane.
+    usage_log: UsageLog,
+    /// The usage pane's window, in seconds, while it shows.
+    usage_pane: Option<u64>,
+    /// A command held for the person, and where their answer goes.
+    approval: Option<(Approval, oneshot::Sender<bool>)>,
     command: LineEditor,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
@@ -511,6 +527,9 @@ impl App {
             pending: None,
             input: LineEditor::default(),
             history: History::default(),
+            usage_log: UsageLog::default(),
+            usage_pane: None,
+            approval: None,
             command: LineEditor::default(),
             transcript,
             scroll_back: Cell::new(0),
@@ -678,6 +697,9 @@ impl App {
             // their mind.
             self.quit_armed = false;
             self.notice = None;
+            if self.approval_key(key) {
+                return None;
+            }
             if let Some(effect) = self.picker_key(key) {
                 return effect;
             }
@@ -1447,13 +1469,28 @@ impl App {
                 self.info(format!("Named: {name}"));
                 return Some(Effect::Save);
             }
-            Command::Resume => {
+            Command::Resume(id) => {
                 if self.is_running() {
                     self.error("Still working on the last message: stop it with Ctrl-C first");
                     return None;
                 }
-                return Some(Effect::ListSessions);
+                return Some(match id {
+                    Some(id) => Effect::Resume(id),
+                    None => Effect::ListSessions,
+                });
             }
+            Command::Usage(window) => match window.as_deref() {
+                None => {
+                    self.usage_pane = match self.usage_pane {
+                        Some(_) => None,
+                        None => Some(60 * 60),
+                    };
+                }
+                Some(text) => match parse_window(text) {
+                    Some(secs) => self.usage_pane = Some(secs),
+                    None => self.error("/usage takes a window such as 1h, 6h or 24h"),
+                },
+            },
             Command::Cost => {
                 let partial = if self.cost_complete {
                     ""
@@ -1508,13 +1545,10 @@ impl App {
                 }
             }
             Command::Defaults => return Some(Effect::SaveDefaults(self.defaults())),
-            Command::Effort(None) => {
-                let next = match self.settings.effort {
-                    Effort::Max => Effort::Low,
-                    effort => effort.step(1),
-                };
-                self.set_effort(next);
-            }
+            Command::Effort(None) => self.info(format!(
+                "Effort: {}. /effort <level> changes it: low, medium, high, xhigh, max",
+                self.settings.effort
+            )),
             Command::Effort(Some(level)) => match level.parse() {
                 Ok(effort) => self.set_effort(effort),
                 Err(e) => self.error(e),
@@ -1532,14 +1566,18 @@ impl App {
                         return None;
                     }
                 };
-                let planner_effort = self.settings.effort.max(Effort::High);
+                // High at most for the planner: past it, a step can think for
+                // minutes for little more. A coder thinking less rereads
+                // everything and stops before writing.
+                let planner_effort = self.settings.effort.min(Effort::High);
+                let coder_effort = Effort::High;
                 self.info(format!(
-                    "Pair: {planner} picks the code to read and plans (effort {planner_effort}), ironquill reads it, {coder} codes (effort low), without the earlier conversation"
+                    "Pair: {planner} picks the code to read and plans (effort {planner_effort}), ironquill reads it, {coder} codes (effort {coder_effort}), without the earlier conversation"
                 ));
                 let pair = Pair {
                     planner,
                     planner_effort,
-                    coder_effort: Effort::Low,
+                    coder_effort,
                 };
                 return self.submit_with(text, vec![coder], Some(pair));
             }
@@ -1581,6 +1619,13 @@ impl App {
         match message {
             AgentMessage::Event(event) => {
                 self.on_event(event);
+                false
+            }
+            AgentMessage::Approve(approval, answer) => {
+                // One at a time: the agent waits for the answer.
+                if let Some((_, earlier)) = self.approval.replace((approval, answer)) {
+                    let _ = earlier.send(false);
+                }
                 false
             }
             AgentMessage::Done(Ok(outcome)) => {
@@ -1649,6 +1694,7 @@ impl App {
             cost_complete: self.cost_complete,
             transcript: self.transcript.clone(),
             session,
+            usage_log: self.usage_log.clone(),
         })
     }
 
@@ -1662,6 +1708,8 @@ impl App {
         self.cost = saved.cost;
         self.cost_complete = saved.cost_complete;
         self.transcript = saved.transcript;
+        self.usage_log = saved.usage_log;
+        self.usage_log.prune(sessions::now());
         self.history = History::default();
         for entry in &self.transcript {
             if let Entry::User(text) = entry {
@@ -1671,8 +1719,8 @@ impl App {
         self.expanded.clear();
         self.selected_reply = None;
         self.transcript.push(Entry::Info(format!(
-            "Resumed \"{}\": the conversation continues where it stopped",
-            saved.name
+            "Resumed \"{}\" ({}): the conversation continues where it stopped",
+            saved.name, self.session_id
         )));
         self.scroll_back.set(0);
         self.picker = None;
@@ -2030,7 +2078,46 @@ impl App {
         self.model_picker = Some(ModelPicker {
             filter: String::new(),
             selected,
+            effort_at_open: self.settings.effort,
         });
+    }
+
+    /// Keys while a held command waits for the person: `y` runs it, `n` or
+    /// Esc refuses it. Returns whether the key was for it.
+    fn approval_key(&mut self, key: KeyEvent) -> bool {
+        if self.approval.is_none() {
+            return false;
+        }
+        let answer = match key.code {
+            KeyCode::Char('y' | 'Y') => true,
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => false,
+            _ => return true,
+        };
+        if let Some((_, sender)) = self.approval.take() {
+            // The agent may have been stopped meanwhile.
+            let _ = sender.send(answer);
+        }
+        true
+    }
+
+    /// The usage samples, and the pane's window while it shows.
+    pub(crate) fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
+        self.usage_pane.map(|window| (&self.usage_log, window))
+    }
+
+    /// The command waiting for the person's answer, if any.
+    pub(crate) fn approval(&self) -> Option<&Approval> {
+        self.approval.as_ref().map(|(approval, _)| approval)
+    }
+
+    /// Closes the model picker, saying the effort when ← → changed it there:
+    /// a higher one costs more on every call after.
+    fn close_model_picker(&mut self) {
+        if let Some(picker) = self.model_picker.take()
+            && picker.effort_at_open != self.settings.effort
+        {
+            self.set_effort(self.settings.effort);
+        }
     }
 
     /// Keys while the model picker is open. Returns whether the key was for it.
@@ -2054,7 +2141,7 @@ impl App {
             KeyCode::Up => set(self, selected.saturating_sub(1)),
             KeyCode::Down => set(self, (selected + 1).min(last)),
             KeyCode::Enter => {
-                self.model_picker = None;
+                self.close_model_picker();
                 if let Some(row) = rows.get(selected) {
                     let model = row.model.clone();
                     self.use_model(model.clone());
@@ -2096,9 +2183,9 @@ impl App {
             // The effort, shown at the top of the list, beside the search.
             KeyCode::Left => self.settings.effort = self.settings.effort.step(-1),
             KeyCode::Right => self.settings.effort = self.settings.effort.step(1),
-            KeyCode::Esc => self.model_picker = None,
+            KeyCode::Esc => self.close_model_picker(),
             // Ctrl-E again closes it, as the shortcut that opened it.
-            KeyCode::Char('e') if ctrl => self.model_picker = None,
+            KeyCode::Char('e') if ctrl => self.close_model_picker(),
             KeyCode::Backspace => {
                 if let Some(p) = &mut self.model_picker {
                     p.filter.pop();
@@ -2249,7 +2336,11 @@ impl App {
     fn entry_text(entry: &Entry) -> Option<String> {
         let text = match entry {
             Entry::Welcome | Entry::Cost { .. } => return None,
-            Entry::Info(text) | Entry::Error(text) | Entry::Said(text) => text.clone(),
+            Entry::Info(text)
+            | Entry::Ended(text)
+            | Entry::Refused(text)
+            | Entry::Error(text)
+            | Entry::Said(text) => text.clone(),
             Entry::User(text) => format!("> {text}"),
             Entry::Tool {
                 name,
@@ -2444,7 +2535,20 @@ impl App {
                 cost,
                 subscription,
                 context,
+                cache,
             } => {
+                // A point for the usage pane; the conversation's context
+                // only, not a member's.
+                self.usage_log.push(Sample {
+                    at: sessions::now(),
+                    model: model.to_string(),
+                    input: usage.input.0,
+                    output: usage.output.0,
+                    cost: cost.map(|c| c.0),
+                    cache_read: cache.map(|c| c.read.0),
+                    cache_written: cache.and_then(|c| c.written.map(|w| w.0)),
+                    context: context.filter(|_| self.member.is_none()).map(|c| c.used.0),
+                });
                 // The model that answers is back: the member is done.
                 if self.member.as_ref().is_some_and(|m| *m != model) {
                     self.member = None;
@@ -2582,6 +2686,50 @@ impl App {
                 self.member = None;
                 Entry::OverBudget { spent, budget }
             }
+            Event::Tried { command, outcome } => {
+                // The first lines say it; the rest is for the planner.
+                let short: Vec<&str> = outcome.lines().take(3).collect();
+                Entry::Info(format!(
+                    "Before any change, `{command}` {}",
+                    short.join(" ")
+                ))
+            }
+            Event::PairEnded { text } => Entry::Ended(text),
+            Event::Restarted {
+                model,
+                idle_secs,
+                before,
+                after,
+            } => Entry::Info(format!(
+                "{model}'s prompt cache had expired ({} unused): the conversation goes on from \
+                 its summary and the latest exchanges, about {before} → {after} tokens. /context \
+                 shows it",
+                sessions::ago(0, idle_secs).trim_end_matches(" ago")
+            )),
+            Event::Notice { model, text } => Entry::Info(format!("{model}: {text}")),
+            Event::Denied {
+                model,
+                action,
+                reason,
+            } => Entry::Refused(format!(
+                "{model}'s safety checks refused: {action}{}. To allow it, say so in your next message",
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", first_sentence(&reason))
+                }
+            )),
+            Event::Held {
+                command,
+                reasons,
+                approved,
+            } => {
+                if approved {
+                    Entry::Info(format!("Approved: {command}"))
+                } else {
+                    Entry::Refused(format!("Refused: {command} ({})", reasons.join("; ")))
+                }
+            }
         };
         self.push_entry(entry);
     }
@@ -2627,6 +2775,8 @@ impl App {
 
     pub(crate) fn on_cancelled(&mut self) {
         self.running_since = None;
+        // Its answer would reach nobody.
+        self.approval = None;
         self.info("Stopped. Files already edited stay edited: /diff shows them");
     }
 
@@ -2637,6 +2787,26 @@ impl App {
     pub(crate) fn on_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
     }
+}
+
+/// A window such as `90m`, `6h` or `1d`, in seconds, a day at most.
+fn parse_window(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (number, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
+    let number: u64 = number.parse().ok().filter(|n| *n > 0)?;
+    let secs = match unit {
+        "m" | "min" => number * 60,
+        "h" => number * 60 * 60,
+        "d" => number * 24 * 60 * 60,
+        _ => return None,
+    };
+    Some(secs.min(crate::usage::KEEP_SECS))
+}
+
+/// The first sentence of `text`, for a line: an agent's reasons run long.
+fn first_sentence(text: &str) -> &str {
+    let text = text.trim();
+    text.find(". ").map_or(text, |end| &text[..end])
 }
 
 /// `3/4 Planning · tensorx/glm-5.3 · effort high`, or `by ironquill`.
@@ -2694,6 +2864,85 @@ mod tests {
             },
             PathBuf::from("/p"),
         )
+    }
+
+    #[test]
+    fn the_usage_pane_shows_what_each_model_used() {
+        use ironquill_core::CacheUse;
+        let mut app = ready();
+        for (model, cost, written) in [("glm", 0.01, 500), ("opus", 0.2, 9_000), ("glm", 0.01, 400)]
+        {
+            app.on_agent(AgentMessage::Event(Event::Turn {
+                model: ModelId::new(model).unwrap(),
+                usage: Usage {
+                    input: TokenCount(10_000),
+                    output: TokenCount(100),
+                },
+                cost: Some(Usd(cost)),
+                subscription: false,
+                context: Some(ContextUse {
+                    used: TokenCount(10_000),
+                    window: TokenCount(200_000),
+                }),
+                cache: Some(CacheUse {
+                    read: TokenCount(10_000 - written),
+                    written: Some(TokenCount(written)),
+                }),
+            }));
+        }
+        type_text(&mut app, "/usage 6h");
+        press(&mut app, KeyCode::Enter);
+        let (log, window) = app.usage_pane().unwrap();
+        assert_eq!(window, 6 * 3600);
+        assert_eq!(log.samples.len(), 3);
+
+        let backend = ratatui::backend::TestBackend::new(140, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::view::render(frame, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(screen.contains("Usage · last 6h"));
+        assert!(screen.contains("$0.020 · 2 calls · cache 96%"), "{screen}");
+        assert!(screen.contains("$0.200 · 1 call · cache 10% · 1 rebuilt"));
+
+        // Kept with the conversation.
+        app.transcript.push(Entry::User("hi".into()));
+        let saved = app.to_saved(Session::new()).unwrap();
+        assert_eq!(saved.usage_log.samples.len(), 3);
+        type_text(&mut app, "/usage");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.usage_pane().is_none());
+    }
+
+    #[test]
+    fn a_held_command_waits_for_yes_or_no() {
+        let mut app = ready();
+        let approval = || Approval {
+            model: ModelId::new("cheap").unwrap(),
+            command: "git push origin main".into(),
+            reasons: vec!["it sends commits to another repository".into()],
+        };
+        let (answer, mut answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(approval(), answer));
+        assert_eq!(app.approval().unwrap().command, "git push origin main");
+        // Other keys wait for the answer, and type nothing.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.approval().is_some());
+        assert_eq!(app.input().text(), "");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.approval().is_none());
+        assert_eq!(answered.try_recv(), Ok(true));
+
+        let (answer, mut answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(approval(), answer));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(answered.try_recv(), Ok(false));
     }
 
     #[test]
@@ -2784,6 +3033,7 @@ mod tests {
                 cost: Some(Usd(0.002)),
                 subscription: false,
                 context: None,
+                cache: None,
             }));
         }
         let (usage, cost, complete) = app.totals();
@@ -2932,6 +3182,7 @@ mod tests {
             cost: Some(Usd(0.0003)),
             subscription: false,
             context: None,
+            cache: None,
         }));
         let finished = app.on_agent(AgentMessage::Done(Ok(Outcome {
             verdict: Verdict::Answered,
@@ -3206,6 +3457,7 @@ mod tests {
                 cost: None,
                 subscription: false,
                 context: None,
+                cache: None,
             })
         };
         app.on_agent(AgentMessage::Event(Event::Delegating {
@@ -3223,6 +3475,7 @@ mod tests {
             cost: Some(Usd(0.012)),
             subscription: false,
             context: None,
+            cache: None,
         }));
         app.on_agent(AgentMessage::Event(Event::Said {
             model: id("strong"),
@@ -3277,10 +3530,13 @@ mod tests {
         let mut app = ready();
         assert_eq!(app.effort(), Effort::High);
 
-        // Alone, /effort goes to the next level, and round.
+        // Alone, /effort only shows it.
         type_text(&mut app, "/effort");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.effort(), Effort::Xhigh);
+        assert_eq!(app.effort(), Effort::High);
+        assert!(
+            matches!(app.transcript.last(), Some(Entry::Info(t)) if t.starts_with("Effort: high."))
+        );
         type_text(&mut app, "/effort low");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.effort(), Effort::Low);
@@ -3296,6 +3552,10 @@ mod tests {
         press(&mut app, KeyCode::Left);
         assert_eq!(app.effort(), Effort::Medium);
         press(&mut app, KeyCode::Esc);
+        // Closing the picker says what it changed.
+        assert!(
+            matches!(app.transcript.last(), Some(Entry::Info(t)) if t.starts_with("Effort: medium."))
+        );
 
         // Kept with the other choices.
         assert_eq!(app.defaults().effort.as_deref(), Some("medium"));
@@ -3387,7 +3647,7 @@ mod tests {
         assert!(app.transcript.iter().any(|e| matches!(
             e,
             Entry::Info(t) if t.contains("smart picks the code to read and plans (effort high)")
-                && t.contains("cheap codes (effort low)")
+                && t.contains("cheap codes (effort high)")
         )));
         // The model that answers stays the one picked.
         assert_eq!(app.current_model(), Some(&id("smart")));
@@ -3407,6 +3667,7 @@ mod tests {
                 cost: Some(Usd(cost)),
                 subscription: false,
                 context: None,
+                cache: None,
             })
         };
         type_text(&mut app, "do it");
@@ -3497,6 +3758,7 @@ mod tests {
             cost: None,
             subscription: true,
             context: None,
+            cache: None,
         }));
         let (usage, cost, complete) = app.totals();
         assert_eq!(usage.input, TokenCount(30_000));

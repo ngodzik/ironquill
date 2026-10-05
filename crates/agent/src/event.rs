@@ -1,4 +1,4 @@
-use ironquill_core::{ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
+use ironquill_core::{CacheUse, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::ToolSummary;
 
 /// Something that happened during a session, for whoever is watching.
@@ -20,6 +20,8 @@ pub enum Event {
         subscription: bool,
         /// How full the model's context was, when its window is known.
         context: Option<ContextUse>,
+        /// What it read from the prompt cache and wrote to it, when known.
+        cache: Option<CacheUse>,
     },
     /// Text as it is being written, by an agent that reports it in pieces.
     Saying {
@@ -89,6 +91,58 @@ pub enum Event {
         model: Option<ModelId>,
         /// How hard that model thinks.
         effort: Option<Effort>,
+    },
+    /// Something about how an agent works the person should know.
+    Notice {
+        /// The agent.
+        model: ModelId,
+        /// What.
+        text: String,
+    },
+    /// An agent's safety checks refused one of its calls: the person may
+    /// approve it in their next message.
+    Denied {
+        /// The agent.
+        model: ModelId,
+        /// What it wanted to do, such as the command.
+        action: String,
+        /// Why it was refused, when the agent says.
+        reason: String,
+    },
+    /// A command a model wanted to run was put to the person, who said yes
+    /// or no, or could not be asked.
+    Held {
+        /// The command.
+        command: String,
+        /// Why it was held.
+        reasons: Vec<String>,
+        /// Whether it ran.
+        approved: bool,
+    },
+    /// A check was tried before any change, to see whether it can judge one.
+    Tried {
+        /// The command.
+        command: String,
+        /// What it did: passes, fails already, or cannot judge, and why.
+        outcome: String,
+    },
+    /// A pair ended: who did what, how it ended, what judged it, and the
+    /// files changed, in one line.
+    PairEnded {
+        /// That line.
+        text: String,
+    },
+    /// The provider's cache had expired: the conversation goes on from its
+    /// summary, with the latest exchanges as they were.
+    Restarted {
+        /// The model the conversation is sent to.
+        model: ModelId,
+        /// How long it was left unused.
+        idle_secs: u64,
+        /// About how many tokens it held before.
+        before: TokenCount,
+        /// And after.
+        after: TokenCount,
     },
     /// Old tool results were dropped from the conversation to resend less.
     Compacted {

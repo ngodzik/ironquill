@@ -22,6 +22,7 @@ pub mod keymap;
 mod markdown;
 mod sessions;
 mod tree;
+mod usage;
 mod view;
 mod wrap;
 
@@ -29,14 +30,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use ironquill_agent::{AgentConfig, Session};
+use ironquill_agent::{AgentConfig, Approver, Session};
 use ironquill_core::{ChatModel, Delegate};
 use ironquill_tools::{Toolbox, Workspace};
 use ratatui::crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyEventKind,
 };
 use ratatui::crossterm::execute;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::app::{AgentMessage, App, Effect};
@@ -46,7 +47,7 @@ pub use app::Settings;
 pub use defaults::Defaults;
 
 /// How the interface starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Start {
     /// A new conversation.
     #[default]
@@ -55,6 +56,8 @@ pub enum Start {
     Continue,
     /// The list of saved conversations, to pick one.
     Pick,
+    /// The conversation with this id, or whose id starts so.
+    Id(String),
 }
 pub use error::TuiError;
 
@@ -126,6 +129,7 @@ where
             None => app.report_error("No saved conversation for this project yet".into()),
         },
         Start::Pick => app.show_picker(store.as_ref().map(Store::list).unwrap_or_default()),
+        Start::Id(id) => resume(&store, &mut app, &conversation, &workspace, &id).await,
     }
     let mut keys = EventStream::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentMessage>();
@@ -187,9 +191,23 @@ where
             None => {}
             Some(Effect::Send { text, config }) => {
                 // Read again each time: an edit counts from the next request.
+                // A held command is put to the person in a window; the agent
+                // waits for the answer.
+                let asks = tx.clone();
+                let approver = Approver::new(move |approval| {
+                    let asks = asks.clone();
+                    async move {
+                        let (answer, answered) = oneshot::channel();
+                        if asks.send(AgentMessage::Approve(approval, answer)).is_err() {
+                            return false;
+                        }
+                        answered.await.unwrap_or(false)
+                    }
+                });
                 let config = config
                     .with_instructions(Defaults::instructions())
-                    .with_project_rules(ironquill_tools::project_instructions(app.root()));
+                    .with_project_rules(ironquill_tools::project_instructions(app.root()))
+                    .with_approver(approver);
                 task = Some(spawn_agent(
                     Arc::clone(&model),
                     Arc::clone(&delegate),
@@ -341,7 +359,7 @@ async fn resume(
     let Some(store) = store else {
         return;
     };
-    match store.load(id) {
+    match store.find(id).and_then(|id| store.load(&id)) {
         Ok(saved) => {
             *conversation.lock().await = Conversation {
                 session: saved.session.clone(),
