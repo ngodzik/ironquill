@@ -91,6 +91,12 @@ impl Workspace {
     }
 
     pub(crate) fn write(&self, relative: &str, content: &str) -> Result<(), ToolError> {
+        if Path::new(relative)
+            .components()
+            .any(|c| c.as_os_str() == ".git")
+        {
+            return Err(ToolError::Protected(relative.into()));
+        }
         let path = self.resolve(relative)?;
         let io = |source| ToolError::Io {
             path: self.display(&path).to_owned(),

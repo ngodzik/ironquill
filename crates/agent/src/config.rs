@@ -24,21 +24,60 @@ pub struct AgentConfig {
     pub(crate) instructions: Option<String>,
     pub(crate) project_rules: Option<String>,
     pub(crate) approver: Option<Approver>,
+    pub(crate) allowed_secrets: Vec<String>,
+    pub(crate) strict_commands: bool,
+    pub(crate) audit_log: Option<std::path::PathBuf>,
 }
 
-/// A command a model wants to run, put to the person first.
+/// A question put to the person while a model works.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approval {
-    /// The model that wants it.
+    /// The model it is about.
     pub model: ModelId,
-    /// The command, as it would run.
-    pub command: String,
-    /// What it does that cannot be undone, leaves the machine or cannot be
-    /// read from the command.
-    pub reasons: Vec<String>,
+    /// What they are asked.
+    pub question: Question,
 }
 
-type Ask = dyn Fn(Approval) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync;
+/// What the person is asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Question {
+    /// Whether a held command may run.
+    Command {
+        /// The command, as it would run.
+        command: String,
+        /// What it does that cannot be undone, leaves the machine or
+        /// cannot be read from the command.
+        reasons: Vec<String>,
+        /// The secrets of the environment it names that were not allowed:
+        /// they may be allowed for good.
+        secrets: Vec<String>,
+    },
+    /// Whether the model may go on, having used all its turns.
+    MoreTurns {
+        /// How many more it would get.
+        turns: u32,
+    },
+}
+
+/// The person's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Yes, this once.
+    Yes,
+    /// Yes, and the secrets it names from now on.
+    Always,
+    /// No.
+    No,
+}
+
+impl Answer {
+    /// Whether it may go ahead.
+    pub fn yes(self) -> bool {
+        self != Answer::No
+    }
+}
+
+type Ask = dyn Fn(Approval) -> Pin<Box<dyn Future<Output = Answer> + Send>> + Send + Sync;
 
 /// Asks the person whether a held command may run. Without one, held
 /// commands are refused, as when nobody is there to answer.
@@ -50,12 +89,12 @@ impl Approver {
     pub fn new<F, Fut>(ask: F) -> Self
     where
         F: Fn(Approval) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = bool> + Send + 'static,
+        Fut: Future<Output = Answer> + Send + 'static,
     {
         Self(Arc::new(move |approval| Box::pin(ask(approval))))
     }
 
-    pub(crate) async fn ask(&self, approval: Approval) -> bool {
+    pub(crate) async fn ask(&self, approval: Approval) -> Answer {
         (self.0)(approval).await
     }
 }
@@ -167,6 +206,25 @@ impl AgentConfig {
     /// interface.
     pub fn with_approver(mut self, approver: Approver) -> Self {
         self.approver = Some(approver);
+        self
+    }
+
+    /// Whether a command running a program ironquill does not know waits
+    /// for the person too.
+    pub fn with_strict_commands(mut self, strict: bool) -> Self {
+        self.strict_commands = strict;
+        self
+    }
+
+    /// Where every command a model runs, or was refused, is written down.
+    pub fn with_audit_log(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.audit_log = path;
+        self
+    }
+
+    /// The secrets of the environment the person allowed commands to use.
+    pub fn with_allowed_secrets(mut self, names: Vec<String>) -> Self {
+        self.allowed_secrets = names;
         self
     }
 }
@@ -306,6 +364,9 @@ impl AgentConfigBuilder {
             pair: self.pair,
             detect_checks: self.detect_checks,
             approver: None,
+            allowed_secrets: Vec::new(),
+            strict_commands: false,
+            audit_log: None,
             instructions: self.instructions,
             project_rules: self.project_rules,
         })

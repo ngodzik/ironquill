@@ -25,7 +25,7 @@ mod toolbox;
 mod workspace;
 
 pub use check::{Check, CheckFailure, CheckReport, Trial};
-pub use command::{CommandOutput, assess, run_command};
+pub use command::{Assessment, CommandOutput, assess, run_command, unreadable};
 pub use detect::detect_checks;
 pub use diff::{DiffLine, line_diff};
 pub use docker::{Container, running_containers};

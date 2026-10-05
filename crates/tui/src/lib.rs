@@ -30,11 +30,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use ironquill_agent::{AgentConfig, Approver, Session};
+use ironquill_agent::{AgentConfig, Answer, Approver, Session};
 use ironquill_core::{ChatModel, Delegate};
 use ironquill_tools::{Toolbox, Workspace};
 use ratatui::crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, EventStream, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -43,7 +44,7 @@ use tokio::task::JoinHandle;
 use crate::app::{AgentMessage, App, Effect};
 use crate::sessions::Store;
 
-pub use app::Settings;
+pub use app::{Settings, parse_window};
 pub use defaults::Defaults;
 
 /// How the interface starts.
@@ -93,13 +94,20 @@ where
     let mut terminal = ratatui::try_init().map_err(TuiError::Terminal)?;
     // Clicks and the wheel reach the interface. Selecting text with the mouse
     // then needs Shift held, as in most terminal applications that do this.
-    let mouse = execute!(std::io::stdout(), EnableMouseCapture).map_err(TuiError::Terminal);
+    // Pasted text arrives in one piece, so that its line breaks do not send
+    // the message.
+    let mouse = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)
+        .map_err(TuiError::Terminal);
     let result = match mouse {
         Ok(()) => event_loop(&mut terminal, model, delegate, workspace, settings, start).await,
         Err(e) => Err(e),
     };
     // Restored whatever happened, or the person's shell is left in raw mode.
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -150,6 +158,10 @@ where
         let effect = tokio::select! {
             key = keys.next() => match key {
                 Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Some(Ok(TermEvent::Paste(text))) => {
+                    app.on_paste(&text);
+                    None
+                }
                 Some(Ok(TermEvent::Mouse(mouse))) => {
                     app.on_mouse(mouse);
                     None
@@ -199,13 +211,14 @@ where
                     async move {
                         let (answer, answered) = oneshot::channel();
                         if asks.send(AgentMessage::Approve(approval, answer)).is_err() {
-                            return false;
+                            return Answer::No;
                         }
-                        answered.await.unwrap_or(false)
+                        answered.await.unwrap_or(Answer::No)
                     }
                 });
                 let config = config
                     .with_instructions(Defaults::instructions())
+                    .with_audit_log(Defaults::audit_log_path())
                     .with_project_rules(ironquill_tools::project_instructions(app.root()))
                     .with_approver(approver);
                 task = Some(spawn_agent(
@@ -229,9 +242,18 @@ where
             Some(Effect::Cancel) => {
                 if let Some(handle) = task.take() {
                     handle.abort();
+                    // Once it has stopped, the conversation is free: it says
+                    // the request was cut short, and is kept as it is.
+                    let _ = handle.await;
+                    conversation.lock().await.session.interrupted();
                 }
                 app.on_cancelled();
+                save(&store, &mut app, &conversation).await;
             }
+            Some(Effect::Copy(text)) => match clipboard::copy(&text) {
+                Ok(how) => app.info(format!("Copied ({how})")),
+                Err(e) => app.report_error(e),
+            },
             Some(Effect::Diff) => {
                 let text = ironquill_tools::diff_stat(workspace.root())
                     .await

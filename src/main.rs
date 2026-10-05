@@ -202,7 +202,15 @@ async fn main() -> Result<()> {
                 .instructions(Defaults::instructions())
                 .project_rules(ironquill_tools::project_instructions(Path::new(".")));
             builder = builder.effort(Some(cli.effort.unwrap_or_default()));
-            run_task(&provider, &builder.build()?, &task).await
+            let kept = Defaults::path()
+                .and_then(|path| Defaults::load(&path).ok())
+                .unwrap_or_default();
+            let config = builder
+                .build()?
+                .with_audit_log(Defaults::audit_log_path())
+                .with_allowed_secrets(kept.allowed_secrets)
+                .with_strict_commands(kept.strict_commands);
+            run_task(&provider, &config, &task).await
         }
     }
 }
@@ -366,6 +374,12 @@ async fn interface(
             choices.effort.or_kept(kept).unwrap_or_default()
         },
         planner: defaults.planner.as_deref().map(ModelId::new).transpose()?,
+        usage_window: defaults
+            .usage_window
+            .as_deref()
+            .and_then(ironquill_tui::parse_window),
+        allowed_secrets: defaults.allowed_secrets.clone(),
+        strict_commands: defaults.strict_commands,
         detect_checks,
         notes,
         catalog,
@@ -680,6 +694,18 @@ fn show(event: Event) {
             eprintln!("· before any change, `{command}` {first}");
         }
         Event::PairEnded { text } => eprintln!("■ {text}"),
+        Event::Command {
+            command,
+            status,
+            checked_by,
+            ..
+        } => {
+            let checked = checked_by.map_or_else(String::new, |m| format!(", checked by {m}"));
+            eprintln!("$ {command}  ({status}{checked})");
+        }
+        Event::Silent { model } => eprintln!("✗ {model} answered nothing, twice"),
+        Event::Progress { by, text, .. } => eprintln!("· where the work stands ({by}):\n{text}"),
+        Event::OutOfTurns { model, turns } => eprintln!("· {model} used its {turns} turns"),
         Event::Restarted {
             model,
             before,
