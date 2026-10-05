@@ -291,6 +291,8 @@ struct Ctx<'a, M, D, O> {
     windows: BTreeMap<String, u64>,
     /// The secrets of the environment commands may use.
     allowed_secrets: Vec<String>,
+    /// The servers the person allowed besides the known ones.
+    allowed_hosts: Vec<String>,
 }
 
 enum Attempt {
@@ -428,6 +430,7 @@ impl Session {
             failing_before: Vec::new(),
             windows: std::mem::take(&mut self.windows),
             allowed_secrets: config.allowed_secrets.clone(),
+            allowed_hosts: config.allowed_hosts.clone(),
         };
         self.restart_if_cold(&mut ctx).await;
         let verdict = match self.work(&mut ctx, text, context).await {
@@ -1357,6 +1360,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         failing_before: Vec::new(),
         windows: BTreeMap::new(),
         allowed_secrets: config.allowed_secrets.clone(),
+        allowed_hosts: config.allowed_hosts.clone(),
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -2906,7 +2910,13 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
         Err(e) => return format!("error: the arguments are not valid: {e}"),
     };
     let root = ctx.toolbox.workspace().root().to_owned();
-    let found = ironquill_tools::assess(&command, &root, ctx.config.strict_commands);
+    let mut known = ironquill_tools::known_hosts(&root);
+    known.extend(ctx.allowed_hosts.iter().cloned());
+    let policy = ironquill_tools::Policy {
+        strict: ctx.config.strict_commands,
+        known_hosts: Some(known),
+    };
+    let found = ironquill_tools::assess(&command, &root, &policy);
     // A secret's value is never shown to a model, whoever would allow it.
     if !found.refused.is_empty() {
         audit(
@@ -2940,6 +2950,12 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
             .iter()
             .map(|name| format!("it uses the secret {name}")),
     );
+    reasons.extend(
+        found
+            .hosts
+            .iter()
+            .map(|host| format!("it reaches {host}, a server not used here before")),
+    );
     // Held only because its text does not say what it does: another model
     // reads it, and only a plain READ lets it run without asking. Not when
     // it uses a secret, nor when it speaks to its judge.
@@ -2949,6 +2965,7 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
         .any(|w| w.eq_ignore_ascii_case("read") || w.eq_ignore_ascii_case("write"));
     if !reasons.is_empty()
         && missing.is_empty()
+        && found.hosts.is_empty()
         && !addresses_judge
         && reasons.iter().all(|r| ironquill_tools::unreadable(r))
     {
@@ -2981,6 +2998,7 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
                 command: command.clone(),
                 reasons: reasons.clone(),
                 secrets: missing.clone(),
+                hosts: found.hosts.clone(),
             },
         };
         let answer = match &ctx.config.approver {
@@ -3018,6 +3036,7 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
         }
         if answer == Answer::Always {
             ctx.allowed_secrets.extend(missing.iter().cloned());
+            ctx.allowed_hosts.extend(found.hosts.iter().cloned());
         }
         secrets.extend(missing);
         decision = if answer == Answer::Always {
@@ -4735,6 +4754,7 @@ mod tests {
                 command: "rm old.txt".into(),
                 reasons: vec!["it deletes files".into()],
                 secrets: vec![],
+                hosts: vec![],
             }
         );
         assert_eq!(

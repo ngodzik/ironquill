@@ -35,6 +35,9 @@ pub(crate) enum Command {
     Secrets(Option<String>),
     /// `/strict [on|off]`: whether a program ironquill does not know asks.
     Strict(Option<String>),
+    /// `/hosts` lists the servers allowed besides the known ones; `/hosts
+    /// forget <host>` takes one back.
+    Hosts(Option<String>),
     /// `/claude <task>` hands one task to Claude Code, `/codex <task>` to Codex.
     Delegate(Agent, Option<String>),
     /// `/context` opens the conversation's context in the editor.
@@ -99,6 +102,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "usage" => Ok(Command::Usage(rest_opt)),
         "secrets" => Ok(Command::Secrets(rest_opt)),
         "strict" => Ok(Command::Strict(rest_opt)),
+        "hosts" => Ok(Command::Hosts(rest_opt)),
         "claude" | "cc" => Ok(Command::Delegate(Agent::ClaudeCode, rest_opt)),
         "codex" | "cx" => Ok(Command::Delegate(Agent::Codex, rest_opt)),
         "budget" => Ok(Command::Budget(rest_opt)),
@@ -135,6 +139,7 @@ pub(crate) const NAMES: &[&str] = &[
     "usage",
     "secrets",
     "strict",
+    "hosts",
     "defaults",
     "diff",
     "effort",
@@ -289,7 +294,8 @@ Type a question or a change and press Enter. Changes are checked before they are
 /cost                what this conversation has cost
 /usage [1h|6h|24h]   a pane of cost per model, context and cache rebuilds over time
 /secrets             the secrets commands may use; /secrets forget <name>
-/strict [on|off]     whether a program ironquill does not know asks first
+/strict [on|off]     whether a program ironquill does not know asks first (on)
+/hosts               servers allowed besides those already used; /hosts forget
                      (every command is written down in ~/.ironquill/audit.log)
 /q                   quit
 Files: Ctrl-B, or Esc then ,n, shows the file tree. Arrows move, → or Enter opens,

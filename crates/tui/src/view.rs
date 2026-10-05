@@ -79,6 +79,7 @@ fn render_approval(frame: &mut Frame, app: &App) {
             command,
             reasons,
             secrets,
+            hosts,
         } => {
             let mut lines = vec![
                 Line::styled(
@@ -97,12 +98,13 @@ fn render_approval(frame: &mut Frame, app: &App) {
             for reason in reasons {
                 lines.push(Line::styled(format!(" · {reason}"), fg(Color::Gray)));
             }
-            let keys = if secrets.is_empty() {
+            let lasting: Vec<&str> = secrets.iter().chain(hosts).map(String::as_str).collect();
+            let keys = if lasting.is_empty() {
                 " y: run it · n: refuse · c: copy ".to_owned()
             } else {
                 format!(
                     " y: run it · a: always allow {} · n: refuse · c: copy ",
-                    secrets.join(", ")
+                    lasting.join(", ")
                 )
             };
             (Color::Red, " Run this command? ", keys, lines)

@@ -26,6 +26,7 @@ pub struct AgentConfig {
     pub(crate) approver: Option<Approver>,
     pub(crate) allowed_secrets: Vec<String>,
     pub(crate) strict_commands: bool,
+    pub(crate) allowed_hosts: Vec<String>,
     pub(crate) audit_log: Option<std::path::PathBuf>,
 }
 
@@ -51,6 +52,9 @@ pub enum Question {
         /// The secrets of the environment it names that were not allowed:
         /// they may be allowed for good.
         secrets: Vec<String>,
+        /// The servers it reaches that were not known: they may be allowed
+        /// for good.
+        hosts: Vec<String>,
     },
     /// Whether the model may go on, having used all its turns.
     MoreTurns {
@@ -64,7 +68,7 @@ pub enum Question {
 pub enum Answer {
     /// Yes, this once.
     Yes,
-    /// Yes, and the secrets it names from now on.
+    /// Yes, and the secrets and servers it names from now on.
     Always,
     /// No.
     No,
@@ -222,6 +226,13 @@ impl AgentConfig {
         self
     }
 
+    /// The servers the person allowed commands to reach, besides those the
+    /// project and its tools already use.
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = hosts;
+        self
+    }
+
     /// The secrets of the environment the person allowed commands to use.
     pub fn with_allowed_secrets(mut self, names: Vec<String>) -> Self {
         self.allowed_secrets = names;
@@ -366,6 +377,7 @@ impl AgentConfigBuilder {
             approver: None,
             allowed_secrets: Vec::new(),
             strict_commands: false,
+            allowed_hosts: Vec::new(),
             audit_log: None,
             instructions: self.instructions,
             project_rules: self.project_rules,

@@ -209,7 +209,8 @@ async fn main() -> Result<()> {
                 .build()?
                 .with_audit_log(Defaults::audit_log_path())
                 .with_allowed_secrets(kept.allowed_secrets)
-                .with_strict_commands(kept.strict_commands);
+                .with_allowed_hosts(kept.allowed_hosts)
+                .with_strict_commands(!kept.lenient_commands);
             run_task(&provider, &config, &task).await
         }
     }
@@ -379,7 +380,8 @@ async fn interface(
             .as_deref()
             .and_then(ironquill_tui::parse_window),
         allowed_secrets: defaults.allowed_secrets.clone(),
-        strict_commands: defaults.strict_commands,
+        strict_commands: !defaults.lenient_commands,
+        allowed_hosts: defaults.allowed_hosts.clone(),
         detect_checks,
         notes,
         catalog,

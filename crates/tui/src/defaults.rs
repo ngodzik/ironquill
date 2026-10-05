@@ -46,9 +46,14 @@ pub struct Defaults {
     /// values stay in the environment, never here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_secrets: Vec<String>,
-    /// Whether a command running a program ironquill does not know asks too.
+    /// Whether a program ironquill does not know runs without asking, as
+    /// `/strict off` chose; by default it asks.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub strict_commands: bool,
+    pub lenient_commands: bool,
+    /// Servers commands may reach besides those already used, as the
+    /// person allowed them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Defaults {
@@ -137,7 +142,8 @@ mod tests {
             planner: Some("b/strong".into()),
             usage_window: Some("6h".into()),
             allowed_secrets: vec!["API_TOKEN".into()],
-            strict_commands: true,
+            lenient_commands: true,
+            allowed_hosts: vec!["api.example.com".into()],
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));
