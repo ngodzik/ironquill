@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ironquill_agent::{AgentConfig, Approval, Event, Member, Outcome, Pair, Session, Verdict};
+use ironquill_agent::{
+    AgentConfig, Answer, Approval, Event, Member, Outcome, Pair, Question, Session, Verdict,
+};
 use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use ratatui::crossterm::event::{
@@ -86,6 +88,15 @@ pub struct Settings {
     /// What the person should know at startup, such as a model given on the
     /// command line in place of the one kept.
     pub notes: Vec<String>,
+    /// The usage pane's window, in seconds, as kept from the last session.
+    pub usage_window: Option<u64>,
+    /// The secrets of the environment commands may use, as the person
+    /// allowed them.
+    pub allowed_secrets: Vec<String>,
+    /// Whether a command running a program ironquill does not know asks.
+    pub strict_commands: bool,
+    /// Servers commands may reach besides those already used.
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Tokens and cost of one part of a request.
@@ -144,6 +155,8 @@ pub(crate) struct ModelRow {
 /// Something only the event loop can do, asked for by the state.
 #[derive(Debug)]
 pub(crate) enum Effect {
+    /// Put this text on the system clipboard.
+    Copy(String),
     /// Send this message to the conversation.
     Send { text: String, config: AgentConfig },
     /// Stop the request in progress.
@@ -177,7 +190,7 @@ pub(crate) enum Effect {
 pub(crate) enum AgentMessage {
     Event(Event),
     /// A command held for the person, and where to send their answer.
-    Approve(Approval, oneshot::Sender<bool>),
+    Approve(Approval, oneshot::Sender<Answer>),
     Done(Result<Outcome, String>),
 }
 
@@ -191,6 +204,16 @@ pub(crate) enum Entry {
     Ended(String),
     /// Something held back by a safety check: what, and why.
     Refused(String),
+    /// A command a model ran, folded to its first line until opened.
+    Command {
+        model: ModelId,
+        command: String,
+        status: String,
+        output: String,
+        checked_by: Option<ModelId>,
+    },
+    /// The person stopped the request before it ended.
+    Interrupted,
     Error(String),
     User(String),
     Said(String),
@@ -264,6 +287,27 @@ impl Entry {
             Entry::Said(_) => true,
             Entry::Member { entry, .. } => entry.is_reply(),
             _ => false,
+        }
+    }
+
+    /// What can be selected, folded and copied: a reply, or a command.
+    pub(crate) fn folds(&self) -> bool {
+        match self {
+            Entry::Said(_) | Entry::Command { .. } => true,
+            Entry::Member { entry, .. } => entry.folds(),
+            _ => false,
+        }
+    }
+
+    /// The text copied from it: a reply, or a command and what it printed.
+    pub(crate) fn copied(&self) -> Option<String> {
+        match self {
+            Entry::Said(text) => Some(text.clone()),
+            Entry::Command {
+                command, output, ..
+            } => Some(format!("{command}\n{output}")),
+            Entry::Member { entry, .. } => entry.copied(),
+            _ => None,
         }
     }
 }
@@ -404,10 +448,12 @@ pub(crate) struct App {
     history: History,
     /// Each call to a model of the last day, for the usage pane.
     usage_log: UsageLog,
-    /// The usage pane's window, in seconds, while it shows.
-    usage_pane: Option<u64>,
+    /// The usage pane's window, in seconds, kept while it is hidden.
+    usage_window: u64,
+    /// Whether the usage pane shows.
+    usage_open: bool,
     /// A command held for the person, and where their answer goes.
-    approval: Option<(Approval, oneshot::Sender<bool>)>,
+    approval: Option<(Approval, oneshot::Sender<Answer>)>,
     command: LineEditor,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
@@ -518,6 +564,7 @@ impl App {
             || root.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
+        let usage_window = settings.usage_window.unwrap_or(3600);
         let mut app = Self {
             settings,
             root,
@@ -528,7 +575,8 @@ impl App {
             input: LineEditor::default(),
             history: History::default(),
             usage_log: UsageLog::default(),
-            usage_pane: None,
+            usage_window,
+            usage_open: false,
             approval: None,
             command: LineEditor::default(),
             transcript,
@@ -697,8 +745,8 @@ impl App {
             // their mind.
             self.quit_armed = false;
             self.notice = None;
-            if self.approval_key(key) {
-                return None;
+            if let Some(effect) = self.approval_key(key) {
+                return effect;
             }
             if let Some(effect) = self.picker_key(key) {
                 return effect;
@@ -822,6 +870,24 @@ impl App {
                 self.select_reply(lines);
             }
             Action::Move(lines) => self.move_focused(lines),
+            Action::CopySelected => {
+                if let Some(text) = self
+                    .selected_reply
+                    .and_then(|i| self.transcript.get(i))
+                    .and_then(Entry::copied)
+                {
+                    return Some(Effect::Copy(text));
+                }
+            }
+            Action::ToggleUsage => self.usage_open = !self.usage_open,
+            Action::NextUsageWindow => {
+                self.usage_window = match self.usage_window {
+                    w if w < 6 * 3600 => 6 * 3600,
+                    w if w < 24 * 3600 => 24 * 3600,
+                    _ => 3600,
+                };
+                self.usage_open = true;
+            }
             Action::Fold => match self.selected_reply {
                 Some(entry) => self.toggle_fold(entry),
                 // Nothing to fold: Enter keeps its old meaning.
@@ -1010,7 +1076,7 @@ impl App {
         self.transcript
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.is_reply())
+            .filter(|(_, e)| e.folds())
             .map(|(i, _)| i)
             .collect()
     }
@@ -1233,7 +1299,7 @@ impl App {
                             .find(|(_, first, last)| (*first..=*last).contains(&line))
                             .map(|(e, _, _)| *e);
                         if let Some(entry) = entry
-                            && self.transcript.get(entry).is_some_and(Entry::is_reply)
+                            && self.transcript.get(entry).is_some_and(Entry::folds)
                         {
                             self.toggle_fold(entry);
                         }
@@ -1315,11 +1381,16 @@ impl App {
         builder = builder
             .effort(Some(self.settings.effort))
             .detect_checks(self.settings.detect_checks);
+        let allowed = self.settings.allowed_secrets.clone();
         if let Some(pair) = pair {
             builder = builder.pair(pair);
         }
         match builder.build() {
             Ok(config) => {
+                let config = config
+                    .with_allowed_secrets(allowed)
+                    .with_allowed_hosts(self.settings.allowed_hosts.clone())
+                    .with_strict_commands(self.settings.strict_commands);
                 self.input.take();
                 self.transcript.push(Entry::User(text.clone()));
                 // A new request: the last sub-agent's work leaves the screen,
@@ -1343,7 +1414,7 @@ impl App {
         }
     }
 
-    fn info(&mut self, text: impl Into<String>) {
+    pub(crate) fn info(&mut self, text: impl Into<String>) {
         self.transcript.push(Entry::Info(text.into()));
     }
 
@@ -1480,16 +1551,79 @@ impl App {
                 });
             }
             Command::Usage(window) => match window.as_deref() {
-                None => {
-                    self.usage_pane = match self.usage_pane {
-                        Some(_) => None,
-                        None => Some(60 * 60),
-                    };
-                }
+                None => self.usage_open = !self.usage_open,
                 Some(text) => match parse_window(text) {
-                    Some(secs) => self.usage_pane = Some(secs),
+                    Some(secs) => {
+                        self.usage_window = secs;
+                        self.usage_open = true;
+                    }
                     None => self.error("/usage takes a window such as 1h, 6h or 24h"),
                 },
+            },
+            Command::Hosts(None) => self.info(if self.settings.allowed_hosts.is_empty() {
+                "No server allowed besides those the project and its tools already use: \
+                 GitHub, AWS, your clusters, the package registries, the git remotes"
+                    .to_owned()
+            } else {
+                format!(
+                    "Commands may also reach: {}. /hosts forget <host> takes one back",
+                    self.settings.allowed_hosts.join(", ")
+                )
+            }),
+            Command::Hosts(Some(rest)) => match rest.strip_prefix("forget ") {
+                Some(host) if self.settings.allowed_hosts.iter().any(|h| h == host.trim()) => {
+                    let host = host.trim().to_owned();
+                    self.settings.allowed_hosts.retain(|h| *h != host);
+                    self.info(format!(
+                        "{host} is no longer allowed: a command reaching it asks first"
+                    ));
+                }
+                Some(host) => self.error(format!("{} is not allowed anyway", host.trim())),
+                None => self.error("/hosts lists them; /hosts forget <host> takes one back"),
+            },
+            Command::Strict(on) => {
+                match on.as_deref() {
+                    None => self.settings.strict_commands = !self.settings.strict_commands,
+                    Some("on") => self.settings.strict_commands = true,
+                    Some("off") => self.settings.strict_commands = false,
+                    Some(other) => {
+                        self.error(format!("/strict takes on or off, not {other}"));
+                        return None;
+                    }
+                }
+                self.info(if self.settings.strict_commands {
+                    "Strict: a command running a program ironquill does not know asks first"
+                } else {
+                    "Not strict: what ironquill does not know runs, unless it looks dangerous"
+                });
+            }
+            Command::Secrets(None) => self.info(if self.settings.allowed_secrets.is_empty() {
+                "No secret of the environment is allowed: a command that names one asks first. \
+                 Models never see their values"
+                    .to_owned()
+            } else {
+                format!(
+                    "Commands may use: {}. Models never see their values. /secrets forget <name> \
+                     takes one back",
+                    self.settings.allowed_secrets.join(", ")
+                )
+            }),
+            Command::Secrets(Some(rest)) => match rest.strip_prefix("forget ") {
+                Some(name)
+                    if self
+                        .settings
+                        .allowed_secrets
+                        .iter()
+                        .any(|s| s == name.trim()) =>
+                {
+                    let name = name.trim().to_owned();
+                    self.settings.allowed_secrets.retain(|s| *s != name);
+                    self.info(format!(
+                        "{name} is no longer allowed: a command naming it asks first"
+                    ));
+                }
+                Some(name) => self.error(format!("{} is not allowed anyway", name.trim())),
+                None => self.error("/secrets lists them; /secrets forget <name> takes one back"),
             },
             Command::Cost => {
                 let partial = if self.cost_complete {
@@ -1624,7 +1758,7 @@ impl App {
             AgentMessage::Approve(approval, answer) => {
                 // One at a time: the agent waits for the answer.
                 if let Some((_, earlier)) = self.approval.replace((approval, answer)) {
-                    let _ = earlier.send(false);
+                    let _ = earlier.send(Answer::No);
                 }
                 false
             }
@@ -2084,25 +2218,49 @@ impl App {
 
     /// Keys while a held command waits for the person: `y` runs it, `n` or
     /// Esc refuses it. Returns whether the key was for it.
-    fn approval_key(&mut self, key: KeyEvent) -> bool {
-        if self.approval.is_none() {
-            return false;
-        }
+    fn approval_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
+        let (approval, _) = self.approval.as_ref()?;
+        let (secrets, hosts) = match &approval.question {
+            Question::Command { secrets, hosts, .. } => (secrets.clone(), hosts.clone()),
+            Question::MoreTurns { .. } => (Vec::new(), Vec::new()),
+        };
         let answer = match key.code {
-            KeyCode::Char('y' | 'Y') => true,
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => false,
-            _ => return true,
+            KeyCode::Char('y' | 'Y') => Answer::Yes,
+            // The secrets it names, from now on: kept with the defaults.
+            KeyCode::Char('a' | 'A') if !secrets.is_empty() || !hosts.is_empty() => {
+                for name in secrets {
+                    if !self.settings.allowed_secrets.contains(&name) {
+                        self.settings.allowed_secrets.push(name);
+                    }
+                }
+                for host in hosts {
+                    if !self.settings.allowed_hosts.contains(&host) {
+                        self.settings.allowed_hosts.push(host);
+                    }
+                }
+                Answer::Always
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Answer::No,
+            // The held command, to look at elsewhere or run by hand.
+            KeyCode::Char('c' | 'C') => {
+                return Some(match &approval.question {
+                    Question::Command { command, .. } => Some(Effect::Copy(command.clone())),
+                    Question::MoreTurns { .. } => None,
+                });
+            }
+            _ => return Some(None),
         };
         if let Some((_, sender)) = self.approval.take() {
             // The agent may have been stopped meanwhile.
             let _ = sender.send(answer);
         }
-        true
+        Some(None)
     }
 
     /// The usage samples, and the pane's window while it shows.
     pub(crate) fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
-        self.usage_pane.map(|window| (&self.usage_log, window))
+        self.usage_open
+            .then_some((&self.usage_log, self.usage_window))
     }
 
     /// The command waiting for the person's answer, if any.
@@ -2283,6 +2441,10 @@ impl App {
             budget: self.settings.budget.map(|b| b.0),
             effort: Some(self.settings.effort.to_string()),
             planner: self.settings.planner.as_ref().map(ToString::to_string),
+            usage_window: Some(crate::usage::window_name(self.usage_window)),
+            allowed_secrets: self.settings.allowed_secrets.clone(),
+            lenient_commands: !self.settings.strict_commands,
+            allowed_hosts: self.settings.allowed_hosts.clone(),
         }
     }
 
@@ -2342,6 +2504,13 @@ impl App {
             | Entry::Error(text)
             | Entry::Said(text) => text.clone(),
             Entry::User(text) => format!("> {text}"),
+            Entry::Command {
+                command,
+                status,
+                output,
+                ..
+            } => format!("$ {command}\n{status}\n{output}"),
+            Entry::Interrupted => "■ Interrupted: the request stopped before it ended".into(),
             Entry::Tool {
                 name,
                 path,
@@ -2695,6 +2864,28 @@ impl App {
                 ))
             }
             Event::PairEnded { text } => Entry::Ended(text),
+            Event::Command {
+                model,
+                command,
+                status,
+                output,
+                checked_by,
+            } => Entry::Command {
+                model,
+                command,
+                status,
+                output,
+                checked_by,
+            },
+            Event::Silent { model } => Entry::Error(format!(
+                "{model} answered nothing, twice: the request ends without a reply"
+            )),
+            Event::Progress { by, text, .. } => Entry::Said(format!(
+                "Where the work stands, summed up by {by}:\n\n{text}"
+            )),
+            Event::OutOfTurns { model, turns } => {
+                Entry::Info(format!("{model} used its {turns} turns"))
+            }
             Event::Restarted {
                 model,
                 idle_secs,
@@ -2777,7 +2968,36 @@ impl App {
         self.running_since = None;
         // Its answer would reach nobody.
         self.approval = None;
-        self.info("Stopped. Files already edited stay edited: /diff shows them");
+        self.transcript.push(Entry::Interrupted);
+        self.info("Files already edited stay edited: /diff shows them");
+    }
+
+    /// Text pasted in one piece: into the message box whole, line breaks
+    /// kept, so that a pasted log is not sent at its first line; on the
+    /// command line, on one line.
+    pub(crate) fn on_paste(&mut self, text: &str) {
+        if self.approval.is_some()
+            || self.picker.is_some()
+            || self.model_picker.is_some()
+            || self.focus == Focus::File
+        {
+            return;
+        }
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        match self.mode {
+            Mode::Insert => {
+                self.focus = Focus::Chat;
+                for c in text.chars() {
+                    self.input.insert(c);
+                }
+            }
+            Mode::Command => {
+                for c in text.chars() {
+                    self.command.insert(if c == '\n' { ' ' } else { c });
+                }
+            }
+            Mode::Normal => {}
+        }
     }
 
     pub(crate) fn on_diff(&mut self, text: &str) {
@@ -2790,7 +3010,7 @@ impl App {
 }
 
 /// A window such as `90m`, `6h` or `1d`, in seconds, a day at most.
-fn parse_window(text: &str) -> Option<u64> {
+pub fn parse_window(text: &str) -> Option<u64> {
     let text = text.trim();
     let (number, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
     let number: u64 = number.parse().ok().filter(|n| *n > 0)?;
@@ -2920,29 +3140,167 @@ mod tests {
         assert!(app.usage_pane().is_none());
     }
 
+    fn screen(app: &App) -> String {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::view::render(frame, app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn a_pasted_log_is_typed_whole_and_not_sent() {
+        let mut app = ready();
+        app.on_paste("error: one\r\nerror: two\n");
+        assert_eq!(app.input().text(), "error: one\nerror: two\n");
+        assert!(screen(&app).contains("error: one↵error: two↵"));
+        // Sent as it was pasted.
+        type_text(&mut app, "fix it");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::Send { text, .. }) if text == "error: one\nerror: two\nfix it"
+        ));
+
+        // On the command line, on one line.
+        let mut app = ready();
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char(':'));
+        app.on_paste("usage\n6h");
+        assert_eq!(app.command.text(), "usage 6h");
+        // Not while a question waits.
+        let mut app = ready();
+        let (answer, _answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(
+            Approval {
+                model: ModelId::new("cheap").unwrap(),
+                question: Question::MoreTurns { turns: 30 },
+            },
+            answer,
+        ));
+        app.on_paste("y");
+        assert_eq!(app.input().text(), "");
+        assert!(screen(&app).contains(" Go on? "));
+    }
+
+    #[test]
+    fn a_command_folds_to_a_line_and_copies() {
+        let mut app = ready();
+        app.on_agent(AgentMessage::Event(Event::Command {
+            model: ModelId::new("cheap").unwrap(),
+            command: "kubectl -n web get pods\n  -o wide".into(),
+            status: "exit status 0".into(),
+            output: "api-1 Running\napi-2 Running\n".into(),
+            checked_by: Some(ModelId::new("glm").unwrap()),
+        }));
+        let folded = screen(&app);
+        assert!(folded.contains("Run(kubectl -n web get pods…)"), "{folded}");
+        assert!(
+            folded.contains("exit status 0 · checked by glm · 2 lines · click or Enter to show")
+        );
+        assert!(!folded.contains("api-1 Running"));
+
+        // Selected and opened, then copied.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&app).contains("api-1 Running"));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Effect::Copy(text)) if text.starts_with("kubectl -n web get pods") && text.ends_with("api-2 Running\n")
+        ));
+    }
+
+    #[test]
+    fn ctrl_o_and_ctrl_p_show_the_usage_pane_and_its_window() {
+        let mut app = ready();
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('o'));
+        assert_eq!(app.usage_pane().map(|(_, w)| w), Some(3600));
+        app.on_key(ctrl('o'));
+        assert!(app.usage_pane().is_none());
+        // The next window, shown.
+        app.on_key(ctrl('p'));
+        assert_eq!(app.usage_pane().map(|(_, w)| w), Some(6 * 3600));
+        app.on_key(ctrl('p'));
+        app.on_key(ctrl('p'));
+        assert_eq!(app.usage_pane().map(|(_, w)| w), Some(3600));
+        app.on_key(ctrl('p'));
+        // Kept for the next session.
+        assert_eq!(app.defaults().usage_window.as_deref(), Some("6h"));
+    }
+
+    #[test]
+    fn a_stopped_request_says_so() {
+        let mut app = ready();
+        app.on_cancelled();
+        assert!(app.transcript.contains(&Entry::Interrupted));
+        assert!(screen(&app).contains("Interrupted: the request stopped before it ended"));
+    }
+
+    #[test]
+    fn a_secret_may_be_allowed_for_good() {
+        let mut app = ready();
+        let (answer, mut answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(
+            Approval {
+                model: ModelId::new("cheap").unwrap(),
+                question: Question::Command {
+                    command: "curl -H \"X: $API_TOKEN\" https://x.example.com".into(),
+                    reasons: vec!["it uses the secret API_TOKEN".into()],
+                    secrets: vec!["API_TOKEN".into()],
+                    hosts: vec![],
+                },
+            },
+            answer,
+        ));
+        assert!(screen(&app).contains("a: always allow API_TOKEN"));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(answered.try_recv(), Ok(Answer::Always));
+        assert_eq!(app.defaults().allowed_secrets, ["API_TOKEN"]);
+        type_text(&mut app, "/secrets forget API_TOKEN");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.defaults().allowed_secrets.is_empty());
+    }
+
     #[test]
     fn a_held_command_waits_for_yes_or_no() {
         let mut app = ready();
         let approval = || Approval {
             model: ModelId::new("cheap").unwrap(),
-            command: "git push origin main".into(),
-            reasons: vec!["it sends commits to another repository".into()],
+            question: Question::Command {
+                command: "git push origin main".into(),
+                reasons: vec!["it sends commits to another repository".into()],
+                secrets: vec![],
+                hosts: vec![],
+            },
         };
         let (answer, mut answered) = oneshot::channel();
         app.on_agent(AgentMessage::Approve(approval(), answer));
-        assert_eq!(app.approval().unwrap().command, "git push origin main");
+        assert!(app.approval().is_some());
+        // c copies the command, and the window stays.
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c')),
+            Some(Effect::Copy(text)) if text == "git push origin main"
+        ));
+        assert!(app.approval().is_some());
         // Other keys wait for the answer, and type nothing.
         press(&mut app, KeyCode::Char('x'));
         assert!(app.approval().is_some());
         assert_eq!(app.input().text(), "");
         press(&mut app, KeyCode::Char('y'));
         assert!(app.approval().is_none());
-        assert_eq!(answered.try_recv(), Ok(true));
+        assert_eq!(answered.try_recv(), Ok(Answer::Yes));
 
         let (answer, mut answered) = oneshot::channel();
         app.on_agent(AgentMessage::Approve(approval(), answer));
         press(&mut app, KeyCode::Esc);
-        assert_eq!(answered.try_recv(), Ok(false));
+        assert_eq!(answered.try_recv(), Ok(Answer::No));
     }
 
     #[test]
@@ -3411,6 +3769,10 @@ mod tests {
                 budget: Some(0.25),
                 effort: Some("high".into()),
                 planner: None,
+                usage_window: Some("1h".into()),
+                allowed_secrets: vec![],
+                lenient_commands: true,
+                allowed_hosts: vec![],
             }
         );
     }

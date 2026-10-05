@@ -109,6 +109,41 @@ pub enum Event {
         /// Why it was refused, when the agent says.
         reason: String,
     },
+    /// A model ran a command.
+    Command {
+        /// The model.
+        model: ModelId,
+        /// The command.
+        command: String,
+        /// How it ended: `exit status 0`, or why it stopped.
+        status: String,
+        /// What it printed, secrets taken out, the end kept when long.
+        output: String,
+        /// The model that read it and found it only reads, when it could
+        /// not be read from its text alone.
+        checked_by: Option<ModelId>,
+    },
+    /// A model answered nothing, twice: no text and no tool call.
+    Silent {
+        /// The model.
+        model: ModelId,
+    },
+    /// Where the work stands, summed up when a model used all its turns.
+    Progress {
+        /// The model that worked.
+        model: ModelId,
+        /// The model that summed it up.
+        by: ModelId,
+        /// The summary.
+        text: String,
+    },
+    /// A model used all its turns.
+    OutOfTurns {
+        /// The model.
+        model: ModelId,
+        /// How many it had.
+        turns: u32,
+    },
     /// A command a model wanted to run was put to the person, who said yes
     /// or no, or could not be asked.
     Held {

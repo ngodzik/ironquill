@@ -30,6 +30,14 @@ pub(crate) enum Command {
     Cost,
     /// `/usage` shows or hides the usage pane; `/usage 6h` sets its window.
     Usage(Option<String>),
+    /// `/secrets` lists the secrets commands may use; `/secrets forget
+    /// <name>` takes one back.
+    Secrets(Option<String>),
+    /// `/strict [on|off]`: whether a program ironquill does not know asks.
+    Strict(Option<String>),
+    /// `/hosts` lists the servers allowed besides the known ones; `/hosts
+    /// forget <host>` takes one back.
+    Hosts(Option<String>),
     /// `/claude <task>` hands one task to Claude Code, `/codex <task>` to Codex.
     Delegate(Agent, Option<String>),
     /// `/context` opens the conversation's context in the editor.
@@ -92,6 +100,9 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "resume" => Ok(Command::Resume(rest_opt)),
         "cost" => Ok(Command::Cost),
         "usage" => Ok(Command::Usage(rest_opt)),
+        "secrets" => Ok(Command::Secrets(rest_opt)),
+        "strict" => Ok(Command::Strict(rest_opt)),
+        "hosts" => Ok(Command::Hosts(rest_opt)),
         "claude" | "cc" => Ok(Command::Delegate(Agent::ClaudeCode, rest_opt)),
         "codex" | "cx" => Ok(Command::Delegate(Agent::Codex, rest_opt)),
         "budget" => Ok(Command::Budget(rest_opt)),
@@ -126,6 +137,9 @@ pub(crate) const NAMES: &[&str] = &[
     "copy",
     "cost",
     "usage",
+    "secrets",
+    "strict",
+    "hosts",
     "defaults",
     "diff",
     "effort",
@@ -279,6 +293,10 @@ Type a question or a change and press Enter. Changes are checked before they are
                      the start of it (ironquill -c: the last one, -r <id>)
 /cost                what this conversation has cost
 /usage [1h|6h|24h]   a pane of cost per model, context and cache rebuilds over time
+/secrets             the secrets commands may use; /secrets forget <name>
+/strict [on|off]     whether a program ironquill does not know asks first (on)
+/hosts               servers allowed besides those already used; /hosts forget
+                     (every command is written down in ~/.ironquill/audit.log)
 /q                   quit
 Files: Ctrl-B, or Esc then ,n, shows the file tree. Arrows move, → or Enter opens,
   ← closes a folder, q hides the pane. Files the agent changed are marked ●.

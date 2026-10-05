@@ -44,9 +44,9 @@ In `ironquill-tui`, keys become actions only in `keymap.rs`, `App` turns actions
 
 `ironquill-agent` does not depend on `ironquill-llm`: it is generic over `ChatModel`, which is what lets its tests run against a scripted model with no network.
 
-A `Delegate` (Claude Code) is an agent rather than a model: it gets a whole task, edits files itself and reports what it does as events. It still never runs commands (`Bash` is disallowed), and its changes go through the same checks.
+A `Delegate` (Claude Code, Codex) is an agent rather than a model: it gets a whole task, edits files and runs commands itself, and reports what it does as events. Claude Code runs in its own auto permission mode, Codex in its sandbox; a planner or reviewer only reads. What their safety checks refuse is shown, for the person to approve in their next message.
 
-The model never runs commands. It edits files through `Toolbox`; checks are run by the agent, so a model can neither skip nor fake them.
+A model edits files through `Toolbox` and runs commands through the agent's `run_command`, where `ironquill_tools::assess` holds what cannot be undone, leaves the machine or cannot be read, for the person to approve; a command held only because it cannot be read is first read by the cheapest priced model. Writing where code runs later (hooks, CI workflows, shell start-up files, tools' settings) is held, and every command is written to `~/.ironquill/audit.log`. A command that would show a secret is refused outright; secrets reach a command only when a program reads its own or the person allowed one it names, and output is redacted of them. Checks are run by the agent, so a model can neither skip nor fake them; they judge a pair and `ironquill do`, not a request in the conversation.
 
 A new crate (workflows, context, TUI) is added when its first real code lands, not before, and this graph is updated in the same commit.
 

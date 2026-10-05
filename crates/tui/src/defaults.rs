@@ -39,6 +39,21 @@ pub struct Defaults {
     /// The member of the team that plans in a pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner: Option<String>,
+    /// The usage pane's window, such as `6h`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_window: Option<String>,
+    /// The names of the secrets of the environment commands may use. Their
+    /// values stay in the environment, never here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_secrets: Vec<String>,
+    /// Whether a program ironquill does not know runs without asking, as
+    /// `/strict off` chose; by default it asks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lenient_commands: bool,
+    /// Servers commands may reach besides those already used, as the
+    /// person allowed them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Defaults {
@@ -52,6 +67,12 @@ impl Defaults {
             None => PathBuf::from(std::env::var_os("HOME")?).join(".ironquill"),
         };
         Some(base.join("config.toml"))
+    }
+
+    /// Where every command a model runs is written down:
+    /// `~/.ironquill/audit.log`.
+    pub fn audit_log_path() -> Option<PathBuf> {
+        Self::path().map(|p| p.with_file_name("audit.log"))
     }
 
     /// The person's own instructions for every model, next to the defaults:
@@ -119,6 +140,10 @@ mod tests {
             budget: Some(0.25),
             effort: Some("max".into()),
             planner: Some("b/strong".into()),
+            usage_window: Some("6h".into()),
+            allowed_secrets: vec!["API_TOKEN".into()],
+            lenient_commands: true,
+            allowed_hosts: vec!["api.example.com".into()],
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));

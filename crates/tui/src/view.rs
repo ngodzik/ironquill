@@ -1,4 +1,5 @@
-use ironquill_core::{Effort, TokenCount};
+use ironquill_agent::Question;
+use ironquill_core::{Effort, ModelId, TokenCount};
 use ironquill_tools::{Container, DiffLine, LineMark, ToolSummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -71,23 +72,66 @@ fn render_approval(frame: &mut Frame, app: &App) {
     let screen = frame.area();
     let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
     let inner_width = usize::from(width.saturating_sub(2));
-    let mut lines = vec![
-        Line::styled(
-            format!(" {} wants to run:", approval.model),
-            fg(Color::Gray),
+    // What cannot be undone in red, not a yellow one skims past; going on
+    // costs only money, in cyan.
+    let (color, title, keys, mut lines) = match &approval.question {
+        Question::Command {
+            command,
+            reasons,
+            secrets,
+            hosts,
+        } => {
+            let mut lines = vec![
+                Line::styled(
+                    format!(" {} wants to run:", approval.model),
+                    fg(Color::Gray),
+                ),
+                Line::default(),
+            ];
+            for row in wrap_plain(command, inner_width.saturating_sub(2)) {
+                lines.push(Line::styled(
+                    format!(" {row}"),
+                    fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::default());
+            for reason in reasons {
+                lines.push(Line::styled(format!(" · {reason}"), fg(Color::Gray)));
+            }
+            let lasting: Vec<&str> = secrets.iter().chain(hosts).map(String::as_str).collect();
+            let keys = if lasting.is_empty() {
+                " y: run it · n: refuse · c: copy ".to_owned()
+            } else {
+                format!(
+                    " y: run it · a: always allow {} · n: refuse · c: copy ",
+                    lasting.join(", ")
+                )
+            };
+            (Color::Red, " Run this command? ", keys, lines)
+        }
+        Question::MoreTurns { turns } => (
+            Color::Cyan,
+            " Go on? ",
+            " y: go on · n: answer now ".to_owned(),
+            vec![Line::raw(format!(
+                " {} used its {turns} turns. Go on for {turns} more, or have it answer now \
+                 with what it found?",
+                approval.model
+            ))],
         ),
-        Line::default(),
-    ];
-    for row in wrap_plain(&approval.command, inner_width.saturating_sub(2)) {
-        lines.push(Line::styled(
-            format!(" {row}"),
-            fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ));
-    }
-    lines.push(Line::default());
-    for reason in &approval.reasons {
-        lines.push(Line::styled(format!(" · {reason}"), fg(Color::Gray)));
-    }
+    };
+    lines = lines
+        .into_iter()
+        .flat_map(|line| {
+            // The question may be longer than the window is wide.
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let style = line.spans.first().map_or(Style::new(), |s| s.style);
+            wrap_plain(&text, inner_width)
+                .into_iter()
+                .map(move |row| Line::styled(row, style))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let height = (lines.len() as u16 + 2).min(screen.height);
     let area = Rect::new(
         screen.x + (screen.width - width) / 2,
@@ -96,11 +140,28 @@ fn render_approval(frame: &mut Frame, app: &App) {
         height,
     );
     frame.render_widget(Clear, area);
-    let block = pane_block(" Run this command? ".into(), true)
-        .title_bottom(Line::styled(" y: run it · n: refuse ", fg(ACCENT)).centered());
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(fg(color))
+        .title(Span::styled(title, fg(color).add_modifier(Modifier::BOLD)))
+        .title_bottom(Line::styled(keys, fg(color)).centered());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// How a command ended, who read it when it could not be read alone, and
+/// how much it printed.
+fn command_details(status: &str, checked_by: Option<&ModelId>, output: &str) -> String {
+    let mut details = status.to_owned();
+    if let Some(by) = checked_by {
+        details.push_str(&format!(" · checked by {by}"));
+    }
+    details.push_str(&format!(
+        " · {}",
+        plural(output.lines().count(), "line", "lines")
+    ));
+    details
 }
 
 /// `text` cut into rows of `width` characters at most.
@@ -978,6 +1039,45 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     match entry {
         Entry::Welcome => welcome(&mut out, app, width),
+        Entry::Command {
+            command,
+            status,
+            output,
+            checked_by,
+            ..
+        } => {
+            out.push(Line::from(vec![
+                Span::styled("● ", fg(Color::Cyan)),
+                Span::styled("Run", Style::new().add_modifier(Modifier::BOLD)),
+            ]));
+            for line in command.lines() {
+                push_wrapped(
+                    &mut out,
+                    Span::raw("  "),
+                    "  ",
+                    line,
+                    fg(Color::White),
+                    width,
+                );
+            }
+            result(
+                &mut out,
+                &command_details(status, checked_by.as_ref(), output),
+                fg(DIM),
+                width,
+            );
+            for line in output.lines() {
+                push_wrapped(&mut out, Span::raw("     "), "     ", line, fg(DIM), width);
+            }
+        }
+        Entry::Interrupted => push_wrapped(
+            &mut out,
+            Span::styled("■ ", fg(Color::Red)),
+            "  ",
+            "Interrupted: the request stopped before it ended",
+            fg(Color::Red).add_modifier(Modifier::BOLD),
+            width,
+        ),
         Entry::Refused(text) => {
             push_wrapped(
                 &mut out,
@@ -1374,7 +1474,35 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             continue;
         }
         let first = lines.len();
-        let mut block = entry_lines(entry, app, width);
+        let mut block = match entry {
+            // A command shows one line until opened.
+            Entry::Command {
+                command,
+                status,
+                output,
+                checked_by,
+                ..
+            } if !app.is_expanded(i) => {
+                let room = width.saturating_sub(10).max(10);
+                let first_line = command.lines().next().unwrap_or_default();
+                let mut shown: String = first_line.chars().take(room).collect();
+                if shown.chars().count() < command.chars().count() {
+                    shown.push('…');
+                }
+                let mut block = vec![action(Color::Cyan, "Run", &shown)];
+                result(
+                    &mut block,
+                    &format!(
+                        "{} · click or Enter to show",
+                        command_details(status, checked_by.as_ref(), output)
+                    ),
+                    fg(DIM),
+                    width,
+                );
+                block
+            }
+            _ => entry_lines(entry, app, width),
+        };
         if let Entry::Delegating { to, spent, .. } = entry {
             let steps = app.transcript()[i + 1..]
                 .iter()
@@ -1528,7 +1656,16 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
 /// The slice of the line that fits, scrolled so that the cursor stays in view,
 /// and the cursor column within it.
 fn visible_window(editor: &LineEditor, prompt: &str, width: usize) -> (String, usize) {
-    let full: Vec<char> = prompt.chars().chain(editor.text().chars()).collect();
+    // A pasted line break shows as ↵; the message keeps it.
+    let full: Vec<char> = prompt
+        .chars()
+        .chain(
+            editor
+                .text()
+                .chars()
+                .map(|c| if c == '\n' { '↵' } else { c }),
+        )
+        .collect();
     let cursor = prompt.chars().count() + editor.cursor();
     let width = width.max(1);
     let start = (cursor + 1).saturating_sub(width);
@@ -1655,7 +1792,10 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
     let now = sessions::now();
     let from = now.saturating_sub(window);
     let span = window as f64;
-    let block = pane_block(format!(" Usage · last {} ", window_name(window)), false);
+    let block = pane_block(
+        format!(" Usage · last {} ", crate::usage::window_name(window)),
+        false,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let models = log.models(from);
@@ -1703,7 +1843,7 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     let time_axis = || {
         Axis::default().bounds([0.0, span]).labels([
-            Span::styled(format!("-{}", window_name(window)), fg(DIM)),
+            Span::styled(format!("-{}", crate::usage::window_name(window)), fg(DIM)),
             Span::styled("now", fg(DIM)),
         ])
     };
@@ -1779,13 +1919,4 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
     frame.render_widget(Paragraph::new(lines), table);
-}
-
-/// A window in seconds as a person writes it: `90m`, `6h`, `1d`.
-fn window_name(secs: u64) -> String {
-    match secs {
-        s if s % (24 * 3600) == 0 => format!("{}d", s / (24 * 3600)),
-        s if s % 3600 == 0 => format!("{}h", s / 3600),
-        s => format!("{}m", s.div_ceil(60)),
-    }
 }

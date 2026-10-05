@@ -116,6 +116,12 @@ pub enum Action {
     Cancel,
     /// Leave ironquill.
     Quit,
+    /// Copy the selected reply, or command and its output.
+    CopySelected,
+    /// Show or hide the usage pane.
+    ToggleUsage,
+    /// The usage pane's next window: an hour, six, a day.
+    NextUsageWindow,
 }
 
 /// Every shortcut, as Ctrl-S lists them. Kept next to the bindings above so
@@ -140,6 +146,8 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "show or hide the sub-agent pane: what the model handed a task did",
             ),
             ("Ctrl-K", "show or hide the Docker containers"),
+            ("Ctrl-O", "show or hide the usage pane (/usage)"),
+            ("Ctrl-P", "the usage pane's window: 1h, 6h, 24h"),
             ("Ctrl-S", "this list"),
             ("Ctrl-C", "stop the request; twice to quit"),
             ("Tab", "next pane"),
@@ -169,7 +177,11 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Up Down Home End",
                 "move in the pane; in the conversation, select a reply",
             ),
-            ("Enter Space", "unfold or fold the selected reply"),
+            (
+                "Enter Space",
+                "unfold or fold the selected reply or command",
+            ),
+            ("y", "copy the selected reply, or command and its output"),
         ],
     ),
     (
@@ -244,6 +256,9 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         // T for team.
         KeyCode::Char('t') if ctrl => return Some(Action::ToggleSubAgent),
         KeyCode::Char('k') if ctrl => return Some(Action::ToggleDocker),
+        // O for overview of what was used; P for its period.
+        KeyCode::Char('o') if ctrl => return Some(Action::ToggleUsage),
+        KeyCode::Char('p') if ctrl => return Some(Action::NextUsageWindow),
         // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
         KeyCode::Char('e') if ctrl => return Some(Action::PickModel),
         _ => {}
@@ -322,6 +337,7 @@ fn normal(focus: Focus, key: KeyEvent, ctrl: bool) -> Option<Action> {
         // keys and the wheel scroll.
         Focus::Chat => match key.code {
             KeyCode::Enter | KeyCode::Char(' ') => Some(Action::Fold),
+            KeyCode::Char('y') => Some(Action::CopySelected),
             _ => None,
         },
     }
