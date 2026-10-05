@@ -22,6 +22,7 @@ pub mod keymap;
 mod markdown;
 mod sessions;
 mod tree;
+mod usage;
 mod view;
 mod wrap;
 

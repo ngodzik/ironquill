@@ -270,6 +270,8 @@ struct Ctx<'a, M, D, O> {
     /// The checks that failed before any change: a failure of theirs is
     /// not the code's, so the coder is not sent back to it.
     failing_before: Vec<String>,
+    /// The agents' context windows, by model, as they reported them.
+    windows: BTreeMap<String, u64>,
 }
 
 enum Attempt {
@@ -309,6 +311,10 @@ pub struct Session {
     /// A model's summary of the conversation, for those who start afresh.
     #[serde(default)]
     summary: Option<Summary>,
+    /// The agents' context windows, by model, so that how full theirs is
+    /// shows as they work.
+    #[serde(default)]
+    windows: BTreeMap<String, u64>,
 }
 
 /// A summary of the conversation and how far it goes.
@@ -352,6 +358,7 @@ impl Session {
             agents: BTreeMap::new(),
             planners: BTreeMap::new(),
             summary: None,
+            windows: BTreeMap::new(),
         }
     }
 
@@ -396,6 +403,7 @@ impl Session {
             effort: config.effort,
             judges: Judges::Nothing,
             failing_before: Vec::new(),
+            windows: std::mem::take(&mut self.windows),
         };
         let verdict = match self.work(&mut ctx, text, context).await {
             Err(AgentError::OverBudget) => {
@@ -415,6 +423,7 @@ impl Session {
         if !matches!(verdict, Verdict::OverBudget { .. }) {
             self.summarize(&mut ctx).await;
         }
+        self.windows = std::mem::take(&mut ctx.windows);
         Ok(ctx.ledger.outcome(verdict, ctx.toolbox))
     }
 
@@ -523,6 +532,7 @@ impl Session {
             cost: response.cost,
             subscription: false,
             context: None,
+            cache: response.cache,
         });
         let text = response.content.unwrap_or_default().trim().to_owned();
         if text.is_empty() {
@@ -1171,6 +1181,7 @@ impl Session {
             cost: response.cost,
             subscription: false,
             context: None,
+            cache: response.cache,
         });
         if let Some(text) = &response.content {
             (ctx.observe)(Event::Said {
@@ -1307,6 +1318,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         effort: config.effort,
         judges: Judges::Configured,
         failing_before: Vec::new(),
+        windows: BTreeMap::new(),
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -1541,6 +1553,7 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
             toolbox,
             observe,
             ledger,
+            windows,
             ..
         } = &mut *ctx;
         let mut on_event = |event: DelegateEvent| {
@@ -1551,6 +1564,7 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
                     usage,
                     cost,
                     billed,
+                    cache,
                 } => {
                     live_calls += 1;
                     unpriced |= billed && cost.is_none();
@@ -1562,12 +1576,19 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
                     } else {
                         ledger.subscription = true;
                     }
+                    // How full its context is, as it works, once its window
+                    // is known from an earlier request.
+                    let context = windows.get(tier.as_str()).map(|window| ContextUse {
+                        used: usage.input,
+                        window: TokenCount(*window),
+                    });
                     Event::Turn {
                         model: tier.clone(),
                         usage,
                         cost,
                         subscription: !billed,
-                        context: None,
+                        context,
+                        cache,
                     }
                 }
                 DelegateEvent::TextStart => Event::Saying {
@@ -1628,6 +1649,10 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
         reply
     };
 
+    if let Some(context) = reply.context {
+        ctx.windows
+            .insert(tier.as_str().to_owned(), context.window.0);
+    }
     // The calls counted as they came are what this request used. The
     // agent's own total covers its whole session, earlier requests included
     // when it was resumed: it may only stand in for what could not be
@@ -1666,6 +1691,7 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
             cost,
             subscription: !reply.billed,
             context: reply.context,
+            cache: None,
         });
     }
     Ok(reply)
@@ -2182,6 +2208,7 @@ async fn ask_planner<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         cost: response.cost,
         subscription: false,
         context: None,
+        cache: response.cache,
     });
     let text = response.content.unwrap_or_default();
     (ctx.observe)(Event::Said {
@@ -2417,6 +2444,7 @@ async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
         cost: response.cost,
         subscription: false,
         context: None,
+        cache: response.cache,
     });
     let text = response.content.unwrap_or_default();
     (ctx.observe)(Event::Said {
@@ -2563,6 +2591,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             cost: response.cost,
             subscription: false,
             context,
+            cache: response.cache,
         });
         if let Some(text) = &response.content {
             (ctx.observe)(Event::Said {
@@ -2948,6 +2977,7 @@ mod tests {
                 output: TokenCount(10),
             },
             cost: Some(Usd(0.001)),
+            cache: None,
         }
     }
 
@@ -4325,6 +4355,7 @@ mod tests {
                     },
                     cost: *cost,
                     billed: true,
+                    cache: None,
                 });
             }
             Ok(DelegateReply {

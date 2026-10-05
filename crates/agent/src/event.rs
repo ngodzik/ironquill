@@ -1,4 +1,4 @@
-use ironquill_core::{ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
+use ironquill_core::{CacheUse, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::ToolSummary;
 
 /// Something that happened during a session, for whoever is watching.
@@ -20,6 +20,8 @@ pub enum Event {
         subscription: bool,
         /// How full the model's context was, when its window is known.
         context: Option<ContextUse>,
+        /// What it read from the prompt cache and wrote to it, when known.
+        cache: Option<CacheUse>,
     },
     /// Text as it is being written, by an agent that reports it in pieces.
     Saying {

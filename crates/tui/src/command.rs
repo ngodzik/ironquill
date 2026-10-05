@@ -27,6 +27,8 @@ pub(crate) enum Command {
     Resume,
     /// `/cost` shows what the conversation has cost so far.
     Cost,
+    /// `/usage` shows or hides the usage pane; `/usage 6h` sets its window.
+    Usage(Option<String>),
     /// `/claude <task>` hands one task to Claude Code, `/codex <task>` to Codex.
     Delegate(Agent, Option<String>),
     /// `/context` opens the conversation's context in the editor.
@@ -88,6 +90,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "name" | "rename" => Ok(Command::Name(rest_opt)),
         "resume" => Ok(Command::Resume),
         "cost" => Ok(Command::Cost),
+        "usage" => Ok(Command::Usage(rest_opt)),
         "claude" | "cc" => Ok(Command::Delegate(Agent::ClaudeCode, rest_opt)),
         "codex" | "cx" => Ok(Command::Delegate(Agent::Codex, rest_opt)),
         "budget" => Ok(Command::Budget(rest_opt)),
@@ -121,6 +124,7 @@ pub(crate) const NAMES: &[&str] = &[
     "context",
     "copy",
     "cost",
+    "usage",
     "defaults",
     "diff",
     "effort",
@@ -272,6 +276,7 @@ Type a question or a change and press Enter. Changes are checked before they are
 /name <title>        name this conversation (it is saved after every request)
 /resume              pick a saved conversation to continue (ironquill -c: the last one)
 /cost                what this conversation has cost
+/usage [1h|6h|24h]   a pane of cost per model, context and cache rebuilds over time
 /q                   quit
 Files: Ctrl-B, or Esc then ,n, shows the file tree. Arrows move, → or Enter opens,
   ← closes a folder, q hides the pane. Files the agent changed are marked ●.

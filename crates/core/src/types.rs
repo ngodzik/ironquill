@@ -106,6 +106,17 @@ impl fmt::Display for ModelId {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TokenCount(pub u64);
 
+/// What a call read from the provider's prompt cache, and wrote to it. A
+/// provider that says nothing of its cache gives none of this: unknown, not
+/// a cache that never hits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheUse {
+    /// Input tokens read from the cache.
+    pub read: TokenCount,
+    /// Input tokens written to it, when the provider says.
+    pub written: Option<TokenCount>,
+}
+
 impl Add for TokenCount {
     type Output = Self;
 
@@ -471,6 +482,8 @@ pub enum DelegateEvent {
         /// Whether the agent bills by use, with an API key, rather than a
         /// subscription: the cost is then owed.
         billed: bool,
+        /// What it read from the prompt cache and wrote to it, when known.
+        cache: Option<CacheUse>,
     },
     /// A tool call finished.
     Tool {
@@ -529,6 +542,8 @@ pub struct ChatResponse {
     /// The cost, when the provider reports it. Preferred over a price list
     /// lookup, since it accounts for caching and discounts the list cannot.
     pub cost: Option<Usd>,
+    /// What it read from the prompt cache and wrote to it, when known.
+    pub cache: Option<CacheUse>,
 }
 
 impl ChatResponse {

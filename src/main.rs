@@ -625,6 +625,7 @@ fn show(event: Event) {
             cost,
             subscription,
             context,
+            ..
         } => {
             let cost = match cost {
                 Some(c) => c.to_string(),

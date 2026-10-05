@@ -20,6 +20,7 @@ use crate::highlight::Highlighter;
 use crate::keymap::{self, Action, Focus, Mode, Pending};
 use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
+use crate::usage::{Sample, UsageLog};
 
 /// Lines moved by one turn of the mouse wheel.
 const WHEEL_LINES: i32 = 3;
@@ -401,6 +402,10 @@ pub(crate) struct App {
     input: LineEditor,
     /// The messages sent before, for Up and Down in the message box.
     history: History,
+    /// Each call to a model of the last day, for the usage pane.
+    usage_log: UsageLog,
+    /// The usage pane's window, in seconds, while it shows.
+    usage_pane: Option<u64>,
     /// A command held for the person, and where their answer goes.
     approval: Option<(Approval, oneshot::Sender<bool>)>,
     command: LineEditor,
@@ -522,6 +527,8 @@ impl App {
             pending: None,
             input: LineEditor::default(),
             history: History::default(),
+            usage_log: UsageLog::default(),
+            usage_pane: None,
             approval: None,
             command: LineEditor::default(),
             transcript,
@@ -1469,6 +1476,18 @@ impl App {
                 }
                 return Some(Effect::ListSessions);
             }
+            Command::Usage(window) => match window.as_deref() {
+                None => {
+                    self.usage_pane = match self.usage_pane {
+                        Some(_) => None,
+                        None => Some(60 * 60),
+                    };
+                }
+                Some(text) => match parse_window(text) {
+                    Some(secs) => self.usage_pane = Some(secs),
+                    None => self.error("/usage takes a window such as 1h, 6h or 24h"),
+                },
+            },
             Command::Cost => {
                 let partial = if self.cost_complete {
                     ""
@@ -1672,6 +1691,7 @@ impl App {
             cost_complete: self.cost_complete,
             transcript: self.transcript.clone(),
             session,
+            usage_log: self.usage_log.clone(),
         })
     }
 
@@ -1685,6 +1705,8 @@ impl App {
         self.cost = saved.cost;
         self.cost_complete = saved.cost_complete;
         self.transcript = saved.transcript;
+        self.usage_log = saved.usage_log;
+        self.usage_log.prune(sessions::now());
         self.history = History::default();
         for entry in &self.transcript {
             if let Entry::User(text) = entry {
@@ -2073,6 +2095,11 @@ impl App {
             let _ = sender.send(answer);
         }
         true
+    }
+
+    /// The usage samples, and the pane's window while it shows.
+    pub(crate) fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
+        self.usage_pane.map(|window| (&self.usage_log, window))
     }
 
     /// The command waiting for the person's answer, if any.
@@ -2505,7 +2532,20 @@ impl App {
                 cost,
                 subscription,
                 context,
+                cache,
             } => {
+                // A point for the usage pane; the conversation's context
+                // only, not a member's.
+                self.usage_log.push(Sample {
+                    at: sessions::now(),
+                    model: model.to_string(),
+                    input: usage.input.0,
+                    output: usage.output.0,
+                    cost: cost.map(|c| c.0),
+                    cache_read: cache.map(|c| c.read.0),
+                    cache_written: cache.and_then(|c| c.written.map(|w| w.0)),
+                    context: context.filter(|_| self.member.is_none()).map(|c| c.used.0),
+                });
                 // The model that answers is back: the member is done.
                 if self.member.as_ref().is_some_and(|m| *m != model) {
                     self.member = None;
@@ -2735,6 +2775,20 @@ impl App {
     }
 }
 
+/// A window such as `90m`, `6h` or `1d`, in seconds, a day at most.
+fn parse_window(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (number, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
+    let number: u64 = number.parse().ok().filter(|n| *n > 0)?;
+    let secs = match unit {
+        "m" | "min" => number * 60,
+        "h" => number * 60 * 60,
+        "d" => number * 24 * 60 * 60,
+        _ => return None,
+    };
+    Some(secs.min(crate::usage::KEEP_SECS))
+}
+
 /// The first sentence of `text`, for a line: an agent's reasons run long.
 fn first_sentence(text: &str) -> &str {
     let text = text.trim();
@@ -2796,6 +2850,60 @@ mod tests {
             },
             PathBuf::from("/p"),
         )
+    }
+
+    #[test]
+    fn the_usage_pane_shows_what_each_model_used() {
+        use ironquill_core::CacheUse;
+        let mut app = ready();
+        for (model, cost, written) in [("glm", 0.01, 500), ("opus", 0.2, 9_000), ("glm", 0.01, 400)]
+        {
+            app.on_agent(AgentMessage::Event(Event::Turn {
+                model: ModelId::new(model).unwrap(),
+                usage: Usage {
+                    input: TokenCount(10_000),
+                    output: TokenCount(100),
+                },
+                cost: Some(Usd(cost)),
+                subscription: false,
+                context: Some(ContextUse {
+                    used: TokenCount(10_000),
+                    window: TokenCount(200_000),
+                }),
+                cache: Some(CacheUse {
+                    read: TokenCount(10_000 - written),
+                    written: Some(TokenCount(written)),
+                }),
+            }));
+        }
+        type_text(&mut app, "/usage 6h");
+        press(&mut app, KeyCode::Enter);
+        let (log, window) = app.usage_pane().unwrap();
+        assert_eq!(window, 6 * 3600);
+        assert_eq!(log.samples.len(), 3);
+
+        let backend = ratatui::backend::TestBackend::new(140, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::view::render(frame, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(screen.contains("Usage · last 6h"));
+        assert!(screen.contains("$0.020 · 2 calls · cache 96%"), "{screen}");
+        assert!(screen.contains("$0.200 · 1 call · cache 10% · 1 rebuilt"));
+
+        // Kept with the conversation.
+        app.transcript.push(Entry::User("hi".into()));
+        let saved = app.to_saved(Session::new()).unwrap();
+        assert_eq!(saved.usage_log.samples.len(), 3);
+        type_text(&mut app, "/usage");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.usage_pane().is_none());
     }
 
     #[test]
@@ -2911,6 +3019,7 @@ mod tests {
                 cost: Some(Usd(0.002)),
                 subscription: false,
                 context: None,
+                cache: None,
             }));
         }
         let (usage, cost, complete) = app.totals();
@@ -3059,6 +3168,7 @@ mod tests {
             cost: Some(Usd(0.0003)),
             subscription: false,
             context: None,
+            cache: None,
         }));
         let finished = app.on_agent(AgentMessage::Done(Ok(Outcome {
             verdict: Verdict::Answered,
@@ -3333,6 +3443,7 @@ mod tests {
                 cost: None,
                 subscription: false,
                 context: None,
+                cache: None,
             })
         };
         app.on_agent(AgentMessage::Event(Event::Delegating {
@@ -3350,6 +3461,7 @@ mod tests {
             cost: Some(Usd(0.012)),
             subscription: false,
             context: None,
+            cache: None,
         }));
         app.on_agent(AgentMessage::Event(Event::Said {
             model: id("strong"),
@@ -3541,6 +3653,7 @@ mod tests {
                 cost: Some(Usd(cost)),
                 subscription: false,
                 context: None,
+                cache: None,
             })
         };
         type_text(&mut app, "do it");
@@ -3631,6 +3744,7 @@ mod tests {
             cost: None,
             subscription: true,
             context: None,
+            cache: None,
         }));
         let (usage, cost, complete) = app.totals();
         assert_eq!(usage.input, TokenCount(30_000));

@@ -3,8 +3,11 @@ use ironquill_tools::{Container, DiffLine, LineMark, ToolSummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
+use ratatui::widgets::{
+    Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, LegendPosition, Padding, Paragraph,
+};
 
 use crate::app::{App, Entry, LineEditor, Panes, SubAgent};
 use crate::editor::{Editor, EditorMode, Kind};
@@ -326,6 +329,16 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
             (top, Some(bottom))
         }
         None => (area, None),
+    };
+    // The usage pane, when shown, on the right of everything above Docker.
+    let area = if app.usage_pane().is_some() {
+        let width = (area.width / 3).clamp(36, 64).min(area.width / 2);
+        let [main, usage] =
+            Layout::horizontal([Constraint::Min(20), Constraint::Length(width)]).areas(area);
+        render_usage(frame, app, usage);
+        main
+    } else {
+        area
     };
     let tree_width = if app.tree().is_some() {
         (area.width / 4).clamp(20, 34)
@@ -1628,4 +1641,149 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).areas(area);
     frame.render_widget(Paragraph::new(left), left_area);
     frame.render_widget(Paragraph::new(right), right_area);
+}
+
+/// The usage pane: each model's cost added up over the window, the
+/// conversation's context with the calls that rebuilt their cache, and a
+/// line per model.
+fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
+    let Some((log, window)) = app.usage_pane() else {
+        return;
+    };
+    let now = sessions::now();
+    let from = now.saturating_sub(window);
+    let span = window as f64;
+    let block = pane_block(format!(" Usage · last {} ", window_name(window)), false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let models = log.models(from);
+    if models.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(" No call in this window yet", fg(DIM))),
+            inner,
+        );
+        return;
+    }
+    let table_height = models.len() as u16 * 2;
+    let [costs, contexts, table] = Layout::vertical([
+        Constraint::Percentage(50),
+        Constraint::Min(4),
+        Constraint::Length(table_height),
+    ])
+    .areas(inner);
+
+    // Cost, each model a line that steps up at each of its calls and runs
+    // on to now.
+    let steps: Vec<(Color, Vec<(f64, f64)>)> = models
+        .iter()
+        .map(|m| {
+            let mut points = log.cost_steps(&m.model, from);
+            let last = points.last().map_or(0.0, |p| p.1);
+            points.push((span, last));
+            (m.color, points)
+        })
+        .collect();
+    let top = models
+        .iter()
+        .map(|m| m.cost)
+        .fold(0.0_f64, f64::max)
+        .max(0.001)
+        * 1.1;
+    let datasets: Vec<Dataset> = steps
+        .iter()
+        .map(|(color, points)| {
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(fg(*color))
+                .data(points)
+        })
+        .collect();
+    let time_axis = || {
+        Axis::default().bounds([0.0, span]).labels([
+            Span::styled(format!("-{}", window_name(window)), fg(DIM)),
+            Span::styled("now", fg(DIM)),
+        ])
+    };
+    frame.render_widget(
+        Chart::new(datasets)
+            .x_axis(time_axis())
+            .y_axis(Axis::default().bounds([0.0, top]).labels([
+                Span::styled("$0", fg(DIM)),
+                Span::styled(format!("${top:.2}"), fg(DIM)),
+            ])),
+        costs,
+    );
+
+    // The conversation's context, and the calls that wrote most of their
+    // input to the cache: it had expired.
+    let context = log.context_line(from);
+    let rebuilds = log.rebuilds(from);
+    let most = context
+        .iter()
+        .chain(&rebuilds)
+        .map(|p| p.1)
+        .fold(0.0_f64, f64::max)
+        .max(1_000.0)
+        * 1.1;
+    let datasets = vec![
+        Dataset::default()
+            .name("context")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(fg(Color::Gray))
+            .data(&context),
+        Dataset::default()
+            .name("cache rebuilt")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Scatter)
+            .style(fg(Color::Rgb(213, 94, 0)))
+            .data(&rebuilds),
+    ];
+    frame.render_widget(
+        Chart::new(datasets)
+            .x_axis(time_axis())
+            .y_axis(Axis::default().bounds([0.0, most]).labels([
+                Span::styled("0", fg(DIM)),
+                Span::styled(TokenCount(most as u64).to_string(), fg(DIM)),
+            ]))
+            .legend_position(Some(LegendPosition::TopLeft)),
+        contexts,
+    );
+
+    let mut lines = Vec::new();
+    for m in &models {
+        let cache = m.cache_share.map_or_else(
+            || "cache ?".to_owned(),
+            |s| format!("cache {:.0}%", s * 100.0),
+        );
+        let rebuilt = if m.rebuilds == 0 {
+            String::new()
+        } else {
+            format!(" · {} rebuilt", m.rebuilds)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("● ", fg(m.color)),
+            Span::raw(m.model.clone()),
+        ]));
+        lines.push(Line::styled(
+            format!(
+                "  ${:.3} · {} call{} · {cache}{rebuilt}",
+                m.cost,
+                m.calls,
+                if m.calls == 1 { "" } else { "s" }
+            ),
+            fg(Color::Gray),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), table);
+}
+
+/// A window in seconds as a person writes it: `90m`, `6h`, `1d`.
+fn window_name(secs: u64) -> String {
+    match secs {
+        s if s % (24 * 3600) == 0 => format!("{}d", s / (24 * 3600)),
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s => format!("{}m", s.div_ceil(60)),
+    }
 }

@@ -4,7 +4,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use ironquill_core::{
-    ContextUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount, Usage, Usd,
+    CacheUse, ContextUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount,
+    Usage, Usd,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -350,6 +351,10 @@ impl StreamParser {
                         usage,
                         cost,
                         billed: self.billed,
+                        cache: Some(CacheUse {
+                            read: TokenCount(tokens.cache_read),
+                            written: Some(TokenCount(tokens.cache_write)),
+                        }),
                     });
                 }
             }
@@ -556,6 +561,7 @@ mod tests {
                 usage,
                 cost,
                 billed,
+                cache,
             },
         ] = events.as_slice()
         else {
@@ -565,6 +571,14 @@ mod tests {
         assert_eq!(usage.output, TokenCount(500));
         assert!((cost.unwrap().0 - 0.044).abs() < 1e-12);
         assert!(billed);
+        // What it read from the cache and wrote to it.
+        assert_eq!(
+            *cache,
+            Some(CacheUse {
+                read: TokenCount(100_000),
+                written: Some(TokenCount(2_000)),
+            })
+        );
         assert!(parser.finish().unwrap().billed);
     }
 

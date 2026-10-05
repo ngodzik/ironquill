@@ -14,6 +14,6 @@ mod types;
 pub use error::CoreError;
 pub use traits::{ChatModel, Delegate};
 pub use types::{
-    Agent, ChatRequest, ChatResponse, ContextUse, DelegateEvent, DelegateReply, DelegateRequest,
-    Effort, Message, ModelId, Pricing, TokenCount, ToolCall, ToolSpec, Usage, Usd,
+    Agent, CacheUse, ChatRequest, ChatResponse, ContextUse, DelegateEvent, DelegateReply,
+    DelegateRequest, Effort, Message, ModelId, Pricing, TokenCount, ToolCall, ToolSpec, Usage, Usd,
 };

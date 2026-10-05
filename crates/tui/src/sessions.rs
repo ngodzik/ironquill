@@ -16,6 +16,7 @@ use ironquill_core::{Usage, Usd};
 use serde::{Deserialize, Serialize};
 
 use crate::app::Entry;
+use crate::usage::UsageLog;
 
 /// A whole conversation as written to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +33,9 @@ pub(crate) struct Saved {
     pub(crate) cost_complete: bool,
     pub(crate) transcript: Vec<Entry>,
     pub(crate) session: Session,
+    /// The calls of the last day, for the usage pane.
+    #[serde(default)]
+    pub(crate) usage_log: UsageLog,
 }
 
 /// What the resume list shows of a conversation. Read from the same file:
@@ -162,6 +166,7 @@ mod tests {
             cost_complete: true,
             transcript: vec![Entry::User("hello".into())],
             session: Session::new(),
+            usage_log: UsageLog::default(),
         }
     }
 
