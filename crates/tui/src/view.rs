@@ -10,7 +10,7 @@ use ratatui::widgets::{
     Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, LegendPosition, Padding, Paragraph,
 };
 
-use crate::app::{App, Entry, LineEditor, Panes, SubAgent};
+use crate::app::{App, CompactRow, Entry, LineEditor, Panes, SubAgent};
 use crate::editor::{Editor, EditorMode, Kind};
 use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
@@ -58,6 +58,9 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     }
     if app.keys_open().is_some() {
         render_keys(frame, app);
+    }
+    if app.compact_picker().is_some() {
+        render_compact(frame, app);
     }
     if app.approval().is_some() || app.keep_warm_question().is_some() {
         render_approval(frame, app);
@@ -188,6 +191,85 @@ fn command_details(status: &str, checked_by: Option<&ModelId>, output: &str) -> 
         plural(output.lines().count(), "line", "lines")
     ));
     details
+}
+
+/// The /compact window: the subjects, ticked to keep, one open with its
+/// exchanges.
+fn render_compact(frame: &mut Frame, app: &App) {
+    let Some(picker) = app.compact_picker() else {
+        return;
+    };
+    let mut lines = vec![Line::styled(
+        " Ticked is summed up and kept; unticked goes. ",
+        fg(Color::Gray),
+    )];
+    let tick = |on: bool| if on { "[x]" } else { "[ ]" };
+    for (row, kind) in picker.rows().into_iter().enumerate() {
+        let selected = row == picker.cursor;
+        let text = match kind {
+            CompactRow::Subject(s) => {
+                let subject = &picker.compaction.subjects[s];
+                let kept = subject
+                    .exchanges
+                    .iter()
+                    .filter(|e| picker.kept[**e])
+                    .count();
+                let mark = if kept == subject.exchanges.len() {
+                    "[x]"
+                } else if kept == 0 {
+                    "[ ]"
+                } else {
+                    "[-]"
+                };
+                format!(
+                    " {mark} {} ({})",
+                    subject.name,
+                    plural(subject.exchanges.len(), "exchange", "exchanges")
+                )
+            }
+            CompactRow::Exchange(e) => format!(
+                "     {} {}",
+                tick(picker.kept[e]),
+                picker.compaction.exchanges[e]
+            ),
+        };
+        let style = if selected {
+            fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+                .bg(SELECTED_BG)
+        } else {
+            Style::new()
+        };
+        lines.push(Line::styled(text, style));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        format!(
+            " {} The last exchange stays as it was (l)",
+            tick(picker.last_as_is)
+        ),
+        fg(Color::Gray),
+    ));
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = pane_block(" Compact ".into(), true).title_bottom(
+        Line::styled(
+            " Space: tick · →: open · ←: close · Enter: compact · Esc: cancel ",
+            fg(DIM),
+        )
+        .centered(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// `text` cut into rows of `width` characters at most.

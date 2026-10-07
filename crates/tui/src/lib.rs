@@ -300,6 +300,58 @@ where
                         .await;
                 });
             }
+            Some(Effect::PlanCompaction(config)) => {
+                let (conversation, model, delegate, tx) = (
+                    Arc::clone(&conversation),
+                    Arc::clone(&model),
+                    Arc::clone(&delegate),
+                    tx.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut guard = conversation.lock().await;
+                    let Conversation { session, toolbox } = &mut *guard;
+                    let events = tx.clone();
+                    let result = session
+                        .plan_compaction(&*model, &*delegate, toolbox, &config, |e| {
+                            let _ = events.send(AgentMessage::Event(e));
+                        })
+                        .await
+                        .map_err(|e| error_chain(&e));
+                    let _ = tx.send(AgentMessage::Compaction(result));
+                });
+            }
+            Some(Effect::Compact {
+                config,
+                keep,
+                last_as_is,
+            }) => {
+                let (conversation, model, delegate, tx) = (
+                    Arc::clone(&conversation),
+                    Arc::clone(&model),
+                    Arc::clone(&delegate),
+                    tx.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut guard = conversation.lock().await;
+                    let Conversation { session, toolbox } = &mut *guard;
+                    let events = tx.clone();
+                    let result = session
+                        .compact(
+                            &*model,
+                            &*delegate,
+                            toolbox,
+                            &config,
+                            &keep,
+                            last_as_is,
+                            |e| {
+                                let _ = events.send(AgentMessage::Event(e));
+                            },
+                        )
+                        .await
+                        .map_err(|e| error_chain(&e));
+                    let _ = tx.send(AgentMessage::Compacted(result));
+                });
+            }
             Some(Effect::Copy(text)) => match clipboard::copy(&text) {
                 Ok(how) => app.info(format!("Copied ({how})")),
                 Err(e) => app.report_error(e),

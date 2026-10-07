@@ -22,4 +22,4 @@ pub use config::{
 };
 pub use error::AgentError;
 pub use event::Event;
-pub use run::{Outcome, Session, Verdict, run};
+pub use run::{Compaction, Outcome, Session, Subject, Verdict, run};

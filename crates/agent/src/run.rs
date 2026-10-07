@@ -11,6 +11,10 @@ use crate::delegate;
 use crate::error::AgentError;
 use crate::event::Event;
 
+mod compact;
+
+pub use compact::{Compaction, Subject};
+
 /// For one task with no person in the loop: `ironquill do`, and the brief a
 /// stronger model gets when it takes over.
 const TASK_PROMPT: &str = "You are a careful software engineer working in a project through tools. \

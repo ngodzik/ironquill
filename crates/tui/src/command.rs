@@ -60,6 +60,8 @@ pub(crate) enum Command {
     NewPair(Option<String>),
     /// `/tick`: keep the warm sessions warm while the conversation waits.
     Tick,
+    /// `/compact`: sum the conversation up, choosing what to keep.
+    Compact,
     /// `/planner <model>` picks the member that plans; alone, says which.
     Planner(Option<String>),
     /// `/copy` opens the conversation as text, to select and copy from.
@@ -117,6 +119,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "pair" => Ok(Command::Pair(rest_opt)),
         "newpair" => Ok(Command::NewPair(rest_opt)),
         "tick" => Ok(Command::Tick),
+        "compact" => Ok(Command::Compact),
         "planner" => Ok(Command::Planner(rest_opt)),
         "copy" | "chat" => Ok(Command::Copy),
         "instructions" => Ok(Command::Instructions),
@@ -161,6 +164,7 @@ pub(crate) const NAMES: &[&str] = &[
     "pair",
     "newpair",
     "tick",
+    "compact",
     "planner",
     "q",
     "quit",
@@ -271,6 +275,8 @@ Type a question or a change and press Enter. Changes are checked before they are
 /pair <request>      in a pair: the planner reads the code and plans, the coder
                      codes, the planner reviews; it goes on from the last pair
 /newpair <request>   the same, the planner starting from a copy of the chat
+/compact             sum the conversation up: pick the subjects to keep, the rest
+                     goes; the agents start again from the summary
 /tick                keep Claude Code's warm sessions warm while you think: a one
                      word read every four minutes, asking again after half an hour
 /planner <model>     the model that plans in a pair; by default the best scored,

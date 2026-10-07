@@ -5,7 +5,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ironquill_agent::{
-    AgentConfig, Answer, Approval, Event, Member, Outcome, Pair, Question, Session, Verdict,
+    AgentConfig, Answer, Approval, Compaction, Event, Member, Outcome, Pair, Question, Session,
+    Verdict,
 };
 use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
@@ -164,6 +165,14 @@ pub(crate) enum Effect {
     Copy(String),
     /// Read the warm sessions, to keep their caches warm.
     KeepWarm,
+    /// Group the conversation's exchanges by subject, for /compact.
+    PlanCompaction(AgentConfig),
+    /// Compact the conversation to the exchanges kept.
+    Compact {
+        config: AgentConfig,
+        keep: Vec<usize>,
+        last_as_is: bool,
+    },
     /// Send this message to the conversation.
     Send { text: String, config: AgentConfig },
     /// Stop the request in progress.
@@ -200,6 +209,10 @@ pub(crate) enum AgentMessage {
     Approve(Approval, oneshot::Sender<Answer>),
     /// The person stopped the request before it began: it was not sent.
     NotSent(String),
+    /// The subjects of the conversation, for the person to pick from.
+    Compaction(Result<Compaction, String>),
+    /// The conversation was compacted: about how many tokens before, after.
+    Compacted(Result<(TokenCount, TokenCount), String>),
     Done(Result<Outcome, String>),
 }
 
@@ -318,6 +331,40 @@ impl Entry {
             Entry::Member { entry, .. } => entry.copied(),
             _ => None,
         }
+    }
+}
+
+/// What /compact keeps: subjects, each open or not, ticked exchanges.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CompactPicker {
+    pub(crate) compaction: Compaction,
+    /// Whether each exchange is kept, summed up.
+    pub(crate) kept: Vec<bool>,
+    /// The subject shown with its exchanges.
+    pub(crate) open: Option<usize>,
+    pub(crate) cursor: usize,
+    /// Whether the last exchange stays as it was rather than summed up.
+    pub(crate) last_as_is: bool,
+}
+
+/// A row of the /compact window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactRow {
+    Subject(usize),
+    Exchange(usize),
+}
+
+impl CompactPicker {
+    /// The rows shown: each subject, and the exchanges of the open one.
+    pub(crate) fn rows(&self) -> Vec<CompactRow> {
+        let mut rows = Vec::new();
+        for (s, subject) in self.compaction.subjects.iter().enumerate() {
+            rows.push(CompactRow::Subject(s));
+            if self.open == Some(s) {
+                rows.extend(subject.exchanges.iter().map(|e| CompactRow::Exchange(*e)));
+            }
+        }
+        rows
     }
 }
 
@@ -463,6 +510,8 @@ pub(crate) struct App {
     usage_open: bool,
     /// A command held for the person, and where their answer goes.
     approval: Option<(Approval, oneshot::Sender<Answer>)>,
+    /// The subjects to keep or drop, while /compact asks.
+    compact_picker: Option<CompactPicker>,
     /// When the last request ended, and the sessions were last kept warm.
     idle_since: Instant,
     last_warm: Option<Instant>,
@@ -595,6 +644,7 @@ impl App {
             usage_window,
             usage_open: false,
             approval: None,
+            compact_picker: None,
             idle_since: Instant::now(),
             last_warm: None,
             ask_keep_warm: false,
@@ -768,6 +818,9 @@ impl App {
             self.quit_armed = false;
             self.notice = None;
             if let Some(effect) = self.approval_key(key) {
+                return effect;
+            }
+            if let Some(effect) = self.compact_key(key) {
                 return effect;
             }
             if let Some(effect) = self.picker_key(key) {
@@ -1630,6 +1683,19 @@ impl App {
                 Some(host) => self.error(format!("{} is not allowed anyway", host.trim())),
                 None => self.error("/hosts lists them; /hosts forget <host> takes one back"),
             },
+            Command::Compact => {
+                if self.is_running() {
+                    self.error("Still working on the last message: compact after it");
+                    return None;
+                }
+                let Some(config) = self.small_job_config() else {
+                    self.error("Pick a model first (Ctrl-E)");
+                    return None;
+                };
+                self.running_since = Some(Instant::now());
+                self.info("Grouping the conversation by subject…");
+                return Some(Effect::PlanCompaction(config));
+            }
             Command::Tick => {
                 self.settings.tick = !self.settings.tick;
                 self.last_warm = None;
@@ -1793,6 +1859,35 @@ impl App {
             AgentMessage::Event(event) => {
                 self.on_event(event);
                 false
+            }
+            AgentMessage::Compaction(Ok(compaction)) => {
+                self.running_since = None;
+                let kept = vec![true; compaction.exchanges.len()];
+                if kept.is_empty() {
+                    self.info("Nothing to compact yet");
+                } else {
+                    self.compact_picker = Some(CompactPicker {
+                        compaction,
+                        kept,
+                        open: None,
+                        cursor: 0,
+                        last_as_is: true,
+                    });
+                }
+                false
+            }
+            AgentMessage::Compaction(Err(e)) | AgentMessage::Compacted(Err(e)) => {
+                self.running_since = None;
+                self.error(e);
+                false
+            }
+            AgentMessage::Compacted(Ok((before, after))) => {
+                self.running_since = None;
+                self.info(format!(
+                    "Compacted: about {before} → {after} tokens. The agents' sessions start again \
+                     from the summary. /context shows it"
+                ));
+                true
             }
             AgentMessage::NotSent(text) => {
                 self.running_since = None;
@@ -2273,6 +2368,76 @@ impl App {
     }
 
     /// The team as the agent gets it, with what tells its members apart.
+    /// A configuration for work outside a request, such as compacting: the
+    /// model that answers, the team, the budget.
+    fn small_job_config(&self) -> Option<AgentConfig> {
+        let mut builder = AgentConfig::builder().tier(self.current_model()?.clone());
+        for member in self.members() {
+            builder = builder.member(member);
+        }
+        if let Some(budget) = self.settings.budget {
+            builder = builder.budget(budget);
+        }
+        builder.build().ok()
+    }
+
+    /// Keys while /compact asks what to keep. Returns `None` when the key
+    /// was not for it.
+    fn compact_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
+        let picker = self.compact_picker.as_mut()?;
+        let rows = picker.rows();
+        let row = rows.get(picker.cursor).copied();
+        match key.code {
+            KeyCode::Up => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Down => picker.cursor = (picker.cursor + 1).min(rows.len().saturating_sub(1)),
+            KeyCode::Right => {
+                if let Some(CompactRow::Subject(s)) = row {
+                    picker.open = Some(s);
+                }
+            }
+            KeyCode::Left => {
+                if let Some(open) = picker.open.take() {
+                    picker.cursor = open;
+                }
+            }
+            KeyCode::Char(' ') => match row {
+                Some(CompactRow::Subject(s)) => {
+                    let exchanges = picker.compaction.subjects[s].exchanges.clone();
+                    let on = !exchanges.iter().all(|e| picker.kept[*e]);
+                    for e in exchanges {
+                        picker.kept[e] = on;
+                    }
+                }
+                Some(CompactRow::Exchange(e)) => picker.kept[e] = !picker.kept[e],
+                None => {}
+            },
+            KeyCode::Char('l' | 'L') => picker.last_as_is = !picker.last_as_is,
+            KeyCode::Esc => {
+                self.compact_picker = None;
+                self.info("Not compacted");
+            }
+            KeyCode::Enter => {
+                let picker = self.compact_picker.take()?;
+                let keep: Vec<usize> = (0..picker.kept.len()).filter(|e| picker.kept[*e]).collect();
+                let config = self.small_job_config()?;
+                self.running_since = Some(Instant::now());
+                self.info("Compacting…");
+                return Some(Some(Effect::Compact {
+                    config,
+                    keep,
+                    last_as_is: picker.last_as_is,
+                }));
+            }
+            _ => {}
+        }
+        Some(None)
+    }
+
+    /// The /compact window while it is open.
+    pub(crate) fn compact_picker(&self) -> Option<&CompactPicker> {
+        self.compact_picker.as_ref()
+    }
+
     fn members(&self) -> Vec<Member> {
         self.settings
             .team
@@ -3525,6 +3690,50 @@ mod tests {
         screen(&app);
         click(&mut app, row_of("▸ "));
         assert!(app.is_expanded(1));
+    }
+
+    #[test]
+    fn compact_lets_the_person_pick_what_to_keep() {
+        use ironquill_agent::Subject;
+        let mut app = ready();
+        type_text(&mut app, "/compact");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::PlanCompaction(_))
+        ));
+        app.on_agent(AgentMessage::Compaction(Ok(Compaction {
+            exchanges: vec![
+                "fix the parser".into(),
+                "add a test".into(),
+                "the docs".into(),
+            ],
+            subjects: vec![
+                Subject {
+                    name: "Parser".into(),
+                    exchanges: vec![0, 1],
+                },
+                Subject {
+                    name: "Docs".into(),
+                    exchanges: vec![2],
+                },
+            ],
+        })));
+        assert!(screen(&app).contains("[x] Parser (2 exchanges)"));
+        // Open the parser, untick its test.
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(screen(&app).contains("[-] Parser (2 exchanges)"));
+        // The docs go as well; the last exchange is not kept as it was.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('l'));
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::Compact { keep, last_as_is: false, .. }) if keep == [0]
+        ));
+        assert!(app.compact_picker().is_none());
     }
 
     #[test]
