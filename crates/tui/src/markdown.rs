@@ -5,6 +5,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::pictures::{Picture, Pictures};
+
 const CODE_BLOCK: Color = Color::Rgb(229, 192, 123);
 
 /// The colour of code blocks, which references inside are not looked for.
@@ -19,14 +21,27 @@ type Piece = (String, Style);
 
 /// Renders `text` as lines no wider than `width`, in `base` style where
 /// Markdown says nothing else.
-pub(crate) fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
+///
+/// Pictures are drawn by `pictures` where it can: a line that is only an
+/// image, `![what](path.png)`, and ```mermaid blocks, which keep their copy
+/// mark. Where it cannot, they stay text.
+pub(crate) fn render(
+    text: &str,
+    width: usize,
+    base: Style,
+    pictures: &dyn Pictures,
+) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut out = Vec::new();
     let mut in_code = false;
     // Inside a ```diff block: its lines in the colours of a diff.
     let mut in_diff = false;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut at = 0;
 
-    for raw in text.lines() {
+    while at < lines.len() {
+        let raw = lines[at];
+        at += 1;
         let trimmed = raw.trim_start();
         if let Some(language) = trimmed.strip_prefix("```") {
             // An opening fence becomes the copy mark, a closing one nothing.
@@ -41,6 +56,19 @@ pub(crate) fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>
                     ));
                 }
                 out.push(Line::from(spans));
+                // A diagram drawn takes the place of its code.
+                if language.trim() == "mermaid"
+                    && let Some(end) = lines[at..]
+                        .iter()
+                        .position(|l| l.trim_start().starts_with("```"))
+                {
+                    let source = lines[at..at + end].join("\n");
+                    if let Some(drawn) = pictures.lines(Picture::Mermaid(&source), width) {
+                        out.extend(drawn);
+                        at += end + 1;
+                        in_code = false;
+                    }
+                }
             }
             continue;
         }
@@ -69,6 +97,13 @@ pub(crate) fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>
         }
         if trimmed.is_empty() {
             out.push(Line::default());
+            continue;
+        }
+
+        if let Some(path) = image(trimmed)
+            && let Some(drawn) = pictures.lines(Picture::File(path), width)
+        {
+            out.extend(drawn);
             continue;
         }
 
@@ -139,6 +174,15 @@ pub(crate) fn code_blocks(text: &str) -> Vec<String> {
         blocks.push(lines.join("\n"));
     }
     blocks
+}
+
+/// The path of a line that is only a local image, `![what](path)`.
+fn image(line: &str) -> Option<&str> {
+    let rest = line.trim_end().strip_prefix("![")?;
+    let (_, rest) = rest.split_once("](")?;
+    let path = rest.strip_suffix(')')?;
+    let local = !path.is_empty() && !path.contains("://") && !path.contains(char::is_whitespace);
+    local.then_some(path)
 }
 
 /// The text of a `#` heading line, without its hashes.
@@ -248,6 +292,11 @@ fn fill(out: &mut Vec<Line<'static>>, pieces: &[Piece], width: usize, lead: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pictures::NoPictures;
+
+    fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
+        super::render(text, width, base, &NoPictures)
+    }
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(ToString::to_string).collect()
@@ -298,6 +347,45 @@ mod tests {
     fn list_items_get_bullets_and_hanging_indent() {
         let out = render("- one two three four", 10, Style::new());
         assert_eq!(text(&out), ["• one two", "  three", "  four"]);
+    }
+
+    /// Draws every picture as one line naming it.
+    struct Named;
+
+    impl Pictures for Named {
+        fn lines(&self, picture: Picture<'_>, _: usize) -> Option<Vec<Line<'static>>> {
+            Some(vec![Line::raw(match picture {
+                Picture::File(path) => format!("[{path}]"),
+                Picture::Mermaid(source) => format!("[{}]", source.replace('\n', "/")),
+            })])
+        }
+    }
+
+    #[test]
+    fn pictures_take_the_place_of_their_text_where_drawn() {
+        let reply = "See:\n![plan](docs/plan.png)\n```mermaid\ngraph LR\n  A --> B\n```\nok ![inline](x.png)\n![web](https://a.b/c.png)";
+        assert_eq!(
+            text(&super::render(reply, 40, Style::new(), &Named)),
+            [
+                "See:",
+                "[docs/plan.png]",
+                "⧉ copy · mermaid",
+                "[graph LR/  A --> B]",
+                "ok ![inline](x.png)",
+                "![web](https://a.b/c.png)",
+            ]
+        );
+        // The copy mark still copies the diagram's source.
+        assert_eq!(code_blocks(reply), ["graph LR\n  A --> B"]);
+        // Where none is drawn, all stays text.
+        assert_eq!(
+            text(&render(
+                "![plan](a.png)\n```mermaid\ngraph\n```",
+                40,
+                Style::new()
+            )),
+            ["![plan](a.png)", "⧉ copy · mermaid", "graph"]
+        );
     }
 
     #[test]

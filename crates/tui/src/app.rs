@@ -19,9 +19,11 @@ use tokio::sync::oneshot;
 use crate::command::{self, Command};
 use crate::defaults::Defaults;
 use crate::editor::{Editor, Outcome as EditorOutcome};
+use crate::graphics::Images;
 use crate::highlight::Highlighter;
 use crate::keymap::{self, Action, Focus, Mode, Pending};
 use crate::markdown;
+use crate::pictures::{Gallery, Picture, Pictures};
 use crate::references::{self, Reference};
 use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
@@ -105,6 +107,11 @@ pub struct Settings {
     /// Whether the warm sessions are kept warm while the conversation
     /// waits, as `/tick` turns on.
     pub tick: bool,
+    /// Whether replies show images, and in which terminals.
+    pub images: Images,
+    /// The command that draws Mermaid diagrams, as configured; `None` finds
+    /// one.
+    pub mermaid: Option<Vec<String>>,
 }
 
 /// Tokens and cost of one part of a request.
@@ -310,6 +317,9 @@ pub(crate) enum Entry {
         #[serde(default)]
         runs: Vec<(ModelId, Spent)>,
     },
+    /// A PNG file the person opened from a reply, shown where the terminal
+    /// draws images.
+    Image(String),
 }
 
 impl Entry {
@@ -598,6 +608,8 @@ pub(crate) struct App {
     link_marks: RefCell<Vec<(usize, usize, usize, Reference)>>,
     /// Whether a cited file or commit exists, as found out.
     known_references: RefCell<HashMap<Reference, bool>>,
+    /// The pictures replies show, and what the terminal needs for them.
+    gallery: RefCell<Gallery>,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -648,6 +660,7 @@ impl App {
             |name| name.to_string_lossy().into_owned(),
         );
         let usage_window = settings.usage_window.unwrap_or(3600);
+        let gallery = RefCell::new(Gallery::new(root.clone()));
         let mut app = Self {
             settings,
             root,
@@ -705,6 +718,7 @@ impl App {
             copy_marks: RefCell::new(Vec::new()),
             link_marks: RefCell::new(Vec::new()),
             known_references: RefCell::new(HashMap::new()),
+            gallery,
             zoomed: false,
             zoom_focus: None,
             completion: None,
@@ -1268,6 +1282,19 @@ impl App {
         }
     }
 
+    /// The pictures replies show.
+    pub(crate) fn gallery(&self) -> &RefCell<Gallery> {
+        &self.gallery
+    }
+
+    /// A diagram is drawn, or could not be: shown, or said why.
+    pub(crate) fn on_diagram(&mut self, key: u64, result: Result<PathBuf, String>) {
+        self.gallery.borrow_mut().drawn(key, &result);
+        if let Err(reason) = result {
+            self.report_error(format!("The diagram could not be drawn: {reason}"));
+        }
+    }
+
     /// Opens a file a reply cited, at its line, showing what the branch
     /// changed in it.
     fn open_reference(&mut self, path: &str, line: Option<usize>) {
@@ -1478,6 +1505,16 @@ impl App {
                             .find(|(at, from, to, _)| *at == line && (*from..*to).contains(&column))
                             .map(|(_, _, _, r)| r.clone());
                         match link {
+                            // A picture shows in the conversation, where
+                            // the terminal draws them.
+                            Some(Reference::File { path, .. })
+                                if self.gallery.borrow().shows()
+                                    && path.to_lowercase().ends_with(".png") =>
+                            {
+                                self.transcript.push(Entry::Image(path));
+                                self.scroll_back.set(0);
+                                return None;
+                            }
                             Some(Reference::File { path, line }) => {
                                 self.open_reference(&path, line);
                                 return None;
@@ -2938,6 +2975,9 @@ impl App {
             allowed_hosts: self.settings.allowed_hosts.clone(),
             pair_mode: Some(self.settings.pair_mode),
             tick: self.settings.tick,
+            // Set in the file only: kept as written there.
+            images: (self.settings.images != Images::Auto).then_some(self.settings.images),
+            mermaid: self.settings.mermaid.clone(),
         }
     }
 
@@ -2997,6 +3037,7 @@ impl App {
             | Entry::Error(text)
             | Entry::Said(text) => text.clone(),
             Entry::User(text) => format!("> {text}"),
+            Entry::Image(path) => format!("![]({path})"),
             Entry::Command {
                 command,
                 status,
@@ -3554,6 +3595,16 @@ fn command_name(agent: Agent) -> &'static str {
     match agent {
         Agent::ClaudeCode => "claude",
         Agent::Codex => "codex",
+    }
+}
+
+impl Pictures for App {
+    fn lines(
+        &self,
+        picture: Picture<'_>,
+        width: usize,
+    ) -> Option<Vec<ratatui::text::Line<'static>>> {
+        self.gallery.borrow_mut().lines(picture, width)
     }
 }
 
@@ -4434,6 +4485,8 @@ mod tests {
                 allowed_hosts: vec![],
                 pair_mode: Some(false),
                 tick: false,
+                images: None,
+                mermaid: None,
             }
         );
     }
