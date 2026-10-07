@@ -1493,6 +1493,11 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let selected = app.selected_reply();
     let mut lines: Vec<Line> = Vec::new();
     let mut ranges = Vec::new();
+    // The lines a click folds or unfolds, and those that copy a code block.
+    let mut fold_marks = Vec::new();
+    let mut copy_marks = Vec::new();
+    // The latest reply stays open: it folds once another follows it.
+    let latest = app.transcript().iter().rposition(Entry::is_reply);
     for (i, entry) in app.transcript().iter().enumerate() {
         // A member's work shows in the sub-agent pane; here a line says how
         // much there was.
@@ -1525,6 +1530,13 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                     fg(DIM),
                     width,
                 );
+                fold_marks.push(first + block.len() - 1);
+                block
+            }
+            Entry::Command { .. } => {
+                let mut block = entry_lines(entry, app, width);
+                fold_marks.push(first + block.len());
+                block.push(Line::styled("  ▾ fold", fg(DIM)));
                 block
             }
             _ => entry_lines(entry, app, width),
@@ -1542,13 +1554,33 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 fg(Color::Magenta),
             ));
         }
-        if entry.is_reply() && block.len() > FOLD_AT && !app.is_expanded(i) {
+        let long = entry.is_reply() && block.len() > FOLD_AT;
+        // Folded by default but for the latest; a click on its mark, or
+        // Enter, turns it the other way.
+        let folded = long && ((Some(i) != latest) != app.is_expanded(i));
+        if folded {
             let hidden = block.len() - FOLD_SHOW;
             block.truncate(FOLD_SHOW);
+            fold_marks.push(first + block.len());
             block.push(Line::styled(
                 format!("  ▸ {}", plural(hidden, "more line", "more lines")),
                 fg(DIM),
             ));
+        } else if long {
+            fold_marks.push(first + block.len());
+            block.push(Line::styled("  ▾ fold", fg(DIM)));
+        }
+        // The copy marks of a reply's code blocks, as far as shown.
+        if let Entry::Said(text) = entry {
+            let codes = markdown::code_blocks(text);
+            let marked = block.iter().enumerate().filter(|(_, line)| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.as_ref() == markdown::COPY_MARK)
+            });
+            for ((at, _), code) in marked.zip(codes) {
+                copy_marks.push((first + at, code));
+            }
         }
         if selected == Some(i) {
             block = block
@@ -1597,6 +1629,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let back = app.scroll_back().min(max_scroll);
     let top = max_scroll - back;
     app.set_entry_lines(ranges, top, area);
+    app.set_marks(fold_marks, copy_marks);
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
 }

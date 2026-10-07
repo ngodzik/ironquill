@@ -529,6 +529,9 @@ pub(crate) struct App {
     /// written by the view so that a click finds its entry.
     entry_lines: RefCell<Vec<(usize, usize, usize)>>,
     transcript_view: Cell<(usize, Rect)>,
+    /// The transcript's lines a click folds, and those that copy a block.
+    fold_marks: RefCell<Vec<usize>>,
+    copy_marks: RefCell<Vec<(usize, String)>>,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -630,6 +633,8 @@ impl App {
             reveal: Cell::new(false),
             entry_lines: RefCell::new(Vec::new()),
             transcript_view: Cell::new((0, Rect::default())),
+            fold_marks: RefCell::new(Vec::new()),
+            copy_marks: RefCell::new(Vec::new()),
             zoomed: false,
             zoom_focus: None,
             completion: None,
@@ -1141,6 +1146,11 @@ impl App {
         self.reveal.replace(false)
     }
 
+    pub(crate) fn set_marks(&self, fold: Vec<usize>, copy: Vec<(usize, String)>) {
+        *self.fold_marks.borrow_mut() = fold;
+        *self.copy_marks.borrow_mut() = copy;
+    }
+
     pub(crate) fn set_entry_lines(
         &self,
         lines: Vec<(usize, usize, usize)>,
@@ -1272,7 +1282,7 @@ impl App {
         self.focus_on(Focus::File);
     }
 
-    pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) {
+    pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Effect> {
         let at = Position::new(mouse.column, mouse.row);
         let panes = self.panes.get();
         let hit = if panes.docker.is_some_and(|r| r.contains(at)) {
@@ -1286,7 +1296,7 @@ impl App {
         } else if panes.chat.contains(at) {
             Focus::Chat
         } else {
-            return;
+            return None;
         };
 
         match mouse.kind {
@@ -1309,6 +1319,18 @@ impl App {
                     let (top, area) = self.transcript_view.get();
                     if area.contains(at) {
                         let line = top + usize::from(mouse.row - area.y);
+                        // A code block's mark copies it as written.
+                        let code = self
+                            .copy_marks
+                            .borrow()
+                            .iter()
+                            .find(|(at, _)| *at == line)
+                            .map(|(_, code)| code.clone());
+                        if let Some(code) = code {
+                            return Some(Effect::Copy(code));
+                        }
+                        // Only a fold mark folds: a click elsewhere in a
+                        // reply should not make it jump.
                         let entry = self
                             .entry_lines
                             .borrow()
@@ -1316,12 +1338,12 @@ impl App {
                             .find(|(_, first, last)| (*first..=*last).contains(&line))
                             .map(|(e, _, _)| *e);
                         if let Some(entry) = entry
-                            && self.transcript.get(entry).is_some_and(Entry::folds)
+                            && self.fold_marks.borrow().contains(&line)
                         {
                             self.toggle_fold(entry);
                         }
                     }
-                    return;
+                    return None;
                 }
                 self.focus_on(hit);
                 if hit == Focus::File
@@ -1346,6 +1368,7 @@ impl App {
             }
             _ => {}
         }
+        None
     }
 
     fn scroll(&mut self, down: i32) {
@@ -3467,6 +3490,41 @@ mod tests {
         assert_eq!(app.input().text(), "fix it");
         assert!(!app.is_running());
         assert!(!app.transcript.contains(&Entry::User("fix it".into())));
+    }
+
+    #[test]
+    fn a_code_block_copies_with_a_click_and_only_its_mark_folds() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = ready();
+        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        app.transcript.push(Entry::Said(format!(
+            "Try:\n```sh\ncargo test -q\n```\n{long}"
+        )));
+        app.transcript.push(Entry::Said(long.clone()));
+        let screen_text = screen(&app);
+        let rows: Vec<&str> = screen_text.lines().collect();
+        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap() as u16;
+        let click = |app: &mut App, row: u16| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        // The first reply is folded, the latest open.
+        assert!(screen_text.contains("▸ "));
+        assert!(screen_text.contains("▾ fold"));
+        assert!(matches!(
+            click(&mut app, row_of("⧉ copy")),
+            Some(Effect::Copy(code)) if code == "cargo test -q"
+        ));
+        // A click on the text does not fold; one on the mark does.
+        click(&mut app, row_of("Try:"));
+        assert!(!app.is_expanded(1));
+        screen(&app);
+        click(&mut app, row_of("▸ "));
+        assert!(app.is_expanded(1));
     }
 
     #[test]

@@ -152,11 +152,24 @@ where
     // Whether keeping the sessions warm is due is looked at every half
     // minute; it happens every four.
     let mut warm_tick = tokio::time::interval(Duration::from_secs(30));
+    // The terminal's title follows the conversation's name.
+    let mut title = String::new();
+    // A save asked for while a request runs waits for its end: the
+    // conversation is the request's meanwhile.
+    let mut save_pending = false;
 
     while !app.should_quit() {
         terminal
             .draw(|frame| view::render(frame, &app))
             .map_err(TuiError::Terminal)?;
+        let name = app.name();
+        if name != title {
+            let _ = execute!(
+                std::io::stdout(),
+                ratatui::crossterm::terminal::SetTitle(format!("{name} · ironquill"))
+            );
+            title = name;
+        }
 
         let effect = tokio::select! {
             key = keys.next() => match key {
@@ -165,10 +178,7 @@ where
                     app.on_paste(&text);
                     None
                 }
-                Some(Ok(TermEvent::Mouse(mouse))) => {
-                    app.on_mouse(mouse);
-                    None
-                }
+                Some(Ok(TermEvent::Mouse(mouse))) => app.on_mouse(mouse),
                 Some(Ok(_)) => None,
                 Some(Err(e)) => return Err(TuiError::Terminal(e)),
                 None => break,
@@ -192,6 +202,25 @@ where
                 None
             },
             _ = warm_tick.tick() => app.keep_warm_due().then_some(Effect::KeepWarm),
+        };
+        if save_pending && !app.is_running() {
+            save_pending = false;
+            save(&store, &mut app, &conversation).await;
+        }
+        // What needs the conversation waits while a request has it, rather
+        // than freeze the interface until its end.
+        let effect = match effect {
+            Some(Effect::Save) if app.is_running() => {
+                save_pending = true;
+                None
+            }
+            Some(Effect::OpenContext | Effect::ApplyContext(_) | Effect::ForgetDelegate(_))
+                if app.is_running() =>
+            {
+                app.report_info("That waits for the request to end; Ctrl-C stops it");
+                None
+            }
+            effect => effect,
         };
 
         // The model, the models offered, the team and the budget carry over
