@@ -10,10 +10,11 @@ use ratatui::widgets::{
     Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, LegendPosition, Padding, Paragraph,
 };
 
-use crate::app::{App, Entry, LineEditor, Panes, SubAgent};
+use crate::app::{App, CompactRow, Entry, LineEditor, Panes, SubAgent};
 use crate::editor::{Editor, EditorMode, Kind};
 use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
+use crate::references::{self, Reference};
 use crate::sessions;
 use crate::wrap::wrap;
 
@@ -59,14 +60,18 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     if app.keys_open().is_some() {
         render_keys(frame, app);
     }
-    if app.approval().is_some() {
+    if app.compact_picker().is_some() {
+        render_compact(frame, app);
+    }
+    if app.approval().is_some() || app.keep_warm_question().is_some() {
         render_approval(frame, app);
     }
 }
 
 /// A command held for the person, over everything else, until they answer.
 fn render_approval(frame: &mut Frame, app: &App) {
-    let Some(approval) = app.approval() else {
+    let asked = app.keep_warm_question();
+    let Some(approval) = app.approval().or(asked.as_ref()) else {
         return;
     };
     let screen = frame.area();
@@ -109,6 +114,31 @@ fn render_approval(frame: &mut Frame, app: &App) {
             };
             (Color::Red, " Run this command? ", keys, lines)
         }
+        Question::ColdStart {
+            idle_minutes,
+            tokens,
+        } => (
+            Color::Cyan,
+            " The cache has expired ",
+            " y: new session from the summary · n: go on as it is · c: stop, to compact "
+                .to_owned(),
+            vec![Line::raw(format!(
+                " {}'s conversation was left {idle_minutes} minutes: its cache has expired. Going \
+                 on as it is writes it all to the cache again{}, at the dearest rate; a new \
+                 session starts from its summary and the latest exchanges.",
+                approval.model,
+                tokens.map_or_else(String::new, |t| format!(", about {}", TokenCount(t)))
+            ))],
+        ),
+        Question::KeepWarm { minutes } => (
+            Color::Cyan,
+            " Keep the sessions warm? ",
+            " y: another half hour · n: stop ".to_owned(),
+            vec![Line::raw(format!(
+                " No request for {minutes} minutes. Each read of the warm sessions costs a \
+                 little; letting them cool, the next request writes them to the cache again."
+            ))],
+        ),
         Question::MoreTurns { turns } => (
             Color::Cyan,
             " Go on? ",
@@ -150,6 +180,53 @@ fn render_approval(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// `line` with the references in it drawn as links, and where they are:
+/// first and last column, what they open. Code blocks are left as they are.
+fn link_line(app: &App, line: Line<'static>) -> (Line<'static>, Vec<(usize, usize, Reference)>) {
+    if line
+        .spans
+        .iter()
+        .any(|s| s.style.fg == Some(markdown::CODE_BLOCK_COLOR))
+    {
+        return (line, Vec::new());
+    }
+    let mut spans = Vec::new();
+    let mut links = Vec::new();
+    let mut column = 0;
+    for span in line.spans {
+        let text = span.content.to_string();
+        let mut at = 0;
+        for (start, end, reference) in references::candidates(&text) {
+            if !app.reference_exists(&reference) {
+                continue;
+            }
+            if start > at {
+                let piece = text[at..start].to_owned();
+                column += piece.chars().count();
+                spans.push(Span::styled(piece, span.style));
+            }
+            let piece = text[start..end].to_owned();
+            let width = piece.chars().count();
+            spans.push(Span::styled(
+                piece,
+                span.style
+                    .fg(Color::Rgb(130, 170, 255))
+                    .add_modifier(Modifier::UNDERLINED),
+            ));
+            spans.push(Span::styled("↗", fg(DIM)));
+            links.push((column, column + width + 1, reference));
+            column += width + 1;
+            at = end;
+        }
+        if at < text.len() {
+            let piece = text[at..].to_owned();
+            column += piece.chars().count();
+            spans.push(Span::styled(piece, span.style));
+        }
+    }
+    (Line::from(spans).style(line.style), links)
+}
+
 /// How a command ended, who read it when it could not be read alone, and
 /// how much it printed.
 fn command_details(status: &str, checked_by: Option<&ModelId>, output: &str) -> String {
@@ -162,6 +239,85 @@ fn command_details(status: &str, checked_by: Option<&ModelId>, output: &str) -> 
         plural(output.lines().count(), "line", "lines")
     ));
     details
+}
+
+/// The /compact window: the subjects, ticked to keep, one open with its
+/// exchanges.
+fn render_compact(frame: &mut Frame, app: &App) {
+    let Some(picker) = app.compact_picker() else {
+        return;
+    };
+    let mut lines = vec![Line::styled(
+        " Ticked is summed up and kept; unticked goes. ",
+        fg(Color::Gray),
+    )];
+    let tick = |on: bool| if on { "[x]" } else { "[ ]" };
+    for (row, kind) in picker.rows().into_iter().enumerate() {
+        let selected = row == picker.cursor;
+        let text = match kind {
+            CompactRow::Subject(s) => {
+                let subject = &picker.compaction.subjects[s];
+                let kept = subject
+                    .exchanges
+                    .iter()
+                    .filter(|e| picker.kept[**e])
+                    .count();
+                let mark = if kept == subject.exchanges.len() {
+                    "[x]"
+                } else if kept == 0 {
+                    "[ ]"
+                } else {
+                    "[-]"
+                };
+                format!(
+                    " {mark} {} ({})",
+                    subject.name,
+                    plural(subject.exchanges.len(), "exchange", "exchanges")
+                )
+            }
+            CompactRow::Exchange(e) => format!(
+                "     {} {}",
+                tick(picker.kept[e]),
+                picker.compaction.exchanges[e]
+            ),
+        };
+        let style = if selected {
+            fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+                .bg(SELECTED_BG)
+        } else {
+            Style::new()
+        };
+        lines.push(Line::styled(text, style));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        format!(
+            " {} The last exchange stays as it was (l)",
+            tick(picker.last_as_is)
+        ),
+        fg(Color::Gray),
+    ));
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = pane_block(" Compact ".into(), true).title_bottom(
+        Line::styled(
+            " Space: tick · →: open · ←: close · Enter: compact · Esc: cancel ",
+            fg(DIM),
+        )
+        .centered(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// `text` cut into rows of `width` characters at most.
@@ -1467,6 +1623,12 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let selected = app.selected_reply();
     let mut lines: Vec<Line> = Vec::new();
     let mut ranges = Vec::new();
+    // The lines a click folds or unfolds, and those that copy a code block.
+    let mut fold_marks = Vec::new();
+    let mut copy_marks = Vec::new();
+    let mut link_marks = Vec::new();
+    // The latest reply stays open: it folds once another follows it.
+    let latest = app.transcript().iter().rposition(Entry::is_reply);
     for (i, entry) in app.transcript().iter().enumerate() {
         // A member's work shows in the sub-agent pane; here a line says how
         // much there was.
@@ -1499,6 +1661,13 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                     fg(DIM),
                     width,
                 );
+                fold_marks.push(first + block.len() - 1);
+                block
+            }
+            Entry::Command { .. } => {
+                let mut block = entry_lines(entry, app, width);
+                fold_marks.push(first + block.len());
+                block.push(Line::styled("  ▾ fold", fg(DIM)));
                 block
             }
             _ => entry_lines(entry, app, width),
@@ -1516,13 +1685,41 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 fg(Color::Magenta),
             ));
         }
-        if entry.is_reply() && block.len() > FOLD_AT && !app.is_expanded(i) {
+        let long = entry.is_reply() && block.len() > FOLD_AT;
+        // Folded by default but for the latest; a click on its mark, or
+        // Enter, turns it the other way.
+        let folded = long && ((Some(i) != latest) != app.is_expanded(i));
+        if folded {
             let hidden = block.len() - FOLD_SHOW;
             block.truncate(FOLD_SHOW);
+            fold_marks.push(first + block.len());
             block.push(Line::styled(
                 format!("  ▸ {}", plural(hidden, "more line", "more lines")),
                 fg(DIM),
             ));
+        } else if long {
+            fold_marks.push(first + block.len());
+            block.push(Line::styled("  ▾ fold", fg(DIM)));
+        }
+        // Cited files and commits, as links.
+        if matches!(entry, Entry::Said(_)) {
+            for (row, line) in block.iter_mut().enumerate() {
+                let (linked, links) = link_line(app, std::mem::take(line));
+                *line = linked;
+                link_marks.extend(links.into_iter().map(|(a, b, r)| (first + row, a, b, r)));
+            }
+        }
+        // The copy marks of a reply's code blocks, as far as shown.
+        if let Entry::Said(text) = entry {
+            let codes = markdown::code_blocks(text);
+            let marked = block.iter().enumerate().filter(|(_, line)| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.as_ref() == markdown::COPY_MARK)
+            });
+            for ((at, _), code) in marked.zip(codes) {
+                copy_marks.push((first + at, code));
+            }
         }
         if selected == Some(i) {
             block = block
@@ -1571,6 +1768,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let back = app.scroll_back().min(max_scroll);
     let top = max_scroll - back;
     app.set_entry_lines(ranges, top, area);
+    app.set_marks(fold_marks, copy_marks, link_marks);
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
 }

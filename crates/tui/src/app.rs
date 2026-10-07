@@ -1,11 +1,12 @@
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ironquill_agent::{
-    AgentConfig, Answer, Approval, Event, Member, Outcome, Pair, Question, Session, Verdict,
+    AgentConfig, Answer, Approval, Compaction, Event, Member, Outcome, Pair, Question, Session,
+    Verdict,
 };
 use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
@@ -20,6 +21,8 @@ use crate::defaults::Defaults;
 use crate::editor::{Editor, Outcome as EditorOutcome};
 use crate::highlight::Highlighter;
 use crate::keymap::{self, Action, Focus, Mode, Pending};
+use crate::markdown;
+use crate::references::{self, Reference};
 use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
 use crate::usage::{Sample, UsageLog};
@@ -97,6 +100,11 @@ pub struct Settings {
     pub strict_commands: bool,
     /// Servers commands may reach besides those already used.
     pub allowed_hosts: Vec<String>,
+    /// `/pair` with Claude Code's Opus planning and its Sonnet coding.
+    pub pair_mode: bool,
+    /// Whether the warm sessions are kept warm while the conversation
+    /// waits, as `/tick` turns on.
+    pub tick: bool,
 }
 
 /// Tokens and cost of one part of a request.
@@ -157,6 +165,22 @@ pub(crate) struct ModelRow {
 pub(crate) enum Effect {
     /// Put this text on the system clipboard.
     Copy(String),
+    /// Show what a commit did, as a reply cited it.
+    ShowCommit(String),
+    /// Fetch a pull request's review comments, for /address.
+    Address(String),
+    /// Apply these patches with git, all or none: their numbers, and them.
+    Apply(Vec<usize>, Vec<String>),
+    /// Read the warm sessions, to keep their caches warm.
+    KeepWarm,
+    /// Group the conversation's exchanges by subject, for /compact.
+    PlanCompaction(AgentConfig),
+    /// Compact the conversation to the exchanges kept.
+    Compact {
+        config: AgentConfig,
+        keep: Vec<usize>,
+        last_as_is: bool,
+    },
     /// Send this message to the conversation.
     Send { text: String, config: AgentConfig },
     /// Stop the request in progress.
@@ -191,6 +215,14 @@ pub(crate) enum AgentMessage {
     Event(Event),
     /// A command held for the person, and where to send their answer.
     Approve(Approval, oneshot::Sender<Answer>),
+    /// The person stopped the request before it began: it was not sent.
+    NotSent(String),
+    /// A pull request's review comments, as a request to send.
+    Addressed(Result<String, String>),
+    /// The subjects of the conversation, for the person to pick from.
+    Compaction(Result<Compaction, String>),
+    /// The conversation was compacted: about how many tokens before, after.
+    Compacted(Result<(TokenCount, TokenCount), String>),
     Done(Result<Outcome, String>),
 }
 
@@ -309,6 +341,40 @@ impl Entry {
             Entry::Member { entry, .. } => entry.copied(),
             _ => None,
         }
+    }
+}
+
+/// What /compact keeps: subjects, each open or not, ticked exchanges.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CompactPicker {
+    pub(crate) compaction: Compaction,
+    /// Whether each exchange is kept, summed up.
+    pub(crate) kept: Vec<bool>,
+    /// The subject shown with its exchanges.
+    pub(crate) open: Option<usize>,
+    pub(crate) cursor: usize,
+    /// Whether the last exchange stays as it was rather than summed up.
+    pub(crate) last_as_is: bool,
+}
+
+/// A row of the /compact window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactRow {
+    Subject(usize),
+    Exchange(usize),
+}
+
+impl CompactPicker {
+    /// The rows shown: each subject, and the exchanges of the open one.
+    pub(crate) fn rows(&self) -> Vec<CompactRow> {
+        let mut rows = Vec::new();
+        for (s, subject) in self.compaction.subjects.iter().enumerate() {
+            rows.push(CompactRow::Subject(s));
+            if self.open == Some(s) {
+                rows.extend(subject.exchanges.iter().map(|e| CompactRow::Exchange(*e)));
+            }
+        }
+        rows
     }
 }
 
@@ -454,6 +520,16 @@ pub(crate) struct App {
     usage_open: bool,
     /// A command held for the person, and where their answer goes.
     approval: Option<(Approval, oneshot::Sender<Answer>)>,
+    /// The subjects to keep or drop, while /compact asks.
+    compact_picker: Option<CompactPicker>,
+    /// An effect to run next, raised outside a key: a request built from a
+    /// pull request's comments.
+    queued: Option<Effect>,
+    /// When the last request ended, and the sessions were last kept warm.
+    idle_since: Instant,
+    last_warm: Option<Instant>,
+    /// Asking whether to keep the sessions warm, after a long wait.
+    ask_keep_warm: bool,
     command: LineEditor,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
@@ -515,6 +591,13 @@ pub(crate) struct App {
     /// written by the view so that a click finds its entry.
     entry_lines: RefCell<Vec<(usize, usize, usize)>>,
     transcript_view: Cell<(usize, Rect)>,
+    /// The transcript's lines a click folds, and those that copy a block.
+    fold_marks: RefCell<Vec<usize>>,
+    copy_marks: RefCell<Vec<(usize, String)>>,
+    /// The references drawn: line, first and last column, what they open.
+    link_marks: RefCell<Vec<(usize, usize, usize, Reference)>>,
+    /// Whether a cited file or commit exists, as found out.
+    known_references: RefCell<HashMap<Reference, bool>>,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -578,6 +661,11 @@ impl App {
             usage_window,
             usage_open: false,
             approval: None,
+            compact_picker: None,
+            queued: None,
+            idle_since: Instant::now(),
+            last_warm: None,
+            ask_keep_warm: false,
             command: LineEditor::default(),
             transcript,
             scroll_back: Cell::new(0),
@@ -613,6 +701,10 @@ impl App {
             reveal: Cell::new(false),
             entry_lines: RefCell::new(Vec::new()),
             transcript_view: Cell::new((0, Rect::default())),
+            fold_marks: RefCell::new(Vec::new()),
+            copy_marks: RefCell::new(Vec::new()),
+            link_marks: RefCell::new(Vec::new()),
+            known_references: RefCell::new(HashMap::new()),
             zoomed: false,
             zoom_focus: None,
             completion: None,
@@ -746,6 +838,9 @@ impl App {
             self.quit_armed = false;
             self.notice = None;
             if let Some(effect) = self.approval_key(key) {
+                return effect;
+            }
+            if let Some(effect) = self.compact_key(key) {
                 return effect;
             }
             if let Some(effect) = self.picker_key(key) {
@@ -1124,6 +1219,78 @@ impl App {
         self.reveal.replace(false)
     }
 
+    pub(crate) fn set_marks(
+        &self,
+        fold: Vec<usize>,
+        copy: Vec<(usize, String)>,
+        links: Vec<(usize, usize, usize, Reference)>,
+    ) {
+        *self.fold_marks.borrow_mut() = fold;
+        *self.copy_marks.borrow_mut() = copy;
+        *self.link_marks.borrow_mut() = links;
+    }
+
+    /// Whether `reference` exists: a file is looked at when first drawn; a
+    /// commit only as [`App::learn_commits`] found it, git staying off the
+    /// drawing.
+    pub(crate) fn reference_exists(&self, reference: &Reference) -> bool {
+        if let Some(known) = self.known_references.borrow().get(reference) {
+            return *known;
+        }
+        let exists = match reference {
+            Reference::File { path, .. } => !path.contains("..") && self.root.join(path).is_file(),
+            Reference::Commit(_) => false,
+        };
+        self.known_references
+            .borrow_mut()
+            .insert(reference.clone(), exists);
+        exists
+    }
+
+    /// Finds out which commits the replies cite exist.
+    fn learn_all_commits(&self) {
+        for entry in &self.transcript {
+            if let Entry::Said(text) = entry {
+                self.learn_commits(text);
+            }
+        }
+    }
+
+    /// Finds out which commits a reply cites exist.
+    fn learn_commits(&self, text: &str) {
+        for (_, _, reference) in references::candidates(text) {
+            if let Reference::Commit(hash) = &reference
+                && !self.known_references.borrow().contains_key(&reference)
+            {
+                let exists = ironquill_tools::is_commit(&self.root, hash);
+                self.known_references.borrow_mut().insert(reference, exists);
+            }
+        }
+    }
+
+    /// Opens a file a reply cited, at its line, showing what the branch
+    /// changed in it.
+    fn open_reference(&mut self, path: &str, line: Option<usize>) {
+        if self.file.as_ref().is_some_and(Editor::is_modified) {
+            if let Some(file) = &mut self.file {
+                file.refuse_close();
+            }
+            self.focus_on(Focus::File);
+            return;
+        }
+        let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
+        self.unzoom();
+        let mut editor = Editor::open(&self.root, self.root.join(path), highlighter);
+        if let Some(base) = ironquill_tools::branch_base(&self.root) {
+            editor.compare_with(base);
+        }
+        if let Some(line) = line {
+            editor.go_to_line(line);
+        }
+        self.file = Some(editor);
+        self.focus_on(Focus::File);
+    }
+
     pub(crate) fn set_entry_lines(
         &self,
         lines: Vec<(usize, usize, usize)>,
@@ -1255,7 +1422,7 @@ impl App {
         self.focus_on(Focus::File);
     }
 
-    pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) {
+    pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Effect> {
         let at = Position::new(mouse.column, mouse.row);
         let panes = self.panes.get();
         let hit = if panes.docker.is_some_and(|r| r.contains(at)) {
@@ -1269,7 +1436,7 @@ impl App {
         } else if panes.chat.contains(at) {
             Focus::Chat
         } else {
-            return;
+            return None;
         };
 
         match mouse.kind {
@@ -1292,6 +1459,34 @@ impl App {
                     let (top, area) = self.transcript_view.get();
                     if area.contains(at) {
                         let line = top + usize::from(mouse.row - area.y);
+                        // A code block's mark copies it as written.
+                        let code = self
+                            .copy_marks
+                            .borrow()
+                            .iter()
+                            .find(|(at, _)| *at == line)
+                            .map(|(_, code)| code.clone());
+                        if let Some(code) = code {
+                            return Some(Effect::Copy(code));
+                        }
+                        // A cited file or commit opens.
+                        let column = usize::from(mouse.column.saturating_sub(area.x));
+                        let link = self
+                            .link_marks
+                            .borrow()
+                            .iter()
+                            .find(|(at, from, to, _)| *at == line && (*from..*to).contains(&column))
+                            .map(|(_, _, _, r)| r.clone());
+                        match link {
+                            Some(Reference::File { path, line }) => {
+                                self.open_reference(&path, line);
+                                return None;
+                            }
+                            Some(Reference::Commit(hash)) => return Some(Effect::ShowCommit(hash)),
+                            None => {}
+                        }
+                        // Only a fold mark folds: a click elsewhere in a
+                        // reply should not make it jump.
                         let entry = self
                             .entry_lines
                             .borrow()
@@ -1299,12 +1494,12 @@ impl App {
                             .find(|(_, first, last)| (*first..=*last).contains(&line))
                             .map(|(e, _, _)| *e);
                         if let Some(entry) = entry
-                            && self.transcript.get(entry).is_some_and(Entry::folds)
+                            && self.fold_marks.borrow().contains(&line)
                         {
                             self.toggle_fold(entry);
                         }
                     }
-                    return;
+                    return None;
                 }
                 self.focus_on(hit);
                 if hit == Focus::File
@@ -1329,6 +1524,7 @@ impl App {
             }
             _ => {}
         }
+        None
     }
 
     fn scroll(&mut self, down: i32) {
@@ -1356,6 +1552,15 @@ impl App {
     ) -> Option<Effect> {
         if text.is_empty() {
             return None;
+        }
+        // A secret pasted with a log does not reach a model, nor the saved
+        // conversation.
+        let (text, secrets) = ironquill_tools::redact_secrets(&text);
+        if !secrets.is_empty() {
+            self.info(format!(
+                "Took the value of {} out of the message",
+                secrets.join(", ")
+            ));
         }
         if self.is_running() {
             self.transcript.push(Entry::Error(
@@ -1581,6 +1786,75 @@ impl App {
                 Some(host) => self.error(format!("{} is not allowed anyway", host.trim())),
                 None => self.error("/hosts lists them; /hosts forget <host> takes one back"),
             },
+            Command::Address(None) => self.error("Give the pull request: /address <number>"),
+            Command::Address(Some(number)) => {
+                if self.is_running() {
+                    self.error("Still working on the last message: address it after");
+                    return None;
+                }
+                let number = number.trim().trim_start_matches('#').to_owned();
+                if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+                    self.error("/address takes the number of a pull request");
+                    return None;
+                }
+                self.running_since = Some(Instant::now());
+                self.info(format!("Reading the review comments of #{number}…"));
+                return Some(Effect::Address(number));
+            }
+            Command::Apply(numbers) => {
+                let numbers: Vec<usize> = numbers
+                    .unwrap_or_default()
+                    .split([' ', ','])
+                    .filter_map(|n| n.trim().parse().ok())
+                    .collect();
+                if numbers.is_empty() {
+                    self.error("Say which changes: /apply 1 3");
+                    return None;
+                }
+                let Some(reply) = self.transcript.iter().rev().find_map(|e| match e {
+                    Entry::Said(text) => Some(text.clone()),
+                    _ => None,
+                }) else {
+                    self.error("No reply to take changes from");
+                    return None;
+                };
+                let blocks = markdown::diff_blocks(&reply);
+                let mut patches = Vec::new();
+                for n in &numbers {
+                    match blocks.iter().find(|(b, _)| b == n) {
+                        Some((_, patch)) => patches.push(patch.clone()),
+                        None => {
+                            self.error(format!("The last reply has no diff block {n}"));
+                            return None;
+                        }
+                    }
+                }
+                return Some(Effect::Apply(numbers, patches));
+            }
+            Command::Compact => {
+                if self.is_running() {
+                    self.error("Still working on the last message: compact after it");
+                    return None;
+                }
+                let Some(config) = self.small_job_config() else {
+                    self.error("Pick a model first (Ctrl-E)");
+                    return None;
+                };
+                self.running_since = Some(Instant::now());
+                self.info("Grouping the conversation by subject…");
+                return Some(Effect::PlanCompaction(config));
+            }
+            Command::Tick => {
+                self.settings.tick = !self.settings.tick;
+                self.last_warm = None;
+                self.idle_since = Instant::now();
+                self.info(if self.settings.tick {
+                    "Keeping Claude Code's warm sessions warm while the conversation waits: a one \
+                     word read every four minutes, asking again after half an hour"
+                } else {
+                    "No longer keeping the sessions warm"
+                });
+            }
             Command::Strict(on) => {
                 match on.as_deref() {
                     None => self.settings.strict_commands = !self.settings.strict_commands,
@@ -1689,32 +1963,11 @@ impl App {
             },
             Command::Copy => self.open_transcript(),
             Command::Instructions => return Some(Effect::OpenInstructions),
-            Command::Pair(None) => {
+            Command::Pair(None) | Command::NewPair(None) => {
                 self.error("Give it a question: /pair <what to do>");
             }
-            Command::Pair(Some(text)) => {
-                let (coder, planner) = match self.pair_roles() {
-                    Ok(roles) => roles,
-                    Err(why) => {
-                        self.error(why);
-                        return None;
-                    }
-                };
-                // High at most for the planner: past it, a step can think for
-                // minutes for little more. A coder thinking less rereads
-                // everything and stops before writing.
-                let planner_effort = self.settings.effort.min(Effort::High);
-                let coder_effort = Effort::High;
-                self.info(format!(
-                    "Pair: {planner} picks the code to read and plans (effort {planner_effort}), ironquill reads it, {coder} codes (effort {coder_effort}), without the earlier conversation"
-                ));
-                let pair = Pair {
-                    planner,
-                    planner_effort,
-                    coder_effort,
-                };
-                return self.submit_with(text, vec![coder], Some(pair));
-            }
+            Command::Pair(Some(text)) => return self.pair(text, false),
+            Command::NewPair(Some(text)) => return self.pair(text, true),
             Command::Planner(None) => match self.planner() {
                 Some(planner) => self.info(format!(
                     "Planner: {planner}{}",
@@ -1755,6 +2008,56 @@ impl App {
                 self.on_event(event);
                 false
             }
+            AgentMessage::Compaction(Ok(compaction)) => {
+                self.running_since = None;
+                let kept = vec![true; compaction.exchanges.len()];
+                if kept.is_empty() {
+                    self.info("Nothing to compact yet");
+                } else {
+                    self.compact_picker = Some(CompactPicker {
+                        compaction,
+                        kept,
+                        open: None,
+                        cursor: 0,
+                        last_as_is: true,
+                    });
+                }
+                false
+            }
+            AgentMessage::Compaction(Err(e)) | AgentMessage::Compacted(Err(e)) => {
+                self.running_since = None;
+                self.error(e);
+                false
+            }
+            AgentMessage::Compacted(Ok((before, after))) => {
+                self.running_since = None;
+                self.info(format!(
+                    "Compacted: about {before} → {after} tokens. The agents' sessions start again \
+                     from the summary. /context shows it"
+                ));
+                true
+            }
+            AgentMessage::Addressed(Ok(request)) => {
+                self.running_since = None;
+                self.queued = self.submit(request);
+                false
+            }
+            AgentMessage::Addressed(Err(e)) => {
+                self.running_since = None;
+                self.error(e);
+                false
+            }
+            AgentMessage::NotSent(text) => {
+                self.running_since = None;
+                if matches!(self.transcript.last(), Some(Entry::User(t)) if *t == text) {
+                    self.transcript.pop();
+                }
+                self.input.set(text);
+                self.info(
+                    "Not sent: compact the conversation first (/compact), then send it again",
+                );
+                false
+            }
             AgentMessage::Approve(approval, answer) => {
                 // One at a time: the agent waits for the answer.
                 if let Some((_, earlier)) = self.approval.replace((approval, answer)) {
@@ -1763,6 +2066,9 @@ impl App {
                 false
             }
             AgentMessage::Done(Ok(outcome)) => {
+                self.learn_all_commits();
+                self.idle_since = Instant::now();
+                self.last_warm = Some(Instant::now());
                 let seconds = self
                     .running_since
                     .take()
@@ -1842,6 +2148,7 @@ impl App {
         self.cost = saved.cost;
         self.cost_complete = saved.cost_complete;
         self.transcript = saved.transcript;
+        self.learn_all_commits();
         self.usage_log = saved.usage_log;
         self.usage_log.prune(sessions::now());
         self.history = History::default();
@@ -2072,7 +2379,53 @@ impl App {
     /// or the best, by Artificial Analysis' score, else by price. The coder
     /// is then the cheapest of the others that can use tools. Without one,
     /// the reason, rather than roles the wrong way round.
+    /// Sends `text` to a pair; `fresh` has its planner start from the chat
+    /// rather than go on from the last pair.
+    fn pair(&mut self, text: String, fresh: bool) -> Option<Effect> {
+        if self.settings.pair_mode {
+            for model in ["claude-code/opus", "claude-code/sonnet"] {
+                let model = ModelId::new(model).expect("a plain name");
+                if !self.settings.team.contains(&model) {
+                    self.settings.team.push(model);
+                }
+            }
+        }
+        let (coder, planner) = match self.pair_roles() {
+            Ok(roles) => roles,
+            Err(why) => {
+                self.error(why);
+                return None;
+            }
+        };
+        // High at most for the planner: past it, a step can think for
+        // minutes for little more. A coder thinking less rereads
+        // everything and stops before writing.
+        let planner_effort = self.settings.effort.min(Effort::High);
+        let coder_effort = Effort::High;
+        self.info(format!(
+            "Pair: {planner} plans and reviews (effort {planner_effort}), {coder} codes (effort {coder_effort}){}",
+            if fresh {
+                ", the planner starting from the chat"
+            } else {
+                ""
+            }
+        ));
+        let pair = Pair {
+            planner,
+            planner_effort,
+            coder_effort,
+            fresh,
+        };
+        self.submit_with(text, vec![coder], Some(pair))
+    }
+
     pub(crate) fn pair_roles(&self) -> Result<(ModelId, ModelId), String> {
+        // Pair mode: Claude Code's Opus plans and reviews, its Sonnet codes.
+        if self.settings.pair_mode {
+            let planner = ModelId::new("claude-code/opus").expect("a plain name");
+            let coder = ModelId::new("claude-code/sonnet").expect("a plain name");
+            return Ok((coder, planner));
+        }
         let mut models: Vec<Member> = self.members();
         if let Some(lead) = self.current_model()
             && !models.iter().any(|m| &m.model == lead)
@@ -2175,6 +2528,81 @@ impl App {
     }
 
     /// The team as the agent gets it, with what tells its members apart.
+    /// A configuration for work outside a request, such as compacting: the
+    /// model that answers, the team, the budget.
+    fn small_job_config(&self) -> Option<AgentConfig> {
+        let mut builder = AgentConfig::builder().tier(self.current_model()?.clone());
+        for member in self.members() {
+            builder = builder.member(member);
+        }
+        if let Some(budget) = self.settings.budget {
+            builder = builder.budget(budget);
+        }
+        builder.build().ok()
+    }
+
+    /// Keys while /compact asks what to keep. Returns `None` when the key
+    /// was not for it.
+    fn compact_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
+        let picker = self.compact_picker.as_mut()?;
+        let rows = picker.rows();
+        let row = rows.get(picker.cursor).copied();
+        match key.code {
+            KeyCode::Up => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Down => picker.cursor = (picker.cursor + 1).min(rows.len().saturating_sub(1)),
+            KeyCode::Right => {
+                if let Some(CompactRow::Subject(s)) = row {
+                    picker.open = Some(s);
+                }
+            }
+            KeyCode::Left => {
+                if let Some(open) = picker.open.take() {
+                    picker.cursor = open;
+                }
+            }
+            KeyCode::Char(' ') => match row {
+                Some(CompactRow::Subject(s)) => {
+                    let exchanges = picker.compaction.subjects[s].exchanges.clone();
+                    let on = !exchanges.iter().all(|e| picker.kept[*e]);
+                    for e in exchanges {
+                        picker.kept[e] = on;
+                    }
+                }
+                Some(CompactRow::Exchange(e)) => picker.kept[e] = !picker.kept[e],
+                None => {}
+            },
+            KeyCode::Char('l' | 'L') => picker.last_as_is = !picker.last_as_is,
+            KeyCode::Esc => {
+                self.compact_picker = None;
+                self.info("Not compacted");
+            }
+            KeyCode::Enter => {
+                let picker = self.compact_picker.take()?;
+                let keep: Vec<usize> = (0..picker.kept.len()).filter(|e| picker.kept[*e]).collect();
+                let config = self.small_job_config()?;
+                self.running_since = Some(Instant::now());
+                self.info("Compacting…");
+                return Some(Some(Effect::Compact {
+                    config,
+                    keep,
+                    last_as_is: picker.last_as_is,
+                }));
+            }
+            _ => {}
+        }
+        Some(None)
+    }
+
+    /// The effect raised outside a key, to run next.
+    pub(crate) fn take_queued(&mut self) -> Option<Effect> {
+        self.queued.take()
+    }
+
+    /// The /compact window while it is open.
+    pub(crate) fn compact_picker(&self) -> Option<&CompactPicker> {
+        self.compact_picker.as_ref()
+    }
+
     fn members(&self) -> Vec<Member> {
         self.settings
             .team
@@ -2218,14 +2646,66 @@ impl App {
 
     /// Keys while a held command waits for the person: `y` runs it, `n` or
     /// Esc refuses it. Returns whether the key was for it.
+    /// Whether the warm sessions should be read now: `/tick` is on, no
+    /// request runs, four minutes went by since the last time. After half an
+    /// hour without a request, the person is asked first.
+    pub(crate) fn keep_warm_due(&mut self) -> bool {
+        if !self.settings.tick || self.is_running() || self.ask_keep_warm {
+            return false;
+        }
+        if self.idle_since.elapsed() >= KEEP_WARM_ASK {
+            self.ask_keep_warm = true;
+            return false;
+        }
+        let due = self
+            .last_warm
+            .is_none_or(|t| t.elapsed() >= KEEP_WARM_EVERY);
+        if due {
+            self.last_warm = Some(Instant::now());
+        }
+        due
+    }
+
+    /// The question asked after a long wait, while it is.
+    pub(crate) fn keep_warm_question(&self) -> Option<Approval> {
+        self.ask_keep_warm.then(|| Approval {
+            model: self
+                .current_model()
+                .cloned()
+                .unwrap_or_else(|| ModelId::agent(Agent::ClaudeCode)),
+            question: Question::KeepWarm {
+                minutes: KEEP_WARM_ASK.as_secs() / 60,
+            },
+        })
+    }
+
     fn approval_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
+        if self.ask_keep_warm {
+            match key.code {
+                // Another half hour.
+                KeyCode::Char('y' | 'Y') => self.idle_since = Instant::now(),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    self.settings.tick = false;
+                    self.info("No longer keeping the sessions warm: /tick turns it on again");
+                }
+                _ => return Some(None),
+            }
+            self.ask_keep_warm = false;
+            return Some(None);
+        }
         let (approval, _) = self.approval.as_ref()?;
         let (secrets, hosts) = match &approval.question {
             Question::Command { secrets, hosts, .. } => (secrets.clone(), hosts.clone()),
-            Question::MoreTurns { .. } => (Vec::new(), Vec::new()),
+            Question::MoreTurns { .. } | Question::KeepWarm { .. } | Question::ColdStart { .. } => {
+                (Vec::new(), Vec::new())
+            }
         };
         let answer = match key.code {
             KeyCode::Char('y' | 'Y') => Answer::Yes,
+            // Stop, to compact first: only for a cold start.
+            KeyCode::Char('c' | 'C') if matches!(approval.question, Question::ColdStart { .. }) => {
+                Answer::Stop
+            }
             // The secrets it names, from now on: kept with the defaults.
             KeyCode::Char('a' | 'A') if !secrets.is_empty() || !hosts.is_empty() => {
                 for name in secrets {
@@ -2245,7 +2725,9 @@ impl App {
             KeyCode::Char('c' | 'C') => {
                 return Some(match &approval.question {
                     Question::Command { command, .. } => Some(Effect::Copy(command.clone())),
-                    Question::MoreTurns { .. } => None,
+                    Question::MoreTurns { .. }
+                    | Question::KeepWarm { .. }
+                    | Question::ColdStart { .. } => None,
                 });
             }
             _ => return Some(None),
@@ -2311,6 +2793,15 @@ impl App {
                         self.info(format!("Model: {model}"));
                     }
                 }
+            }
+            // Tab: the pair mode, Opus planning and Sonnet coding.
+            KeyCode::Tab => {
+                self.settings.pair_mode = !self.settings.pair_mode;
+                self.info(if self.settings.pair_mode {
+                    "Pair mode: /pair has Claude Code's Opus plan and review, its Sonnet code"
+                } else {
+                    "Pair mode off: /pair takes its models from the team"
+                });
             }
             KeyCode::Char(' ') => {
                 if let Some(row) = rows.get(selected) {
@@ -2445,6 +2936,8 @@ impl App {
             allowed_secrets: self.settings.allowed_secrets.clone(),
             lenient_commands: !self.settings.strict_commands,
             allowed_hosts: self.settings.allowed_hosts.clone(),
+            pair_mode: Some(self.settings.pair_mode),
+            tick: self.settings.tick,
         }
     }
 
@@ -3023,6 +3516,13 @@ pub fn parse_window(text: &str) -> Option<u64> {
     Some(secs.min(crate::usage::KEEP_SECS))
 }
 
+/// How often the warm sessions are read while the conversation waits.
+const KEEP_WARM_EVERY: Duration = Duration::from_secs(4 * 60);
+
+/// How long the conversation may wait before the person is asked whether
+/// to keep reading them.
+const KEEP_WARM_ASK: Duration = Duration::from_secs(30 * 60);
+
 /// The first sentence of `text`, for a line: an agent's reasons run long.
 fn first_sentence(text: &str) -> &str {
     let text = text.trim();
@@ -3266,6 +3766,165 @@ mod tests {
         type_text(&mut app, "/secrets forget API_TOKEN");
         press(&mut app, KeyCode::Enter);
         assert!(app.defaults().allowed_secrets.is_empty());
+    }
+
+    #[test]
+    fn pair_mode_has_opus_plan_and_sonnet_code() {
+        let mut app = ready();
+        app.settings.pair_mode = true;
+        type_text(&mut app, "/newpair make done");
+        let Some(Effect::Send { config, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("a pair is sent");
+        };
+        assert!(format!("{config:?}").contains("claude-code/opus"));
+        assert!(
+            app.settings
+                .team
+                .contains(&ModelId::new("claude-code/sonnet").unwrap())
+        );
+        // Tab in the model picker turns it off.
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.settings.pair_mode);
+    }
+
+    #[test]
+    fn tick_keeps_sessions_warm_and_asks_after_a_long_wait() {
+        let mut app = ready();
+        assert!(!app.keep_warm_due());
+        type_text(&mut app, "/tick");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.keep_warm_due());
+        // Not again before four minutes.
+        assert!(!app.keep_warm_due());
+        app.last_warm = Instant::now().checked_sub(Duration::from_secs(5 * 60));
+        assert!(app.keep_warm_due());
+        // Half an hour without a request: asked first.
+        app.idle_since = Instant::now()
+            .checked_sub(Duration::from_secs(31 * 60))
+            .unwrap();
+        assert!(!app.keep_warm_due());
+        assert!(screen(&app).contains("Keep the sessions warm?"));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.settings.tick);
+        assert!(app.keep_warm_question().is_none());
+        assert!(!app.defaults().tick);
+    }
+
+    #[test]
+    fn a_request_not_sent_comes_back_to_the_box() {
+        let mut app = ready();
+        type_text(&mut app, "fix it");
+        press(&mut app, KeyCode::Enter);
+        app.on_agent(AgentMessage::NotSent("fix it".into()));
+        assert_eq!(app.input().text(), "fix it");
+        assert!(!app.is_running());
+        assert!(!app.transcript.contains(&Entry::User("fix it".into())));
+    }
+
+    #[test]
+    fn a_code_block_copies_with_a_click_and_only_its_mark_folds() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = ready();
+        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        app.transcript.push(Entry::Said(format!(
+            "Try:\n```sh\ncargo test -q\n```\n{long}"
+        )));
+        app.transcript.push(Entry::Said(long.clone()));
+        let screen_text = screen(&app);
+        let rows: Vec<&str> = screen_text.lines().collect();
+        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap() as u16;
+        let click = |app: &mut App, row: u16| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        // The first reply is folded, the latest open.
+        assert!(screen_text.contains("▸ "));
+        assert!(screen_text.contains("▾ fold"));
+        assert!(matches!(
+            click(&mut app, row_of("⧉ copy")),
+            Some(Effect::Copy(code)) if code == "cargo test -q"
+        ));
+        // A click on the text does not fold; one on the mark does.
+        click(&mut app, row_of("Try:"));
+        assert!(!app.is_expanded(1));
+        screen(&app);
+        click(&mut app, row_of("▸ "));
+        assert!(app.is_expanded(1));
+    }
+
+    #[test]
+    fn compact_lets_the_person_pick_what_to_keep() {
+        use ironquill_agent::Subject;
+        let mut app = ready();
+        type_text(&mut app, "/compact");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::PlanCompaction(_))
+        ));
+        app.on_agent(AgentMessage::Compaction(Ok(Compaction {
+            exchanges: vec![
+                "fix the parser".into(),
+                "add a test".into(),
+                "the docs".into(),
+            ],
+            subjects: vec![
+                Subject {
+                    name: "Parser".into(),
+                    exchanges: vec![0, 1],
+                },
+                Subject {
+                    name: "Docs".into(),
+                    exchanges: vec![2],
+                },
+            ],
+        })));
+        assert!(screen(&app).contains("[x] Parser (2 exchanges)"));
+        // Open the parser, untick its test.
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(screen(&app).contains("[-] Parser (2 exchanges)"));
+        // The docs go as well; the last exchange is not kept as it was.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('l'));
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::Compact { keep, last_as_is: false, .. }) if keep == [0]
+        ));
+        assert!(app.compact_picker().is_none());
+    }
+
+    #[test]
+    fn a_cited_file_opens_at_its_line_with_a_click() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = project();
+        app.transcript.push(Entry::Said(
+            "The second line is in src/lib.rs:2, not in nowhere.rs:1.".into(),
+        ));
+        let shown = screen(&app);
+        assert!(shown.contains("src/lib.rs:2↗"));
+        assert!(!shown.contains("nowhere.rs:1↗"));
+        let (row, column) = shown
+            .lines()
+            .enumerate()
+            .find_map(|(r, l)| l.find("src/lib.rs:2").map(|c| (r, l[..c].chars().count())))
+            .unwrap();
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column as u16 + 2,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        let file = app.file().expect("the file is open");
+        assert_eq!(file.lines(), ["one", "two"]);
+        assert_eq!(file.cursor().0, 1);
     }
 
     #[test]
@@ -3773,6 +4432,8 @@ mod tests {
                 allowed_secrets: vec![],
                 lenient_commands: true,
                 allowed_hosts: vec![],
+                pair_mode: Some(false),
+                tick: false,
             }
         );
     }
@@ -4008,7 +4669,7 @@ mod tests {
         assert!(matches!(effect, Some(Effect::Send { ref text, .. }) if text == "add a feature"));
         assert!(app.transcript.iter().any(|e| matches!(
             e,
-            Entry::Info(t) if t.contains("smart picks the code to read and plans (effort high)")
+            Entry::Info(t) if t.contains("smart plans and reviews (effort high)")
                 && t.contains("cheap codes (effort high)")
         )));
         // The model that answers stays the one picked.

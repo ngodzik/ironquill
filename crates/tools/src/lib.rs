@@ -26,14 +26,17 @@ mod workspace;
 
 pub use check::{Check, CheckFailure, CheckReport, Trial};
 pub use command::{
-    Assessment, CommandOutput, Policy, assess, known_hosts, run_command, unreadable,
+    Assessment, CommandOutput, Policy, assess, known_hosts, redact_secrets, run_command, unreadable,
 };
 pub use detect::detect_checks;
 pub use diff::{DiffLine, line_diff};
 pub use docker::{Container, running_containers};
 pub use error::ToolError;
 pub use git::{changes_text, diff_stat, is_clean, project_context, project_files, tracked_files};
-pub use gitview::{LineChanges, LineMark, committed_lines, file_status, line_changes};
+pub use gitview::{
+    LineChanges, LineMark, branch_base, committed_lines, file_status, is_commit, line_changes,
+    lines_at,
+};
 pub use outline::project_map;
 pub use rules::project_instructions;
 pub use snapshot::Snapshot;

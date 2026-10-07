@@ -20,6 +20,8 @@ mod error;
 mod highlight;
 pub mod keymap;
 mod markdown;
+mod references;
+mod review;
 mod sessions;
 mod tree;
 mod usage;
@@ -149,45 +151,83 @@ where
     let (docker_tx, mut docker_rx) = mpsc::unbounded_channel();
     let mut docker_tick = tokio::time::interval(Duration::from_secs(2));
     let mut docker_asking = false;
+    // Whether keeping the sessions warm is due is looked at every half
+    // minute; it happens every four.
+    let mut warm_tick = tokio::time::interval(Duration::from_secs(30));
+    // The terminal's title follows the conversation's name.
+    let mut title = String::new();
+    // A save asked for while a request runs waits for its end: the
+    // conversation is the request's meanwhile.
+    let mut save_pending = false;
 
     while !app.should_quit() {
         terminal
             .draw(|frame| view::render(frame, &app))
             .map_err(TuiError::Terminal)?;
+        let name = app.name();
+        if name != title {
+            let _ = execute!(
+                std::io::stdout(),
+                ratatui::crossterm::terminal::SetTitle(format!("{name} · ironquill"))
+            );
+            title = name;
+        }
 
-        let effect = tokio::select! {
-            key = keys.next() => match key {
-                Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
-                Some(Ok(TermEvent::Paste(text))) => {
-                    app.on_paste(&text);
+        let queued = app.take_queued();
+        let effect = if queued.is_some() {
+            queued
+        } else {
+            tokio::select! {
+                key = keys.next() => match key {
+                    Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Some(Ok(TermEvent::Paste(text))) => {
+                        app.on_paste(&text);
+                        None
+                    }
+                    Some(Ok(TermEvent::Mouse(mouse))) => app.on_mouse(mouse),
+                    Some(Ok(_)) => None,
+                    Some(Err(e)) => return Err(TuiError::Terminal(e)),
+                    None => break,
+                },
+                Some(message) = rx.recv() => {
+                    if app.on_agent(message) {
+                        save(&store, &mut app, &conversation).await;
+                    }
                     None
-                }
-                Some(Ok(TermEvent::Mouse(mouse))) => {
-                    app.on_mouse(mouse);
+                },
+                Some(result) = docker_rx.recv() => {
+                    docker_asking = false;
+                    app.on_docker(result);
                     None
-                }
-                Some(Ok(_)) => None,
-                Some(Err(e)) => return Err(TuiError::Terminal(e)),
-                None => break,
-            },
-            Some(message) = rx.recv() => {
-                if app.on_agent(message) {
-                    save(&store, &mut app, &conversation).await;
-                }
+                },
+                _ = docker_tick.tick(), if app.docker().is_some() && !docker_asking => {
+                    Some(Effect::RefreshDocker)
+                },
+                _ = tick.tick(), if app.is_running() => {
+                    app.on_tick();
+                    None
+                },
+                _ = warm_tick.tick() => app.keep_warm_due().then_some(Effect::KeepWarm),
+            }
+        };
+        if save_pending && !app.is_running() {
+            save_pending = false;
+            save(&store, &mut app, &conversation).await;
+        }
+        // What needs the conversation waits while a request has it, rather
+        // than freeze the interface until its end.
+        let effect = match effect {
+            Some(Effect::Save) if app.is_running() => {
+                save_pending = true;
                 None
-            },
-            Some(result) = docker_rx.recv() => {
-                docker_asking = false;
-                app.on_docker(result);
+            }
+            Some(Effect::OpenContext | Effect::ApplyContext(_) | Effect::ForgetDelegate(_))
+                if app.is_running() =>
+            {
+                app.report_info("That waits for the request to end; Ctrl-C stops it");
                 None
-            },
-            _ = docker_tick.tick(), if app.docker().is_some() && !docker_asking => {
-                Some(Effect::RefreshDocker)
-            },
-            _ = tick.tick(), if app.is_running() => {
-                app.on_tick();
-                None
-            },
+            }
+            effect => effect,
         };
 
         // The model, the models offered, the team and the budget carry over
@@ -249,6 +289,111 @@ where
                 }
                 app.on_cancelled();
                 save(&store, &mut app, &conversation).await;
+            }
+            Some(Effect::KeepWarm) => {
+                // In the background, while the conversation waits; a request
+                // sent meanwhile waits for it.
+                let conversation = Arc::clone(&conversation);
+                let delegate = Arc::clone(&delegate);
+                let root = workspace.root().to_owned();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut guard = conversation.lock().await;
+                    guard
+                        .session
+                        .keep_warm(&*delegate, &root, |e| {
+                            let _ = tx.send(AgentMessage::Event(e));
+                        })
+                        .await;
+                });
+            }
+            Some(Effect::PlanCompaction(config)) => {
+                let (conversation, model, delegate, tx) = (
+                    Arc::clone(&conversation),
+                    Arc::clone(&model),
+                    Arc::clone(&delegate),
+                    tx.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut guard = conversation.lock().await;
+                    let Conversation { session, toolbox } = &mut *guard;
+                    let events = tx.clone();
+                    let result = session
+                        .plan_compaction(&*model, &*delegate, toolbox, &config, |e| {
+                            let _ = events.send(AgentMessage::Event(e));
+                        })
+                        .await
+                        .map_err(|e| error_chain(&e));
+                    let _ = tx.send(AgentMessage::Compaction(result));
+                });
+            }
+            Some(Effect::Compact {
+                config,
+                keep,
+                last_as_is,
+            }) => {
+                let (conversation, model, delegate, tx) = (
+                    Arc::clone(&conversation),
+                    Arc::clone(&model),
+                    Arc::clone(&delegate),
+                    tx.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut guard = conversation.lock().await;
+                    let Conversation { session, toolbox } = &mut *guard;
+                    let events = tx.clone();
+                    let result = session
+                        .compact(
+                            &*model,
+                            &*delegate,
+                            toolbox,
+                            &config,
+                            &keep,
+                            last_as_is,
+                            |e| {
+                                let _ = events.send(AgentMessage::Event(e));
+                            },
+                        )
+                        .await
+                        .map_err(|e| error_chain(&e));
+                    let _ = tx.send(AgentMessage::Compacted(result));
+                });
+            }
+            Some(Effect::Address(number)) => {
+                let root = workspace.root().to_owned();
+                let tx = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(AgentMessage::Addressed(review::request(&root, &number)));
+                });
+            }
+            Some(Effect::Apply(numbers, patches)) => {
+                match review::apply(workspace.root(), &patches) {
+                    Ok(()) => {
+                        let list = numbers
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        conversation.lock().await.session.note_from_person(&format!(
+                            "I applied the changes {list} with git apply."
+                        ));
+                        app.report_info(&format!("Applied {list}"));
+                    }
+                    Err(e) => app.report_error(e),
+                }
+            }
+            Some(Effect::ShowCommit(hash)) => {
+                let shown = std::process::Command::new("git")
+                    .args(["show", "--stat", "--format=%h %s%n%an, %ar%n", &hash])
+                    .current_dir(workspace.root())
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_owned());
+                match shown {
+                    Some(text) => app.report_info(&text),
+                    None => app.report_error(format!("git cannot show {hash}")),
+                }
             }
             Some(Effect::Copy(text)) => match clipboard::copy(&text) {
                 Ok(how) => app.info(format!("Copied ({how})")),
@@ -425,7 +570,12 @@ where
                 },
             )
             .await;
-        let _ = tx.send(AgentMessage::Done(result.map_err(|e| error_chain(&e))));
+        let message = match result {
+            // Stopped before it began: the message goes back to the box.
+            Err(ironquill_agent::AgentError::NotSent) => AgentMessage::NotSent(text),
+            result => AgentMessage::Done(result.map_err(|e| error_chain(&e))),
+        };
+        let _ = tx.send(message);
     })
 }
 

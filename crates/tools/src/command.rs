@@ -1722,6 +1722,21 @@ fn environment(
         .collect()
 }
 
+/// `text` with the value of every secret of the environment replaced by
+/// `<redacted:NAME>`, and the names of those taken out: for what the person
+/// sends, as for what commands print.
+pub fn redact_secrets(text: &str) -> (String, Vec<String>) {
+    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let redacted = redact(text, &env);
+    let names = env
+        .iter()
+        .filter_map(|(name, _)| name.to_str())
+        .filter(|name| redacted.contains(&format!("<redacted:{name}>")))
+        .map(str::to_owned)
+        .collect();
+    (redacted, names)
+}
+
 /// `text` with the value of every secret of `env` replaced by its name, the
 /// longest first, so that a part of one is not left over. Values shorter
 /// than 8 characters are too common to be told from ordinary words.

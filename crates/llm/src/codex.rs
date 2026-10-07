@@ -92,7 +92,8 @@ impl Codex {
     fn command(&self, request: &DelegateRequest) -> Command {
         let mut command = Command::new(&self.program);
         command.arg("exec");
-        if let Some(session) = &request.resume {
+        // Codex has no copy of a session: a fork starts afresh.
+        if let Some(session) = request.resume.as_ref().filter(|_| !request.fork) {
             command.arg("resume");
             command.arg(session);
         }
@@ -629,6 +630,8 @@ mod tests {
             resume: Some("s1".into()),
             directory: PathBuf::from("/tmp"),
             read_only: false,
+            fork: false,
+            ephemeral: false,
         };
         let command = Codex::new("codex").command(&request);
         let args: Vec<String> = command

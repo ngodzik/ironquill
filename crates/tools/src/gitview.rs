@@ -104,13 +104,36 @@ fn mark(marks: &mut [LineMark], from: usize, len: usize, mark: LineMark) {
 /// `None` when `root` is not in a git repository, so that nothing is marked.
 /// An empty list for a file git does not know yet: all of it is new.
 pub fn committed_lines(root: &Path, path: &Path) -> Option<Vec<String>> {
+    lines_at(root, path, "HEAD")
+}
+
+/// The lines of the file at `path` as of `rev`, as [`committed_lines`]
+/// does for the last commit.
+pub fn lines_at(root: &Path, path: &Path, rev: &str) -> Option<Vec<String>> {
     git(root, &["rev-parse", "--is-inside-work-tree"])?;
-    let spec = format!("HEAD:./{}", path.to_string_lossy());
+    let spec = format!("{rev}:./{}", path.to_string_lossy());
     Some(
         git(root, &["show", &spec])
             .map(|text| text.lines().map(str::to_owned).collect())
             .unwrap_or_default(),
     )
+}
+
+/// Where the current branch left the main one: the merge base of `HEAD`
+/// with `main`, `master` or their remote, when that is not `HEAD` itself.
+pub fn branch_base(root: &Path) -> Option<String> {
+    let head = git(root, &["rev-parse", "HEAD"])?;
+    ["main", "master", "origin/main", "origin/master"]
+        .iter()
+        .find_map(|branch| git(root, &["merge-base", "HEAD", branch]))
+        .map(|base| base.trim().to_owned())
+        .filter(|base| *base != head.trim())
+}
+
+/// Whether `hash` names a commit of the repository at `root`.
+pub fn is_commit(root: &Path, hash: &str) -> bool {
+    hash.chars().all(|c| c.is_ascii_hexdigit())
+        && git(root, &["cat-file", "-e", &format!("{hash}^{{commit}}")]).is_some()
 }
 
 /// What git says of each changed file, relative to `root`: `M` modified,

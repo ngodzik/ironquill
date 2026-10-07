@@ -460,6 +460,13 @@ pub struct DelegateRequest {
     /// The agent's session to continue, to send it a follow-up such as a
     /// failing check; `None` starts a fresh one.
     pub resume: Option<String>,
+    /// Continue a copy of `resume` rather than the session itself: the
+    /// copy starts from the same context, and so reads the same prompt
+    /// cache, while the session is left as it was. Claude Code only.
+    pub fork: bool,
+    /// Keep nothing of this request once it ends, as for a call that only
+    /// keeps a cache warm. Claude Code only.
+    pub ephemeral: bool,
     /// The project directory the agent works in.
     pub directory: std::path::PathBuf,
 }

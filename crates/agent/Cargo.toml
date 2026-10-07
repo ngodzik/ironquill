@@ -12,6 +12,8 @@ ironquill-tools.workspace = true
 thiserror.workspace       = true
 serde.workspace           = true
 serde_json.workspace      = true
+# Keeping a cache warm while a model works: a timer beside the work.
+tokio = { workspace = true, features = ["time", "macros"] }
 
 [dev-dependencies]
 tempfile.workspace   = true

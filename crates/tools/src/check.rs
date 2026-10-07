@@ -265,24 +265,85 @@ fn excerpt(text: &str) -> String {
             !trimmed.is_empty() && !NOISE.iter().any(|n| trimmed.starts_with(n))
         })
         .collect();
-    let mut out = useful
-        .iter()
-        .take(EXCERPT_LINES)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    if useful.len() > EXCERPT_LINES {
-        out.push_str(&format!(
-            "\n[{} more lines cut]",
-            useful.len() - EXCERPT_LINES
-        ));
+    if useful.len() <= EXCERPT_LINES {
+        return useful.join("\n");
     }
-    out
+    // Too long: the lines that say what failed, with the one before each,
+    // then the end, where runners sum up. The start is mostly warnings.
+    let mut keep = vec![false; useful.len()];
+    let mut failing = 0;
+    for (i, line) in useful.iter().enumerate() {
+        if failing < EXCERPT_LINES - SUMMARY_LINES && says_failure(line) {
+            keep[i.saturating_sub(1)] = true;
+            keep[i] = true;
+            failing += 2;
+        }
+    }
+    let end = useful.len().saturating_sub(SUMMARY_LINES);
+    for k in &mut keep[end..] {
+        *k = true;
+    }
+    let mut out = Vec::new();
+    let mut cut = 0;
+    for (line, kept) in useful.iter().zip(&keep) {
+        if *kept {
+            if cut > 0 {
+                out.push(format!("[{cut} lines cut]"));
+                cut = 0;
+            }
+            out.push((*line).to_owned());
+        } else {
+            cut += 1;
+        }
+    }
+    if cut > 0 {
+        out.push(format!("[{cut} lines cut]"));
+    }
+    out.join("\n")
+}
+
+/// The lines kept from the end of a long output: runners sum up there.
+const SUMMARY_LINES: usize = 20;
+
+/// Whether a line of a check's output says what failed.
+fn says_failure(line: &str) -> bool {
+    let line = line.trim_start();
+    const MARKS: [&str; 12] = [
+        "FAIL",
+        "ERROR",
+        "Error",
+        "error",
+        "panicked",
+        "Traceback",
+        "Exception",
+        "assert",
+        "Assert",
+        "✗",
+        "×",
+        "E   ",
+    ];
+    MARKS.iter().any(|m| line.starts_with(m)) || line.contains("Error:")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_failure_keeps_what_failed_and_the_end() {
+        let mut output: Vec<String> = (0..200).map(|i| format!("warning: unused {i}")).collect();
+        output.push("ModuleNotFoundError: No module named 'redis'".into());
+        output.extend((0..100).map(|i| format!("tests/test_{i}.py .")));
+        output.push("FAILED tests/test_cache.py::test_get".into());
+        output.extend((0..30).map(|i| format!("line {i}")));
+        output.push("1 failed, 99 passed".into());
+        let text = excerpt(&output.join("\n"));
+        assert!(text.contains("ModuleNotFoundError: No module named 'redis'"));
+        assert!(text.contains("FAILED tests/test_cache.py::test_get"));
+        assert!(text.ends_with("1 failed, 99 passed"));
+        assert!(!text.contains("warning: unused 3\n"));
+        assert!(text.lines().count() <= EXCERPT_LINES + 10);
+    }
 
     #[test]
     fn parse_splits_on_whitespace() {
@@ -310,7 +371,9 @@ mod tests {
         let out = excerpt(&text);
         assert!(out.starts_with("error[E0425]"));
         assert!(!out.contains("Compiling"));
-        assert!(out.ends_with("[41 more lines cut]"));
+        // What failed, then the end.
+        assert!(out.contains("[80 lines cut]"));
+        assert!(out.ends_with("line 99"));
     }
 
     #[cfg(unix)]

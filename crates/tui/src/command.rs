@@ -55,6 +55,17 @@ pub(crate) enum Command {
     /// `/pair <question>`: the best of the model that answers and its team
     /// plans, the cheapest codes.
     Pair(Option<String>),
+    /// `/newpair <request>`: a pair whose planner starts from the chat
+    /// rather than going on from the last pair.
+    NewPair(Option<String>),
+    /// `/tick`: keep the warm sessions warm while the conversation waits.
+    Tick,
+    /// `/compact`: sum the conversation up, choosing what to keep.
+    Compact,
+    /// `/address <pr>`: answer a pull request's review comments.
+    Address(Option<String>),
+    /// `/apply 1 3`: apply those diff blocks of the last reply.
+    Apply(Option<String>),
     /// `/planner <model>` picks the member that plans; alone, says which.
     Planner(Option<String>),
     /// `/copy` opens the conversation as text, to select and copy from.
@@ -110,6 +121,11 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "team" => Ok(Command::Team),
         "effort" => Ok(Command::Effort(rest_opt)),
         "pair" => Ok(Command::Pair(rest_opt)),
+        "newpair" => Ok(Command::NewPair(rest_opt)),
+        "tick" => Ok(Command::Tick),
+        "compact" => Ok(Command::Compact),
+        "address" => Ok(Command::Address(rest_opt)),
+        "apply" => Ok(Command::Apply(rest_opt)),
         "planner" => Ok(Command::Planner(rest_opt)),
         "copy" | "chat" => Ok(Command::Copy),
         "instructions" => Ok(Command::Instructions),
@@ -152,6 +168,11 @@ pub(crate) const NAMES: &[&str] = &[
     "new",
     "nocheck",
     "pair",
+    "newpair",
+    "tick",
+    "compact",
+    "address",
+    "apply",
     "planner",
     "q",
     "quit",
@@ -259,12 +280,16 @@ Type a question or a change and press Enter. Changes are checked before they are
 /budget <dollars>    the most one request may cost (none: no limit); past it the
                      work stops and the model says where it is and asks what next
 /team                who answers and who it may hand tasks to
-/pair <question>     in a pair, among the model that answers and its team: the
-                     best sees a map of the project and picks the code to read,
-                     ironquill reads it, the best plans from it, thinking hard;
-                     the cheapest codes it, thinking little, without the earlier
-                     conversation; the planner revises its plan if checks fail,
-                     then reviews the diff, and the coder fixes what it finds
+/pair <request>      in a pair: the planner reads the code and plans, the coder
+                     codes, the planner reviews; it goes on from the last pair
+/newpair <request>   the same, the planner starting from a copy of the chat
+/address <pr>        answer a pull request's review comments, one by one: what each
+                     asks, whether it is handled, the change as a diff, a reply
+/apply 1 3           apply those diff blocks of the last reply with git, all or none
+/compact             sum the conversation up: pick the subjects to keep, the rest
+                     goes; the agents start again from the summary
+/tick                keep Claude Code's warm sessions warm while you think: a one
+                     word read every four minutes, asking again after half an hour
 /planner <model>     the model that plans in a pair; by default the best scored,
                      or the dearest
 /effort <level>      how hard models think: low, medium, high (the default),

@@ -6,7 +6,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 const CODE_BLOCK: Color = Color::Rgb(229, 192, 123);
+
+/// The colour of code blocks, which references inside are not looked for.
+pub(crate) const CODE_BLOCK_COLOR: Color = CODE_BLOCK;
 const INLINE_CODE: Color = Color::Rgb(130, 170, 255);
+
+/// The mark drawn over a code block: a click copies the block as written.
+pub(crate) const COPY_MARK: &str = "⧉ copy";
 
 /// A run of text in one style.
 type Piece = (String, Style);
@@ -17,16 +23,38 @@ pub(crate) fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>
     let width = width.max(1);
     let mut out = Vec::new();
     let mut in_code = false;
+    // Inside a ```diff block: its lines in the colours of a diff.
+    let mut in_diff = false;
 
     for raw in text.lines() {
         let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") {
-            // The fences themselves carry no content worth a line.
+        if let Some(language) = trimmed.strip_prefix("```") {
+            // An opening fence becomes the copy mark, a closing one nothing.
             in_code = !in_code;
+            in_diff = in_code && language.trim().starts_with("diff");
+            if in_code {
+                let mut spans = vec![Span::styled(COPY_MARK, base.fg(Color::DarkGray))];
+                if !language.trim().is_empty() {
+                    spans.push(Span::styled(
+                        format!(" · {}", language.trim()),
+                        base.fg(Color::DarkGray),
+                    ));
+                }
+                out.push(Line::from(spans));
+            }
             continue;
         }
         if in_code {
-            let style = base.fg(CODE_BLOCK);
+            let style = if in_diff {
+                match raw.chars().next() {
+                    Some('+') => base.fg(Color::Rgb(110, 180, 120)),
+                    Some('-') => base.fg(Color::Rgb(200, 110, 110)),
+                    Some('@') => base.fg(Color::Cyan),
+                    _ => base.fg(CODE_BLOCK),
+                }
+            } else {
+                base.fg(CODE_BLOCK)
+            };
             let chars: Vec<char> = raw.chars().collect();
             if chars.is_empty() {
                 out.push(Line::default());
@@ -60,6 +88,57 @@ pub(crate) fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>
         }
     }
     out
+}
+
+/// The ```diff blocks of `text`, numbered: by the number after `diff`, as
+/// `/address` asks for, else in order from 1.
+pub(crate) fn diff_blocks(text: &str) -> Vec<(usize, String)> {
+    let mut blocks = Vec::new();
+    // The block being read: whether a diff, its number, its lines.
+    let mut current: Option<(bool, Option<usize>, Vec<&str>)> = None;
+    let mut order = 0;
+    for line in text.lines() {
+        if let Some(info) = line.trim_start().strip_prefix("```") {
+            match current.take() {
+                Some((true, number, lines)) => {
+                    order += 1;
+                    blocks.push((number.unwrap_or(order), lines.join("\n") + "\n"));
+                }
+                Some((false, _, _)) => {}
+                None => {
+                    let mut words = info.split_whitespace();
+                    let diff = words.next() == Some("diff");
+                    let number = words.next().and_then(|n| n.parse().ok());
+                    current = Some((diff, number, Vec::new()));
+                }
+            }
+        } else if let Some((_, _, lines)) = current.as_mut() {
+            lines.push(line);
+        }
+    }
+    blocks
+}
+
+/// The code blocks of `text`, as written, in order: what each copy mark
+/// copies.
+pub(crate) fn code_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            match current.take() {
+                Some(lines) => blocks.push(lines.join("\n")),
+                None => current = Some(Vec::new()),
+            }
+        } else if let Some(lines) = current.as_mut() {
+            lines.push(line);
+        }
+    }
+    // A block left open still copies what it has.
+    if let Some(lines) = current {
+        blocks.push(lines.join("\n"));
+    }
+    blocks
 }
 
 /// The text of a `#` heading line, without its hashes.
@@ -175,14 +254,26 @@ mod tests {
     }
 
     #[test]
-    fn fences_disappear_and_code_keeps_its_lines() {
-        let out = render(
-            "Run:\n```python\nprint(\"hi\")\n```\nDone.",
-            40,
-            Style::new(),
+    fn fences_become_a_copy_mark_and_code_keeps_its_lines() {
+        let text_in = "Run:\n```python\nprint(\"hi\")\nx = 1\n```\nDone.";
+        let out = render(text_in, 40, Style::new());
+        assert_eq!(
+            text(&out),
+            ["Run:", "⧉ copy · python", "print(\"hi\")", "x = 1", "Done."]
         );
-        assert_eq!(text(&out), ["Run:", "print(\"hi\")", "Done."]);
-        assert_eq!(out[1].spans[0].style.fg, Some(CODE_BLOCK));
+        assert_eq!(out[2].spans[0].style.fg, Some(CODE_BLOCK));
+        assert_eq!(code_blocks(text_in), ["print(\"hi\")\nx = 1"]);
+    }
+
+    #[test]
+    fn diff_blocks_are_numbered_as_labelled_or_in_order() {
+        let text = "1.\n```diff 3\n-a\n+b\n```\n```text\nreply\n```\n```diff\n-c\n+d\n```";
+        assert_eq!(
+            diff_blocks(text),
+            [(3, "-a\n+b\n".to_owned()), (2, "-c\n+d\n".to_owned())]
+        );
+        let out = render("```diff\n-a\n+b\n```", 40, Style::new());
+        assert_ne!(out[1].spans[0].style.fg, out[2].spans[0].style.fg);
     }
 
     #[test]

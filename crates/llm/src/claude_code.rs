@@ -103,6 +103,12 @@ impl ClaudeCode {
         }
         if let Some(session) = &request.resume {
             command.args(["--resume", session]);
+            if request.fork {
+                command.arg("--fork-session");
+            }
+        }
+        if request.ephemeral {
+            command.arg("--no-session-persistence");
         }
         command
     }
@@ -664,6 +670,8 @@ mod tests {
             resume: Some("s1".into()),
             directory: PathBuf::from("/tmp"),
             read_only: false,
+            fork: false,
+            ephemeral: false,
         };
         let command = ClaudeCode::new("claude").command(&request, true);
         let args: Vec<String> = command

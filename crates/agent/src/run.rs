@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use ironquill_core::{
-    Agent, ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateReply,
+    Agent, CacheUse, ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateReply,
     DelegateRequest, Effort, Message, ModelId, Pricing, TokenCount, ToolSpec, Usage, Usd,
 };
 use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox, Trial};
@@ -10,6 +10,10 @@ use crate::config::{AgentConfig, Answer, Approval, Member, Pair, Question};
 use crate::delegate;
 use crate::error::AgentError;
 use crate::event::Event;
+
+mod compact;
+
+pub use compact::{Compaction, Subject};
 
 /// For one task with no person in the loop: `ironquill do`, and the brief a
 /// stronger model gets when it takes over.
@@ -54,37 +58,17 @@ const ANSWER_PROMPT: &str = "You are a careful software engineer. Another assist
 the question below, with everything you need in it; you cannot read files or run anything. \
 Answer it directly and briefly.";
 
-/// For the planner, choosing what to read from the map of the project.
-const SCOUT_PROMPT: &str = "Before planning, say which code you need to see, from the map: one \
-line per excerpt, as `path:start-end`, at most 12 excerpts and about 600 lines in all. Reply with \
-those lines only, or `none` if the map is enough. ironquill reads them for you.";
-
-/// Excerpts the planner may ask for, and lines in all, so that it reads
-/// what matters rather than the project.
-const MAX_EXCERPTS: usize = 12;
-const MAX_EXCERPT_LINES: usize = 800;
-
-/// For the planner, which reads nothing itself.
-const PLAN_PROMPT: &str = "You are the architect of a change in a software project. You see \
-the code you ask for, not the whole project. Another model will implement your plan with tools; it follows instructions \
-well but should not have to make design decisions. Write a precise plan: the files to change; for \
-each, the functions to add or change, with their signatures and exact behaviour; the edge cases; \
-the tests to add or adjust. Give short code where precision matters. If the brief lacks \
-something essential, say what the implementer must read first. Be concise: every word is paid \
-for. Write in the language of the request. If nothing needs to change, or no change to the code \
-can help, reply with `STOP` on the first line, then the reason, and nothing else.";
-
-/// For the planner, in every message where it decides: a way to end the
-/// work rather than go on for nothing.
-const STOP_RULE: &str = "If nothing needs to change, or no change to the code can help (for \
-instance the checks fail for a reason outside the code), reply with `STOP` on the first line, \
-then the reason, and nothing else.";
+/// For a pair's planner: the role, whatever reads the code.
+const PLAN_PROMPT: &str = "You are the architect of a change in a software project. You read \
+the code you need with your tools; another model implements your plan with tools; it follows \
+instructions well but should not have to make design decisions. Be concise: every word is paid \
+for. Write in the language of the request.";
 
 /// For Claude Code or Codex when they plan or review: their tools that
 /// write are turned off.
 const AGENT_PLAN_PROMPT: &str = "You plan and review; another model writes the code. Your \
 tools that change files are turned off: do not try to edit anything. Read what you need, then \
-answer as asked: the lines to read, the plan, or the review.";
+answer as asked.";
 
 /// How long an agent's session stays worth resuming: past it, the
 /// provider's prompt cache has expired, and resuming would write the whole
@@ -127,11 +111,9 @@ const FIRST_REQUEST_BYTES: usize = 4_000;
 const CATCH_UP_BYTES: usize = 24_000;
 
 /// For the first model, once the plan is there.
-const IMPLEMENT_PROMPT: &str = "Implement the plan above, exactly. The code the planner read is \
-above too: do not read it again, read only what is missing, and start writing early. Where the \
-plan is unclear, choose the simplest reading. As soon as you stop calling tools, ironquill runs \
-the checks and tells you how they went. When you are done, reply with one short sentence.";
-
+const IMPLEMENT_PROMPT: &str = "Implement this plan, exactly. Where it is unclear, choose the \
+simplest reading. Read only what you need and start writing early. As soon as you stop, ironquill \
+runs the checks and tells you how they went. When you are done, reply with one short sentence.";
 /// For the planner, with the plan: what will judge the work.
 const CHECKS_RULE: &str = "End the plan with the commands that will judge the work, one per \
 line: `Check: <command>` to run it at the root of the project, or `Check in <dir>: <command>` to \
@@ -140,34 +122,35 @@ test command, limited to the tests concerned. Each is tried once before any chan
 failure already there is not blamed on the code. Write `Check: none` when no command can judge \
 the work.";
 
-/// For the planner, whenever the coder stops short: it decides what comes
-/// next, rather than the work going round.
-const DECIDE_PROMPT: &str = "Decide what comes next, and reply with one of these: a revised \
-plan for the coder, brief, with `Check:` lines if the checks should change; only `Check:` lines, \
-to judge the work as it is with other checks; `Check: none` to go on without checks; `DONE` on the \
-first line, then why, if the work is done as it is; or `STOP` on the first line, then the reason, \
-if no change to the code can help. If you need to see code first, reply only with \
-`path:start-end` lines.";
-
 /// For the planner, once the checks pass: the person will not review it.
-const REVIEW_PROMPT: &str = "The checks pass. Review the work before it goes to the person, who \
-will not review it. Check it against the request and your plan: every part of the request is \
-done and can be used, in the interface too when the request is about it; no code is left \
-unused; no module uses another's private helpers; the documentation says what changed in \
-behaviour or API; the new behaviour is tested; nothing unrelated changed. Reply with exactly `OK` \
-if nothing needs changing. Otherwise reply with a numbered list of concrete changes, each naming \
-the file and what to do, and nothing else.";
+const REVIEW_PROMPT: &str = "Review the work before it goes to the person, who will not review \
+it. Judge it against the request first, then against your plan: the plan itself may have been \
+wrong. Every part of the request is done and can be used, in the interface too when the request \
+is about it; no code is left unused; the documentation says what changed in behaviour or API; \
+the new behaviour is tested; nothing unrelated changed. Reply with exactly `OK` if nothing needs \
+changing. Otherwise reply with a numbered list of concrete changes, each naming the file and \
+what to do, with `Check:` lines if other checks should judge the work; or with `STOP` on the \
+first line, then the reason, if no change to the code can help.";
 
-/// How many rounds of fixes a review may ask for before the work is
-/// handed over with what is left said.
-const REVIEW_FIXES: usize = 2;
+/// For the planner, with the request: the plan, an answer, or a stop.
+const PLAN_STEP_PROMPT: &str = "Read the code you need, then write the plan: the files to \
+change; for each, the functions to add or change, with their signatures and exact behaviour; the \
+edge cases; the tests to add or adjust. Do not write the code: the coder does; signatures only, \
+and short snippets where precision matters. Change no file. If the request is a question, reply \
+with `ANSWER` on the first line, then the answer. If nothing needs to change, or no change to \
+the code can help, reply with `STOP` on the first line, then the reason.";
+
+/// For a copy of the chat's session made the planner: it keeps the chat's
+/// tools, for the cache's sake, and is told what it may do with them.
+const FORK_PLAN_PROMPT: &str = "From here on you are the planner of a pair: another model writes \
+the code, and you review it after. Change no file and run nothing that changes anything: you \
+read only, and ironquill stops the pair if a file changes.";
+
+/// The tools a planner reading through ironquill gets.
+const READ_TOOLS: [&str; 4] = ["search", "outline", "read_file", "list_dir"];
 
 /// The most of a diff a review reads, in bytes.
 const REVIEW_DIFF_BYTES: usize = 40_000;
-
-/// How many times the planner may decide what comes next after the coder
-/// stopped short.
-const MAX_DECISIONS: usize = 3;
 
 /// The tool through which the first model hands a task to the team.
 const DELEGATE_TOOL: &str = "delegate";
@@ -178,6 +161,8 @@ in the current directory. You can read and edit its files, and run commands, thr
 command that cannot be undone or reaches outside the machine is put to the person first. \
 Reply in the language the person writes in. Talk normally and answer questions directly. \
 Only change files when the person asks for a change, and only what they asked for. \
+When you mean code of the project, cite it as `path:line` or `path:start-end`, so that the \
+person can open it with a click. \
 If you need to ask the person something, ask it and end your reply there: do not call any tool \
 in that reply, and do not act on a guess of the answer. They will reply in their next message. \
 The project's files are listed below: use the list instead of listing directories, and do not \
@@ -293,6 +278,10 @@ struct Ctx<'a, M, D, O> {
     allowed_secrets: Vec<String>,
     /// The servers the person allowed besides the known ones.
     allowed_hosts: Vec<String>,
+    /// The settings of the last call to an agent, and its context's size:
+    /// what its session is kept with.
+    last_call: Option<Call>,
+    last_context: Option<u64>,
 }
 
 enum Attempt {
@@ -324,11 +313,14 @@ pub struct Session {
     /// requests to other models and restarts, until it is reset.
     #[serde(default)]
     agents: BTreeMap<Agent, Thread>,
-    /// Each agent's session as a pair's planner, kept apart from its chat:
-    /// its instructions and tools differ, and one would rewrite the other's
-    /// prompt cache.
+    /// Each agent's session as a pair's planner, the last pair's, for
+    /// `/pair` to go on from while warm.
     #[serde(default)]
     planners: BTreeMap<Agent, Thread>,
+    /// Each agent's session as a pair's coder, kept from one pair to the
+    /// next while warm.
+    #[serde(default)]
+    coders: BTreeMap<Agent, Thread>,
     /// A model's summary of the conversation, for those who start afresh.
     #[serde(default)]
     summary: Option<Summary>,
@@ -358,6 +350,12 @@ struct Thread {
     /// When it was last used, in seconds since 1970.
     #[serde(default)]
     used: u64,
+    /// The settings of its last call, for the next to read the same cache.
+    #[serde(default)]
+    call: Option<Call>,
+    /// How many tokens its context held at its last call, when known.
+    #[serde(default)]
+    context: Option<u64>,
 }
 
 /// Seconds since 1970, now.
@@ -381,6 +379,7 @@ impl Session {
             context_added: false,
             agents: BTreeMap::new(),
             planners: BTreeMap::new(),
+            coders: BTreeMap::new(),
             summary: None,
             windows: BTreeMap::new(),
             last_used: 0,
@@ -431,9 +430,19 @@ impl Session {
             windows: std::mem::take(&mut self.windows),
             allowed_secrets: config.allowed_secrets.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
+            last_call: None,
+            last_context: None,
         };
-        self.restart_if_cold(&mut ctx).await;
-        let verdict = match self.work(&mut ctx, text, context).await {
+        let started = match self.restart_if_cold(&mut ctx).await {
+            Err(e) => Err(e),
+            Ok(()) => self.work(&mut ctx, text, context).await,
+        };
+        // Stopped before it began: as if it had not been sent.
+        if matches!(started, Err(AgentError::NotSent)) {
+            self.messages.pop();
+            return Err(AgentError::NotSent);
+        }
+        let verdict = match started {
             Err(AgentError::OverBudget) => {
                 let budget = config.budget.unwrap_or_default();
                 (ctx.observe)(Event::OverBudget {
@@ -499,18 +508,35 @@ impl Session {
     async fn restart_if_cold<M: ChatModel, D, O: FnMut(Event) + Send>(
         &mut self,
         ctx: &mut Ctx<'_, M, D, O>,
-    ) {
-        let Some(first) = ctx.config.tiers.first() else {
-            return;
+    ) -> Result<(), AgentError> {
+        let Some(first) = ctx.config.tiers.first().cloned() else {
+            return Ok(());
         };
         if ctx.config.pair.is_some() || first.delegate().is_some() || self.last_used == 0 {
-            return;
+            return Ok(());
         }
         let idle = now_secs().saturating_sub(self.last_used);
         let before = crate::context::approx_tokens(&self.messages);
-        if idle <= cache_lifetime(first) || before < RESTART_TOKENS {
-            return;
+        if idle <= cache_lifetime(&first) || before < RESTART_TOKENS {
+            return Ok(());
         }
+        match Self::ask_cold_start(ctx, &first, idle, Some(before)).await {
+            Answer::Stop => return Err(AgentError::NotSent),
+            Answer::No => return Ok(()),
+            Answer::Yes | Answer::Always => {}
+        }
+        self.restart_from_summary(ctx, &first, idle, before).await;
+        Ok(())
+    }
+
+    /// Replaces the history before the latest exchanges by its summary.
+    async fn restart_from_summary<M: ChatModel, D, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+        first: &ModelId,
+        idle: u64,
+        before: u64,
+    ) {
         // The latest exchanges stay as they were, from a request on.
         let request = self.messages.len() - 1;
         let requests: Vec<usize> = (1..request)
@@ -569,6 +595,28 @@ impl Session {
             before: TokenCount(before),
             after: TokenCount(after),
         });
+    }
+
+    /// Asks the person what to do with a conversation whose cache expired;
+    /// without anybody to ask, it starts again from its summary.
+    async fn ask_cold_start<M, D, O>(
+        ctx: &Ctx<'_, M, D, O>,
+        model: &ModelId,
+        idle: u64,
+        tokens: Option<u64>,
+    ) -> Answer {
+        let Some(approver) = &ctx.config.approver else {
+            return Answer::Yes;
+        };
+        approver
+            .ask(Approval {
+                model: model.clone(),
+                question: Question::ColdStart {
+                    idle_minutes: idle / 60,
+                    tokens,
+                },
+            })
+            .await
     }
 
     /// What a model starting afresh is told of the conversation before
@@ -637,8 +685,19 @@ impl Session {
         // picked, and is told what was said without it meanwhile.
         let agent = first.delegate().map(|(agent, _)| agent);
         if let Some(agent) = agent {
-            // A cold session starts afresh and is told the conversation.
-            let thread = self.warm(agent).map(|t| (t.session.clone(), t.seen));
+            // A cold session starts afresh and is told the conversation,
+            // unless the person would rather go on with it as it is.
+            let mut thread = self.warm(agent).map(|t| (t.session.clone(), t.seen));
+            if thread.is_none()
+                && let Some(cold) = self.agents.get(&agent).cloned()
+            {
+                let idle = now_secs().saturating_sub(cold.used);
+                match Self::ask_cold_start(ctx, first, idle, cold.context).await {
+                    Answer::Stop => return Err(AgentError::NotSent),
+                    Answer::No => thread = Some((cold.session, cold.seen)),
+                    Answer::Yes | Answer::Always => {}
+                }
+            }
             let request = self.messages.len() - 1;
             ctx.catch_up = match &thread {
                 Some((_, seen)) => catch_up(&self.messages[(*seen).min(request)..request]),
@@ -648,7 +707,8 @@ impl Session {
         }
         let first_attempt = attempt(ctx, first, &mut self.messages, &mut failure, true).await;
         if let (Some(agent), Some(session)) = (agent, ctx.thread.take()) {
-            self.keep_thread(agent, session);
+            let (call, context) = (ctx.last_call.take(), ctx.last_context.take());
+            self.keep_thread(agent, session, call, context);
         }
 
         match first_attempt? {
@@ -697,13 +757,13 @@ impl Session {
         Ok(Verdict::GaveUp { failure })
     }
 
-    /// Works on the request as an architect and an editor. The planner reads
-    /// the code it asks for, plans, and names the checks that will judge the
-    /// work; ironquill tries them before any change. The coder implements the
-    /// plan; whenever it stops short, the planner decides what comes next from
-    /// what happened: a revised plan, other checks, none, done, or stop. Once
-    /// the work stands, the planner reviews the diff and the coder fixes what
-    /// it finds.
+    /// Works on the request in three steps. The planner reads the code it
+    /// needs itself and plans, naming the checks that will judge the work;
+    /// ironquill tries them before any change. The coder implements the
+    /// plan, given in its message. The planner reviews the result from a
+    /// copy of its planning, as it was right after the plan, so that it
+    /// knows why without the noise of later rounds, and says OK, asks for
+    /// fixes, changes the checks, or stops.
     async fn work_in_pair<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         &mut self,
         ctx: &mut Ctx<'_, M, D, O>,
@@ -714,426 +774,340 @@ impl Session {
         let Some(coder) = ctx.config.tiers.first().cloned() else {
             return Err(AgentError::Config("at least one model is needed"));
         };
-        let planner = &pair.planner;
+        let planner = pair.planner.clone();
+        // A planner reads the code itself: an agent with its own tools, a
+        // model with ironquill's tools that read. One without tools cannot.
+        if planner.delegate().is_none()
+            && ctx
+                .config
+                .team
+                .iter()
+                .any(|m| m.model == planner && !m.tools)
+        {
+            return Err(AgentError::Config(
+                "the planner must be able to read the code: pick one that uses tools",
+            ));
+        }
+        let mut account = PairAccount::new(&planner, &coder);
+        let request_at = self.messages.len() - 1;
 
-        // The planner sees the map of the project, a parser's work, and
-        // says which code it needs; ironquill reads it, no model does.
         (ctx.observe)(Event::Step {
             number: 1,
-            of: 6,
-            name: "Choosing the code to read".into(),
-            model: Some(planner.clone()),
-            effort: Some(pair.planner_effort),
-        });
-        let root = ctx.toolbox.workspace().root().to_owned();
-        // An agent planner continues its own warm session, kept apart from
-        // the agent's chat so that neither rewrites the other's cache; any
-        // planner is told the conversation it has not seen, so that a
-        // follow-up makes sense.
-        let planner_agent = planner.delegate().map(|(agent, _)| agent);
-        let thread = planner_agent
-            .and_then(|agent| self.warm_planner(agent))
-            .map(|t| (t.session.clone(), t.seen));
-        let request_at = self.messages.len() - 1;
-        let earlier = match &thread {
-            Some((_, seen)) => catch_up(&self.messages[(*seen).min(request_at)..request_at]),
-            None => self.recap(ctx, request_at).await,
-        };
-        // A session that planned before holds the map already.
-        let map = if thread.is_some() {
-            "The map of the project is the one you saw before, apart from the changes since."
-                .to_owned()
-        } else {
-            format!(
-                "The map of the project, its definitions with their lines:\n{}",
-                ironquill_tools::project_map(&root)
-            )
-        };
-        let mut planner_session = thread.map(|(session, _)| session);
-        let earlier = if earlier.trim().is_empty() {
-            String::new()
-        } else {
-            format!("The conversation so far:\n{earlier}\n")
-        };
-        let mut planning = vec![
-            Message::system(format!(
-                "{PLAN_PROMPT}{}",
-                identity(
-                    planner,
-                    false,
-                    &AgentConfig {
-                        team: Vec::new(),
-                        ..ctx.config.clone()
-                    }
-                )
-            )),
-            Message::user(format!(
-                "{earlier}The request:\n{text}\n\n{map}\n\n{context}\n\n{SCOUT_PROMPT} \
-                 {STOP_RULE}{}",
-                spent_so_far(ctx)
-            )),
-        ];
-        let mut account = PairAccount::new(planner, &coder);
-        let wanted = ask_planner(
-            ctx,
-            planner,
-            pair.planner_effort,
-            &mut planning,
-            &mut planner_session,
-        )
-        .await?;
-        if stops(&wanted) {
-            account.ended = format!("{planner} stopped before any code: {}", reason(&wanted));
-            let verdict = nothing_or_gave_up(ctx.toolbox, None);
-            return self.end_pair(ctx, planner_session, &account, Ok(verdict));
-        }
-
-        (ctx.observe)(Event::Step {
-            number: 2,
-            of: 6,
-            name: "Reading the code asked for".into(),
-            model: None,
-            effort: None,
-        });
-        let excerpts = read_excerpts(ctx, &wanted);
-
-        (ctx.observe)(Event::Step {
-            number: 3,
-            of: 6,
+            of: 3,
             name: "Planning".into(),
             model: Some(planner.clone()),
             effort: Some(pair.planner_effort),
         });
-        planning.push(Message::user(format!(
-            "The code you asked for:\n{excerpts}\n\nNow write the plan. {CHECKS_RULE}{}{}",
-            check_suggestions(ctx),
-            spent_so_far(ctx)
-        )));
-        let mut plan = ask_planner(
-            ctx,
-            planner,
-            pair.planner_effort,
-            &mut planning,
-            &mut planner_session,
-        )
-        .await?;
+        let mut planning = self.start_planning(ctx, pair, request_at).await;
+        let mut plan = match planning
+            .ask(
+                ctx,
+                &format!(
+                    "{}{PLAN_STEP_PROMPT} {CHECKS_RULE}{}\n\nThe request:\n{text}\n\n{context}{}",
+                    planning.preamble(),
+                    check_suggestions(ctx),
+                    spent_so_far(ctx)
+                ),
+                Step::Plan,
+            )
+            .await
+        {
+            Ok(plan) => plan,
+            Err(e) => return self.end_pair(ctx, &planning, None, &account, Err(e)),
+        };
+        // Code in the plan is the coder's to write: once, it goes back.
+        let code = fenced_lines(&plan);
+        if code > PLAN_CODE_LINES {
+            plan = match planning
+                .ask(
+                    ctx,
+                    &format!(
+                        "Your plan holds {code} lines of code. The coder writes the code: give \
+                         the files, the signatures and the behaviour only, and the Check: lines."
+                    ),
+                    Step::Plan,
+                )
+                .await
+            {
+                Ok(plan) => plan,
+                Err(e) => return self.end_pair(ctx, &planning, None, &account, Err(e)),
+            };
+        }
+        if first_word_is(&plan, "answer") {
+            // A question: the plan is the answer.
+            let answer = after_first_word(&plan);
+            (ctx.observe)(Event::Said {
+                model: planner.clone(),
+                text: answer.clone(),
+            });
+            account.ended = format!("{planner} answered, with nothing to code");
+            account.answer = answer;
+            return self.end_pair(ctx, &planning, None, &account, Ok(Verdict::Answered));
+        }
         if stops(&plan) {
             account.ended = format!("{planner} stopped before any code: {}", reason(&plan));
             let verdict = nothing_or_gave_up(ctx.toolbox, None);
-            return self.end_pair(ctx, planner_session, &account, Ok(verdict));
+            return self.end_pair(ctx, &planning, None, &account, Ok(verdict));
         }
 
-        // The checks it named are tried before any change: one that cannot
-        // judge goes back to it once, and one that fails already is known
-        // to, so that a failure is not blamed on the code.
-        (ctx.observe)(Event::Step {
-            number: 3,
-            of: 6,
-            name: "Trying the checks before any change".into(),
-            model: None,
-            effort: None,
-        });
+        // The checks it named are tried before any change.
         let named = named_checks(&plan).unwrap_or_else(|| ctx.config.checks.clone());
-        let mut rejected = try_checks(ctx, &named, false).await;
-        if !rejected.is_empty() {
-            planning.push(Message::user(format!(
-                "These checks cannot judge the work:\n{rejected}\nName others with `Check:` \
-                 lines, or write `Check: none`. Reply with those lines only.{}",
-                spent_so_far(ctx)
-            )));
-            let reply = ask_planner(
-                ctx,
-                planner,
-                pair.planner_effort,
-                &mut planning,
-                &mut planner_session,
-            )
-            .await?;
-            rejected = try_checks(ctx, &named_checks(&reply).unwrap_or_default(), true).await;
-        }
-        let mut dropped = rejected;
+        account.dropped = try_checks(ctx, &named, false).await;
 
-        (ctx.observe)(Event::Step {
-            number: 4,
-            of: 6,
-            name: "Coding".into(),
-            model: Some(coder.clone()),
-            effort: Some(pair.coder_effort),
-        });
-        // The coder implements it in a conversation of its own: the plan and
-        // the request, not everything said before, which every call would
-        // resend.
+        // The coder gets the plan in its message, in a conversation of its
+        // own: an agent's session is kept from one pair to the next.
         ctx.effort = Some(pair.coder_effort);
+        let coder_agent = coder.delegate().map(|(agent, _)| agent);
+        ctx.thread = coder_agent
+            .and_then(|agent| self.warm_coder(agent))
+            .map(|t| t.session.clone());
+        ctx.catch_up.clear();
         let system = self
             .messages
             .first()
             .cloned()
             .unwrap_or_else(|| Message::system(CHAT_PROMPT));
-        let mut work = vec![
-            system,
-            Message::user(format!(
-                "{text}\n\nThe code the planner read, as it is now:\n{excerpts}"
-            )),
-            Message::Assistant {
-                content: Some(format!("Plan by {planner}:\n{}", without_checks(&plan))),
-                tool_calls: Vec::new(),
-            },
-            Message::user(format!(
-                "{IMPLEMENT_PROMPT} {}{}",
-                judged_by(ctx),
-                spent_so_far(ctx)
-            )),
-        ];
-        let mut failure = None;
-        // Whether the coder works next, or only the checks run, after the
-        // planner changed them.
+        let mut work = vec![system];
+        let mut instruction = format!(
+            "{text}\n\nThe plan, by {planner}:\n{}\n\n{IMPLEMENT_PROMPT} {}{}",
+            without_checks(&plan),
+            judged_by(ctx),
+            spent_so_far(ctx)
+        );
+        let mut failure: Option<CheckFailure> = None;
+        // How the checks stood after the last coding: `None` with no check.
+        let mut checked: Option<bool> = None;
+        let mut asked: Vec<String> = Vec::new();
         let mut code_next = true;
+        // Said when the coder changed nothing.
+        let mut idle = "";
         let result: Result<Verdict, AgentError> = 'work: {
-            for decision in 0..=MAX_DECISIONS {
-                account.coded |= code_next;
-                let step = if code_next {
-                    match attempt(ctx, &coder, &mut work, &mut failure, false).await {
+            for review in 1..=MAX_REVIEWS {
+                if code_next {
+                    account.coded = true;
+                    (ctx.observe)(Event::Step {
+                        number: 2,
+                        of: 3,
+                        name: if review == 1 {
+                            "Coding".into()
+                        } else {
+                            "Fixing what the review found".into()
+                        },
+                        model: Some(coder.clone()),
+                        effort: Some(pair.coder_effort),
+                    });
+                    work.push(Message::user(instruction.clone()));
+                    ctx.effort = Some(pair.coder_effort);
+                    let ticker = planning.ticker(ctx);
+                    let (step, ticks) = match &ticker {
+                        Some(ticker) => {
+                            ticker
+                                .during(attempt(ctx, &coder, &mut work, &mut failure, false))
+                                .await
+                        }
+                        None => (
+                            attempt(ctx, &coder, &mut work, &mut failure, false).await,
+                            Vec::new(),
+                        ),
+                    };
+                    count_ticks(ctx, &planner, ticks);
+                    let step = match step {
                         Ok(step) => step,
                         Err(e) => break 'work Err(e),
-                    }
-                } else if checks_now(ctx).is_empty() {
-                    Attempt::Unchecked
-                } else {
-                    match check(ctx).await {
-                        Ok(None) => Attempt::Passed,
+                    };
+                    idle = match step {
+                        Attempt::Idle { out_of_turns: true } => {
+                            "The coder changed nothing, and ran out of turns, most likely \
+                             reading files again."
+                        }
+                        Attempt::Idle {
+                            out_of_turns: false,
+                        } => "The coder changed nothing.",
+                        _ => "",
+                    };
+                    checked = match step {
+                        Attempt::Passed => Some(true),
+                        Attempt::Failed => Some(false),
+                        Attempt::Unchecked | Attempt::Answered => None,
+                        Attempt::Idle { .. } => checked,
+                    };
+                } else if !checks_now(ctx).is_empty() {
+                    checked = match check(ctx).await {
+                        Ok(None) => Some(true),
                         Ok(Some(f)) => {
                             failure = Some(f);
-                            Attempt::Failed
+                            Some(false)
                         }
-                        Err(e) => break 'work Err(e),
-                    }
-                };
-                let words = last_reply(&work).unwrap_or_default();
-                let changed = changed_files(ctx.toolbox);
-                let report = match step {
-                    Attempt::Passed => {
-                        account.ended = "the checks pass".into();
-                        break 'work Ok(Verdict::Passed {
-                            model: coder.clone(),
-                        });
-                    }
-                    Attempt::Unchecked | Attempt::Answered => {
-                        account.ended = format!("{coder} finished, with no check to judge it");
-                        break 'work Ok(Verdict::Unchecked);
-                    }
-                    Attempt::Idle { out_of_turns } => format!(
-                        "{coder} changed nothing{}. Its last words:\n{words}",
-                        if out_of_turns {
-                            ", and ran out of turns, most likely reading files again"
-                        } else {
-                            ""
-                        }
-                    ),
-                    Attempt::Failed => {
-                        let Some(f) = failure.as_ref() else {
-                            break 'work Ok(Verdict::GaveUp { failure: None });
-                        };
-                        format!(
-                            "{coder} worked on the plan, but `{}` fails, {}.\n\n{}\n\nFiles \
-                             changed: {changed}\n\n{coder}'s last words:\n{words}",
-                            f.command,
-                            if ctx.failing_before.contains(&f.command) {
-                                "as it already did before any change: the environment, or \
-                                 what the request is about, rather than this change"
-                            } else {
-                                "while it passed before any change"
-                            },
-                            describe(f)
-                        )
-                    }
-                };
-                if decision == MAX_DECISIONS {
-                    account.ended = format!(
-                        "{} after {MAX_DECISIONS} decisions by {planner}",
-                        match &failure {
-                            Some(f) => format!("`{}` still fails", f.command),
-                            None => "the work stopped".to_owned(),
-                        }
-                    );
-                    break 'work Ok(nothing_or_gave_up(ctx.toolbox, failure.clone()));
-                }
-                (ctx.observe)(Event::Step {
-                    number: 3,
-                    of: 6,
-                    name: "Deciding what comes next".into(),
-                    model: Some(planner.clone()),
-                    effort: Some(pair.planner_effort),
-                });
-                planning.push(Message::user(format!(
-                    "{report}\n\n{DECIDE_PROMPT}{}",
-                    spent_so_far(ctx)
-                )));
-                let mut reply = match ask_planner(
-                    ctx,
-                    planner,
-                    pair.planner_effort,
-                    &mut planning,
-                    &mut planner_session,
-                )
-                .await
-                {
-                    Ok(reply) => reply,
-                    Err(e) => break 'work Err(e),
-                };
-                // It asked to see code: ironquill reads it, then it decides.
-                if !looks_like_a_plan(&reply)
-                    && named_checks(&reply).is_none()
-                    && !excerpt_requests(&reply).is_empty()
-                {
-                    let excerpts = read_excerpts(ctx, &reply);
-                    planning.push(Message::user(format!(
-                        "The code you asked for, as it is now:\n{excerpts}\n\nNow decide.{}",
-                        spent_so_far(ctx)
-                    )));
-                    reply = match ask_planner(
-                        ctx,
-                        planner,
-                        pair.planner_effort,
-                        &mut planning,
-                        &mut planner_session,
-                    )
-                    .await
-                    {
-                        Ok(reply) => reply,
                         Err(e) => break 'work Err(e),
                     };
                 }
+                (ctx.observe)(Event::Step {
+                    number: 3,
+                    of: 3,
+                    name: "Reviewing".into(),
+                    model: Some(planner.clone()),
+                    effort: Some(pair.planner_effort),
+                });
+                let prompt =
+                    review_prompt(ctx, text, checked, failure.as_ref(), &work, &asked, idle).await;
+                let reply = match planning.ask(ctx, &prompt, Step::Review).await {
+                    Ok(reply) => reply,
+                    Err(e) => break 'work Err(e),
+                };
                 if stops(&reply) {
                     account.ended = format!("{planner} stopped: {}", reason(&reply));
                     break 'work Ok(nothing_or_gave_up(ctx.toolbox, failure.clone()));
                 }
-                if first_word_is(&reply, "done") {
-                    account.ended = format!("{planner} judged it done: {}", reason(&reply));
-                    break 'work Ok(if ctx.toolbox.changed().next().is_none() {
-                        Verdict::Answered
-                    } else {
-                        Verdict::Unchecked
+                if approves(&reply) {
+                    account.reviewed = "the review approved it".into();
+                    account.ended = match checked {
+                        Some(true) => "the checks pass".into(),
+                        Some(false) => "the checks still fail".into(),
+                        None => "no check judged it".into(),
+                    };
+                    break 'work Ok(match checked {
+                        Some(true) => Verdict::Passed {
+                            model: coder.clone(),
+                        },
+                        _ if ctx.toolbox.changed().next().is_none() => Verdict::Answered,
+                        _ => Verdict::Unchecked,
                     });
                 }
                 if let Some(checks) = named_checks(&reply) {
                     let rejected = try_checks(ctx, &checks, false).await;
-                    dropped.push_str(&rejected);
+                    account.dropped.push_str(&rejected);
                 }
-                let revised = without_checks(&reply);
-                code_next = !revised.trim().is_empty();
+                let fixes = without_checks(&reply);
+                code_next = !fixes.trim().is_empty();
                 if code_next {
-                    plan = revised;
-                    ctx.effort = Some(pair.coder_effort);
-                    (ctx.observe)(Event::Step {
-                        number: 4,
-                        of: 6,
-                        name: "Coding the revised plan".into(),
-                        model: Some(coder.clone()),
-                        effort: Some(pair.coder_effort),
-                    });
-                    work.push(Message::user(format!(
-                        "Revised plan by {planner}:\n{plan}\n\n{IMPLEMENT_PROMPT} {}{}",
+                    asked.push(fixes.clone());
+                    instruction = format!(
+                        "A review of your work by {planner} asks for these changes:\n{fixes}\n\n\
+                         Make them. {}{}",
                         judged_by(ctx),
                         spent_so_far(ctx)
-                    )));
+                    );
                 }
             }
-            Ok(Verdict::GaveUp {
-                failure: failure.clone(),
+            account.reviewed =
+                format!("the review still asked for changes after {MAX_REVIEWS} rounds");
+            account.left = asked.last().cloned().unwrap_or_default();
+            Ok(match checked {
+                Some(false) => Verdict::GaveUp {
+                    failure: failure.clone(),
+                },
+                _ => nothing_or_gave_up(ctx.toolbox, None),
             })
         };
-
-        // The planner reviews what was done, from the diff, and the coder
-        // fixes what it finds: nobody should have to review it after.
-        let mut result = result;
-        if matches!(result, Ok(Verdict::Passed { .. } | Verdict::Unchecked)) {
-            for round in 0..=REVIEW_FIXES {
-                (ctx.observe)(Event::Step {
-                    number: 5,
-                    of: 6,
-                    name: "Reviewing the work".into(),
-                    model: Some(planner.clone()),
-                    effort: Some(pair.planner_effort),
-                });
-                let changed: Vec<String> = ctx.toolbox.changed().map(str::to_owned).collect();
-                let diff = ironquill_tools::changes_text(&root, &changed, REVIEW_DIFF_BYTES).await;
-                planning.push(Message::user(format!(
-                    "{REVIEW_PROMPT}\n\nThe request:\n{text}\n\nWhat changed:\n{diff}{}",
-                    spent_so_far(ctx)
-                )));
-                let review = match ask_planner(
-                    ctx,
-                    planner,
-                    pair.planner_effort,
-                    &mut planning,
-                    &mut planner_session,
-                )
-                .await
-                {
-                    Ok(review) => review,
-                    Err(e) => {
-                        result = Err(e);
-                        break;
-                    }
-                };
-                if approves(&review) {
-                    account.reviewed = "the review approved it".into();
-                    break;
-                }
-                if round == REVIEW_FIXES {
-                    account.reviewed = "the review still asks for changes".into();
-                    account.left = review;
-                    break;
-                }
-                (ctx.observe)(Event::Step {
-                    number: 6,
-                    of: 6,
-                    name: "Fixing what the review found".into(),
-                    model: Some(coder.clone()),
-                    effort: Some(pair.coder_effort),
-                });
-                ctx.effort = Some(pair.coder_effort);
-                work.push(Message::user(format!(
-                    "A review of your work by {planner} asks for these changes:\n{review}\n\n\
-                     Make them.{}",
-                    spent_so_far(ctx)
-                )));
-                let mut failed = None;
-                match attempt(ctx, &coder, &mut work, &mut failed, false).await {
-                    Ok(Attempt::Passed) => {
-                        result = Ok(Verdict::Passed {
-                            model: coder.clone(),
-                        });
-                    }
-                    Ok(Attempt::Unchecked | Attempt::Answered | Attempt::Idle { .. }) => {}
-                    Ok(Attempt::Failed) => {
-                        result = Ok(Verdict::GaveUp { failure: failed });
-                        account.reviewed = "the checks failed after the review's fixes".into();
-                        break;
-                    }
-                    Err(e) => {
-                        result = Err(e);
-                        break;
-                    }
-                }
-            }
+        if let (Some(agent), Some(session)) = (coder_agent, ctx.thread.take()) {
+            self.keep_coder(agent, session);
         }
-
         account.plan = without_checks(&plan);
         account.report = last_reply(&work).unwrap_or_default();
         account.judged_by = checks_list(ctx);
-        account.dropped = dropped;
-        self.end_pair(ctx, planner_session, &account, result)
+        self.end_pair(ctx, &planning, Some(&plan), &account, result)
+    }
+
+    /// Where a pair's planner starts. An agent goes on from the last pair's
+    /// session while warm, unless the person asked for a new pair; else
+    /// from a copy of the chat's own session with the same agent and model,
+    /// which reads the chat's cache; else afresh, told the conversation.
+    async fn start_planning<M: ChatModel, D, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+        pair: &Pair,
+        request_at: usize,
+    ) -> Planning {
+        let planner = pair.planner.clone();
+        let Some((agent, model)) = planner.delegate() else {
+            let earlier = self.recap(ctx, request_at).await;
+            return Planning::Model {
+                planner,
+                effort: pair.planner_effort,
+                messages: vec![Message::system(format!(
+                    "{PLAN_PROMPT}{}",
+                    if earlier.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\nThe conversation so far:\n{earlier}")
+                    }
+                ))],
+                after_plan: Vec::new(),
+            };
+        };
+        let fresh_call = Call {
+            model: model.to_owned(),
+            effort: Some(pair.planner_effort),
+            instructions: agent_instructions(
+                &format!("{PLAN_PROMPT}\n\n{AGENT_PLAN_PROMPT}"),
+                ctx.config,
+            ),
+            read_only: true,
+        };
+        let last_pair = (!pair.fresh)
+            .then(|| self.warm_planner(agent))
+            .flatten()
+            .filter(|t| t.call.as_ref().is_some_and(|c| c.model == model));
+        if let Some(thread) = last_pair {
+            return Planning::Agent {
+                planner,
+                agent,
+                call: thread.call.clone().unwrap_or(fresh_call),
+                base: Some(thread.session.clone()),
+                fork: false,
+                session: None,
+                latest: None,
+                preamble: String::new(),
+            };
+        }
+        let chat = self
+            .warm(agent)
+            .filter(|t| t.call.as_ref().is_some_and(|c| c.model == model))
+            .cloned();
+        if let Some(thread) = chat {
+            let missed = catch_up(&self.messages[thread.seen.min(request_at)..request_at]);
+            let missed = if missed.trim().is_empty() {
+                String::new()
+            } else {
+                format!("Meanwhile the conversation went on:\n{missed}\n")
+            };
+            return Planning::Agent {
+                planner,
+                agent,
+                call: thread.call.clone().unwrap_or(fresh_call),
+                base: Some(thread.session.clone()),
+                fork: true,
+                session: None,
+                latest: None,
+                preamble: format!("{missed}{FORK_PLAN_PROMPT}\n\n"),
+            };
+        }
+        let earlier = self.recap(ctx, request_at).await;
+        Planning::Agent {
+            planner,
+            agent,
+            call: fresh_call,
+            base: None,
+            fork: false,
+            session: None,
+            latest: None,
+            preamble: if earlier.trim().is_empty() {
+                String::new()
+            } else {
+                format!("The conversation so far:\n{earlier}\n\n")
+            },
+        }
     }
 
     /// Ends a pair: says in one line who did what, how it ended, what judged
-    /// it and which files changed, and keeps the planner's session before
-    /// writing that account into the conversation, so that the planner is
-    /// told it next time.
+    /// it and which files changed, and keeps the planner's latest session,
+    /// for `/pair` to go on from, before writing that account into the
+    /// conversation, so that the planner is told it next time.
     fn end_pair<M, D, O: FnMut(Event) + Send>(
         &mut self,
         ctx: &mut Ctx<'_, M, D, O>,
-        planner_session: Option<String>,
+        planning: &Planning,
+        _plan: Option<&String>,
         account: &PairAccount,
         result: Result<Verdict, AgentError>,
     ) -> Result<Verdict, AgentError> {
@@ -1141,10 +1115,19 @@ impl Session {
         if matches!(result, Err(AgentError::OverBudget)) {
             account.ended = "the budget ran out".into();
         }
+        if let Err(AgentError::Config(why)) = &result {
+            account.ended = (*why).to_owned();
+        }
         let line = account.line(ctx.toolbox);
         (ctx.observe)(Event::PairEnded { text: line.clone() });
-        if let (Some((agent, _)), Some(session)) = (account.planner.delegate(), planner_session) {
-            self.keep_planner(agent, session);
+        if let Planning::Agent {
+            agent,
+            call,
+            latest: Some(latest),
+            ..
+        } = planning
+        {
+            self.keep_planner(*agent, latest.clone(), call.clone());
         }
         self.note(account.note(&line));
         result
@@ -1262,14 +1245,101 @@ impl Session {
             .filter(|t| now_secs().saturating_sub(t.used) <= THREAD_WARM_SECS)
     }
 
-    /// Keeps the session `agent` ended in, as knowing everything said so far.
-    fn keep_thread(&mut self, agent: Agent, session: String) {
+    /// Keeps the session `agent` ended in, as knowing everything said so
+    /// far, with the settings of its last call and its size.
+    fn keep_thread(
+        &mut self,
+        agent: Agent,
+        session: String,
+        call: Option<Call>,
+        context: Option<u64>,
+    ) {
         let thread = Thread {
             session,
             seen: self.messages.len(),
             used: now_secs(),
+            call,
+            context,
         };
         self.agents.insert(agent, thread);
+    }
+
+    /// Whether a session is warm enough to keep warm: Claude Code's chat or
+    /// last pair, used in the last minutes, with the settings of its last
+    /// call known.
+    pub fn has_warm_sessions(&self) -> bool {
+        !self.warm_sessions().is_empty()
+    }
+
+    fn warm_sessions(&self) -> Vec<(Agent, bool, Thread)> {
+        let warm =
+            |t: &&Thread| now_secs().saturating_sub(t.used) <= THREAD_WARM_SECS && t.call.is_some();
+        let mut out = Vec::new();
+        for (pair, map) in [(false, &self.agents), (true, &self.planners)] {
+            // Only Claude Code makes copies of a session.
+            if let Some(thread) = map.get(&Agent::ClaudeCode).filter(warm) {
+                out.push((Agent::ClaudeCode, pair, thread.clone()));
+            }
+        }
+        out
+    }
+
+    /// Keeps the warm sessions warm while the conversation waits: each is
+    /// read by a one word copy of it, with the very same settings as its
+    /// last call, and counts as used again. What that costs is told as
+    /// turns.
+    pub async fn keep_warm<D: Delegate>(
+        &mut self,
+        delegate: &D,
+        root: &std::path::Path,
+        mut observe: impl FnMut(Event) + Send,
+    ) {
+        for (agent, pair, thread) in self.warm_sessions() {
+            let Some(call) = thread.call.clone() else {
+                continue;
+            };
+            let request = DelegateRequest {
+                agent,
+                effort: call.effort,
+                model: call.model.clone(),
+                prompt: TICK_PROMPT.into(),
+                instructions: call.instructions.clone(),
+                resume: Some(thread.session.clone()),
+                fork: true,
+                ephemeral: true,
+                directory: root.to_owned(),
+                read_only: call.read_only,
+            };
+            let model = ModelId::agent(agent);
+            let mut on_event = |event: DelegateEvent| {
+                if let DelegateEvent::Usage {
+                    usage,
+                    cost,
+                    billed,
+                    cache,
+                } = event
+                {
+                    observe(Event::Turn {
+                        model: model.clone(),
+                        usage,
+                        cost: cost.filter(|_| billed),
+                        subscription: !billed,
+                        context: None,
+                        cache,
+                    });
+                }
+            };
+            if delegate.run(&request, &mut on_event).await.is_ok() {
+                let map = if pair {
+                    &mut self.planners
+                } else {
+                    &mut self.agents
+                };
+                if let Some(t) = map.get_mut(&agent) {
+                    t.used = now_secs();
+                }
+            }
+        }
     }
 
     /// The session of `agent` its next request would continue, if any.
@@ -1281,6 +1351,7 @@ impl Session {
     pub fn forget_delegate(&mut self, agent: Agent) {
         self.agents.remove(&agent);
         self.planners.remove(&agent);
+        self.coders.remove(&agent);
     }
 
     /// The planning session of `agent` worth resuming, as [`Session::warm`].
@@ -1290,14 +1361,47 @@ impl Session {
             .filter(|t| now_secs().saturating_sub(t.used) <= THREAD_WARM_SECS)
     }
 
-    /// Keeps the planning session `agent` ended in.
-    fn keep_planner(&mut self, agent: Agent, session: String) {
+    /// Keeps the planning session `agent` ended in, and the settings that
+    /// read its cache.
+    fn keep_planner(&mut self, agent: Agent, session: String, call: Call) {
         let thread = Thread {
             session,
             seen: self.messages.len(),
             used: now_secs(),
+            call: Some(call),
+            context: None,
         };
         self.planners.insert(agent, thread);
+    }
+
+    /// The coding session of `agent` worth resuming.
+    fn warm_coder(&self, agent: Agent) -> Option<&Thread> {
+        self.coders
+            .get(&agent)
+            .filter(|t| now_secs().saturating_sub(t.used) <= THREAD_WARM_SECS)
+    }
+
+    /// Keeps the coding session `agent` ended in.
+    fn keep_coder(&mut self, agent: Agent, session: String) {
+        let thread = Thread {
+            session,
+            seen: self.messages.len(),
+            used: now_secs(),
+            call: None,
+            context: None,
+        };
+        self.coders.insert(agent, thread);
+    }
+
+    /// Records something the person did outside the requests, such as
+    /// applying changes, so that the next model knows.
+    pub fn note_from_person(&mut self, text: &str) {
+        self.settle();
+        self.messages.push(Message::user(format!("({text})")));
+        self.messages.push(Message::Assistant {
+            content: Some("Noted.".into()),
+            tool_calls: Vec::new(),
+        });
     }
 
     /// Records that the person stopped the request before it ended: the
@@ -1361,6 +1465,8 @@ pub async fn run<M: ChatModel, D: Delegate>(
         windows: BTreeMap::new(),
         allowed_secrets: config.allowed_secrets.clone(),
         allowed_hosts: config.allowed_hosts.clone(),
+        last_call: None,
+        last_context: None,
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -1536,6 +1642,8 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
             resume: session.clone(),
             directory: root.clone(),
             read_only: false,
+            fork: false,
+            ephemeral: false,
         };
 
         let edits = ctx.toolbox.edits();
@@ -1546,6 +1654,14 @@ async fn attempt_delegated<M, D: Delegate, O: FnMut(Event) + Send>(
         });
         session = Some(reply.session);
         ctx.thread = session.clone();
+        // What reads this session's cache next time: the very same settings.
+        ctx.last_call = Some(Call {
+            model: request.model.clone(),
+            effort: request.effort,
+            instructions: request.instructions.clone(),
+            read_only: request.read_only,
+        });
+        ctx.last_context = reply.context.map(|c| c.used.0);
 
         if may_answer && round == 0 && ctx.toolbox.changed().next().is_none() {
             return Ok(Attempt::Answered);
@@ -1699,10 +1815,10 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
             .await
             .map_err(|e| AgentError::Model(Box::new(e)))?;
         if let Some(before) = before {
+            // Each counts, even a file its own tools wrote before: a
+            // formatter rewriting it is a change too.
             for path in before.changed(&root) {
-                if !toolbox.changed().any(|p| p == path) {
-                    toolbox.mark_changed(path);
-                }
+                toolbox.mark_changed(path);
             }
         }
         reply
@@ -1802,6 +1918,366 @@ fn within_budget<M, D, O>(
     }
 }
 
+/// The settings of a call to an agent. A session is read from the prompt
+/// cache only by a call with the very same ones: model, effort,
+/// instructions and tools.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Call {
+    model: String,
+    effort: Option<Effort>,
+    instructions: String,
+    read_only: bool,
+}
+
+/// The step of a pair the planner works on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Plan,
+    Review,
+}
+
+/// Where a pair's planner thinks.
+enum Planning {
+    /// An agent's session: its plan session, and each review a copy of it
+    /// as it was right after the plan.
+    Agent {
+        planner: ModelId,
+        agent: Agent,
+        /// The settings of every call, the same for the cache to hold.
+        call: Call,
+        /// The session the plan starts from, and whether as a copy.
+        base: Option<String>,
+        fork: bool,
+        /// The session holding the plan, once there is one.
+        session: Option<String>,
+        /// The latest session, a review's once there is one: what the next
+        /// `/pair` goes on from.
+        latest: Option<String>,
+        /// What the plan's message starts with: the role of a copy of the
+        /// chat, or the conversation for a new session.
+        preamble: String,
+    },
+    /// A model's conversation, reading through ironquill's tools.
+    Model {
+        planner: ModelId,
+        effort: Effort,
+        messages: Vec<Message>,
+        /// The conversation as it was right after the plan.
+        after_plan: Vec<Message>,
+    },
+}
+
+impl Planning {
+    fn preamble(&self) -> String {
+        match self {
+            Planning::Agent { preamble, .. } => preamble.clone(),
+            Planning::Model { .. } => String::new(),
+        }
+    }
+
+    /// Asks the planner for the plan, or a review from a copy of the
+    /// planning as it was right after the plan.
+    async fn ask<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+        prompt: &str,
+        step: Step,
+    ) -> Result<String, AgentError> {
+        match self {
+            Planning::Agent {
+                planner,
+                agent,
+                call,
+                base,
+                fork,
+                session,
+                latest,
+                ..
+            } => {
+                let (resume, copy) = match (step, session.as_ref()) {
+                    // A second plan goes on in the plan session.
+                    (Step::Plan, Some(plan)) => (Some(plan.clone()), false),
+                    (Step::Plan, None) => (base.clone(), *fork),
+                    (Step::Review, plan) => (plan.cloned().or_else(|| base.clone()), true),
+                };
+                let request = DelegateRequest {
+                    agent: *agent,
+                    effort: call.effort,
+                    model: call.model.clone(),
+                    prompt: prompt.to_owned(),
+                    instructions: call.instructions.clone(),
+                    resume,
+                    fork: copy,
+                    ephemeral: false,
+                    directory: ctx.toolbox.workspace().root().to_owned(),
+                    read_only: call.read_only,
+                };
+                // A planner with its tools, as a copy of the chat keeps them
+                // for the cache's sake, is told not to change anything; the
+                // project says whether it did.
+                let root = ctx.toolbox.workspace().root().to_owned();
+                let before = (!call.read_only).then(|| ironquill_tools::Snapshot::take(&root));
+                ctx.effort = call.effort;
+                let reply = run_agent(ctx, planner, &request).await?;
+                if let Some(before) = before {
+                    let changed = before.changed(&root);
+                    if !changed.is_empty() {
+                        return Err(AgentError::Config(
+                            "the planner changed files although it may only read: the pair stopped",
+                        ));
+                    }
+                }
+                if step == Step::Plan || session.is_none() {
+                    *session = Some(reply.session.clone());
+                }
+                *latest = Some(reply.session);
+                Ok(reply.text)
+            }
+            Planning::Model {
+                planner,
+                effort,
+                messages,
+                after_plan,
+            } => {
+                let mut conversation = match step {
+                    Step::Plan => std::mem::take(messages),
+                    Step::Review => after_plan.clone(),
+                };
+                conversation.push(Message::user(prompt));
+                ctx.effort = Some(*effort);
+                let planner = planner.clone();
+                converse(ctx, &planner, &mut conversation, Role::Reader).await?;
+                let reply = last_reply(&conversation).unwrap_or_default();
+                if step == Step::Plan {
+                    after_plan.clone_from(&conversation);
+                    *messages = conversation;
+                }
+                Ok(reply)
+            }
+        }
+    }
+
+    /// What keeps the planner's session warm while the coder works, for an
+    /// agent's session that holds the plan.
+    fn ticker<'d, M, D: Delegate, O>(&self, ctx: &Ctx<'d, M, D, O>) -> Option<Ticker<'d, D>> {
+        let Planning::Agent {
+            agent,
+            call,
+            session: Some(session),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(Ticker {
+            delegate: ctx.delegate,
+            request: DelegateRequest {
+                agent: *agent,
+                effort: call.effort,
+                model: call.model.clone(),
+                prompt: TICK_PROMPT.into(),
+                instructions: call.instructions.clone(),
+                resume: Some(session.clone()),
+                fork: true,
+                ephemeral: true,
+                directory: ctx.toolbox.workspace().root().to_owned(),
+                read_only: call.read_only,
+            },
+        })
+    }
+}
+
+/// What one call that keeps a cache warm used.
+type Tick = (Usage, Option<Usd>, bool, Option<CacheUse>);
+
+/// Reads a session every few minutes with a one word copy of it, with the
+/// very same settings, so that its cache stays warm.
+struct Ticker<'d, D> {
+    delegate: &'d D,
+    request: DelegateRequest,
+}
+
+impl<D: Delegate> Ticker<'_, D> {
+    /// Runs `work`, ticking meanwhile; returns its result and what the
+    /// ticks used.
+    async fn during<T>(&self, work: impl std::future::Future<Output = T>) -> (T, Vec<Tick>) {
+        let spent = std::sync::Mutex::new(Vec::new());
+        let ticks = async {
+            loop {
+                tokio::time::sleep(TICK_EVERY).await;
+                let mut on_event = |event: DelegateEvent| {
+                    if let DelegateEvent::Usage {
+                        usage,
+                        cost,
+                        billed,
+                        cache,
+                    } = event
+                    {
+                        spent
+                            .lock()
+                            .expect("not poisoned")
+                            .push((usage, cost, billed, cache));
+                    }
+                };
+                let _ = self.delegate.run(&self.request, &mut on_event).await;
+            }
+        };
+        let result = tokio::select! {
+            result = work => result,
+            () = ticks => unreachable!("ticks never end"),
+        };
+        (result, spent.into_inner().expect("not poisoned"))
+    }
+}
+
+/// Counts what the ticks used with the request.
+fn count_ticks<M, D, O: FnMut(Event)>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    model: &ModelId,
+    ticks: Vec<Tick>,
+) {
+    for (usage, cost, billed, cache) in ticks {
+        ctx.ledger.usage += usage;
+        let cost = cost.filter(|_| billed);
+        match cost {
+            Some(cost) => ctx.ledger.cost += cost,
+            None => ctx.ledger.subscription = true,
+        }
+        (ctx.observe)(Event::Turn {
+            model: model.clone(),
+            usage,
+            cost,
+            subscription: !billed,
+            context: None,
+            cache,
+        });
+    }
+}
+
+/// How often a session is read to keep its cache warm: within the five
+/// minutes a prompt cache lives unread.
+const TICK_EVERY: std::time::Duration = std::time::Duration::from_secs(4 * 60);
+
+/// The message of a call that only keeps a cache warm.
+const TICK_PROMPT: &str = "Reply with the single word ok.";
+
+/// The most reviews a pair has before it ends.
+const MAX_REVIEWS: usize = 4;
+
+/// Lines of code past which a plan goes back to its planner once.
+const PLAN_CODE_LINES: usize = 15;
+
+/// Lines inside ``` fences.
+fn fenced_lines(text: &str) -> usize {
+    let mut inside = false;
+    let mut count = 0;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            inside = !inside;
+        } else if inside {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Whether `path` looks like a test file, in the usual languages.
+fn is_test_file(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    path.split('/')
+        .any(|part| matches!(part, "tests" | "test" | "__tests__" | "spec"))
+        || name.starts_with("test_")
+        || name.contains("_test.")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+}
+
+/// A reply without its first word, as `ANSWER` or `DONE`.
+fn after_first_word(reply: &str) -> String {
+    let text = reply.trim().trim_start_matches(['*', '`', '#', ' ']);
+    let rest = text
+        .split_once(char::is_whitespace)
+        .map_or("", |(_, rest)| rest);
+    rest.trim_start_matches(['*', '`', ':', '.', '-', '\u{2014}', ' ', '\n'])
+        .trim()
+        .to_owned()
+}
+
+/// What the planner reviews: the request first, then what changed, how the
+/// checks stand, what the coder said, and what earlier reviews asked.
+async fn review_prompt<M, D, O>(
+    ctx: &Ctx<'_, M, D, O>,
+    text: &str,
+    checked: Option<bool>,
+    failure: Option<&CheckFailure>,
+    work: &[Message],
+    asked: &[String],
+    idle: &str,
+) -> String {
+    let root = ctx.toolbox.workspace().root().to_owned();
+    let changed: Vec<String> = ctx.toolbox.changed().map(str::to_owned).collect();
+    let diff = if changed.is_empty() {
+        "Nothing changed.".to_owned()
+    } else {
+        ironquill_tools::changes_text(&root, &changed, REVIEW_DIFF_BYTES).await
+    };
+    let checks = match (checked, failure) {
+        (None, _) => "No check judges the work.".to_owned(),
+        (Some(true), _) => format!("The checks pass: {}.", checks_list(ctx)),
+        (Some(false), Some(f)) => {
+            let before = ctx.failing_before.contains(&f.command);
+            // A test changed under a check that failed already may never
+            // have run: its passing is not known.
+            let tests: Vec<&str> = changed
+                .iter()
+                .map(String::as_str)
+                .filter(|p| is_test_file(p))
+                .collect();
+            let unrun = if before && !tests.is_empty() {
+                format!(
+                    "\n\nThese test files changed, but the check failed before any change: they \
+                     may never have run: {}.",
+                    tests.join(", ")
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "`{}` fails{}.\n\n{}{unrun}",
+                f.command,
+                if before {
+                    ", as it already did before any change: the environment, or what the request \
+                     is about"
+                } else {
+                    ", while it passed before any change"
+                },
+                describe(f)
+            )
+        }
+        (Some(false), None) => "The checks fail.".to_owned(),
+    };
+    let said = format!("{idle} {}", last_reply(work).unwrap_or_default());
+    let said = said.trim();
+    let earlier = if asked.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nEarlier reviews asked:\n{}",
+            asked
+                .iter()
+                .enumerate()
+                .map(|(i, a)| format!("{}. {a}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    format!(
+        "{REVIEW_PROMPT}\n\nThe request:\n{text}\n\nWhat changed:\n{diff}\n\n{checks}\n\nThe \
+         coder said:\n{said}{earlier}{}",
+        spent_so_far(ctx)
+    )
+}
+
 /// What judges the work of a request.
 #[derive(Debug, Clone)]
 enum Judges {
@@ -1832,6 +2308,8 @@ struct PairAccount {
     plan: String,
     /// The coder's last words.
     report: String,
+    /// The planner's answer, when the request was a question.
+    answer: String,
     /// Whether the coder worked at all.
     coded: bool,
 }
@@ -1848,6 +2326,7 @@ impl PairAccount {
             dropped: String::new(),
             plan: String::new(),
             report: String::new(),
+            answer: String::new(),
             coded: false,
         }
     }
@@ -1886,6 +2365,9 @@ impl PairAccount {
     /// The account kept in the conversation, for the models after.
     fn note(&self, line: &str) -> String {
         let mut note = format!("(Worked in a pair. {line}");
+        if !self.answer.is_empty() {
+            note.push_str(&format!("\n\n{}: {}", self.planner, self.answer));
+        }
         if !self.dropped.is_empty() {
             note.push_str(&format!("\nChecks that could not judge:\n{}", self.dropped));
         }
@@ -2114,74 +2596,6 @@ fn approves(review: &str) -> bool {
     review.eq_ignore_ascii_case("ok")
 }
 
-/// Whether a planner's reply is a plan rather than only a list of code to
-/// see: most of its lines are something else than `path:start-end`.
-fn looks_like_a_plan(reply: &str) -> bool {
-    let lines = reply.lines().filter(|l| !l.trim().is_empty()).count();
-    lines > excerpt_requests(reply).len() * 2 + 1
-}
-
-/// The excerpts a planner asked for, as `path:start-end` lines.
-fn excerpt_requests(text: &str) -> Vec<(String, usize, usize)> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line
-                .trim()
-                .trim_start_matches(['-', '*', ' '])
-                .trim_matches('`')
-                .trim();
-            let (path, range) = line.rsplit_once(':')?;
-            let (start, end) = range.trim().split_once('-')?;
-            let (start, end) = (start.trim().parse().ok()?, end.trim().parse().ok()?);
-            (!path.is_empty() && start >= 1 && end >= start)
-                .then(|| (path.trim().to_owned(), start, end))
-        })
-        .take(MAX_EXCERPTS)
-        .collect()
-}
-
-/// Reads what the planner asked for with the read tool, in the sandbox,
-/// shown as reads. No model is involved: the lines are copied as they are.
-fn read_excerpts<M, D, O: FnMut(Event)>(ctx: &mut Ctx<'_, M, D, O>, wanted: &str) -> String {
-    let mut out = Vec::new();
-    let mut lines = 0;
-    for (n, (path, start, end)) in excerpt_requests(wanted).into_iter().enumerate() {
-        let end = end.min(start + (MAX_EXCERPT_LINES.saturating_sub(lines)).max(1) - 1);
-        if lines >= MAX_EXCERPT_LINES {
-            out.push(format!(
-                "({path}:{start}-{end} not read: enough lines already)"
-            ));
-            continue;
-        }
-        let call = ironquill_core::ToolCall {
-            id: format!("excerpt-{n}"),
-            name: "read_file".into(),
-            arguments: serde_json::json!({"path": path, "start": start, "end": end}).to_string(),
-        };
-        let result = ctx.toolbox.call(&call);
-        (ctx.observe)(Event::Tool {
-            name: call.name.clone(),
-            path: Some(path.clone()),
-            outcome: result
-                .as_ref()
-                .map(|o| o.summary.clone())
-                .map_err(ToString::to_string),
-        });
-        match result {
-            Ok(output) => {
-                lines += output.for_model.lines().count();
-                out.push(format!("{path}\n{}", output.for_model));
-            }
-            Err(e) => out.push(format!("{path}:{start}-{end}: {e}")),
-        }
-    }
-    if out.is_empty() {
-        "(nothing was asked for)".into()
-    } else {
-        out.join("\n\n")
-    }
-}
-
 /// The latest thing a model wrote in `messages`.
 fn last_reply(messages: &[Message]) -> Option<String> {
     messages.iter().rev().find_map(|m| match m {
@@ -2203,85 +2617,6 @@ fn spent_so_far<M, D, O>(ctx: &Ctx<'_, M, D, O>) -> String {
         ),
         None => format!("\n\n(This request has cost {} so far.)", ctx.ledger.cost),
     }
-}
-
-/// Asks the planner for its plan, or its revision: one call without tools,
-/// its conversation kept in `planning` so that it follows the thread. An
-/// agent such as Claude Code gets the latest message and reads what it
-/// wants itself.
-async fn ask_planner<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
-    ctx: &mut Ctx<'_, M, D, O>,
-    planner: &ModelId,
-    effort: Effort,
-    planning: &mut Vec<Message>,
-    session: &mut Option<String>,
-) -> Result<String, AgentError> {
-    ctx.effort = Some(effort);
-    if let Some((agent, model)) = planner.delegate() {
-        // One session for the whole pair, so that it knows the request, the
-        // code it read and the plan it wrote; and it may only read.
-        let prompt = match planning.last() {
-            Some(Message::User(text)) => text.clone(),
-            _ => String::new(),
-        };
-        let request = DelegateRequest {
-            agent,
-            effort: ctx.effort,
-            model: model.to_owned(),
-            prompt,
-            instructions: agent_instructions(
-                &format!("{PLAN_PROMPT}\n\n{AGENT_PLAN_PROMPT}"),
-                ctx.config,
-            ),
-            resume: session.clone(),
-            directory: ctx.toolbox.workspace().root().to_owned(),
-            read_only: true,
-        };
-        let reply = run_agent(ctx, planner, &request).await?;
-        *session = Some(reply.session);
-        let text = reply.text;
-        planning.push(Message::Assistant {
-            content: Some(text.clone()),
-            tool_calls: Vec::new(),
-        });
-        return Ok(text);
-    }
-    let request = ChatRequest {
-        model: planner.clone(),
-        messages: planning.clone(),
-        tools: Vec::new(),
-        effort: ctx.effort,
-    };
-    let pricing = ctx.model.pricing(planner).await;
-    within_budget(ctx, pricing, &request)?;
-    let response = ctx
-        .model
-        .complete(&request)
-        .await
-        .map_err(|e| AgentError::Model(Box::new(e)))?;
-    ctx.ledger.usage += response.usage;
-    match response.cost {
-        Some(cost) => ctx.ledger.cost += cost,
-        None => ctx.ledger.cost_complete = false,
-    }
-    (ctx.observe)(Event::Turn {
-        model: planner.clone(),
-        usage: response.usage,
-        cost: response.cost,
-        subscription: false,
-        context: None,
-        cache: response.cache,
-    });
-    let text = response.content.unwrap_or_default();
-    (ctx.observe)(Event::Said {
-        model: planner.clone(),
-        text: text.clone(),
-    });
-    planning.push(Message::Assistant {
-        content: Some(text.clone()),
-        tool_calls: Vec::new(),
-    });
-    Ok(text)
 }
 
 /// Who the model is, added to its instructions on every call: models
@@ -2433,6 +2768,8 @@ async fn hand_over<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             resume: None,
             directory: ctx.toolbox.workspace().root().to_owned(),
             read_only: false,
+            fork: false,
+            ephemeral: false,
         };
         run_agent(ctx, &to, &request).await?.text
     } else if !member.tools {
@@ -2574,6 +2911,8 @@ enum Role {
     Lead,
     /// Working on a task: every tool, no team.
     Member,
+    /// Planning or reviewing: the tools that read, nothing else.
+    Reader,
 }
 
 /// Lets the model call tools until it stops or runs out of turns. Returns
@@ -2586,7 +2925,11 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
 ) -> Result<bool, AgentError> {
     let leads = role == Role::Lead;
     let mut tools = ctx.toolbox.specs();
-    tools.push(command_spec());
+    if role == Role::Reader {
+        tools.retain(|t| READ_TOOLS.contains(&t.name.as_str()));
+    } else {
+        tools.push(command_spec());
+    }
     if leads && let Some(spec) = delegate_spec(&ctx.config.team, model_id) {
         tools.push(spec);
     }
@@ -3048,9 +3391,7 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
     let before = ironquill_tools::Snapshot::take(&root);
     let result = ironquill_tools::run_command(&command, &root, &secrets).await;
     for path in before.changed(&root) {
-        if !ctx.toolbox.changed().any(|p| p == path) {
-            ctx.toolbox.mark_changed(path);
-        }
+        ctx.toolbox.mark_changed(path);
     }
     let (status, output) = match result {
         Ok(out) => {
@@ -3313,7 +3654,7 @@ mod tests {
 
     use ironquill_core::{ChatResponse, DelegateReply, ToolCall};
 
-    use crate::config::{Approver, Question};
+    use crate::config::{Answer, Approver, Question};
     use ironquill_tools::{ToolSummary, Workspace};
     use serde_json::json;
 
@@ -3480,194 +3821,10 @@ mod tests {
                 planner: ModelId::new("strong").unwrap(),
                 planner_effort: Effort::Max,
                 coder_effort: Effort::Low,
+                fresh: false,
             })
             .build()
             .unwrap()
-    }
-
-    #[tokio::test]
-    async fn the_planner_picks_the_code_to_read_then_the_cheap_model_codes() {
-        let (dir, mut toolbox) = setup();
-        std::fs::write(
-            dir.path().join("app.py"),
-            "def f():\n    pass\n\n\ndef g():\n    pass\n",
-        )
-        .unwrap();
-        let model = Scripted::new(vec![
-            // The planner sees the map and asks for lines.
-            says("- `app.py:1-2`"),
-            // It plans from them.
-            says("Create done.txt containing ok."),
-            // The coder implements.
-            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
-            says("Created done.txt."),
-            // The review approves it.
-            says("OK"),
-        ]);
-        let mut session = Session::new();
-        // A long conversation before: the coding step must not resend it.
-        session.messages.push(Message::user("an earlier question"));
-        session.messages.push(Message::Assistant {
-            content: Some("an earlier answer".into()),
-            tool_calls: vec![],
-        });
-        let mut events = Vec::new();
-        let outcome = session
-            .send(
-                &model,
-                &NoDelegate,
-                &mut toolbox,
-                &pair_config(),
-                "make done",
-                "",
-                |e| {
-                    events.push(e);
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            outcome.verdict,
-            Verdict::Passed {
-                model: ModelId::new("cheap").unwrap()
-            }
-        );
-        let seen = model.seen.lock().unwrap();
-        // Choosing: the planner, no tools, its effort, the map of the project.
-        assert_eq!(seen[0].model.as_str(), "strong");
-        assert!(seen[0].tools.is_empty());
-        assert_eq!(seen[0].effort, Some(Effort::Max));
-        let Some(Message::User(asked)) = seen[0].messages.last() else {
-            panic!("the planner gets the request and the map");
-        };
-        assert!(asked.contains("make done") && asked.contains("L5    def g():"));
-        assert!(asked.contains("so far, of a budget of $1.00"));
-        // Planning: the lines it asked for, read by ironquill, not the rest.
-        let Some(Message::User(code)) = seen[1].messages.last() else {
-            panic!("the planner gets the code it asked for");
-        };
-        assert!(code.contains("(lines 1 to 2 of 6)") && code.contains("def f():"));
-        assert!(!code.contains("def g():"));
-        // It is asked to name the checks, and told the person's.
-        assert!(code.contains("`Check: <command>`"));
-        assert!(code.contains("Check: test -f done.txt (set by the person)"));
-        // Coding: the cheap model, its own conversation, every tool.
-        assert_eq!(seen[2].model.as_str(), "cheap");
-        assert_eq!(seen[2].effort, Some(Effort::Low));
-        assert_eq!(seen[2].messages.len(), 4);
-        assert!(!format!("{:?}", seen[2].messages).contains("an earlier"));
-        assert!(seen[2].tools.iter().any(|t| t.name == "write_file"));
-        // It gets the code the planner read, so as not to read it again.
-        assert!(matches!(
-            &seen[2].messages[1],
-            Message::User(t) if t.starts_with("make done") && t.contains("def f():")
-        ));
-        // Who works is announced at each step.
-        let steps: Vec<(u8, Option<&str>)> = events
-            .iter()
-            .filter_map(|e| match e {
-                Event::Step { number, model, .. } => {
-                    Some((*number, model.as_ref().map(ModelId::as_str)))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            steps,
-            [
-                (1, Some("strong")),
-                (2, None),
-                (3, Some("strong")),
-                // The checks are tried before any change, by ironquill.
-                (3, None),
-                (4, Some("cheap")),
-                (5, Some("strong"))
-            ]
-        );
-        // Named by nobody, the person's check judges; it failed before.
-        assert!(events.iter().any(|e| matches!(
-            e,
-            Event::Tried { command, outcome } if command == "test -f done.txt" && outcome.starts_with("fails already")
-        )));
-        // How it ended, in one line, and in the conversation.
-        let line = "strong planned and reviewed, cheap coded: the checks pass; the review \
-                    approved it. Judged by `test -f done.txt`. Files changed: done.txt.";
-        let ended: Vec<&Event> = events
-            .iter()
-            .filter(|e| matches!(e, Event::PairEnded { .. }))
-            .collect();
-        assert!(
-            matches!(ended[..], [Event::PairEnded { text }] if text == line),
-            "{ended:?}"
-        );
-        assert!(matches!(
-            session.messages.last(),
-            Some(Message::Assistant { content: Some(t), .. })
-                if t.starts_with(&format!("(Worked in a pair. {line}"))
-        ));
-    }
-
-    #[test]
-    fn excerpt_requests_are_read_from_loose_lines() {
-        assert_eq!(
-            excerpt_requests("Here:\n- `a.py:3-9`\n* b/c.rs:10-12\nnone\nd.py:9-3"),
-            [("a.py".to_owned(), 3, 9), ("b/c.rs".to_owned(), 10, 12)]
-        );
-    }
-
-    #[tokio::test]
-    async fn the_review_finds_what_the_tests_miss_and_the_coder_fixes_it() {
-        let (dir, mut toolbox) = setup();
-        let model = Scripted::new(vec![
-            says("none"),
-            says("Create done.txt and document it in README.md."),
-            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
-            says("Created done.txt."),
-            // The checks pass, but the README was forgotten.
-            says("1. README.md: say what done.txt is for."),
-            calls(
-                "write_file",
-                json!({"path": "README.md", "content": "done.txt marks it done."}),
-            ),
-            says("Documented."),
-            says("OK"),
-        ]);
-        let mut events = Vec::new();
-        let outcome = Session::new()
-            .send(
-                &model,
-                &NoDelegate,
-                &mut toolbox,
-                &pair_config(),
-                "make done",
-                "",
-                |e| {
-                    events.push(e);
-                },
-            )
-            .await
-            .unwrap();
-
-        assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
-        assert!(dir.path().join("README.md").exists());
-        let seen = model.seen.lock().unwrap();
-        // The review reads the changes, not the project.
-        let Some(Message::User(review)) = seen[4].messages.last() else {
-            panic!("the planner reviews");
-        };
-        assert!(review.contains("The checks pass. Review the work"));
-        assert!(review.contains("done.txt") && review.contains("ok"));
-        // The coder gets what the review asks for.
-        assert!(matches!(
-            seen[5].messages.last(),
-            Some(Message::User(t)) if t.contains("1. README.md")
-        ));
-        let fixes = events
-            .iter()
-            .filter(|e| matches!(e, Event::Step { number: 6, .. }))
-            .count();
-        assert_eq!(fixes, 1);
     }
 
     #[test]
@@ -3675,102 +3832,6 @@ mod tests {
         assert!(approves("OK"));
         assert!(approves(" `ok`.\n"));
         assert!(!approves("OK, but README.md is missing the route."));
-    }
-
-    #[tokio::test]
-    async fn the_planner_may_look_at_code_before_revising() {
-        let (dir, mut toolbox) = setup();
-        let model = Scripted::new(vec![
-            says("none"),
-            says("Create notes.txt."),
-            // The check failed before any change: the coder is not sent
-            // back to it, the planner decides.
-            calls("write_file", json!({"path": "notes.txt", "content": "a"})),
-            says("Done."),
-            // Asked what next, it wants to see what was written first.
-            says("notes.txt:1-1"),
-            says("1. Wrong file: create done.txt containing ok instead."),
-            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
-            says("Created done.txt."),
-            // The review approves it.
-            says("OK"),
-        ]);
-        let outcome = Session::new()
-            .send(
-                &model,
-                &NoDelegate,
-                &mut toolbox,
-                &pair_config(),
-                "make done",
-                "",
-                |_| {},
-            )
-            .await
-            .unwrap();
-
-        assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
-        assert!(dir.path().join("done.txt").exists());
-        let seen = model.seen.lock().unwrap();
-        // ironquill read what it asked for, then it decided.
-        assert_eq!(seen[5].model.as_str(), "strong");
-        assert!(matches!(
-            seen[5].messages.last(),
-            Some(Message::User(t)) if t.contains("(lines 1 to 1 of 1)") && t.contains("Now decide")
-        ));
-        assert_eq!(seen[6].model.as_str(), "cheap");
-    }
-
-    #[tokio::test]
-    async fn the_planner_decides_when_the_checks_fail_and_may_switch_them() {
-        let (_dir, mut toolbox) = setup();
-        let model = Scripted::new(vec![
-            says("none"),
-            says("Create notes.txt.\nCheck: test ! -f broken.txt"),
-            // Two rounds that break the check, which passed before.
-            calls("write_file", json!({"path": "broken.txt", "content": "a"})),
-            says("Done."),
-            calls("write_file", json!({"path": "notes.txt", "content": "b"})),
-            says("Done again."),
-            // The planner switches the check: the work is judged as it is.
-            says("Check: test -f notes.txt"),
-            // The review approves it.
-            says("OK"),
-        ]);
-        let mut session = Session::new();
-        let mut events = Vec::new();
-        let outcome = session
-            .send(
-                &model,
-                &NoDelegate,
-                &mut toolbox,
-                &pair_config(),
-                "make notes",
-                "",
-                |e| events.push(e),
-            )
-            .await
-            .unwrap();
-
-        assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
-        let seen = model.seen.lock().unwrap();
-        assert_eq!(seen.len(), 8);
-        // The planner follows its own thread, told the failure is new.
-        let decision = &seen[6];
-        assert_eq!(decision.model.as_str(), "strong");
-        assert!(matches!(
-            decision.messages.last(),
-            Some(Message::User(t)) if t.contains("`test ! -f broken.txt` fails, while it passed before any change")
-                && t.contains(DECIDE_PROMPT)
-        ));
-        // The new check was tried, then judged the work without more code.
-        assert!(events.iter().any(|e| matches!(
-            e,
-            Event::Tried { command, outcome } if command == "test -f notes.txt" && outcome == "passes"
-        )));
-        assert!(events.iter().any(|e| matches!(
-            e,
-            Event::PairEnded { text } if text.contains("Judged by `test -f notes.txt`")
-        )));
     }
 
     #[tokio::test]
@@ -4213,104 +4274,6 @@ mod tests {
         assert_eq!(model.seen.lock().unwrap().len(), 3);
     }
 
-    async fn in_pair(model: &Scripted, session: &mut Session, toolbox: &mut Toolbox) -> Outcome {
-        session
-            .send(
-                model,
-                &NoDelegate,
-                toolbox,
-                &pair_config(),
-                "make done",
-                "",
-                |_| {},
-            )
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn the_planner_may_stop_before_any_code() {
-        let (_dir, mut toolbox) = setup();
-        let model = Scripted::new(vec![says("STOP: pytest is not installed here.")]);
-        let mut session = Session::new();
-        let outcome = in_pair(&model, &mut session, &mut toolbox).await;
-
-        assert!(matches!(outcome.verdict, Verdict::Answered));
-        assert_eq!(model.seen.lock().unwrap().len(), 1);
-        assert!(matches!(
-            session.messages.last(),
-            Some(Message::Assistant { content: Some(t), .. })
-                if t.contains("strong planned, nobody coded: strong stopped before any code: pytest is not installed here.")
-        ));
-        // It was told it may.
-        let seen = model.seen.lock().unwrap();
-        assert!(matches!(&seen[0].messages[1], Message::User(t) if t.contains(STOP_RULE)));
-    }
-
-    #[tokio::test]
-    async fn the_planner_may_stop_instead_of_revising() {
-        let (dir, mut toolbox) = setup();
-        let model = Scripted::new(vec![
-            says("none"),
-            says("Create notes.txt."),
-            calls("write_file", json!({"path": "notes.txt", "content": "a"})),
-            says("Done."),
-            says("STOP\nThe check wants a file no plan of mine can make."),
-        ]);
-        let mut session = Session::new();
-        let outcome = in_pair(&model, &mut session, &mut toolbox).await;
-
-        assert!(matches!(outcome.verdict, Verdict::GaveUp { .. }));
-        assert!(!dir.path().join("done.txt").exists());
-        assert_eq!(model.seen.lock().unwrap().len(), 5);
-        assert!(matches!(
-            session.messages.last(),
-            Some(Message::Assistant { content: Some(t), .. })
-                if t.contains("strong stopped: The check wants a file no plan of mine can make.")
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_pair_ends_when_the_coder_changes_nothing() {
-        let (_dir, mut toolbox) = setup();
-        let model = Scripted::new(vec![
-            says("none"),
-            says("Create done.txt."),
-            says("It is already there."),
-            // Told the coder changed nothing, the planner decides.
-            says("DONE: nothing needed changing."),
-        ]);
-        let mut session = Session::new();
-        let mut events = Vec::new();
-        let outcome = session
-            .send(
-                &model,
-                &NoDelegate,
-                &mut toolbox,
-                &pair_config(),
-                "make done",
-                "",
-                |e| events.push(e),
-            )
-            .await
-            .unwrap();
-
-        // No check run: nothing changed to judge.
-        assert!(matches!(outcome.verdict, Verdict::Answered));
-        assert_eq!(checks_run(&events), 0);
-        let seen = model.seen.lock().unwrap();
-        assert_eq!(seen.len(), 4);
-        assert!(matches!(
-            seen[3].messages.last(),
-            Some(Message::User(t)) if t.starts_with("cheap changed nothing. Its last words:\nIt is already there.")
-        ));
-        assert!(matches!(
-            session.messages.last(),
-            Some(Message::Assistant { content: Some(t), .. })
-                if t.contains("strong judged it done: nothing needed changing.")
-        ));
-    }
-
     /// An agent that only answers, from a script, as a planner does.
     struct PlanningAgent {
         replies: Mutex<VecDeque<&'static str>>,
@@ -4359,91 +4322,10 @@ mod tests {
                 planner: ModelId::new("claude-code/opus").unwrap(),
                 planner_effort: Effort::Max,
                 coder_effort: Effort::Low,
+                fresh: false,
             })
             .build()
             .unwrap()
-    }
-
-    #[tokio::test]
-    async fn an_agent_plans_in_one_read_only_session_that_follows_the_conversation() {
-        let (_dir, mut toolbox) = setup();
-        let planner = PlanningAgent::new(vec![
-            "none",
-            "Create done.txt.",
-            "OK",
-            "none",
-            "Nothing else: STOP would be wrong, so create done.txt again.",
-            "OK",
-            "none",
-            "Write done.txt.",
-            "OK",
-        ]);
-        let model = Scripted::new(vec![
-            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
-            says("Created."),
-            calls("write_file", json!({"path": "done.txt", "content": "ok2"})),
-            says("Rewritten."),
-            calls("write_file", json!({"path": "done.txt", "content": "ok3"})),
-            says("Written."),
-        ]);
-        let mut session = Session::new();
-        let config = agent_pair_config();
-        let mut send = async |session: &mut Session, text: &str| {
-            session
-                .send(&model, &planner, &mut toolbox, &config, text, "", |_| {})
-                .await
-                .unwrap()
-        };
-
-        send(&mut session, "make done").await;
-        send(&mut session, "and again").await;
-        // Unused for a while: its cache is gone, a new session is cheaper.
-        session.planners.get_mut(&Agent::ClaudeCode).unwrap().used = 0;
-        send(&mut session, "once more").await;
-        // Its planning session is its own: the chat has none.
-        assert_eq!(session.delegate_session(Agent::ClaudeCode), None);
-
-        let requests = planner.requests.lock().unwrap();
-        assert!(requests.iter().all(|r| r.read_only));
-        assert!(requests[0].instructions.contains(AGENT_PLAN_PROMPT));
-        let resumes: Vec<Option<&str>> = requests.iter().map(|r| r.resume.as_deref()).collect();
-        assert_eq!(
-            resumes,
-            [
-                None,
-                Some("plan-1"),
-                Some("plan-2"),
-                // Warm: the same session goes on.
-                Some("plan-3"),
-                Some("plan-4"),
-                Some("plan-5"),
-                // Cold: a new one, told the conversation so far.
-                None,
-                Some("plan-7"),
-                Some("plan-8"),
-            ]
-        );
-        assert!(!requests[0].prompt.contains("The conversation so far"));
-        // Warm, it knows what was said and the map: it is told only how the
-        // last pair ended, written after its session was kept.
-        assert!(
-            requests[3]
-                .prompt
-                .starts_with("The conversation so far:\nAssistant: (Worked in a pair. claude-code/opus planned and reviewed, cheap coded")
-        );
-        assert!(!requests[3].prompt.contains("User: make done"));
-        assert!(requests[3].prompt.contains("the one you saw before"));
-        assert!(
-            requests[6]
-                .prompt
-                .contains("The map of the project, its definitions")
-        );
-        assert!(
-            requests[6]
-                .prompt
-                .starts_with("The conversation so far:\nUser: make done")
-        );
-        assert!(requests[6].prompt.contains("User: and again"));
     }
 
     #[tokio::test]
@@ -4619,45 +4501,6 @@ mod tests {
             reason("DONE: it was there\nalready"),
             "it was there already"
         );
-    }
-
-    #[tokio::test]
-    async fn a_check_that_cannot_judge_goes_back_to_the_planner_once() {
-        let (_dir, mut toolbox) = setup();
-        let model = Scripted::new(vec![
-            says("none"),
-            says("Create notes.txt.\nCheck in backend: test -f notes.txt"),
-            // Told there is no backend, it names another.
-            says("Check: test -f notes.txt"),
-            calls("write_file", json!({"path": "notes.txt", "content": "a"})),
-            says("Done."),
-            says("OK"),
-        ]);
-        let mut session = Session::new();
-        let mut events = Vec::new();
-        let outcome = session
-            .send(
-                &model,
-                &NoDelegate,
-                &mut toolbox,
-                &pair_config(),
-                "make notes",
-                "",
-                |e| events.push(e),
-            )
-            .await
-            .unwrap();
-
-        assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
-        let seen = model.seen.lock().unwrap();
-        assert!(matches!(
-            seen[2].messages.last(),
-            Some(Message::User(t)) if t.starts_with("These checks cannot judge the work:\n- Check in backend: test -f notes.txt: there is no directory backend")
-        ));
-        assert!(events.iter().any(|e| matches!(
-            e,
-            Event::PairEnded { text } if text.contains("Judged by `test -f notes.txt`")
-        )));
     }
 
     #[tokio::test]
@@ -5216,6 +5059,569 @@ mod tests {
                 .unwrap()
                 .starts_with("refused: it reads or touches a file of secrets")
         );
+    }
+
+    fn pair_steps(events: &[Event]) -> Vec<(u8, Option<String>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Step {
+                    number,
+                    of: 3,
+                    model,
+                    ..
+                } => Some((*number, model.as_ref().map(ToString::to_string))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_pair_plans_codes_and_reviews() {
+        let (dir, mut toolbox) = setup();
+        std::fs::write(dir.path().join("app.py"), "def f():\n    pass\n").unwrap();
+        let model = Scripted::new(vec![
+            // The planner reads what it needs itself, then plans.
+            calls("read_file", json!({"path": "app.py"})),
+            says("1. Create done.txt containing ok."),
+            // The coder codes, from the plan in its message.
+            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
+            says("Created done.txt."),
+            // The review approves it.
+            says("OK"),
+        ]);
+        let mut session = Session::new();
+        let mut events = Vec::new();
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "make done",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Passed {
+                model: ModelId::new("cheap").unwrap()
+            }
+        );
+        assert_eq!(
+            pair_steps(&events),
+            [
+                (1, Some("strong".into())),
+                (2, Some("cheap".into())),
+                (3, Some("strong".into()))
+            ]
+        );
+        let seen = model.seen.lock().unwrap();
+        // The planner reads, and only reads.
+        assert_eq!(seen[0].model.as_str(), "strong");
+        let tools: Vec<&str> = seen[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(tools.iter().all(|t| READ_TOOLS.contains(t)), "{tools:?}");
+        assert!(matches!(
+            seen[0].messages.last(),
+            Some(Message::User(t)) if t.contains(PLAN_STEP_PROMPT) && t.contains("The request:\nmake done")
+        ));
+        // The coder gets the plan itself.
+        assert_eq!(seen[2].model.as_str(), "cheap");
+        assert!(matches!(
+            seen[2].messages.last(),
+            Some(Message::User(t)) if t.contains("The plan, by strong:\n1. Create done.txt containing ok.")
+                && t.contains(IMPLEMENT_PROMPT)
+        ));
+        // The review sees the request, the change and the checks.
+        assert!(matches!(
+            seen[4].messages.last(),
+            Some(Message::User(t)) if t.starts_with(REVIEW_PROMPT)
+                && t.contains("The request:\nmake done")
+                && t.contains("done.txt")
+                && t.contains("The checks pass: `test -f done.txt`.")
+        ));
+        let ended = events.iter().find_map(|e| match e {
+            Event::PairEnded { text } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            ended.as_deref(),
+            Some(
+                "strong planned and reviewed, cheap coded: the checks pass; the review approved \
+                 it. Judged by `test -f done.txt`. Files changed: done.txt."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn each_review_starts_from_the_plan_and_hears_what_earlier_ones_asked() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("1. Create notes.txt.\nCheck: test -f notes.txt"),
+            calls("write_file", json!({"path": "notes.txt", "content": "a"})),
+            says("Done."),
+            says("1. Also create done.txt."),
+            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
+            says("Created it too."),
+            says("OK"),
+        ]);
+        let outcome = Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "make notes",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome.verdict, Verdict::Passed { .. }));
+        let seen = model.seen.lock().unwrap();
+        assert!(matches!(
+            seen[4].messages.last(),
+            Some(Message::User(t)) if t.starts_with("A review of your work by strong asks for these changes:\n1. Also create done.txt.")
+        ));
+        // A copy of the planning right after the plan: not the first review.
+        let second = &seen[6].messages;
+        assert!(!second.iter().any(|m| matches!(
+            m,
+            Message::Assistant { content: Some(t), .. } if t == "1. Also create done.txt."
+        )));
+        assert!(matches!(
+            second.last(),
+            Some(Message::User(t)) if t.contains("Earlier reviews asked:\n1. 1. Also create done.txt.")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_plan_full_of_code_goes_back_once() {
+        let (_dir, mut toolbox) = setup();
+        let code = format!("```rust\n{}```", "let x = 1;\n".repeat(20));
+        let model = Scripted::new(vec![
+            says(&code),
+            says("1. Create done.txt."),
+            calls("write_file", json!({"path": "done.txt", "content": "ok"})),
+            says("Done."),
+            says("OK"),
+        ]);
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "make done",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let seen = model.seen.lock().unwrap();
+        assert!(matches!(
+            seen[1].messages.last(),
+            Some(Message::User(t)) if t.starts_with("Your plan holds 20 lines of code.")
+        ));
+        assert!(matches!(
+            seen[2].messages.last(),
+            Some(Message::User(t)) if t.contains("The plan, by strong:\n1. Create done.txt.")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_question_in_a_pair_comes_back_as_an_answer() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![says("ANSWER: the parser lives in app/parse.py.")]);
+        let mut session = Session::new();
+        let mut events = Vec::new();
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "where is the parser?",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.verdict, Verdict::Answered);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Said { text, .. } if text == "the parser lives in app/parse.py."
+        )));
+        assert!(matches!(
+            session.messages.last(),
+            Some(Message::Assistant { content: Some(t), .. })
+                if t.contains("strong answered, with nothing to code") && t.contains("strong: the parser lives in app/parse.py.")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_planner_may_stop_before_any_code() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![says("STOP: pytest is not installed here.")]);
+        let mut session = Session::new();
+        let outcome = session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "fix the tests",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.verdict, Verdict::Answered);
+        assert!(matches!(
+            session.messages.last(),
+            Some(Message::Assistant { content: Some(t), .. })
+                if t.contains("strong stopped before any code: pytest is not installed here.")
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_agent_plans_from_a_copy_of_the_chat_and_reviews_from_a_copy_of_the_plan() {
+        let (_dir, mut toolbox) = setup();
+        let planner = PlanningAgent::new(vec![
+            // The chat, first.
+            "Hello.",
+            // A pair: the plan, then the review.
+            "1. Create done.txt.",
+            "OK",
+            // Another pair, going on from the last one.
+            "1. Write done.txt again.",
+            "OK",
+            // A new pair, from the chat again.
+            "1. Write done.txt once more.",
+            "OK",
+        ]);
+        let model = Scripted::new(vec![
+            calls("write_file", json!({"path": "done.txt", "content": "1"})),
+            says("Done."),
+            calls("write_file", json!({"path": "done.txt", "content": "2"})),
+            says("Done."),
+            calls("write_file", json!({"path": "done.txt", "content": "3"})),
+            says("Done."),
+        ]);
+        let chat = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        session
+            .send(&model, &planner, &mut toolbox, &chat, "hi", "", |_| {})
+            .await
+            .unwrap();
+        for (text, fresh) in [("make done", false), ("again", false), ("once more", true)] {
+            let config = AgentConfig::builder()
+                .tier(ModelId::new("cheap").unwrap())
+                .member(Member::new(ModelId::new("claude-code/opus").unwrap(), ""))
+                .check(Check::parse("test -f done.txt").unwrap())
+                .pair(Pair {
+                    planner: ModelId::new("claude-code/opus").unwrap(),
+                    planner_effort: Effort::Max,
+                    coder_effort: Effort::Low,
+                    fresh,
+                })
+                .build()
+                .unwrap();
+            let outcome = session
+                .send(&model, &planner, &mut toolbox, &config, text, "", |_| {})
+                .await
+                .unwrap();
+            assert!(matches!(outcome.verdict, Verdict::Passed { .. }), "{text}");
+        }
+
+        let requests = planner.requests.lock().unwrap();
+        let chat = &requests[0];
+        let started: Vec<(Option<&str>, bool)> = requests[1..]
+            .iter()
+            .map(|r| (r.resume.as_deref(), r.fork))
+            .collect();
+        assert_eq!(
+            started,
+            [
+                // A copy of the chat, then of the plan.
+                (Some("plan-1"), true),
+                (Some("plan-2"), true),
+                // On from the last review.
+                (Some("plan-3"), false),
+                (Some("plan-4"), true),
+                // A new pair: a copy of the chat again.
+                (Some("plan-1"), true),
+                (Some("plan-6"), true),
+            ]
+        );
+        // A copy of the chat keeps its settings, for its cache, and is told
+        // to read only.
+        assert_eq!(requests[1].instructions, chat.instructions);
+        assert_eq!(requests[1].read_only, chat.read_only);
+        assert!(requests[1].prompt.starts_with(FORK_PLAN_PROMPT));
+        assert!(!requests[3].prompt.contains(FORK_PLAN_PROMPT));
+    }
+
+    /// A planner that writes a file although it should only read.
+    struct CarelessPlanner;
+
+    impl Delegate for CarelessPlanner {
+        type Error = Infallible;
+
+        async fn run(
+            &self,
+            request: &DelegateRequest,
+            _: &mut (dyn FnMut(DelegateEvent) + Send),
+        ) -> Result<DelegateReply, Infallible> {
+            if request.fork {
+                std::fs::write(request.directory.join("oops.txt"), "x").unwrap();
+            }
+            Ok(DelegateReply {
+                text: "1. Plan.".into(),
+                session: "s".into(),
+                usage: Usage::default(),
+                estimate: None,
+                context: None,
+                billed: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_planner_that_changes_a_file_stops_the_pair() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![]);
+        let mut session = Session::new();
+        let chat = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap();
+        session
+            .send(
+                &model,
+                &CarelessPlanner,
+                &mut toolbox,
+                &chat,
+                "hi",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let error = session
+            .send(
+                &model,
+                &CarelessPlanner,
+                &mut toolbox,
+                &agent_pair_config(),
+                "make done",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("the planner changed files"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_coders_session_lasts_from_one_pair_to_the_next() {
+        let (_dir, mut toolbox) = setup();
+        let coder = FakeClaude {
+            writes_on_round: 1,
+            requests: Mutex::new(Vec::new()),
+        };
+        let model = Scripted::new(vec![
+            says("1. Create done.txt."),
+            says("OK"),
+            says("1. Again."),
+            says("OK"),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/sonnet").unwrap())
+            .member(Member::new(ModelId::new("strong").unwrap(), ""))
+            .pair(Pair {
+                planner: ModelId::new("strong").unwrap(),
+                planner_effort: Effort::High,
+                coder_effort: Effort::High,
+                fresh: false,
+            })
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        for text in ["make done", "again"] {
+            session
+                .send(&model, &coder, &mut toolbox, &config, text, "", |_| {})
+                .await
+                .unwrap();
+        }
+        let requests = coder.requests.lock().unwrap();
+        assert_eq!(requests[0].resume, None);
+        assert!(
+            requests[0]
+                .prompt
+                .contains("The plan, by strong:\n1. Create done.txt.")
+        );
+        assert_eq!(requests[1].resume.as_deref(), Some("claude-session-1"));
+    }
+
+    /// A chat with Claude Code, its session warm, then left `idle` seconds.
+    async fn chat_left(
+        planner: &PlanningAgent,
+        idle: u64,
+    ) -> (Session, tempfile::TempDir, Toolbox) {
+        let (dir, mut toolbox) = setup();
+        let chat = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        session
+            .send(
+                &Scripted::new(vec![]),
+                planner,
+                &mut toolbox,
+                &chat,
+                "hi",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        session.agents.get_mut(&Agent::ClaudeCode).unwrap().used -= idle;
+        (session, dir, toolbox)
+    }
+
+    #[tokio::test]
+    async fn warm_sessions_are_read_by_a_copy_with_the_same_settings() {
+        let planner = PlanningAgent::new(vec!["Hello.", "ok"]);
+        let (mut session, dir, _toolbox) = chat_left(&planner, 60).await;
+        let before = session.agents[&Agent::ClaudeCode].used;
+        let mut turns = 0;
+        session
+            .keep_warm(&planner, dir.path(), |e| {
+                turns += usize::from(matches!(e, Event::Turn { .. }));
+            })
+            .await;
+        let requests = planner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let (chat, tick) = (&requests[0], &requests[1]);
+        assert_eq!(tick.resume.as_deref(), Some("plan-1"));
+        assert!(tick.fork && tick.ephemeral);
+        assert_eq!(tick.prompt, TICK_PROMPT);
+        assert_eq!(
+            (&tick.model, tick.effort, &tick.instructions, tick.read_only),
+            (&chat.model, chat.effort, &chat.instructions, chat.read_only)
+        );
+        assert!(session.agents[&Agent::ClaudeCode].used > before);
+    }
+
+    fn answering_cold(answer: Answer) -> AgentConfig {
+        AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap()
+            .with_approver(Approver::new(move |approval: Approval| {
+                assert!(matches!(approval.question, Question::ColdStart { .. }));
+                async move { answer }
+            }))
+    }
+
+    #[tokio::test]
+    async fn a_cold_session_asks_whether_to_start_again() {
+        for (answer, resumed) in [(Answer::Yes, None), (Answer::No, Some("plan-1"))] {
+            let planner = PlanningAgent::new(vec!["Hello.", "Again."]);
+            let (mut session, _dir, mut toolbox) = chat_left(&planner, 3_600).await;
+            session
+                .send(
+                    &Scripted::new(vec![]),
+                    &planner,
+                    &mut toolbox,
+                    &answering_cold(answer),
+                    "and now?",
+                    "",
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            let requests = planner.requests.lock().unwrap();
+            assert_eq!(requests[1].resume.as_deref(), resumed, "{answer:?}");
+        }
+
+        // Stopped: not sent, left out of the conversation.
+        let planner = PlanningAgent::new(vec!["Hello."]);
+        let (mut session, _dir, mut toolbox) = chat_left(&planner, 3_600).await;
+        let messages = session.messages.len();
+        let error = session
+            .send(
+                &Scripted::new(vec![]),
+                &planner,
+                &mut toolbox,
+                &answering_cold(Answer::Stop),
+                "and now?",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::NotSent));
+        assert_eq!(session.messages.len(), messages);
+        assert_eq!(planner.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_review_hears_of_tests_that_may_never_have_run() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("1. Fix it.\nCheck: test -f done.txt"),
+            calls(
+                "write_file",
+                json!({"path": "tests/test_done.py", "content": "x"}),
+            ),
+            says("Done."),
+            says("STOP: the environment."),
+        ]);
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "fix it",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            model.seen.lock().unwrap()[3].messages.last(),
+            Some(Message::User(t)) if t.contains("they may never have run: tests/test_done.py.")
+        ));
+    }
+
+    #[test]
+    fn test_files_are_known_in_the_usual_languages() {
+        for path in [
+            "tests/test_api.py",
+            "app/api_test.go",
+            "src/api.test.ts",
+            "web/__tests__/a.js",
+            "x/y.spec.ts",
+        ] {
+            assert!(is_test_file(path), "{path}");
+        }
+        for path in ["src/api.py", "contest.py", "README.md"] {
+            assert!(!is_test_file(path), "{path}");
+        }
     }
 
     /// Claude Code on an API key, for the cost tests: the calls it reports

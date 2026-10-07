@@ -177,6 +177,8 @@ pub(crate) struct Editor {
     styled: Option<Vec<StyledLine>>,
     /// The file as of the last commit, `None` outside git.
     base: Option<Vec<String>>,
+    /// The revision changes are shown against: the last commit unless set.
+    base_rev: Option<String>,
     /// How the lines on screen differ from `base`.
     changes: LineChanges,
     /// For each row the view drew, the line it shows, or `None` for a line
@@ -266,6 +268,7 @@ impl Editor {
             read_only: loaded.read_only,
             styled: None,
             base: None,
+            base_rev: None,
             changes: LineChanges::default(),
             rows: RefCell::new(Vec::new()),
             highlighter,
@@ -302,8 +305,53 @@ impl Editor {
         self.base = if self.read_only {
             None
         } else {
-            committed_lines(&self.root, &self.path)
+            match &self.base_rev {
+                Some(rev) => ironquill_tools::lines_at(&self.root, &self.path, rev),
+                None => committed_lines(&self.root, &self.path),
+            }
         };
+    }
+
+    /// Shows what changed since `rev` rather than the last commit, as for a
+    /// file opened from a reference: what the branch changed.
+    pub(crate) fn compare_with(&mut self, rev: String) {
+        self.base_rev = Some(rev);
+        self.load_base();
+        self.restyle();
+    }
+
+    /// Moves to line `line`, counted from 1.
+    pub(crate) fn go_to_line(&mut self, line: usize) {
+        let row = line
+            .saturating_sub(1)
+            .min(self.lines.len().saturating_sub(1));
+        self.go_to(row);
+    }
+
+    /// Moves to the next changed line, or the one before when `back`.
+    fn next_change(&mut self, back: bool) {
+        let Some(changes) = self.changes() else {
+            return;
+        };
+        let changed = |row: usize| {
+            changes
+                .marks
+                .get(row)
+                .is_some_and(|m| *m != ironquill_tools::LineMark::Same)
+                || changes.removed.contains_key(&row)
+        };
+        // The start of the next run of changes, not each line of it.
+        let rows = self.lines.len();
+        let found = if back {
+            (0..self.row)
+                .rev()
+                .find(|r| changed(*r) && (*r == 0 || !changed(r - 1)))
+        } else {
+            (self.row + 1..rows).find(|r| changed(*r) && !changed(r - 1))
+        };
+        if let Some(row) = found {
+            self.go_to(row);
+        }
     }
 
     /// The conversation's context as a document: edited like a file, but
@@ -730,6 +778,14 @@ impl Editor {
 
     fn normal_key(&mut self, key: KeyEvent) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Option with ↓ or ↑: from change to change.
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Down | KeyCode::Up)
+        {
+            self.next_change(key.code == KeyCode::Up);
+            self.keep_visible();
+            return Outcome::Stay;
+        }
         if let Some(first) = self.pending.take() {
             match (first, key.code) {
                 ('d', KeyCode::Char('d')) => self.delete_line(),
