@@ -161,6 +161,8 @@ in the current directory. You can read and edit its files, and run commands, thr
 command that cannot be undone or reaches outside the machine is put to the person first. \
 Reply in the language the person writes in. Talk normally and answer questions directly. \
 Only change files when the person asks for a change, and only what they asked for. \
+When you mean code of the project, cite it as `path:line` or `path:start-end`, so that the \
+person can open it with a click. \
 If you need to ask the person something, ask it and end your reply there: do not call any tool \
 in that reply, and do not act on a guess of the answer. They will reply in their next message. \
 The project's files are listed below: use the list instead of listing directories, and do not \
@@ -1389,6 +1391,17 @@ impl Session {
             context: None,
         };
         self.coders.insert(agent, thread);
+    }
+
+    /// Records something the person did outside the requests, such as
+    /// applying changes, so that the next model knows.
+    pub fn note_from_person(&mut self, text: &str) {
+        self.settle();
+        self.messages.push(Message::user(format!("({text})")));
+        self.messages.push(Message::Assistant {
+            content: Some("Noted.".into()),
+            tool_calls: Vec::new(),
+        });
     }
 
     /// Records that the person stopped the request before it ended: the

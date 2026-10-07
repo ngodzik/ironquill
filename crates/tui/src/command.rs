@@ -62,6 +62,10 @@ pub(crate) enum Command {
     Tick,
     /// `/compact`: sum the conversation up, choosing what to keep.
     Compact,
+    /// `/address <pr>`: answer a pull request's review comments.
+    Address(Option<String>),
+    /// `/apply 1 3`: apply those diff blocks of the last reply.
+    Apply(Option<String>),
     /// `/planner <model>` picks the member that plans; alone, says which.
     Planner(Option<String>),
     /// `/copy` opens the conversation as text, to select and copy from.
@@ -120,6 +124,8 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "newpair" => Ok(Command::NewPair(rest_opt)),
         "tick" => Ok(Command::Tick),
         "compact" => Ok(Command::Compact),
+        "address" => Ok(Command::Address(rest_opt)),
+        "apply" => Ok(Command::Apply(rest_opt)),
         "planner" => Ok(Command::Planner(rest_opt)),
         "copy" | "chat" => Ok(Command::Copy),
         "instructions" => Ok(Command::Instructions),
@@ -165,6 +171,8 @@ pub(crate) const NAMES: &[&str] = &[
     "newpair",
     "tick",
     "compact",
+    "address",
+    "apply",
     "planner",
     "q",
     "quit",
@@ -275,6 +283,9 @@ Type a question or a change and press Enter. Changes are checked before they are
 /pair <request>      in a pair: the planner reads the code and plans, the coder
                      codes, the planner reviews; it goes on from the last pair
 /newpair <request>   the same, the planner starting from a copy of the chat
+/address <pr>        answer a pull request's review comments, one by one: what each
+                     asks, whether it is handled, the change as a diff, a reply
+/apply 1 3           apply those diff blocks of the last reply with git, all or none
 /compact             sum the conversation up: pick the subjects to keep, the rest
                      goes; the agents start again from the summary
 /tick                keep Claude Code's warm sessions warm while you think: a one

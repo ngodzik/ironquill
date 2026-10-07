@@ -20,6 +20,8 @@ mod error;
 mod highlight;
 pub mod keymap;
 mod markdown;
+mod references;
+mod review;
 mod sessions;
 mod tree;
 mod usage;
@@ -171,37 +173,42 @@ where
             title = name;
         }
 
-        let effect = tokio::select! {
-            key = keys.next() => match key {
-                Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
-                Some(Ok(TermEvent::Paste(text))) => {
-                    app.on_paste(&text);
+        let queued = app.take_queued();
+        let effect = if queued.is_some() {
+            queued
+        } else {
+            tokio::select! {
+                key = keys.next() => match key {
+                    Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Some(Ok(TermEvent::Paste(text))) => {
+                        app.on_paste(&text);
+                        None
+                    }
+                    Some(Ok(TermEvent::Mouse(mouse))) => app.on_mouse(mouse),
+                    Some(Ok(_)) => None,
+                    Some(Err(e)) => return Err(TuiError::Terminal(e)),
+                    None => break,
+                },
+                Some(message) = rx.recv() => {
+                    if app.on_agent(message) {
+                        save(&store, &mut app, &conversation).await;
+                    }
                     None
-                }
-                Some(Ok(TermEvent::Mouse(mouse))) => app.on_mouse(mouse),
-                Some(Ok(_)) => None,
-                Some(Err(e)) => return Err(TuiError::Terminal(e)),
-                None => break,
-            },
-            Some(message) = rx.recv() => {
-                if app.on_agent(message) {
-                    save(&store, &mut app, &conversation).await;
-                }
-                None
-            },
-            Some(result) = docker_rx.recv() => {
-                docker_asking = false;
-                app.on_docker(result);
-                None
-            },
-            _ = docker_tick.tick(), if app.docker().is_some() && !docker_asking => {
-                Some(Effect::RefreshDocker)
-            },
-            _ = tick.tick(), if app.is_running() => {
-                app.on_tick();
-                None
-            },
-            _ = warm_tick.tick() => app.keep_warm_due().then_some(Effect::KeepWarm),
+                },
+                Some(result) = docker_rx.recv() => {
+                    docker_asking = false;
+                    app.on_docker(result);
+                    None
+                },
+                _ = docker_tick.tick(), if app.docker().is_some() && !docker_asking => {
+                    Some(Effect::RefreshDocker)
+                },
+                _ = tick.tick(), if app.is_running() => {
+                    app.on_tick();
+                    None
+                },
+                _ = warm_tick.tick() => app.keep_warm_due().then_some(Effect::KeepWarm),
+            }
         };
         if save_pending && !app.is_running() {
             save_pending = false;
@@ -351,6 +358,42 @@ where
                         .map_err(|e| error_chain(&e));
                     let _ = tx.send(AgentMessage::Compacted(result));
                 });
+            }
+            Some(Effect::Address(number)) => {
+                let root = workspace.root().to_owned();
+                let tx = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(AgentMessage::Addressed(review::request(&root, &number)));
+                });
+            }
+            Some(Effect::Apply(numbers, patches)) => {
+                match review::apply(workspace.root(), &patches) {
+                    Ok(()) => {
+                        let list = numbers
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        conversation.lock().await.session.note_from_person(&format!(
+                            "I applied the changes {list} with git apply."
+                        ));
+                        app.report_info(&format!("Applied {list}"));
+                    }
+                    Err(e) => app.report_error(e),
+                }
+            }
+            Some(Effect::ShowCommit(hash)) => {
+                let shown = std::process::Command::new("git")
+                    .args(["show", "--stat", "--format=%h %s%n%an, %ar%n", &hash])
+                    .current_dir(workspace.root())
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_owned());
+                match shown {
+                    Some(text) => app.report_info(&text),
+                    None => app.report_error(format!("git cannot show {hash}")),
+                }
             }
             Some(Effect::Copy(text)) => match clipboard::copy(&text) {
                 Ok(how) => app.info(format!("Copied ({how})")),

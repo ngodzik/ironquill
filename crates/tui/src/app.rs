@@ -1,5 +1,5 @@
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -21,6 +21,8 @@ use crate::defaults::Defaults;
 use crate::editor::{Editor, Outcome as EditorOutcome};
 use crate::highlight::Highlighter;
 use crate::keymap::{self, Action, Focus, Mode, Pending};
+use crate::markdown;
+use crate::references::{self, Reference};
 use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
 use crate::usage::{Sample, UsageLog};
@@ -163,6 +165,12 @@ pub(crate) struct ModelRow {
 pub(crate) enum Effect {
     /// Put this text on the system clipboard.
     Copy(String),
+    /// Show what a commit did, as a reply cited it.
+    ShowCommit(String),
+    /// Fetch a pull request's review comments, for /address.
+    Address(String),
+    /// Apply these patches with git, all or none: their numbers, and them.
+    Apply(Vec<usize>, Vec<String>),
     /// Read the warm sessions, to keep their caches warm.
     KeepWarm,
     /// Group the conversation's exchanges by subject, for /compact.
@@ -209,6 +217,8 @@ pub(crate) enum AgentMessage {
     Approve(Approval, oneshot::Sender<Answer>),
     /// The person stopped the request before it began: it was not sent.
     NotSent(String),
+    /// A pull request's review comments, as a request to send.
+    Addressed(Result<String, String>),
     /// The subjects of the conversation, for the person to pick from.
     Compaction(Result<Compaction, String>),
     /// The conversation was compacted: about how many tokens before, after.
@@ -512,6 +522,9 @@ pub(crate) struct App {
     approval: Option<(Approval, oneshot::Sender<Answer>)>,
     /// The subjects to keep or drop, while /compact asks.
     compact_picker: Option<CompactPicker>,
+    /// An effect to run next, raised outside a key: a request built from a
+    /// pull request's comments.
+    queued: Option<Effect>,
     /// When the last request ended, and the sessions were last kept warm.
     idle_since: Instant,
     last_warm: Option<Instant>,
@@ -581,6 +594,10 @@ pub(crate) struct App {
     /// The transcript's lines a click folds, and those that copy a block.
     fold_marks: RefCell<Vec<usize>>,
     copy_marks: RefCell<Vec<(usize, String)>>,
+    /// The references drawn: line, first and last column, what they open.
+    link_marks: RefCell<Vec<(usize, usize, usize, Reference)>>,
+    /// Whether a cited file or commit exists, as found out.
+    known_references: RefCell<HashMap<Reference, bool>>,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -645,6 +662,7 @@ impl App {
             usage_open: false,
             approval: None,
             compact_picker: None,
+            queued: None,
             idle_since: Instant::now(),
             last_warm: None,
             ask_keep_warm: false,
@@ -685,6 +703,8 @@ impl App {
             transcript_view: Cell::new((0, Rect::default())),
             fold_marks: RefCell::new(Vec::new()),
             copy_marks: RefCell::new(Vec::new()),
+            link_marks: RefCell::new(Vec::new()),
+            known_references: RefCell::new(HashMap::new()),
             zoomed: false,
             zoom_focus: None,
             completion: None,
@@ -1199,9 +1219,76 @@ impl App {
         self.reveal.replace(false)
     }
 
-    pub(crate) fn set_marks(&self, fold: Vec<usize>, copy: Vec<(usize, String)>) {
+    pub(crate) fn set_marks(
+        &self,
+        fold: Vec<usize>,
+        copy: Vec<(usize, String)>,
+        links: Vec<(usize, usize, usize, Reference)>,
+    ) {
         *self.fold_marks.borrow_mut() = fold;
         *self.copy_marks.borrow_mut() = copy;
+        *self.link_marks.borrow_mut() = links;
+    }
+
+    /// Whether `reference` exists: a file is looked at when first drawn; a
+    /// commit only as [`App::learn_commits`] found it, git staying off the
+    /// drawing.
+    pub(crate) fn reference_exists(&self, reference: &Reference) -> bool {
+        if let Some(known) = self.known_references.borrow().get(reference) {
+            return *known;
+        }
+        let exists = match reference {
+            Reference::File { path, .. } => !path.contains("..") && self.root.join(path).is_file(),
+            Reference::Commit(_) => false,
+        };
+        self.known_references
+            .borrow_mut()
+            .insert(reference.clone(), exists);
+        exists
+    }
+
+    /// Finds out which commits the replies cite exist.
+    fn learn_all_commits(&self) {
+        for entry in &self.transcript {
+            if let Entry::Said(text) = entry {
+                self.learn_commits(text);
+            }
+        }
+    }
+
+    /// Finds out which commits a reply cites exist.
+    fn learn_commits(&self, text: &str) {
+        for (_, _, reference) in references::candidates(text) {
+            if let Reference::Commit(hash) = &reference
+                && !self.known_references.borrow().contains_key(&reference)
+            {
+                let exists = ironquill_tools::is_commit(&self.root, hash);
+                self.known_references.borrow_mut().insert(reference, exists);
+            }
+        }
+    }
+
+    /// Opens a file a reply cited, at its line, showing what the branch
+    /// changed in it.
+    fn open_reference(&mut self, path: &str, line: Option<usize>) {
+        if self.file.as_ref().is_some_and(Editor::is_modified) {
+            if let Some(file) = &mut self.file {
+                file.refuse_close();
+            }
+            self.focus_on(Focus::File);
+            return;
+        }
+        let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
+        self.unzoom();
+        let mut editor = Editor::open(&self.root, self.root.join(path), highlighter);
+        if let Some(base) = ironquill_tools::branch_base(&self.root) {
+            editor.compare_with(base);
+        }
+        if let Some(line) = line {
+            editor.go_to_line(line);
+        }
+        self.file = Some(editor);
+        self.focus_on(Focus::File);
     }
 
     pub(crate) fn set_entry_lines(
@@ -1381,6 +1468,22 @@ impl App {
                             .map(|(_, code)| code.clone());
                         if let Some(code) = code {
                             return Some(Effect::Copy(code));
+                        }
+                        // A cited file or commit opens.
+                        let column = usize::from(mouse.column.saturating_sub(area.x));
+                        let link = self
+                            .link_marks
+                            .borrow()
+                            .iter()
+                            .find(|(at, from, to, _)| *at == line && (*from..*to).contains(&column))
+                            .map(|(_, _, _, r)| r.clone());
+                        match link {
+                            Some(Reference::File { path, line }) => {
+                                self.open_reference(&path, line);
+                                return None;
+                            }
+                            Some(Reference::Commit(hash)) => return Some(Effect::ShowCommit(hash)),
+                            None => {}
                         }
                         // Only a fold mark folds: a click elsewhere in a
                         // reply should not make it jump.
@@ -1683,6 +1786,51 @@ impl App {
                 Some(host) => self.error(format!("{} is not allowed anyway", host.trim())),
                 None => self.error("/hosts lists them; /hosts forget <host> takes one back"),
             },
+            Command::Address(None) => self.error("Give the pull request: /address <number>"),
+            Command::Address(Some(number)) => {
+                if self.is_running() {
+                    self.error("Still working on the last message: address it after");
+                    return None;
+                }
+                let number = number.trim().trim_start_matches('#').to_owned();
+                if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+                    self.error("/address takes the number of a pull request");
+                    return None;
+                }
+                self.running_since = Some(Instant::now());
+                self.info(format!("Reading the review comments of #{number}…"));
+                return Some(Effect::Address(number));
+            }
+            Command::Apply(numbers) => {
+                let numbers: Vec<usize> = numbers
+                    .unwrap_or_default()
+                    .split([' ', ','])
+                    .filter_map(|n| n.trim().parse().ok())
+                    .collect();
+                if numbers.is_empty() {
+                    self.error("Say which changes: /apply 1 3");
+                    return None;
+                }
+                let Some(reply) = self.transcript.iter().rev().find_map(|e| match e {
+                    Entry::Said(text) => Some(text.clone()),
+                    _ => None,
+                }) else {
+                    self.error("No reply to take changes from");
+                    return None;
+                };
+                let blocks = markdown::diff_blocks(&reply);
+                let mut patches = Vec::new();
+                for n in &numbers {
+                    match blocks.iter().find(|(b, _)| b == n) {
+                        Some((_, patch)) => patches.push(patch.clone()),
+                        None => {
+                            self.error(format!("The last reply has no diff block {n}"));
+                            return None;
+                        }
+                    }
+                }
+                return Some(Effect::Apply(numbers, patches));
+            }
             Command::Compact => {
                 if self.is_running() {
                     self.error("Still working on the last message: compact after it");
@@ -1889,6 +2037,16 @@ impl App {
                 ));
                 true
             }
+            AgentMessage::Addressed(Ok(request)) => {
+                self.running_since = None;
+                self.queued = self.submit(request);
+                false
+            }
+            AgentMessage::Addressed(Err(e)) => {
+                self.running_since = None;
+                self.error(e);
+                false
+            }
             AgentMessage::NotSent(text) => {
                 self.running_since = None;
                 if matches!(self.transcript.last(), Some(Entry::User(t)) if *t == text) {
@@ -1908,6 +2066,7 @@ impl App {
                 false
             }
             AgentMessage::Done(Ok(outcome)) => {
+                self.learn_all_commits();
                 self.idle_since = Instant::now();
                 self.last_warm = Some(Instant::now());
                 let seconds = self
@@ -1989,6 +2148,7 @@ impl App {
         self.cost = saved.cost;
         self.cost_complete = saved.cost_complete;
         self.transcript = saved.transcript;
+        self.learn_all_commits();
         self.usage_log = saved.usage_log;
         self.usage_log.prune(sessions::now());
         self.history = History::default();
@@ -2431,6 +2591,11 @@ impl App {
             _ => {}
         }
         Some(None)
+    }
+
+    /// The effect raised outside a key, to run next.
+    pub(crate) fn take_queued(&mut self) -> Option<Effect> {
+        self.queued.take()
     }
 
     /// The /compact window while it is open.
@@ -3734,6 +3899,32 @@ mod tests {
             Some(Effect::Compact { keep, last_as_is: false, .. }) if keep == [0]
         ));
         assert!(app.compact_picker().is_none());
+    }
+
+    #[test]
+    fn a_cited_file_opens_at_its_line_with_a_click() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = project();
+        app.transcript.push(Entry::Said(
+            "The second line is in src/lib.rs:2, not in nowhere.rs:1.".into(),
+        ));
+        let shown = screen(&app);
+        assert!(shown.contains("src/lib.rs:2↗"));
+        assert!(!shown.contains("nowhere.rs:1↗"));
+        let (row, column) = shown
+            .lines()
+            .enumerate()
+            .find_map(|(r, l)| l.find("src/lib.rs:2").map(|c| (r, l[..c].chars().count())))
+            .unwrap();
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column as u16 + 2,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        let file = app.file().expect("the file is open");
+        assert_eq!(file.lines(), ["one", "two"]);
+        assert_eq!(file.cursor().0, 1);
     }
 
     #[test]

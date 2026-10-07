@@ -14,6 +14,7 @@ use crate::app::{App, CompactRow, Entry, LineEditor, Panes, SubAgent};
 use crate::editor::{Editor, EditorMode, Kind};
 use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
+use crate::references::{self, Reference};
 use crate::sessions;
 use crate::wrap::wrap;
 
@@ -177,6 +178,53 @@ fn render_approval(frame: &mut Frame, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `line` with the references in it drawn as links, and where they are:
+/// first and last column, what they open. Code blocks are left as they are.
+fn link_line(app: &App, line: Line<'static>) -> (Line<'static>, Vec<(usize, usize, Reference)>) {
+    if line
+        .spans
+        .iter()
+        .any(|s| s.style.fg == Some(markdown::CODE_BLOCK_COLOR))
+    {
+        return (line, Vec::new());
+    }
+    let mut spans = Vec::new();
+    let mut links = Vec::new();
+    let mut column = 0;
+    for span in line.spans {
+        let text = span.content.to_string();
+        let mut at = 0;
+        for (start, end, reference) in references::candidates(&text) {
+            if !app.reference_exists(&reference) {
+                continue;
+            }
+            if start > at {
+                let piece = text[at..start].to_owned();
+                column += piece.chars().count();
+                spans.push(Span::styled(piece, span.style));
+            }
+            let piece = text[start..end].to_owned();
+            let width = piece.chars().count();
+            spans.push(Span::styled(
+                piece,
+                span.style
+                    .fg(Color::Rgb(130, 170, 255))
+                    .add_modifier(Modifier::UNDERLINED),
+            ));
+            spans.push(Span::styled("↗", fg(DIM)));
+            links.push((column, column + width + 1, reference));
+            column += width + 1;
+            at = end;
+        }
+        if at < text.len() {
+            let piece = text[at..].to_owned();
+            column += piece.chars().count();
+            spans.push(Span::styled(piece, span.style));
+        }
+    }
+    (Line::from(spans).style(line.style), links)
 }
 
 /// How a command ended, who read it when it could not be read alone, and
@@ -1578,6 +1626,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     // The lines a click folds or unfolds, and those that copy a code block.
     let mut fold_marks = Vec::new();
     let mut copy_marks = Vec::new();
+    let mut link_marks = Vec::new();
     // The latest reply stays open: it folds once another follows it.
     let latest = app.transcript().iter().rposition(Entry::is_reply);
     for (i, entry) in app.transcript().iter().enumerate() {
@@ -1652,6 +1701,14 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             fold_marks.push(first + block.len());
             block.push(Line::styled("  ▾ fold", fg(DIM)));
         }
+        // Cited files and commits, as links.
+        if matches!(entry, Entry::Said(_)) {
+            for (row, line) in block.iter_mut().enumerate() {
+                let (linked, links) = link_line(app, std::mem::take(line));
+                *line = linked;
+                link_marks.extend(links.into_iter().map(|(a, b, r)| (first + row, a, b, r)));
+            }
+        }
         // The copy marks of a reply's code blocks, as far as shown.
         if let Entry::Said(text) = entry {
             let codes = markdown::code_blocks(text);
@@ -1711,7 +1768,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let back = app.scroll_back().min(max_scroll);
     let top = max_scroll - back;
     app.set_entry_lines(ranges, top, area);
-    app.set_marks(fold_marks, copy_marks);
+    app.set_marks(fold_marks, copy_marks, link_marks);
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
