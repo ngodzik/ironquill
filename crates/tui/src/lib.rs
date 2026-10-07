@@ -17,9 +17,11 @@ mod command;
 mod defaults;
 mod editor;
 mod error;
+mod graphics;
 mod highlight;
 pub mod keymap;
 mod markdown;
+mod pictures;
 mod references;
 mod review;
 mod sessions;
@@ -48,6 +50,7 @@ use crate::sessions::Store;
 
 pub use app::{Settings, parse_window};
 pub use defaults::Defaults;
+pub use graphics::Images;
 
 /// How the interface starts.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -126,7 +129,20 @@ where
     M: ChatModel + 'static,
     D: Delegate + 'static,
 {
+    // Whether the terminal draws images is found once, from what it says
+    // of itself.
+    let terminal_kind = graphics::detect(settings.images, |name| std::env::var(name).ok());
+    let renderer =
+        pictures::Renderer::find(settings.mermaid.as_deref(), pictures::Renderer::installed);
+    let cache = Defaults::path().map(|p| p.with_file_name("cache").join("diagrams"));
+    let mut screen = terminal_kind.map(graphics::Screen::new);
     let mut app = App::new(settings, workspace.root().to_owned());
+    app.gallery()
+        .borrow_mut()
+        .show_in(terminal_kind, renderer.clone(), cache.clone());
+    set_cell_size(&app);
+    let (diagram_tx, mut diagram_rx) =
+        mpsc::unbounded_channel::<(u64, Result<std::path::PathBuf, String>)>();
     let conversation = Arc::new(Mutex::new(Conversation {
         session: Session::new(),
         toolbox: Toolbox::new(workspace.clone()),
@@ -164,6 +180,27 @@ where
         terminal
             .draw(|frame| view::render(frame, &app))
             .map_err(TuiError::Terminal)?;
+        // The images just drawn reach the terminal; diagrams first seen are
+        // drawn meanwhile, each on a thread of its own.
+        let wanted = app.gallery().borrow_mut().take_wanted();
+        if let Some(screen) = screen.as_mut()
+            && !wanted.is_empty()
+        {
+            let (escapes, failed) = screen.show(&wanted);
+            app.gallery().borrow_mut().failed(&failed);
+            write_raw(&escapes);
+        }
+        let to_draw = app.gallery().borrow_mut().take_to_draw();
+        for (key, source) in to_draw {
+            let (renderer, cache, tx) = (renderer.clone(), cache.clone(), diagram_tx.clone());
+            std::thread::spawn(move || {
+                let result = match (renderer, cache) {
+                    (Some(renderer), Some(cache)) => renderer.draw(&source, &cache),
+                    _ => Err("nothing draws diagrams".into()),
+                };
+                let _ = tx.send((key, result));
+            });
+        }
         let name = app.name();
         if name != title {
             let _ = execute!(
@@ -185,6 +222,10 @@ where
                         None
                     }
                     Some(Ok(TermEvent::Mouse(mouse))) => app.on_mouse(mouse),
+                    Some(Ok(TermEvent::Resize(..))) => {
+                        set_cell_size(&app);
+                        None
+                    }
                     Some(Ok(_)) => None,
                     Some(Err(e)) => return Err(TuiError::Terminal(e)),
                     None => break,
@@ -193,6 +234,10 @@ where
                     if app.on_agent(message) {
                         save(&store, &mut app, &conversation).await;
                     }
+                    None
+                },
+                Some((key, result)) = diagram_rx.recv() => {
+                    app.on_diagram(key, result);
                     None
                 },
                 Some(result) = docker_rx.recv() => {
@@ -493,7 +538,35 @@ where
     if let Some(handle) = task {
         handle.abort();
     }
+    // The terminal keeps images until told to forget them.
+    if let Some(screen) = screen.as_mut() {
+        write_raw(&screen.clear());
+    }
     Ok(())
+}
+
+/// Writes escapes straight to the terminal, past the drawing: images are
+/// sent this way. A failure only costs the image.
+fn write_raw(escapes: &str) {
+    use std::io::Write;
+    if escapes.is_empty() {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(escapes.as_bytes());
+    let _ = out.flush();
+}
+
+/// Tells the pictures how big a cell is, in pixels, as the terminal says.
+fn set_cell_size(app: &App) {
+    if let Ok(size) = ratatui::crossterm::terminal::window_size()
+        && size.columns > 0
+        && size.rows > 0
+    {
+        app.gallery()
+            .borrow_mut()
+            .set_cell((size.width / size.columns, size.height / size.rows));
+    }
 }
 
 /// Writes the conversation to disk. A failure is reported, never fatal: the

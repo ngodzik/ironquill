@@ -7,6 +7,8 @@
 //! team = ["anthropic/claude-sonnet-4-5"]
 //! budget = 0.10
 //! effort = "high"
+//! images = "auto"
+//! mermaid = ["mmdc", "-i", "{input}", "-o", "{output}", "-b", "transparent"]
 //! ```
 //!
 //! Keys never go here: they come from the environment only.
@@ -16,6 +18,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::graphics::Images;
 
 /// What a new session starts with, unless the command line says otherwise.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -62,6 +66,15 @@ pub struct Defaults {
     /// waits, as `/tick` left it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tick: bool,
+    /// Whether replies show images: `auto` in a terminal known to draw
+    /// them, `kitty` with Kitty's protocol whatever the terminal, `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Images>,
+    /// The command that draws a Mermaid diagram as a PNG image, `{input}`
+    /// and `{output}` standing for the files; `[]` draws none. Unsaid, the
+    /// first installed of mermaid-cli (`mmdc`) and `mmdr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mermaid: Option<Vec<String>>,
 }
 
 impl Defaults {
@@ -154,9 +167,21 @@ mod tests {
             allowed_hosts: vec!["api.example.com".into()],
             pair_mode: Some(true),
             tick: true,
+            images: Some(Images::Off),
+            mermaid: Some(vec!["mmdr".into(), "-i".into(), "{input}".into()]),
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));
+    }
+
+    #[test]
+    fn images_are_auto_kitty_or_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "images = \"kitty\"").unwrap();
+        assert_eq!(Defaults::load(&path).unwrap().images, Some(Images::Kitty));
+        fs::write(&path, "images = \"sometimes\"").unwrap();
+        assert!(Defaults::load(&path).unwrap_err().contains("sometimes"));
     }
 
     #[test]

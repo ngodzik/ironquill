@@ -14,6 +14,7 @@ use crate::app::{App, CompactRow, Entry, LineEditor, Panes, SubAgent};
 use crate::editor::{Editor, EditorMode, Kind};
 use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
+use crate::pictures::{Picture, Pictures};
 use crate::references::{self, Reference};
 use crate::sessions;
 use crate::wrap::wrap;
@@ -1274,6 +1275,24 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 width,
             );
         }
+        Entry::Image(path) => match app.lines(Picture::File(path), width.saturating_sub(2)) {
+            Some(drawn) => {
+                out.push(Line::styled(format!("  {path}"), fg(DIM)));
+                out.extend(drawn.into_iter().map(|line| {
+                    let mut spans = vec![Span::raw("  ")];
+                    spans.extend(line.spans);
+                    Line::from(spans)
+                }));
+            }
+            None => push_wrapped(
+                &mut out,
+                Span::raw("  "),
+                "  ",
+                &format!("{path} cannot be shown here"),
+                fg(DIM),
+                width,
+            ),
+        },
         Entry::User(text) => {
             push_wrapped(
                 &mut out,
@@ -1285,7 +1304,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
             );
         }
         Entry::Said(text) => {
-            let body = markdown::render(text, width.saturating_sub(2), Style::new());
+            let body = markdown::render(text, width.saturating_sub(2), Style::new(), app);
             for (i, line) in body.into_iter().enumerate() {
                 let lead = if i == 0 {
                     Span::styled("● ", fg(Color::White))
