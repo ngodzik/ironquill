@@ -97,6 +97,8 @@ pub struct Settings {
     pub strict_commands: bool,
     /// Servers commands may reach besides those already used.
     pub allowed_hosts: Vec<String>,
+    /// `/pair` with Claude Code's Opus planning and its Sonnet coding.
+    pub pair_mode: bool,
 }
 
 /// Tokens and cost of one part of a request.
@@ -1689,32 +1691,11 @@ impl App {
             },
             Command::Copy => self.open_transcript(),
             Command::Instructions => return Some(Effect::OpenInstructions),
-            Command::Pair(None) => {
+            Command::Pair(None) | Command::NewPair(None) => {
                 self.error("Give it a question: /pair <what to do>");
             }
-            Command::Pair(Some(text)) => {
-                let (coder, planner) = match self.pair_roles() {
-                    Ok(roles) => roles,
-                    Err(why) => {
-                        self.error(why);
-                        return None;
-                    }
-                };
-                // High at most for the planner: past it, a step can think for
-                // minutes for little more. A coder thinking less rereads
-                // everything and stops before writing.
-                let planner_effort = self.settings.effort.min(Effort::High);
-                let coder_effort = Effort::High;
-                self.info(format!(
-                    "Pair: {planner} picks the code to read and plans (effort {planner_effort}), ironquill reads it, {coder} codes (effort {coder_effort}), without the earlier conversation"
-                ));
-                let pair = Pair {
-                    planner,
-                    planner_effort,
-                    coder_effort,
-                };
-                return self.submit_with(text, vec![coder], Some(pair));
-            }
+            Command::Pair(Some(text)) => return self.pair(text, false),
+            Command::NewPair(Some(text)) => return self.pair(text, true),
             Command::Planner(None) => match self.planner() {
                 Some(planner) => self.info(format!(
                     "Planner: {planner}{}",
@@ -2072,7 +2053,53 @@ impl App {
     /// or the best, by Artificial Analysis' score, else by price. The coder
     /// is then the cheapest of the others that can use tools. Without one,
     /// the reason, rather than roles the wrong way round.
+    /// Sends `text` to a pair; `fresh` has its planner start from the chat
+    /// rather than go on from the last pair.
+    fn pair(&mut self, text: String, fresh: bool) -> Option<Effect> {
+        if self.settings.pair_mode {
+            for model in ["claude-code/opus", "claude-code/sonnet"] {
+                let model = ModelId::new(model).expect("a plain name");
+                if !self.settings.team.contains(&model) {
+                    self.settings.team.push(model);
+                }
+            }
+        }
+        let (coder, planner) = match self.pair_roles() {
+            Ok(roles) => roles,
+            Err(why) => {
+                self.error(why);
+                return None;
+            }
+        };
+        // High at most for the planner: past it, a step can think for
+        // minutes for little more. A coder thinking less rereads
+        // everything and stops before writing.
+        let planner_effort = self.settings.effort.min(Effort::High);
+        let coder_effort = Effort::High;
+        self.info(format!(
+            "Pair: {planner} plans and reviews (effort {planner_effort}), {coder} codes (effort {coder_effort}){}",
+            if fresh {
+                ", the planner starting from the chat"
+            } else {
+                ""
+            }
+        ));
+        let pair = Pair {
+            planner,
+            planner_effort,
+            coder_effort,
+            fresh,
+        };
+        self.submit_with(text, vec![coder], Some(pair))
+    }
+
     pub(crate) fn pair_roles(&self) -> Result<(ModelId, ModelId), String> {
+        // Pair mode: Claude Code's Opus plans and reviews, its Sonnet codes.
+        if self.settings.pair_mode {
+            let planner = ModelId::new("claude-code/opus").expect("a plain name");
+            let coder = ModelId::new("claude-code/sonnet").expect("a plain name");
+            return Ok((coder, planner));
+        }
         let mut models: Vec<Member> = self.members();
         if let Some(lead) = self.current_model()
             && !models.iter().any(|m| &m.model == lead)
@@ -2312,6 +2339,15 @@ impl App {
                     }
                 }
             }
+            // Tab: the pair mode, Opus planning and Sonnet coding.
+            KeyCode::Tab => {
+                self.settings.pair_mode = !self.settings.pair_mode;
+                self.info(if self.settings.pair_mode {
+                    "Pair mode: /pair has Claude Code's Opus plan and review, its Sonnet code"
+                } else {
+                    "Pair mode off: /pair takes its models from the team"
+                });
+            }
             KeyCode::Char(' ') => {
                 if let Some(row) = rows.get(selected) {
                     self.toggle_team(row.model.clone());
@@ -2445,6 +2481,7 @@ impl App {
             allowed_secrets: self.settings.allowed_secrets.clone(),
             lenient_commands: !self.settings.strict_commands,
             allowed_hosts: self.settings.allowed_hosts.clone(),
+            pair_mode: Some(self.settings.pair_mode),
         }
     }
 
@@ -3269,6 +3306,26 @@ mod tests {
     }
 
     #[test]
+    fn pair_mode_has_opus_plan_and_sonnet_code() {
+        let mut app = ready();
+        app.settings.pair_mode = true;
+        type_text(&mut app, "/newpair make done");
+        let Some(Effect::Send { config, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("a pair is sent");
+        };
+        assert!(format!("{config:?}").contains("claude-code/opus"));
+        assert!(
+            app.settings
+                .team
+                .contains(&ModelId::new("claude-code/sonnet").unwrap())
+        );
+        // Tab in the model picker turns it off.
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.settings.pair_mode);
+    }
+
+    #[test]
     fn a_held_command_waits_for_yes_or_no() {
         let mut app = ready();
         let approval = || Approval {
@@ -3773,6 +3830,7 @@ mod tests {
                 allowed_secrets: vec![],
                 lenient_commands: true,
                 allowed_hosts: vec![],
+                pair_mode: Some(false),
             }
         );
     }
@@ -4008,7 +4066,7 @@ mod tests {
         assert!(matches!(effect, Some(Effect::Send { ref text, .. }) if text == "add a feature"));
         assert!(app.transcript.iter().any(|e| matches!(
             e,
-            Entry::Info(t) if t.contains("smart picks the code to read and plans (effort high)")
+            Entry::Info(t) if t.contains("smart plans and reviews (effort high)")
                 && t.contains("cheap codes (effort high)")
         )));
         // The model that answers stays the one picked.

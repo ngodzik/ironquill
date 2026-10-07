@@ -54,6 +54,10 @@ pub struct Defaults {
     /// person allowed them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_hosts: Vec<String>,
+    /// Whether `/pair` has Claude Code's Opus plan and its Sonnet code; when
+    /// unsaid, it does when Claude Code is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_mode: Option<bool>,
 }
 
 impl Defaults {
@@ -144,6 +148,7 @@ mod tests {
             allowed_secrets: vec!["API_TOKEN".into()],
             lenient_commands: true,
             allowed_hosts: vec!["api.example.com".into()],
+            pair_mode: Some(true),
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));

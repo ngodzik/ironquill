@@ -382,6 +382,8 @@ async fn interface(
         allowed_secrets: defaults.allowed_secrets.clone(),
         strict_commands: !defaults.lenient_commands,
         allowed_hosts: defaults.allowed_hosts.clone(),
+        // With Claude Code installed, a pair is Opus planning, Sonnet coding.
+        pair_mode: defaults.pair_mode.unwrap_or(claude.is_some()),
         detect_checks,
         notes,
         catalog,

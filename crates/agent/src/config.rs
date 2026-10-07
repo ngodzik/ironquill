@@ -120,6 +120,9 @@ pub struct Pair {
     pub planner_effort: Effort,
     /// How hard the first model thinks while it gathers and codes.
     pub coder_effort: Effort,
+    /// Start from a copy of the chat rather than go on from the last pair:
+    /// for something else, as `/newpair` asks.
+    pub fresh: bool,
 }
 
 /// A model the first one may hand a task to, with what it should know to
