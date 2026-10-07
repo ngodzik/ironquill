@@ -2164,6 +2164,17 @@ fn fenced_lines(text: &str) -> usize {
     count
 }
 
+/// Whether `path` looks like a test file, in the usual languages.
+fn is_test_file(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    path.split('/')
+        .any(|part| matches!(part, "tests" | "test" | "__tests__" | "spec"))
+        || name.starts_with("test_")
+        || name.contains("_test.")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+}
+
 /// A reply without its first word, as `ANSWER` or `DONE`.
 fn after_first_word(reply: &str) -> String {
     let text = reply.trim().trim_start_matches(['*', '`', '#', ' ']);
@@ -2196,17 +2207,36 @@ async fn review_prompt<M, D, O>(
     let checks = match (checked, failure) {
         (None, _) => "No check judges the work.".to_owned(),
         (Some(true), _) => format!("The checks pass: {}.", checks_list(ctx)),
-        (Some(false), Some(f)) => format!(
-            "`{}` fails{}.\n\n{}",
-            f.command,
-            if ctx.failing_before.contains(&f.command) {
-                ", as it already did before any change: the environment, or what the request \
-                 is about"
+        (Some(false), Some(f)) => {
+            let before = ctx.failing_before.contains(&f.command);
+            // A test changed under a check that failed already may never
+            // have run: its passing is not known.
+            let tests: Vec<&str> = changed
+                .iter()
+                .map(String::as_str)
+                .filter(|p| is_test_file(p))
+                .collect();
+            let unrun = if before && !tests.is_empty() {
+                format!(
+                    "\n\nThese test files changed, but the check failed before any change: they \
+                     may never have run: {}.",
+                    tests.join(", ")
+                )
             } else {
-                ", while it passed before any change"
-            },
-            describe(f)
-        ),
+                String::new()
+            };
+            format!(
+                "`{}` fails{}.\n\n{}{unrun}",
+                f.command,
+                if before {
+                    ", as it already did before any change: the environment, or what the request \
+                     is about"
+                } else {
+                    ", while it passed before any change"
+                },
+                describe(f)
+            )
+        }
         (Some(false), None) => "The checks fail.".to_owned(),
     };
     let said = format!("{idle} {}", last_reply(work).unwrap_or_default());
@@ -5529,6 +5559,52 @@ mod tests {
         assert!(matches!(error, AgentError::NotSent));
         assert_eq!(session.messages.len(), messages);
         assert_eq!(planner.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_review_hears_of_tests_that_may_never_have_run() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("1. Fix it.\nCheck: test -f done.txt"),
+            calls(
+                "write_file",
+                json!({"path": "tests/test_done.py", "content": "x"}),
+            ),
+            says("Done."),
+            says("STOP: the environment."),
+        ]);
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &pair_config(),
+                "fix it",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            model.seen.lock().unwrap()[3].messages.last(),
+            Some(Message::User(t)) if t.contains("they may never have run: tests/test_done.py.")
+        ));
+    }
+
+    #[test]
+    fn test_files_are_known_in_the_usual_languages() {
+        for path in [
+            "tests/test_api.py",
+            "app/api_test.go",
+            "src/api.test.ts",
+            "web/__tests__/a.js",
+            "x/y.spec.ts",
+        ] {
+            assert!(is_test_file(path), "{path}");
+        }
+        for path in ["src/api.py", "contest.py", "README.md"] {
+            assert!(!is_test_file(path), "{path}");
+        }
     }
 
     /// Claude Code on an API key, for the cost tests: the calls it reports

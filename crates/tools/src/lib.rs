@@ -26,7 +26,7 @@ mod workspace;
 
 pub use check::{Check, CheckFailure, CheckReport, Trial};
 pub use command::{
-    Assessment, CommandOutput, Policy, assess, known_hosts, run_command, unreadable,
+    Assessment, CommandOutput, Policy, assess, known_hosts, redact_secrets, run_command, unreadable,
 };
 pub use detect::detect_checks;
 pub use diff::{DiffLine, line_diff};

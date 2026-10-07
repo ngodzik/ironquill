@@ -1374,6 +1374,15 @@ impl App {
         if text.is_empty() {
             return None;
         }
+        // A secret pasted with a log does not reach a model, nor the saved
+        // conversation.
+        let (text, secrets) = ironquill_tools::redact_secrets(&text);
+        if !secrets.is_empty() {
+            self.info(format!(
+                "Took the value of {} out of the message",
+                secrets.join(", ")
+            ));
+        }
         if self.is_running() {
             self.transcript.push(Entry::Error(
                 "Still working on the last message. Wait, or stop it with Ctrl-C".into(),
