@@ -56,6 +56,22 @@ pub enum Question {
         /// for good.
         hosts: Vec<String>,
     },
+    /// The conversation's cache has expired: start again from its summary
+    /// (yes), go on as it is, writing it all to the cache (no), or stop, to
+    /// compact it first.
+    ColdStart {
+        /// How long it was left unused.
+        idle_minutes: u64,
+        /// About how many tokens going on as it is writes to the cache,
+        /// when known.
+        tokens: Option<u64>,
+    },
+    /// Whether to go on keeping the sessions warm, after a long wait. Asked
+    /// by the interface, not the agent.
+    KeepWarm {
+        /// How long the conversation has waited.
+        minutes: u64,
+    },
     /// Whether the model may go on, having used all its turns.
     MoreTurns {
         /// How many more it would get.
@@ -72,12 +88,14 @@ pub enum Answer {
     Always,
     /// No.
     No,
+    /// Not now: the request is not sent at all.
+    Stop,
 }
 
 impl Answer {
     /// Whether it may go ahead.
     pub fn yes(self) -> bool {
-        self != Answer::No
+        matches!(self, Answer::Yes | Answer::Always)
     }
 }
 

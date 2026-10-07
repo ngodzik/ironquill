@@ -23,4 +23,9 @@ pub enum AgentError {
     /// [`crate::Verdict::OverBudget`]; it is only seen inside the crate.
     #[error("the request spent its budget")]
     OverBudget,
+
+    /// The person stopped the request before it began, to compact the
+    /// conversation first: it was not sent, and is left out of it.
+    #[error("the request was not sent")]
+    NotSent,
 }

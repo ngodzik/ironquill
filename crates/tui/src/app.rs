@@ -99,6 +99,9 @@ pub struct Settings {
     pub allowed_hosts: Vec<String>,
     /// `/pair` with Claude Code's Opus planning and its Sonnet coding.
     pub pair_mode: bool,
+    /// Whether the warm sessions are kept warm while the conversation
+    /// waits, as `/tick` turns on.
+    pub tick: bool,
 }
 
 /// Tokens and cost of one part of a request.
@@ -159,6 +162,8 @@ pub(crate) struct ModelRow {
 pub(crate) enum Effect {
     /// Put this text on the system clipboard.
     Copy(String),
+    /// Read the warm sessions, to keep their caches warm.
+    KeepWarm,
     /// Send this message to the conversation.
     Send { text: String, config: AgentConfig },
     /// Stop the request in progress.
@@ -193,6 +198,8 @@ pub(crate) enum AgentMessage {
     Event(Event),
     /// A command held for the person, and where to send their answer.
     Approve(Approval, oneshot::Sender<Answer>),
+    /// The person stopped the request before it began: it was not sent.
+    NotSent(String),
     Done(Result<Outcome, String>),
 }
 
@@ -456,6 +463,11 @@ pub(crate) struct App {
     usage_open: bool,
     /// A command held for the person, and where their answer goes.
     approval: Option<(Approval, oneshot::Sender<Answer>)>,
+    /// When the last request ended, and the sessions were last kept warm.
+    idle_since: Instant,
+    last_warm: Option<Instant>,
+    /// Asking whether to keep the sessions warm, after a long wait.
+    ask_keep_warm: bool,
     command: LineEditor,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
@@ -580,6 +592,9 @@ impl App {
             usage_window,
             usage_open: false,
             approval: None,
+            idle_since: Instant::now(),
+            last_warm: None,
+            ask_keep_warm: false,
             command: LineEditor::default(),
             transcript,
             scroll_back: Cell::new(0),
@@ -1583,6 +1598,17 @@ impl App {
                 Some(host) => self.error(format!("{} is not allowed anyway", host.trim())),
                 None => self.error("/hosts lists them; /hosts forget <host> takes one back"),
             },
+            Command::Tick => {
+                self.settings.tick = !self.settings.tick;
+                self.last_warm = None;
+                self.idle_since = Instant::now();
+                self.info(if self.settings.tick {
+                    "Keeping Claude Code's warm sessions warm while the conversation waits: a one \
+                     word read every four minutes, asking again after half an hour"
+                } else {
+                    "No longer keeping the sessions warm"
+                });
+            }
             Command::Strict(on) => {
                 match on.as_deref() {
                     None => self.settings.strict_commands = !self.settings.strict_commands,
@@ -1736,6 +1762,17 @@ impl App {
                 self.on_event(event);
                 false
             }
+            AgentMessage::NotSent(text) => {
+                self.running_since = None;
+                if matches!(self.transcript.last(), Some(Entry::User(t)) if *t == text) {
+                    self.transcript.pop();
+                }
+                self.input.set(text);
+                self.info(
+                    "Not sent: compact the conversation first (/compact), then send it again",
+                );
+                false
+            }
             AgentMessage::Approve(approval, answer) => {
                 // One at a time: the agent waits for the answer.
                 if let Some((_, earlier)) = self.approval.replace((approval, answer)) {
@@ -1744,6 +1781,8 @@ impl App {
                 false
             }
             AgentMessage::Done(Ok(outcome)) => {
+                self.idle_since = Instant::now();
+                self.last_warm = Some(Instant::now());
                 let seconds = self
                     .running_since
                     .take()
@@ -2245,14 +2284,66 @@ impl App {
 
     /// Keys while a held command waits for the person: `y` runs it, `n` or
     /// Esc refuses it. Returns whether the key was for it.
+    /// Whether the warm sessions should be read now: `/tick` is on, no
+    /// request runs, four minutes went by since the last time. After half an
+    /// hour without a request, the person is asked first.
+    pub(crate) fn keep_warm_due(&mut self) -> bool {
+        if !self.settings.tick || self.is_running() || self.ask_keep_warm {
+            return false;
+        }
+        if self.idle_since.elapsed() >= KEEP_WARM_ASK {
+            self.ask_keep_warm = true;
+            return false;
+        }
+        let due = self
+            .last_warm
+            .is_none_or(|t| t.elapsed() >= KEEP_WARM_EVERY);
+        if due {
+            self.last_warm = Some(Instant::now());
+        }
+        due
+    }
+
+    /// The question asked after a long wait, while it is.
+    pub(crate) fn keep_warm_question(&self) -> Option<Approval> {
+        self.ask_keep_warm.then(|| Approval {
+            model: self
+                .current_model()
+                .cloned()
+                .unwrap_or_else(|| ModelId::agent(Agent::ClaudeCode)),
+            question: Question::KeepWarm {
+                minutes: KEEP_WARM_ASK.as_secs() / 60,
+            },
+        })
+    }
+
     fn approval_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
+        if self.ask_keep_warm {
+            match key.code {
+                // Another half hour.
+                KeyCode::Char('y' | 'Y') => self.idle_since = Instant::now(),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    self.settings.tick = false;
+                    self.info("No longer keeping the sessions warm: /tick turns it on again");
+                }
+                _ => return Some(None),
+            }
+            self.ask_keep_warm = false;
+            return Some(None);
+        }
         let (approval, _) = self.approval.as_ref()?;
         let (secrets, hosts) = match &approval.question {
             Question::Command { secrets, hosts, .. } => (secrets.clone(), hosts.clone()),
-            Question::MoreTurns { .. } => (Vec::new(), Vec::new()),
+            Question::MoreTurns { .. } | Question::KeepWarm { .. } | Question::ColdStart { .. } => {
+                (Vec::new(), Vec::new())
+            }
         };
         let answer = match key.code {
             KeyCode::Char('y' | 'Y') => Answer::Yes,
+            // Stop, to compact first: only for a cold start.
+            KeyCode::Char('c' | 'C') if matches!(approval.question, Question::ColdStart { .. }) => {
+                Answer::Stop
+            }
             // The secrets it names, from now on: kept with the defaults.
             KeyCode::Char('a' | 'A') if !secrets.is_empty() || !hosts.is_empty() => {
                 for name in secrets {
@@ -2272,7 +2363,9 @@ impl App {
             KeyCode::Char('c' | 'C') => {
                 return Some(match &approval.question {
                     Question::Command { command, .. } => Some(Effect::Copy(command.clone())),
-                    Question::MoreTurns { .. } => None,
+                    Question::MoreTurns { .. }
+                    | Question::KeepWarm { .. }
+                    | Question::ColdStart { .. } => None,
                 });
             }
             _ => return Some(None),
@@ -2482,6 +2575,7 @@ impl App {
             lenient_commands: !self.settings.strict_commands,
             allowed_hosts: self.settings.allowed_hosts.clone(),
             pair_mode: Some(self.settings.pair_mode),
+            tick: self.settings.tick,
         }
     }
 
@@ -3060,6 +3154,13 @@ pub fn parse_window(text: &str) -> Option<u64> {
     Some(secs.min(crate::usage::KEEP_SECS))
 }
 
+/// How often the warm sessions are read while the conversation waits.
+const KEEP_WARM_EVERY: Duration = Duration::from_secs(4 * 60);
+
+/// How long the conversation may wait before the person is asked whether
+/// to keep reading them.
+const KEEP_WARM_ASK: Duration = Duration::from_secs(30 * 60);
+
 /// The first sentence of `text`, for a line: an agent's reasons run long.
 fn first_sentence(text: &str) -> &str {
     let text = text.trim();
@@ -3323,6 +3424,40 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         press(&mut app, KeyCode::Tab);
         assert!(!app.settings.pair_mode);
+    }
+
+    #[test]
+    fn tick_keeps_sessions_warm_and_asks_after_a_long_wait() {
+        let mut app = ready();
+        assert!(!app.keep_warm_due());
+        type_text(&mut app, "/tick");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.keep_warm_due());
+        // Not again before four minutes.
+        assert!(!app.keep_warm_due());
+        app.last_warm = Instant::now().checked_sub(Duration::from_secs(5 * 60));
+        assert!(app.keep_warm_due());
+        // Half an hour without a request: asked first.
+        app.idle_since = Instant::now()
+            .checked_sub(Duration::from_secs(31 * 60))
+            .unwrap();
+        assert!(!app.keep_warm_due());
+        assert!(screen(&app).contains("Keep the sessions warm?"));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.settings.tick);
+        assert!(app.keep_warm_question().is_none());
+        assert!(!app.defaults().tick);
+    }
+
+    #[test]
+    fn a_request_not_sent_comes_back_to_the_box() {
+        let mut app = ready();
+        type_text(&mut app, "fix it");
+        press(&mut app, KeyCode::Enter);
+        app.on_agent(AgentMessage::NotSent("fix it".into()));
+        assert_eq!(app.input().text(), "fix it");
+        assert!(!app.is_running());
+        assert!(!app.transcript.contains(&Entry::User("fix it".into())));
     }
 
     #[test]
@@ -3831,6 +3966,7 @@ mod tests {
                 lenient_commands: true,
                 allowed_hosts: vec![],
                 pair_mode: Some(false),
+                tick: false,
             }
         );
     }

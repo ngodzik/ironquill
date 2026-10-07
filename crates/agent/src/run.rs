@@ -427,8 +427,16 @@ impl Session {
             last_call: None,
             last_context: None,
         };
-        self.restart_if_cold(&mut ctx).await;
-        let verdict = match self.work(&mut ctx, text, context).await {
+        let started = match self.restart_if_cold(&mut ctx).await {
+            Err(e) => Err(e),
+            Ok(()) => self.work(&mut ctx, text, context).await,
+        };
+        // Stopped before it began: as if it had not been sent.
+        if matches!(started, Err(AgentError::NotSent)) {
+            self.messages.pop();
+            return Err(AgentError::NotSent);
+        }
+        let verdict = match started {
             Err(AgentError::OverBudget) => {
                 let budget = config.budget.unwrap_or_default();
                 (ctx.observe)(Event::OverBudget {
@@ -494,18 +502,35 @@ impl Session {
     async fn restart_if_cold<M: ChatModel, D, O: FnMut(Event) + Send>(
         &mut self,
         ctx: &mut Ctx<'_, M, D, O>,
-    ) {
-        let Some(first) = ctx.config.tiers.first() else {
-            return;
+    ) -> Result<(), AgentError> {
+        let Some(first) = ctx.config.tiers.first().cloned() else {
+            return Ok(());
         };
         if ctx.config.pair.is_some() || first.delegate().is_some() || self.last_used == 0 {
-            return;
+            return Ok(());
         }
         let idle = now_secs().saturating_sub(self.last_used);
         let before = crate::context::approx_tokens(&self.messages);
-        if idle <= cache_lifetime(first) || before < RESTART_TOKENS {
-            return;
+        if idle <= cache_lifetime(&first) || before < RESTART_TOKENS {
+            return Ok(());
         }
+        match Self::ask_cold_start(ctx, &first, idle, Some(before)).await {
+            Answer::Stop => return Err(AgentError::NotSent),
+            Answer::No => return Ok(()),
+            Answer::Yes | Answer::Always => {}
+        }
+        self.restart_from_summary(ctx, &first, idle, before).await;
+        Ok(())
+    }
+
+    /// Replaces the history before the latest exchanges by its summary.
+    async fn restart_from_summary<M: ChatModel, D, O: FnMut(Event) + Send>(
+        &mut self,
+        ctx: &mut Ctx<'_, M, D, O>,
+        first: &ModelId,
+        idle: u64,
+        before: u64,
+    ) {
         // The latest exchanges stay as they were, from a request on.
         let request = self.messages.len() - 1;
         let requests: Vec<usize> = (1..request)
@@ -564,6 +589,28 @@ impl Session {
             before: TokenCount(before),
             after: TokenCount(after),
         });
+    }
+
+    /// Asks the person what to do with a conversation whose cache expired;
+    /// without anybody to ask, it starts again from its summary.
+    async fn ask_cold_start<M, D, O>(
+        ctx: &Ctx<'_, M, D, O>,
+        model: &ModelId,
+        idle: u64,
+        tokens: Option<u64>,
+    ) -> Answer {
+        let Some(approver) = &ctx.config.approver else {
+            return Answer::Yes;
+        };
+        approver
+            .ask(Approval {
+                model: model.clone(),
+                question: Question::ColdStart {
+                    idle_minutes: idle / 60,
+                    tokens,
+                },
+            })
+            .await
     }
 
     /// What a model starting afresh is told of the conversation before
@@ -632,8 +679,19 @@ impl Session {
         // picked, and is told what was said without it meanwhile.
         let agent = first.delegate().map(|(agent, _)| agent);
         if let Some(agent) = agent {
-            // A cold session starts afresh and is told the conversation.
-            let thread = self.warm(agent).map(|t| (t.session.clone(), t.seen));
+            // A cold session starts afresh and is told the conversation,
+            // unless the person would rather go on with it as it is.
+            let mut thread = self.warm(agent).map(|t| (t.session.clone(), t.seen));
+            if thread.is_none()
+                && let Some(cold) = self.agents.get(&agent).cloned()
+            {
+                let idle = now_secs().saturating_sub(cold.used);
+                match Self::ask_cold_start(ctx, first, idle, cold.context).await {
+                    Answer::Stop => return Err(AgentError::NotSent),
+                    Answer::No => thread = Some((cold.session, cold.seen)),
+                    Answer::Yes | Answer::Always => {}
+                }
+            }
             let request = self.messages.len() - 1;
             ctx.catch_up = match &thread {
                 Some((_, seen)) => catch_up(&self.messages[(*seen).min(request)..request]),
@@ -1198,6 +1256,84 @@ impl Session {
             context,
         };
         self.agents.insert(agent, thread);
+    }
+
+    /// Whether a session is warm enough to keep warm: Claude Code's chat or
+    /// last pair, used in the last minutes, with the settings of its last
+    /// call known.
+    pub fn has_warm_sessions(&self) -> bool {
+        !self.warm_sessions().is_empty()
+    }
+
+    fn warm_sessions(&self) -> Vec<(Agent, bool, Thread)> {
+        let warm =
+            |t: &&Thread| now_secs().saturating_sub(t.used) <= THREAD_WARM_SECS && t.call.is_some();
+        let mut out = Vec::new();
+        for (pair, map) in [(false, &self.agents), (true, &self.planners)] {
+            // Only Claude Code makes copies of a session.
+            if let Some(thread) = map.get(&Agent::ClaudeCode).filter(warm) {
+                out.push((Agent::ClaudeCode, pair, thread.clone()));
+            }
+        }
+        out
+    }
+
+    /// Keeps the warm sessions warm while the conversation waits: each is
+    /// read by a one word copy of it, with the very same settings as its
+    /// last call, and counts as used again. What that costs is told as
+    /// turns.
+    pub async fn keep_warm<D: Delegate>(
+        &mut self,
+        delegate: &D,
+        root: &std::path::Path,
+        mut observe: impl FnMut(Event) + Send,
+    ) {
+        for (agent, pair, thread) in self.warm_sessions() {
+            let Some(call) = thread.call.clone() else {
+                continue;
+            };
+            let request = DelegateRequest {
+                agent,
+                effort: call.effort,
+                model: call.model.clone(),
+                prompt: TICK_PROMPT.into(),
+                instructions: call.instructions.clone(),
+                resume: Some(thread.session.clone()),
+                fork: true,
+                ephemeral: true,
+                directory: root.to_owned(),
+                read_only: call.read_only,
+            };
+            let model = ModelId::agent(agent);
+            let mut on_event = |event: DelegateEvent| {
+                if let DelegateEvent::Usage {
+                    usage,
+                    cost,
+                    billed,
+                    cache,
+                } = event
+                {
+                    observe(Event::Turn {
+                        model: model.clone(),
+                        usage,
+                        cost: cost.filter(|_| billed),
+                        subscription: !billed,
+                        context: None,
+                        cache,
+                    });
+                }
+            };
+            if delegate.run(&request, &mut on_event).await.is_ok() {
+                let map = if pair {
+                    &mut self.planners
+                } else {
+                    &mut self.agents
+                };
+                if let Some(t) = map.get_mut(&agent) {
+                    t.used = now_secs();
+                }
+            }
+        }
     }
 
     /// The session of `agent` its next request would continue, if any.
@@ -3471,7 +3607,7 @@ mod tests {
 
     use ironquill_core::{ChatResponse, DelegateReply, ToolCall};
 
-    use crate::config::{Approver, Question};
+    use crate::config::{Answer, Approver, Question};
     use ironquill_tools::{ToolSummary, Workspace};
     use serde_json::json;
 
@@ -5289,6 +5425,110 @@ mod tests {
                 .contains("The plan, by strong:\n1. Create done.txt.")
         );
         assert_eq!(requests[1].resume.as_deref(), Some("claude-session-1"));
+    }
+
+    /// A chat with Claude Code, its session warm, then left `idle` seconds.
+    async fn chat_left(
+        planner: &PlanningAgent,
+        idle: u64,
+    ) -> (Session, tempfile::TempDir, Toolbox) {
+        let (dir, mut toolbox) = setup();
+        let chat = AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        session
+            .send(
+                &Scripted::new(vec![]),
+                planner,
+                &mut toolbox,
+                &chat,
+                "hi",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        session.agents.get_mut(&Agent::ClaudeCode).unwrap().used -= idle;
+        (session, dir, toolbox)
+    }
+
+    #[tokio::test]
+    async fn warm_sessions_are_read_by_a_copy_with_the_same_settings() {
+        let planner = PlanningAgent::new(vec!["Hello.", "ok"]);
+        let (mut session, dir, _toolbox) = chat_left(&planner, 60).await;
+        let before = session.agents[&Agent::ClaudeCode].used;
+        let mut turns = 0;
+        session
+            .keep_warm(&planner, dir.path(), |e| {
+                turns += usize::from(matches!(e, Event::Turn { .. }));
+            })
+            .await;
+        let requests = planner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let (chat, tick) = (&requests[0], &requests[1]);
+        assert_eq!(tick.resume.as_deref(), Some("plan-1"));
+        assert!(tick.fork && tick.ephemeral);
+        assert_eq!(tick.prompt, TICK_PROMPT);
+        assert_eq!(
+            (&tick.model, tick.effort, &tick.instructions, tick.read_only),
+            (&chat.model, chat.effort, &chat.instructions, chat.read_only)
+        );
+        assert!(session.agents[&Agent::ClaudeCode].used > before);
+    }
+
+    fn answering_cold(answer: Answer) -> AgentConfig {
+        AgentConfig::builder()
+            .tier(ModelId::new("claude-code/opus").unwrap())
+            .build()
+            .unwrap()
+            .with_approver(Approver::new(move |approval: Approval| {
+                assert!(matches!(approval.question, Question::ColdStart { .. }));
+                async move { answer }
+            }))
+    }
+
+    #[tokio::test]
+    async fn a_cold_session_asks_whether_to_start_again() {
+        for (answer, resumed) in [(Answer::Yes, None), (Answer::No, Some("plan-1"))] {
+            let planner = PlanningAgent::new(vec!["Hello.", "Again."]);
+            let (mut session, _dir, mut toolbox) = chat_left(&planner, 3_600).await;
+            session
+                .send(
+                    &Scripted::new(vec![]),
+                    &planner,
+                    &mut toolbox,
+                    &answering_cold(answer),
+                    "and now?",
+                    "",
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            let requests = planner.requests.lock().unwrap();
+            assert_eq!(requests[1].resume.as_deref(), resumed, "{answer:?}");
+        }
+
+        // Stopped: not sent, left out of the conversation.
+        let planner = PlanningAgent::new(vec!["Hello."]);
+        let (mut session, _dir, mut toolbox) = chat_left(&planner, 3_600).await;
+        let messages = session.messages.len();
+        let error = session
+            .send(
+                &Scripted::new(vec![]),
+                &planner,
+                &mut toolbox,
+                &answering_cold(Answer::Stop),
+                "and now?",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::NotSent));
+        assert_eq!(session.messages.len(), messages);
+        assert_eq!(planner.requests.lock().unwrap().len(), 1);
     }
 
     /// Claude Code on an API key, for the cost tests: the calls it reports

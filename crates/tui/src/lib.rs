@@ -149,6 +149,9 @@ where
     let (docker_tx, mut docker_rx) = mpsc::unbounded_channel();
     let mut docker_tick = tokio::time::interval(Duration::from_secs(2));
     let mut docker_asking = false;
+    // Whether keeping the sessions warm is due is looked at every half
+    // minute; it happens every four.
+    let mut warm_tick = tokio::time::interval(Duration::from_secs(30));
 
     while !app.should_quit() {
         terminal
@@ -188,6 +191,7 @@ where
                 app.on_tick();
                 None
             },
+            _ = warm_tick.tick() => app.keep_warm_due().then_some(Effect::KeepWarm),
         };
 
         // The model, the models offered, the team and the budget carry over
@@ -249,6 +253,23 @@ where
                 }
                 app.on_cancelled();
                 save(&store, &mut app, &conversation).await;
+            }
+            Some(Effect::KeepWarm) => {
+                // In the background, while the conversation waits; a request
+                // sent meanwhile waits for it.
+                let conversation = Arc::clone(&conversation);
+                let delegate = Arc::clone(&delegate);
+                let root = workspace.root().to_owned();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut guard = conversation.lock().await;
+                    guard
+                        .session
+                        .keep_warm(&*delegate, &root, |e| {
+                            let _ = tx.send(AgentMessage::Event(e));
+                        })
+                        .await;
+                });
             }
             Some(Effect::Copy(text)) => match clipboard::copy(&text) {
                 Ok(how) => app.info(format!("Copied ({how})")),
@@ -425,7 +446,12 @@ where
                 },
             )
             .await;
-        let _ = tx.send(AgentMessage::Done(result.map_err(|e| error_chain(&e))));
+        let message = match result {
+            // Stopped before it began: the message goes back to the box.
+            Err(ironquill_agent::AgentError::NotSent) => AgentMessage::NotSent(text),
+            result => AgentMessage::Done(result.map_err(|e| error_chain(&e))),
+        };
+        let _ = tx.send(message);
     })
 }
 

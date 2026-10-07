@@ -59,14 +59,15 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     if app.keys_open().is_some() {
         render_keys(frame, app);
     }
-    if app.approval().is_some() {
+    if app.approval().is_some() || app.keep_warm_question().is_some() {
         render_approval(frame, app);
     }
 }
 
 /// A command held for the person, over everything else, until they answer.
 fn render_approval(frame: &mut Frame, app: &App) {
-    let Some(approval) = app.approval() else {
+    let asked = app.keep_warm_question();
+    let Some(approval) = app.approval().or(asked.as_ref()) else {
         return;
     };
     let screen = frame.area();
@@ -109,6 +110,31 @@ fn render_approval(frame: &mut Frame, app: &App) {
             };
             (Color::Red, " Run this command? ", keys, lines)
         }
+        Question::ColdStart {
+            idle_minutes,
+            tokens,
+        } => (
+            Color::Cyan,
+            " The cache has expired ",
+            " y: new session from the summary · n: go on as it is · c: stop, to compact "
+                .to_owned(),
+            vec![Line::raw(format!(
+                " {}'s conversation was left {idle_minutes} minutes: its cache has expired. Going \
+                 on as it is writes it all to the cache again{}, at the dearest rate; a new \
+                 session starts from its summary and the latest exchanges.",
+                approval.model,
+                tokens.map_or_else(String::new, |t| format!(", about {}", TokenCount(t)))
+            ))],
+        ),
+        Question::KeepWarm { minutes } => (
+            Color::Cyan,
+            " Keep the sessions warm? ",
+            " y: another half hour · n: stop ".to_owned(),
+            vec![Line::raw(format!(
+                " No request for {minutes} minutes. Each read of the warm sessions costs a \
+                 little; letting them cool, the next request writes them to the cache again."
+            ))],
+        ),
         Question::MoreTurns { turns } => (
             Color::Cyan,
             " Go on? ",
