@@ -118,6 +118,9 @@ pub struct CodeMap {
     pub edges: Vec<Edge>,
     /// How many files were left out to stay under the limit.
     pub left_out: usize,
+    /// The operations of the project's OpenAPI specs, with who serves and
+    /// who calls each.
+    pub operations: Vec<crate::api::Operation>,
 }
 
 impl CodeMap {
@@ -226,6 +229,7 @@ pub fn map(root: &Path, limit: usize) -> CodeMap {
         }],
         edges: Vec::new(),
         left_out,
+        operations: Vec::new(),
     };
     let mut index: HashMap<String, usize> = HashMap::from([(String::new(), 0)]);
     let mut sources: Vec<(usize, String)> = Vec::new();
@@ -295,7 +299,9 @@ pub fn map(root: &Path, limit: usize) -> CodeMap {
             }
         }
     }
-    for (from, to) in crate::api::calls(&map, &sources) {
+    let (operations, calls) = crate::api::read(&map, &sources);
+    map.operations = operations;
+    for (from, to) in calls {
         if from != to {
             map.edges.push(Edge {
                 from,

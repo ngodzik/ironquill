@@ -421,7 +421,7 @@ where
                             return;
                         }
                     }
-                    app.open_path(path);
+                    app.open_instructions(path);
                 }
                 None => app.report_error("No home directory to keep instructions in".into()),
             },

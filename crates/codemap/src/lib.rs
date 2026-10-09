@@ -9,12 +9,13 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-mod api;
+pub(crate) mod api;
 mod architecture;
 mod imports;
 mod layout;
 mod map;
 
+pub use api::Operation;
 pub use architecture::{Architecture, Component, ComponentKind, Link, architecture};
 pub use layout::Layout;
 pub use map::{CodeMap, Edge, EdgeKind, Language, Node, NodeKind, map};

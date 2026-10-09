@@ -146,6 +146,16 @@ impl Plan {
         }
     }
 
+    /// The project as last read.
+    pub(crate) fn map(&self) -> Option<&CodeMap> {
+        self.map.as_ref()
+    }
+
+    /// The project's root.
+    pub(crate) fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Whether the project is being read.
     pub(crate) fn is_reading(&self) -> bool {
         self.reading.is_some()
@@ -1055,13 +1065,17 @@ fn trail(ui: &mut Ui, at: Pos2, level: &str, project: &str) -> Option<String> {
 
 /// The two views of the codebase, top right, to pick with the mouse.
 pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
-    let area = Rect::from_min_size(rect.right_top() + vec2(-230.0, 20.0), vec2(206.0, 30.0));
+    let area = Rect::from_min_size(rect.right_top() + vec2(-300.0, 20.0), vec2(276.0, 30.0));
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(area)
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
         |ui| {
-            for (name, view) in [("Universe", MapView::Universe), ("Plan", MapView::Plan)] {
+            for (name, view) in [
+                ("Universe", MapView::Universe),
+                ("API", MapView::Api),
+                ("Plan", MapView::Plan),
+            ] {
                 let on = app.map_view() == Some(view);
                 let text = RichText::new(name)
                     .size(14.0)

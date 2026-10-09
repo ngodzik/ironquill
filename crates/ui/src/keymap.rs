@@ -124,7 +124,7 @@ pub enum Action {
     NextUsageWindow,
     /// Let what is behind the window show through, or make it opaque again.
     ToggleSeeThrough,
-    /// Show the codebase's plan, then its universe, then the panes again.
+    /// Show the codebase's plan, its API, its universe, then the panes again.
     NextMap,
 }
 
@@ -158,7 +158,7 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "Ctrl-N",
-                "the codebase's plan, then its universe of files, then back (--gui only)",
+                "the codebase's plan, its API, its universe of files, then back (--gui only)",
             ),
             ("Ctrl-S", "this list"),
             ("Ctrl-C", "stop the request; twice to quit"),

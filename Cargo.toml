@@ -35,6 +35,7 @@ thiserror  = "2.0.21"
 anyhow     = "1.0.104"
 serde      = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+yaml-rust2 = "0.13.0"
 tokio      = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 clap       = { version = "4.6.7", features = ["derive", "env"] }
 # The default TLS backend verifies against the operating system trust store, so

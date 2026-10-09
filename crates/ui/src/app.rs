@@ -57,6 +57,9 @@ pub struct Panes {
 pub enum MapView {
     /// Its design, flat: the components, what uses what, in layers.
     Plan,
+    /// Its API: each route of its OpenAPI specs, what serves it and what
+    /// calls it.
+    Api,
     /// Its files as stars in space, lit as the agent works.
     Universe,
 }
@@ -1117,7 +1120,8 @@ impl App {
             Action::NextMap => {
                 let next = match self.map {
                     None => Some(MapView::Plan),
-                    Some(MapView::Plan) => Some(MapView::Universe),
+                    Some(MapView::Plan) => Some(MapView::Api),
+                    Some(MapView::Api) => Some(MapView::Universe),
                     Some(MapView::Universe) => None,
                 };
                 self.show_map(next);
@@ -1545,6 +1549,16 @@ impl App {
         }
     }
 
+    /// Opens a file at line `line`, counted from 1: where a route is
+    /// served, say.
+    pub fn open_path_at(&mut self, path: PathBuf, line: usize) {
+        self.open_path(path);
+        // Unless the file open was kept, with changes not written.
+        if let Some(file) = self.file.as_mut().filter(|f| !f.is_modified()) {
+            file.go_to_line(line);
+        }
+    }
+
     /// Opens a file in the editor, outside the project too.
     pub fn open_path(&mut self, path: PathBuf) {
         if self.file.as_ref().is_some_and(Editor::is_modified) {
@@ -1558,6 +1572,12 @@ impl App {
         self.unzoom();
         self.file = Some(Editor::open(&self.root, path, highlighter));
         self.focus_on(Focus::File);
+    }
+
+    /// Opens the instructions every model is given, saying what saving
+    /// them does.
+    pub fn open_instructions(&mut self, path: PathBuf) {
+        self.open_path(path);
         self.info(
             "Your instructions for every model: :w saves them, they count from the next request",
         );
@@ -3368,8 +3388,12 @@ impl App {
         let notice = match view {
             Some(MapView::Plan) => {
                 "The plan: what uses what, foundations at the bottom. Click a part to see its \
-                 files; Ctrl-N again for the universe (in the terminal, it shows only in the \
-                 window)"
+                 files, double-click to open it; Ctrl-N again for the API (in the terminal, it \
+                 shows only in the window)"
+            }
+            Some(MapView::Api) => {
+                "The API: each route of the OpenAPI specs, what serves it and what calls it. \
+                 Click a route for its way through; Ctrl-N again for the universe"
             }
             Some(MapView::Universe) => {
                 "The universe: drag to turn, scroll to come closer, click a star to centre it; \
@@ -3955,12 +3979,14 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_n_shows_the_plan_then_the_universe_then_the_panes() {
+    fn ctrl_n_shows_the_plan_the_api_the_universe_then_the_panes() {
         let mut app = ready();
         let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
         assert_eq!(app.map_view(), None);
         app.on_key(ctrl_n);
         assert_eq!(app.map_view(), Some(MapView::Plan));
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), Some(MapView::Api));
         app.on_key(ctrl_n);
         assert_eq!(app.map_view(), Some(MapView::Universe));
         app.on_key(ctrl_n);

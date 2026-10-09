@@ -14,6 +14,7 @@
 #![warn(missing_docs)]
 
 mod activity;
+mod api_view;
 mod error;
 mod keys;
 mod plan;
@@ -108,6 +109,7 @@ where
     let plan = Plan::new(app.root().to_owned());
     let shell = Shell {
         plan,
+        api: api_view::ApiView::default(),
         app,
         host,
         runtime,
@@ -194,6 +196,8 @@ struct Shell<M, D> {
     usage: UsageView,
     /// The codebase's plan, drawn by egui alone.
     plan: Plan,
+    /// The codebase's API, from the plan's map.
+    api: api_view::ApiView,
     /// The conversation's scroll as the state last had it, in lines: a key
     /// that scrolls changes it, and the view follows by the difference.
     scroll_seen: usize,
@@ -502,9 +506,11 @@ where
 
     let now = ctx.input(|i| i.time);
     let view = shell.app.map_view();
-    shell
-        .plan
-        .showing(view == Some(MapView::Plan), now, shell.app.transcript());
+    shell.plan.showing(
+        matches!(view, Some(MapView::Plan | MapView::Api)),
+        now,
+        shell.app.transcript(),
+    );
     shell.plan.take_read(now);
     shell.plan.light_up(shell.app.transcript(), now);
     if let Some(view) = view {
@@ -521,13 +527,14 @@ where
         egui::CentralPanel::default()
             .frame(match view {
                 MapView::Universe => Frame::NONE,
-                MapView::Plan => Frame::NONE.fill(background),
+                MapView::Plan | MapView::Api => Frame::NONE.fill(background),
             })
             .show(&mut root, |ui| match view {
                 MapView::Universe => {
                     universe_view(ui, &mut universe, &mut shell.app);
                 }
                 MapView::Plan => plan::show(ui, &mut shell.plan, &mut shell.app),
+                MapView::Api => api_view::show(ui, &mut shell.api, &shell.plan, &mut shell.app),
             });
     } else if shell.app.tree().is_some() {
         egui::Panel::left("tree")
