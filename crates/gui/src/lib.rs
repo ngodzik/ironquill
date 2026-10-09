@@ -27,7 +27,7 @@ use bevy::app::AppExit;
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{KeyCode as PhysicalKey, KeyboardInput};
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
+use bevy::window::{CompositeAlphaMode, PrimaryWindow};
 use bevy::winit::{UpdateMode, WinitSettings};
 use bevy_egui::egui::{
     self, Align, Color32, Frame, Id, LayerId, Layout, Margin, RichText, ScrollArea, Stroke, Ui,
@@ -107,7 +107,9 @@ where
     };
 
     let exit = bevy::app::App::new()
-        .insert_resource(ClearColor(Color::srgb_u8(11, 13, 18)))
+        // Behind the panels, nothing: what shows through a see-through
+        // window is the desktop, through the panels' own alpha.
+        .insert_resource(ClearColor(Color::NONE))
         .insert_resource(WinitSettings {
             focused_mode: UpdateMode::reactive(IDLE_WAIT),
             unfocused_mode: UpdateMode::reactive_low_power(IDLE_WAIT),
@@ -118,6 +120,10 @@ where
                     primary_window: Some(Window {
                         title,
                         resolution: (1400, 900).into(),
+                        // Made see-through from the start: a window cannot
+                        // become so later. Opaque, its panels hide it all.
+                        transparent: true,
+                        composite_alpha_mode: CompositeAlphaMode::PreMultiplied,
                         ..default()
                     }),
                     ..default()
@@ -332,12 +338,16 @@ where
             .layer_id(LayerId::background())
             .max_rect(ctx.content_rect()),
     );
-    let pane = Frame::new().fill(PANEL).inner_margin(Margin::same(14));
+    // Ctrl-M fades the background in or out rather than switching it.
+    let opacity = ctx.animate_value_with_time(Id::new("opacity"), shell.app.opacity(), 0.25);
+    let panel = theme::see(PANEL, opacity);
+    let background = theme::see(theme::BACKGROUND, opacity);
+    let pane = Frame::new().fill(panel).inner_margin(Margin::same(14));
 
     egui::Panel::bottom("status")
         .frame(
             Frame::new()
-                .fill(theme::BACKGROUND)
+                .fill(background)
                 .inner_margin(Margin::symmetric(14, 4)),
         )
         .show_separator_line(false)
@@ -345,7 +355,7 @@ where
     egui::Panel::bottom("input")
         .frame(
             Frame::new()
-                .fill(PANEL)
+                .fill(panel)
                 .inner_margin(Margin::symmetric(14, 10)),
         )
         .show(&mut root, |ui| {
@@ -360,7 +370,7 @@ where
             egui::Panel::right("usage")
                 .resizable(false)
                 .exact_size(USAGE_WIDTH * open)
-                .frame(pane.fill(theme::BACKGROUND).stroke(Stroke::new(1.0, EDGE)))
+                .frame(pane.fill(background).stroke(Stroke::new(1.0, EDGE)))
                 .show(&mut root, |ui| {
                     ScrollArea::vertical().show(ui, |ui| {
                         usage::show(ui, &mut shell.usage, log, window);
@@ -385,11 +395,11 @@ where
             .frame(pane)
             .show(&mut root, |ui| conversation(ui, shell));
         egui::CentralPanel::default()
-            .frame(pane.fill(theme::BACKGROUND))
+            .frame(pane.fill(background))
             .show(&mut root, |ui| file(ui, &shell.app));
     } else {
         egui::CentralPanel::default()
-            .frame(pane.fill(theme::BACKGROUND))
+            .frame(pane.fill(background))
             .show(&mut root, |ui| conversation(ui, shell));
     }
 

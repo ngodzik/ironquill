@@ -37,6 +37,12 @@ pub(crate) const CYAN: Color32 = Color32::from_rgb(86, 182, 194);
 /// The selected row or reply.
 pub(crate) const SELECTED: Color32 = Color32::from_rgb(34, 38, 50);
 
+/// `colour` as opaque as `opacity`, from 0 to 1, for a see-through window.
+pub(crate) fn see(colour: Color32, opacity: f32) -> Color32 {
+    let [r, g, b, _] = colour.to_array();
+    Color32::from_rgba_unmultiplied(r, g, b, (opacity.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
 /// A colour of the state, as egui draws it.
 pub(crate) fn rgb(c: Rgb) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)

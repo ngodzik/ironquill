@@ -58,7 +58,7 @@ The interface follows my editor habits: Vim-like modes, a leader key, files open
 - Conversations saved locally and resumed with `ironquill -c`, `/resume`, or by id with `/resume <id>` or `ironquill -r <id>`
 - A file tree, an open file coloured by language and editable with Vim keys (visual mode, registers including the system clipboard, `:s`, search)
 - A pane listing running Docker containers
-- A window, in progress: `ironquill --gui` draws the same conversation on the GPU, with Bevy and egui, the same keys and commands, the windows that ask, the file tree and the open file, and the usage pane (Ctrl-O) as charts you can hover, drag and zoom. Pictures, diagrams, Docker and the sub-agent pane are still the terminal's
+- A window, in progress: `ironquill --gui` draws the same conversation on the GPU, with Bevy and egui, the same keys and commands, the windows that ask, the file tree and the open file, and the usage pane (Ctrl-O) as charts you can hover, drag and zoom. Ctrl-M makes it see-through, as a terminal can be, and back; it is kept for the next session, and `opacity = 0.7` in `~/.ironquill/config.toml` sets how much (with a compositor, on X11) Pictures, diagrams, Docker and the sub-agent pane are still the terminal's
 - Any OpenAI compatible endpoint, Requesty by default
 
 ## What it does not do

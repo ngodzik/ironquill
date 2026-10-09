@@ -422,6 +422,8 @@ async fn interface(
         // With Claude Code installed, a pair is Opus planning, Sonnet coding.
         pair_mode: defaults.pair_mode.unwrap_or(claude.is_some()),
         tick: defaults.tick,
+        see_through: defaults.see_through,
+        opacity: defaults.opacity,
         images: defaults.images.unwrap_or_default(),
         mermaid: defaults.mermaid.clone(),
         detect_checks,

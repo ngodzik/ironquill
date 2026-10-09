@@ -26,6 +26,13 @@ use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
 use crate::usage::{Sample, UsageLog};
 
+/// How opaque a see-through window is unless `opacity` says otherwise:
+/// enough to read on any wallpaper, little enough to see it.
+pub const DEFAULT_OPACITY: f32 = 0.78;
+
+/// Below this, text on a busy wallpaper is lost.
+const MIN_OPACITY: f32 = 0.2;
+
 /// Lines moved by one turn of the mouse wheel.
 const WHEEL_LINES: i32 = 3;
 
@@ -112,6 +119,11 @@ pub struct Settings {
     /// Whether the warm sessions are kept warm while the conversation
     /// waits, as `/tick` turns on.
     pub tick: bool,
+    /// Whether the window lets what is behind it show through.
+    pub see_through: bool,
+    /// How opaque the window is while see-through, as configured; `None`
+    /// takes [`DEFAULT_OPACITY`].
+    pub opacity: Option<f32>,
     /// Whether replies show images, and in which terminals.
     pub images: Images,
     /// The command that draws Mermaid diagrams, as configured; `None` finds
@@ -1071,6 +1083,17 @@ impl App {
                 }
             }
             Action::ToggleUsage => self.usage_open = !self.usage_open,
+            Action::ToggleSeeThrough => {
+                self.settings.see_through = !self.settings.see_through;
+                self.notice = Some(
+                    if self.settings.see_through {
+                        "See-through window (in the terminal, its own settings do this)"
+                    } else {
+                        "Opaque window"
+                    }
+                    .to_owned(),
+                );
+            }
             Action::NextUsageWindow => {
                 self.usage_window = match self.usage_window {
                     w if w < 6 * 3600 => 6 * 3600,
@@ -3052,7 +3075,9 @@ impl App {
             allowed_hosts: self.settings.allowed_hosts.clone(),
             pair_mode: Some(self.settings.pair_mode),
             tick: self.settings.tick,
+            see_through: self.settings.see_through,
             // Set in the file only: kept as written there.
+            opacity: self.settings.opacity,
             images: (self.settings.images != Images::Auto).then_some(self.settings.images),
             mermaid: self.settings.mermaid.clone(),
         }
@@ -3265,6 +3290,18 @@ impl App {
                 pane.error = None;
             }
             Err(e) => pane.error = Some(e),
+        }
+    }
+
+    /// How opaque the window's background is now: 1 unless see-through.
+    pub fn opacity(&self) -> f32 {
+        if self.settings.see_through {
+            self.settings
+                .opacity
+                .unwrap_or(DEFAULT_OPACITY)
+                .clamp(MIN_OPACITY, 1.0)
+        } else {
+            1.0
         }
     }
 
@@ -3801,6 +3838,21 @@ mod tests {
         app.on_key(ctrl('p'));
         // Kept for the next session.
         assert_eq!(app.defaults().usage_window.as_deref(), Some("6h"));
+    }
+
+    #[test]
+    fn ctrl_m_makes_the_window_see_through_and_keeps_it() {
+        let mut app = ready();
+        assert!((app.opacity() - 1.0).abs() < f32::EPSILON);
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL));
+        assert!((app.opacity() - DEFAULT_OPACITY).abs() < f32::EPSILON);
+        assert!(app.defaults().see_through);
+        // An opacity from the file is held to what stays readable.
+        app.settings.opacity = Some(0.05);
+        assert!((app.opacity() - MIN_OPACITY).abs() < f32::EPSILON);
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL));
+        assert!((app.opacity() - 1.0).abs() < f32::EPSILON);
+        assert!(!app.defaults().see_through);
     }
 
     #[test]
@@ -4445,6 +4497,8 @@ mod tests {
                 allowed_hosts: vec![],
                 pair_mode: Some(false),
                 tick: false,
+                see_through: false,
+                opacity: None,
                 images: None,
                 mermaid: None,
             }

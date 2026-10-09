@@ -122,6 +122,8 @@ pub enum Action {
     ToggleUsage,
     /// The usage pane's next window: an hour, six, a day.
     NextUsageWindow,
+    /// Let what is behind the window show through, or make it opaque again.
+    ToggleSeeThrough,
 }
 
 /// Every shortcut, as Ctrl-S lists them. Kept next to the bindings above so
@@ -148,6 +150,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-K", "show or hide the Docker containers"),
             ("Ctrl-O", "show or hide the usage pane (/usage)"),
             ("Ctrl-P", "the usage pane's window: 1h, 6h, 24h"),
+            (
+                "Ctrl-M",
+                "the window see-through, as a terminal can be, or opaque (--gui only)",
+            ),
             ("Ctrl-S", "this list"),
             ("Ctrl-C", "stop the request; twice to quit"),
             ("Tab", "next pane"),
@@ -259,6 +265,9 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         // O for overview of what was used; P for its period.
         KeyCode::Char('o') if ctrl => return Some(Action::ToggleUsage),
         KeyCode::Char('p') if ctrl => return Some(Action::NextUsageWindow),
+        // Only the window tells Ctrl-M from Enter: a terminal sends both
+        // the same, which is fine, as only the window can be see-through.
+        KeyCode::Char('m') if ctrl => return Some(Action::ToggleSeeThrough),
         // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
         KeyCode::Char('e') if ctrl => return Some(Action::PickModel),
         _ => {}
