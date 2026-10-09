@@ -39,7 +39,7 @@ const EXCERPT_LINES: usize = 6;
 const PLACEHOLDER: &str = "Ask a question or describe a change";
 
 /// Draws the whole interface: panes, activity line, input box, status line.
-pub(crate) fn render(frame: &mut Frame, app: &App) {
+pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
     let [main, activity, input, status] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -48,7 +48,7 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    render_panes(frame, app, main);
+    render_panes(frame, app, pictures, main);
     render_activity(frame, app, activity);
     render_input(frame, app, input);
     render_status(frame, app, status);
@@ -527,10 +527,10 @@ const SIDE_CHAT_MIN: u16 = 36;
 
 /// Tree on the left if open; the open file or the conversation in the middle;
 /// the conversation on the right while a file is open, if there is room.
-fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
+fn render_panes(frame: &mut Frame, app: &App, pictures: &dyn Pictures, area: Rect) {
     if app.is_zoomed() {
         // Only the conversation; the other panes keep their state, unseen.
-        let sub = render_chat(frame, app, area, false);
+        let sub = render_chat(frame, app, pictures, area, false);
         app.set_panes(Panes {
             chat: cells(area),
             sub: sub.map(cells),
@@ -603,10 +603,10 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
         render_command_frame(frame, app, command);
         panes.chat = cells(side);
         if side_width > 0 {
-            panes.sub = render_chat(frame, app, side, true).map(cells);
+            panes.sub = render_chat(frame, app, pictures, side, true).map(cells);
         }
     } else {
-        panes.sub = render_chat(frame, app, center, !alone).map(cells);
+        panes.sub = render_chat(frame, app, pictures, center, !alone).map(cells);
     }
     app.set_panes(panes);
 }
@@ -706,7 +706,13 @@ fn render_docker(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The conversation, and under it the sub-agent pane when it is open,
 /// whose area is returned for the mouse.
-fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) -> Option<Rect> {
+fn render_chat(
+    frame: &mut Frame,
+    app: &App,
+    pictures: &dyn Pictures,
+    area: Rect,
+    framed: bool,
+) -> Option<Rect> {
     // While a model of the team works, or until the next request, its work
     // takes most of the room: the conversation keeps a third.
     if let Some(sub) = app.sub_agent()
@@ -715,17 +721,23 @@ fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) -> Option
         let top = (area.height / 3).max(6);
         let [chat, pane] =
             Layout::vertical([Constraint::Length(top), Constraint::Min(6)]).areas(area);
-        render_conversation(frame, app, chat, true);
-        render_sub_agent(frame, app, &sub, pane);
+        render_conversation(frame, app, pictures, chat, true);
+        render_sub_agent(frame, app, pictures, &sub, pane);
         return Some(pane);
     }
-    render_conversation(frame, app, area, framed);
+    render_conversation(frame, app, pictures, area, framed);
     None
 }
 
 /// The model a task was handed to, at work: who it is, the task, then
 /// everything it does, the latest at the bottom.
-fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect) {
+fn render_sub_agent(
+    frame: &mut Frame,
+    app: &App,
+    pictures: &dyn Pictures,
+    sub: &SubAgent<'_>,
+    area: Rect,
+) {
     let state = if sub.working {
         format!(" working {} ", SPINNER[app.spinner() % SPINNER.len()])
     } else {
@@ -768,7 +780,7 @@ fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect
     );
     lines.push(Line::default());
     for entry in &sub.work {
-        lines.extend(entry_lines(entry, app, width));
+        lines.extend(entry_lines(entry, app, pictures, width));
         lines.push(Line::default());
     }
     if sub.work.is_empty() {
@@ -792,14 +804,20 @@ fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect
     frame.render_widget(Paragraph::new(shown), inner);
 }
 
-fn render_conversation(frame: &mut Frame, app: &App, area: Rect, framed: bool) {
+fn render_conversation(
+    frame: &mut Frame,
+    app: &App,
+    pictures: &dyn Pictures,
+    area: Rect,
+    framed: bool,
+) {
     if framed {
         let block = pane_block(" Chat ".into(), app.focus() == Focus::Chat);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        render_transcript(frame, app, inner);
+        render_transcript(frame, app, pictures, inner);
     } else {
-        render_transcript(frame, app, area);
+        render_transcript(frame, app, pictures, area);
     }
 }
 
@@ -1202,7 +1220,12 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
+fn entry_lines(
+    entry: &Entry,
+    app: &App,
+    pictures: &dyn Pictures,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     match entry {
         Entry::Welcome => welcome(&mut out, app, width),
@@ -1285,7 +1308,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 width,
             );
         }
-        Entry::Image(path) => match app.lines(Picture::File(path), width.saturating_sub(2)) {
+        Entry::Image(path) => match pictures.lines(Picture::File(path), width.saturating_sub(2)) {
             Some(drawn) => {
                 out.push(Line::styled(format!("  {path}"), fg(DIM)));
                 out.extend(drawn.into_iter().map(|line| {
@@ -1314,7 +1337,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
             );
         }
         Entry::Said(text) => {
-            let body = markdown::render(text, width.saturating_sub(2), Style::new(), app);
+            let body = markdown::render(text, width.saturating_sub(2), Style::new(), pictures);
             for (i, line) in body.into_iter().enumerate() {
                 let lead = if i == 0 {
                     Span::styled("● ", fg(Color::White))
@@ -1367,7 +1390,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                     Span::styled(model.to_string(), fg(Color::Magenta)),
                 ]));
             }
-            for line in entry_lines(entry, app, width.saturating_sub(4)) {
+            for line in entry_lines(entry, app, pictures, width.saturating_sub(4)) {
                 let mut spans = vec![bar()];
                 spans.extend(line.spans);
                 out.push(Line::from(spans));
@@ -1647,7 +1670,7 @@ const FOLD_SHOW: usize = 6;
 /// the terminal's, enough to see it, not enough to hurt reading.
 const SELECTED_BG: Color = Color::Rgb(34, 36, 44);
 
-fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
+fn render_transcript(frame: &mut Frame, app: &App, pictures: &dyn Pictures, area: Rect) {
     let width = usize::from(area.width).saturating_sub(1).max(1);
     let selected = app.selected_reply();
     let mut lines: Vec<Line> = Vec::new();
@@ -1694,12 +1717,12 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 block
             }
             Entry::Command { .. } => {
-                let mut block = entry_lines(entry, app, width);
+                let mut block = entry_lines(entry, app, pictures, width);
                 fold_marks.push(first + block.len());
                 block.push(Line::styled("  ▾ fold", fg(DIM)));
                 block
             }
-            _ => entry_lines(entry, app, width),
+            _ => entry_lines(entry, app, pictures, width),
         };
         if let Entry::Delegating { to, spent, .. } = entry {
             let steps = app.transcript()[i + 1..]

@@ -32,6 +32,7 @@ mod usage;
 mod view;
 mod wrap;
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,11 +139,13 @@ where
         pictures::Renderer::find(settings.mermaid.as_deref(), pictures::Renderer::installed);
     let cache = Defaults::path().map(|p| p.with_file_name("cache").join("diagrams"));
     let mut screen = terminal_kind.map(graphics::Screen::new);
-    let mut app = App::new(settings, workspace.root().to_owned());
-    app.gallery()
+    let gallery = RefCell::new(pictures::Gallery::new(workspace.root().to_owned()));
+    gallery
         .borrow_mut()
         .show_in(terminal_kind, renderer.clone(), cache.clone());
-    set_cell_size(&app);
+    set_cell_size(&gallery);
+    let mut app = App::new(settings, workspace.root().to_owned());
+    app.show_pictures(gallery.borrow().shows());
     let (diagram_tx, mut diagram_rx) =
         mpsc::unbounded_channel::<(u64, Result<std::path::PathBuf, String>)>();
     let conversation = Arc::new(Mutex::new(Conversation {
@@ -180,19 +183,19 @@ where
 
     while !app.should_quit() {
         terminal
-            .draw(|frame| view::render(frame, &app))
+            .draw(|frame| view::render(frame, &app, &gallery))
             .map_err(TuiError::Terminal)?;
         // The images just drawn reach the terminal; diagrams first seen are
         // drawn meanwhile, each on a thread of its own.
-        let wanted = app.gallery().borrow_mut().take_wanted();
+        let wanted = gallery.borrow_mut().take_wanted();
         if let Some(screen) = screen.as_mut()
             && !wanted.is_empty()
         {
             let (escapes, failed) = screen.show(&wanted);
-            app.gallery().borrow_mut().failed(&failed);
+            gallery.borrow_mut().failed(&failed);
             write_raw(&escapes);
         }
-        let to_draw = app.gallery().borrow_mut().take_to_draw();
+        let to_draw = gallery.borrow_mut().take_to_draw();
         for (key, source) in to_draw {
             let (renderer, cache, tx) = (renderer.clone(), cache.clone(), diagram_tx.clone());
             std::thread::spawn(move || {
@@ -225,7 +228,7 @@ where
                     }
                     Some(Ok(TermEvent::Mouse(mouse))) => app.on_mouse(from_terminal_mouse(mouse)),
                     Some(Ok(TermEvent::Resize(..))) => {
-                        set_cell_size(&app);
+                        set_cell_size(&gallery);
                         None
                     }
                     Some(Ok(_)) => None,
@@ -239,7 +242,10 @@ where
                     None
                 },
                 Some((key, result)) = diagram_rx.recv() => {
-                    app.on_diagram(key, result);
+                    gallery.borrow_mut().drawn(key, &result);
+                    if let Err(reason) = result {
+                        app.report_error(format!("The diagram could not be drawn: {reason}"));
+                    }
                     None
                 },
                 Some(result) = docker_rx.recv() => {
@@ -560,12 +566,12 @@ fn write_raw(escapes: &str) {
 }
 
 /// Tells the pictures how big a cell is, in pixels, as the terminal says.
-fn set_cell_size(app: &App) {
+fn set_cell_size(gallery: &RefCell<pictures::Gallery>) {
     if let Ok(size) = ratatui::crossterm::terminal::window_size()
         && size.columns > 0
         && size.rows > 0
     {
-        app.gallery()
+        gallery
             .borrow_mut()
             .set_cell((size.width / size.columns, size.height / size.rows));
     }

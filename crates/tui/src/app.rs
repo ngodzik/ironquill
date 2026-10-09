@@ -22,7 +22,6 @@ use crate::input::{
 };
 use crate::keymap::{self, Action, Focus, Mode, Pending};
 use crate::markdown;
-use crate::pictures::{Gallery, Picture, Pictures};
 use crate::references::{self, Reference};
 use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
@@ -607,8 +606,9 @@ pub(crate) struct App {
     link_marks: RefCell<Vec<(usize, usize, usize, Reference)>>,
     /// Whether a cited file or commit exists, as found out.
     known_references: RefCell<HashMap<Reference, bool>>,
-    /// The pictures replies show, and what the terminal needs for them.
-    gallery: RefCell<Gallery>,
+    /// Whether the screen draws pictures, so that a cited PNG shows in the
+    /// conversation rather than open as a file.
+    pictures_shown: bool,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -659,7 +659,6 @@ impl App {
             |name| name.to_string_lossy().into_owned(),
         );
         let usage_window = settings.usage_window.unwrap_or(3600);
-        let gallery = RefCell::new(Gallery::new(root.clone()));
         let mut app = Self {
             settings,
             root,
@@ -717,7 +716,7 @@ impl App {
             copy_marks: RefCell::new(Vec::new()),
             link_marks: RefCell::new(Vec::new()),
             known_references: RefCell::new(HashMap::new()),
-            gallery,
+            pictures_shown: false,
             zoomed: false,
             zoom_focus: None,
             completion: None,
@@ -1281,17 +1280,9 @@ impl App {
         }
     }
 
-    /// The pictures replies show.
-    pub(crate) fn gallery(&self) -> &RefCell<Gallery> {
-        &self.gallery
-    }
-
-    /// A diagram is drawn, or could not be: shown, or said why.
-    pub(crate) fn on_diagram(&mut self, key: u64, result: Result<PathBuf, String>) {
-        self.gallery.borrow_mut().drawn(key, &result);
-        if let Err(reason) = result {
-            self.report_error(format!("The diagram could not be drawn: {reason}"));
-        }
+    /// Says whether the screen draws pictures.
+    pub(crate) fn show_pictures(&mut self, shown: bool) {
+        self.pictures_shown = shown;
     }
 
     /// Opens a file a reply cited, at its line, showing what the branch
@@ -1507,8 +1498,7 @@ impl App {
                             // A picture shows in the conversation, where
                             // the terminal draws them.
                             Some(Reference::File { path, .. })
-                                if self.gallery.borrow().shows()
-                                    && path.to_lowercase().ends_with(".png") =>
+                                if self.pictures_shown && path.to_lowercase().ends_with(".png") =>
                             {
                                 self.transcript.push(Entry::Image(path));
                                 self.scroll_back.set(0);
@@ -3597,16 +3587,6 @@ fn command_name(agent: Agent) -> &'static str {
     }
 }
 
-impl Pictures for App {
-    fn lines(
-        &self,
-        picture: Picture<'_>,
-        width: usize,
-    ) -> Option<Vec<ratatui::text::Line<'static>>> {
-        self.gallery.borrow_mut().lines(picture, width)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::input::{KeyCode, KeyModifiers};
@@ -3669,7 +3649,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(140, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| crate::view::render(frame, &app))
+            .draw(|frame| crate::view::render(frame, &app, &crate::pictures::NoPictures))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let screen: String = buffer
@@ -3694,7 +3674,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| crate::view::render(frame, app))
+            .draw(|frame| crate::view::render(frame, app, &crate::pictures::NoPictures))
             .unwrap();
         let buffer = terminal.backend().buffer();
         buffer
