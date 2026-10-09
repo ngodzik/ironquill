@@ -685,6 +685,8 @@ pub struct App {
     /// Whether the screen draws pictures, so that a cited PNG shows in the
     /// conversation rather than open as a file.
     pictures_shown: bool,
+    /// Whether the window shows the codebase as a universe of files.
+    universe: bool,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -794,6 +796,7 @@ impl App {
             link_marks: RefCell::new(Vec::new()),
             known_references: RefCell::new(HashMap::new()),
             pictures_shown: false,
+            universe: false,
             zoomed: false,
             zoom_focus: None,
             completion: None,
@@ -1083,6 +1086,16 @@ impl App {
                 }
             }
             Action::ToggleUsage => self.usage_open = !self.usage_open,
+            Action::ToggleUniverse => {
+                self.universe = !self.universe;
+                if self.universe {
+                    self.notice = Some(
+                        "The universe: drag to turn, scroll to come closer, click a star to open \
+                         it (in the terminal, it shows only in the window)"
+                            .to_owned(),
+                    );
+                }
+            }
             Action::ToggleSeeThrough => {
                 self.settings.see_through = !self.settings.see_through;
                 self.notice = Some(
@@ -3291,6 +3304,11 @@ impl App {
             }
             Err(e) => pane.error = Some(e),
         }
+    }
+
+    /// Whether the window shows the codebase as a universe of files.
+    pub fn universe_shown(&self) -> bool {
+        self.universe
     }
 
     /// How opaque the window's background is now: 1 unless see-through.

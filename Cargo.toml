@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/llm",
     "crates/tools",
+    "crates/codemap",
     "crates/agent",
     "crates/ui",
     "crates/tui",
@@ -24,6 +25,7 @@ license     = "MIT"
 ironquill-core = { path = "crates/core", version = "0.1.0" }
 ironquill-llm  = { path = "crates/llm", version = "0.1.0" }
 ironquill-tools = { path = "crates/tools", version = "0.1.0" }
+ironquill-codemap = { path = "crates/codemap", version = "0.1.0" }
 ironquill-agent = { path = "crates/agent", version = "0.1.0" }
 ironquill-ui    = { path = "crates/ui", version = "0.1.0" }
 ironquill-tui   = { path = "crates/tui", version = "0.1.0" }
@@ -67,7 +69,8 @@ tree-sitter-javascript = "0.25.0"
 bevy       = { version = "0.19.1", default-features = false, features = [
     "std", "async_executor", "multi_threaded", "bevy_log", "bevy_winit", "bevy_window",
     "x11", "wayland", "bevy_render", "bevy_core_pipeline", "bevy_asset", "bevy_color", "hdr",
-    "bevy_post_process",
+    "bevy_post_process", "bevy_camera", "bevy_mesh", "bevy_image", "bevy_shader", "bevy_material",
+    "bevy_pbr", "bevy_light", "bevy_gizmos", "bevy_gizmos_render",
 ] }
 bevy_egui  = { version = "0.42.0", default-features = false, features = ["render", "default_fonts"] }
 egui_plot  = "0.37.0"

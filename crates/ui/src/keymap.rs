@@ -124,6 +124,8 @@ pub enum Action {
     NextUsageWindow,
     /// Let what is behind the window show through, or make it opaque again.
     ToggleSeeThrough,
+    /// Show the codebase as a universe of files, or the panes again.
+    ToggleUniverse,
 }
 
 /// Every shortcut, as Ctrl-S lists them. Kept next to the bindings above so
@@ -153,6 +155,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (
                 "Ctrl-M",
                 "the window see-through, as a terminal can be, or opaque (--gui only)",
+            ),
+            (
+                "Ctrl-N",
+                "the codebase as a universe of files, lit as the agent works (--gui only)",
             ),
             ("Ctrl-S", "this list"),
             ("Ctrl-C", "stop the request; twice to quit"),
@@ -268,6 +274,7 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         // Only the window tells Ctrl-M from Enter: a terminal sends both
         // the same, which is fine, as only the window can be see-through.
         KeyCode::Char('m') if ctrl => return Some(Action::ToggleSeeThrough),
+        KeyCode::Char('n') if ctrl => return Some(Action::ToggleUniverse),
         // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
         KeyCode::Char('e') if ctrl => return Some(Action::PickModel),
         _ => {}

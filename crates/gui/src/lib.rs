@@ -17,6 +17,7 @@ mod error;
 mod keys;
 mod theme;
 mod transcript;
+mod universe;
 mod usage;
 mod windows;
 
@@ -24,9 +25,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bevy::app::AppExit;
+use bevy::camera::CameraOutputMode;
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{KeyCode as PhysicalKey, KeyboardInput};
 use bevy::prelude::*;
+use bevy::render::render_resource::BlendState;
 use bevy::window::{CompositeAlphaMode, PrimaryWindow};
 use bevy::winit::{UpdateMode, WinitSettings};
 use bevy_egui::egui::{
@@ -34,12 +37,14 @@ use bevy_egui::egui::{
     UiBuilder,
 };
 use bevy_egui::{
-    EguiContexts, EguiInput, EguiInputSet, EguiPlugin, EguiPreUpdateSet, EguiPrimaryContextPass,
+    EguiContexts, EguiGlobalSettings, EguiInput, EguiInputSet, EguiPlugin, EguiPreUpdateSet,
+    EguiPrimaryContextPass, PrimaryEguiContext,
 };
+use ironquill_codemap::NodeKind;
 use ironquill_core::{ChatModel, Delegate};
 use ironquill_tools::Workspace;
 use ironquill_ui::editor::EditorMode;
-use ironquill_ui::input::KeyEvent;
+use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use ironquill_ui::keymap::{Focus, Mode, Pending};
 use ironquill_ui::{App, Effect, Host, Settings, Start, Waiting, clipboard};
 use tokio::runtime::Handle;
@@ -48,6 +53,7 @@ pub use error::GuiError;
 
 use crate::keys::{Held, Pressed};
 use crate::theme::{ACCENT, DIM, EDGE, PANEL, RAISED, SELECTED, TEXT, YELLOW};
+use crate::universe::{Assets3d, Universe};
 use crate::usage::UsageView;
 
 /// How long the window may sleep while a request runs: the spinner turns
@@ -95,6 +101,7 @@ where
     let mut host = Host::new(model, delegate, workspace);
     runtime.block_on(host.start(&mut app, start));
     let title = format!("{} · ironquill", app.name());
+    let universe = Universe::new(app.root().to_owned());
     let shell = Shell {
         app,
         host,
@@ -134,17 +141,32 @@ where
                 }),
         )
         .add_plugins(EguiPlugin::default())
-        .insert_non_send(shell)
-        .add_systems(Startup, |mut commands: Commands| {
-            commands.spawn(Camera2d);
+        // egui draws with the panels' camera, named rather than guessed:
+        // the universe has a camera of its own.
+        .insert_resource(EguiGlobalSettings {
+            auto_create_primary_context: false,
+            ..default()
         })
+        .insert_non_send(shell)
+        .insert_resource(universe)
+        .add_systems(Startup, (panels_camera, universe::setup))
         .add_systems(
             PreUpdate,
             quiet_modifiers
                 .after(EguiInputSet::WriteEguiEvents)
                 .before(EguiPreUpdateSet::BeginPass),
         )
-        .add_systems(Update, (read_keys::<M, D>, drive::<M, D>).chain())
+        .add_systems(
+            Update,
+            (
+                read_keys::<M, D>,
+                drive::<M, D>,
+                universe::show_or_hide,
+                universe_activity::<M, D>,
+                universe::animate,
+            )
+                .chain(),
+        )
         .add_systems(EguiPrimaryContextPass, draw::<M, D>)
         .run();
     match exit {
@@ -214,6 +236,61 @@ where
     }
 }
 
+/// The panels' camera: drawn over the universe's, blending into what it
+/// drew, or over nothing while the universe is hidden.
+fn panels_camera(mut commands: Commands) {
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: 1,
+            clear_color: ClearColorConfig::Custom(Color::NONE),
+            output_mode: CameraOutputMode::Write {
+                blend_state: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                clear_color: ClearColorConfig::Custom(Color::NONE),
+            },
+            ..default()
+        },
+        PrimaryEguiContext,
+    ));
+}
+
+/// Shows the panels over the universe while it is shown, over a cleared
+/// window otherwise.
+fn keep_panels_over(universe: &Universe, camera: &mut Mut<Camera>) {
+    let CameraOutputMode::Write { clear_color, .. } = &camera.output_mode else {
+        return;
+    };
+    // Checked before writing: a write would mark the camera changed.
+    if matches!(clear_color, ClearColorConfig::None) == universe.shown {
+        return;
+    }
+    if let CameraOutputMode::Write { clear_color, .. } = &mut camera.output_mode {
+        *clear_color = if universe.shown {
+            ClearColorConfig::None
+        } else {
+            ClearColorConfig::Custom(Color::NONE)
+        };
+    }
+}
+
+/// Lights the files the agent works on in the universe.
+fn universe_activity<M, D>(
+    shell: NonSend<Shell<M, D>>,
+    mut universe: ResMut<Universe>,
+    mut commands: Commands,
+    assets: Option<Res<Assets3d>>,
+) where
+    M: ChatModel + 'static,
+    D: Delegate + 'static,
+{
+    universe::light_up(
+        &mut universe,
+        shell.app.transcript(),
+        &mut commands,
+        assets.as_deref(),
+    );
+}
+
 /// Drops the modifiers bevy_egui reports every frame when they did not
 /// change. egui takes any event as a reason to draw again at once, so that
 /// one, sent each frame, kept the window from ever sleeping: two cores busy
@@ -274,6 +351,8 @@ fn drive<M, D>(
     mut exit: MessageWriter<AppExit>,
     mut winit: ResMut<WinitSettings>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
+    mut universe: ResMut<Universe>,
+    mut panels: Query<&mut Camera, With<Camera2d>>,
 ) where
     M: ChatModel + 'static,
     D: Delegate + 'static,
@@ -301,12 +380,28 @@ fn drive<M, D>(
     } else {
         IDLE_WAIT
     };
+    let shown = shell.app.universe_shown();
+    if universe.shown != shown {
+        universe.shown = shown;
+    }
+    if let Ok(mut camera) = panels.single_mut() {
+        keep_panels_over(&universe, &mut camera);
+    }
     // Written only when it changes: a write wakes the loop, and a write
-    // every frame would keep it from ever sleeping.
-    let focused = UpdateMode::reactive(wait);
+    // every frame would keep it from ever sleeping. The universe moves all
+    // the time, and only it draws without rest.
+    let focused = if shown {
+        UpdateMode::Continuous
+    } else {
+        UpdateMode::reactive(wait)
+    };
     if winit.focused_mode != focused {
         winit.focused_mode = focused;
-        winit.unfocused_mode = UpdateMode::reactive_low_power(wait);
+        winit.unfocused_mode = if shown {
+            UpdateMode::Continuous
+        } else {
+            UpdateMode::reactive_low_power(wait)
+        };
     }
     if shell.app.should_quit() {
         exit.write(AppExit::Success);
@@ -318,6 +413,7 @@ fn drive<M, D>(
 fn draw<M, D>(
     mut contexts: EguiContexts,
     mut shell: NonSendMut<Shell<M, D>>,
+    mut universe: ResMut<Universe>,
     mut styled: Local<bool>,
 ) -> Result
 where
@@ -383,13 +479,28 @@ where
         }
     }
 
-    if shell.app.tree().is_some() {
+    if shell.app.universe_shown() {
+        // The conversation beside the universe, translucent so that the
+        // stars glow through it; the universe takes the rest.
+        let chat = egui::Panel::right("chat-beside-universe")
+            .default_size(500.0)
+            .frame(pane.fill(theme::see(PANEL, 0.62 * opacity)))
+            .show(&mut root, |ui| conversation(ui, shell));
+        let window = ctx.content_rect().width().max(1.0);
+        universe.covered = (window - chat.response.rect.left()).max(0.0) / window;
+        egui::CentralPanel::default()
+            .frame(Frame::NONE)
+            .show(&mut root, |ui| {
+                universe_view(ui, &mut universe, &mut shell.app, &mut shell.keys);
+            });
+    } else if shell.app.tree().is_some() {
         egui::Panel::left("tree")
             .default_size(280.0)
             .frame(pane)
             .show(&mut root, |ui| tree(ui, &shell.app));
     }
-    if shell.app.file().is_some() {
+    if shell.app.universe_shown() {
+    } else if shell.app.file().is_some() {
         egui::Panel::right("chat-beside-file")
             .default_size(520.0)
             .frame(pane)
@@ -408,6 +519,164 @@ where
         ctx.request_repaint();
     }
     Ok(())
+}
+
+/// The universe's own controls: dragging turns it, the wheel comes closer,
+/// a click centres a star, a double click opens its file. Names show for
+/// the star under the pointer, the one chosen, and those the agent just
+/// touched.
+fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App, keys: &mut Vec<KeyEvent>) {
+    let rect = ui.max_rect();
+    let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+    if response.dragged() {
+        let delta = response.drag_delta();
+        universe.drag += Vec2::new(delta.x, delta.y);
+    }
+    if response.hovered() {
+        universe.zoom += ui.input(|i| i.smooth_scroll_delta.y);
+    }
+    let pointer = response.hover_pos();
+    universe.hovered = pointer.and_then(|at| {
+        universe
+            .on_screen
+            .iter()
+            .enumerate()
+            .filter_map(|(node, p)| p.map(|p| (node, egui::pos2(p.x, p.y).distance(at))))
+            .filter(|(_, d)| *d < 18.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(node, _)| node)
+    });
+    if response.double_clicked()
+        && let Some(node) = universe.hovered
+        && let Some(map) = universe.map()
+        && matches!(map.nodes[node].kind, NodeKind::File { .. })
+    {
+        let path = universe.root().join(&map.nodes[node].path);
+        app.open_path(path);
+        keys.push(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    } else if response.clicked() {
+        universe.chosen = universe.hovered;
+    }
+
+    let painter = ui.painter_at(rect);
+    let Some(map) = universe.map() else {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Mapping the codebase…",
+            egui::FontId::proportional(18.0),
+            DIM,
+        );
+        return;
+    };
+    // The names worth reading: under the pointer, chosen, or just touched.
+    for (node, at) in universe.on_screen.iter().enumerate() {
+        let Some(at) = at else {
+            continue;
+        };
+        let glow = universe.glow(node);
+        let picked = universe.hovered == Some(node) || universe.chosen == Some(node);
+        if !picked && glow < 1.0 {
+            continue;
+        }
+        let entry = &map.nodes[node];
+        let [r, g, b] = universe::srgb(entry.kind);
+        let fade = if picked { 1.0 } else { (glow / 8.0).min(1.0) };
+        let colour = Color32::from_rgb(r, g, b).gamma_multiply(0.4 + 0.6 * fade);
+        let text = if picked {
+            match entry.kind {
+                NodeKind::File { lines, .. } => format!("{}  ·  {lines} lines", entry.path),
+                NodeKind::Folder => format!(
+                    "{}/",
+                    if entry.path.is_empty() {
+                        "."
+                    } else {
+                        &entry.path
+                    }
+                ),
+            }
+        } else {
+            entry.name().to_owned()
+        };
+        let at = egui::pos2(at.x + 12.0, at.y - 10.0);
+        let font = egui::FontId::proportional(if picked { 15.0 } else { 13.0 });
+        painter.text(
+            at + egui::vec2(1.0, 1.0),
+            egui::Align2::LEFT_BOTTOM,
+            &text,
+            font.clone(),
+            Color32::from_black_alpha(200),
+        );
+        painter.text(at, egui::Align2::LEFT_BOTTOM, &text, font, colour);
+    }
+
+    // What the universe is, in the corner, with the colours' meaning.
+    let files = map
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::File { .. }))
+        .count();
+    let imports = map
+        .edges
+        .iter()
+        .filter(|e| e.kind == ironquill_codemap::EdgeKind::Imports)
+        .count();
+    let corner = rect.left_top() + egui::vec2(24.0, 22.0);
+    painter.text(
+        corner,
+        egui::Align2::LEFT_TOP,
+        "Universe",
+        egui::FontId::proportional(26.0),
+        TEXT,
+    );
+    let mut summary = format!("{} · {files} files · {imports} imports", app.project());
+    if map.left_out > 0 {
+        summary.push_str(&format!(" · {} more not shown", map.left_out));
+    }
+    painter.text(
+        corner + egui::vec2(0.0, 34.0),
+        egui::Align2::LEFT_TOP,
+        summary,
+        egui::FontId::proportional(13.0),
+        DIM,
+    );
+    let legend = [
+        ("Rust", ironquill_codemap::Language::Rust),
+        ("Python", ironquill_codemap::Language::Python),
+        ("TypeScript", ironquill_codemap::Language::TypeScript),
+        ("JavaScript", ironquill_codemap::Language::JavaScript),
+        ("Markdown", ironquill_codemap::Language::Markdown),
+        ("Settings", ironquill_codemap::Language::Config),
+    ];
+    let mut at = corner + egui::vec2(0.0, 58.0);
+    for (name, language) in legend {
+        let [r, g, b] = universe::srgb(NodeKind::File { language, lines: 0 });
+        painter.circle_filled(at + egui::vec2(5.0, 7.0), 4.0, Color32::from_rgb(r, g, b));
+        painter.text(
+            at + egui::vec2(16.0, 0.0),
+            egui::Align2::LEFT_TOP,
+            name,
+            egui::FontId::proportional(12.0),
+            DIM,
+        );
+        at.y += 18.0;
+    }
+    let [r, g, b] = universe::srgb(NodeKind::Folder);
+    painter.circle_filled(at + egui::vec2(5.0, 7.0), 4.0, Color32::from_rgb(r, g, b));
+    painter.text(
+        at + egui::vec2(16.0, 0.0),
+        egui::Align2::LEFT_TOP,
+        "folders",
+        egui::FontId::proportional(12.0),
+        DIM,
+    );
+    painter.text(
+        rect.left_bottom() + egui::vec2(24.0, -18.0),
+        egui::Align2::LEFT_BOTTOM,
+        "drag to turn · scroll to come closer · click a star to centre it · double-click to open it · Ctrl-N to leave",
+        egui::FontId::proportional(12.0),
+        DIM,
+    );
 }
 
 /// The conversation, following new output unless a key scrolled it back.
