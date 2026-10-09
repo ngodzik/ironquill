@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use ratatui::style::Color;
+use crate::style::Rgb;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -16,7 +16,7 @@ const THEME: &str = "base16-ocean.dark";
 const MAX_LINES: usize = 20_000;
 
 /// A line as coloured runs of text.
-pub(crate) type StyledLine = Vec<(Color, String)>;
+pub(crate) type StyledLine = Vec<(Rgb, String)>;
 
 /// The grammars and the theme, loaded once and shared by every file opened.
 pub(crate) struct Highlighter {
@@ -63,7 +63,7 @@ impl Highlighter {
                     runs.into_iter()
                         .map(|(style, text)| {
                             let c = style.foreground;
-                            (Color::Rgb(c.r, c.g, c.b), text.to_owned())
+                            (Rgb(c.r, c.g, c.b), text.to_owned())
                         })
                         .collect(),
                 )

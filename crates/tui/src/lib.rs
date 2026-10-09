@@ -26,6 +26,7 @@ mod pictures;
 mod references;
 mod review;
 mod sessions;
+pub mod style;
 mod tree;
 mod usage;
 mod view;

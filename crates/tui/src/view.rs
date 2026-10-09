@@ -611,6 +611,11 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
     app.set_panes(panes);
 }
 
+/// A colour of the state, as the terminal draws it.
+fn rgb(c: crate::style::Rgb) -> Color {
+    Color::Rgb(c.0, c.1, c.2)
+}
+
 /// Where a pane was drawn, as the state reads it to match a click.
 fn cells(area: Rect) -> crate::input::Rect {
     crate::input::Rect::new(area.x, area.y, area.width, area.height)
@@ -870,7 +875,7 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
 /// A line as styled runs: coloured by its language when known, plain otherwise.
 fn line_runs(file: &Editor, row: usize, text: &str) -> Vec<(Style, String)> {
     match file.styled().and_then(|s| s.get(row)) {
-        Some(runs) => runs.iter().map(|(c, t)| (fg(*c), t.clone())).collect(),
+        Some(runs) => runs.iter().map(|(c, t)| (fg(rgb(*c)), t.clone())).collect(),
         None => vec![(Style::new(), text.to_owned())],
     }
 }
@@ -2044,7 +2049,7 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
             let mut points = log.cost_steps(&m.model, from);
             let last = points.last().map_or(0.0, |p| p.1);
             points.push((span, last));
-            (m.color, points)
+            (rgb(m.color), points)
         })
         .collect();
     let top = models
@@ -2127,7 +2132,7 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
             format!(" · {} rebuilt", m.rebuilds)
         };
         lines.push(Line::from(vec![
-            Span::styled("● ", fg(m.color)),
+            Span::styled("● ", fg(rgb(m.color))),
             Span::raw(m.model.clone()),
         ]));
         lines.push(Line::styled(

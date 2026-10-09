@@ -1,7 +1,7 @@
 //! What each call to a model used, over time, for the usage pane: where the
 //! money goes, how full the conversation is, and when a cache was rebuilt.
 
-use ratatui::style::Color;
+use crate::style::Rgb;
 use serde::{Deserialize, Serialize};
 
 /// How long samples are kept: the pane shows a day at most.
@@ -10,14 +10,14 @@ pub(crate) const KEEP_SECS: u64 = 24 * 60 * 60;
 /// Colours told apart with any colour vision (Okabe and Ito's), given to
 /// models in the order they first appear, so that one keeps its colour
 /// whatever the window shows.
-const PALETTE: [Color; 7] = [
-    Color::Rgb(230, 159, 0),
-    Color::Rgb(86, 180, 233),
-    Color::Rgb(0, 158, 115),
-    Color::Rgb(240, 228, 66),
-    Color::Rgb(0, 114, 178),
-    Color::Rgb(213, 94, 0),
-    Color::Rgb(204, 121, 167),
+const PALETTE: [Rgb; 7] = [
+    Rgb(230, 159, 0),
+    Rgb(86, 180, 233),
+    Rgb(0, 158, 115),
+    Rgb(240, 228, 66),
+    Rgb(0, 114, 178),
+    Rgb(213, 94, 0),
+    Rgb(204, 121, 167),
 ];
 
 /// One call to a model.
@@ -59,7 +59,7 @@ pub(crate) struct UsageLog {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ModelUse {
     pub(crate) model: String,
-    pub(crate) color: Color,
+    pub(crate) color: Rgb,
     pub(crate) calls: usize,
     pub(crate) cost: f64,
     /// Cache read, as a share of the input, over the calls that said.
@@ -82,7 +82,7 @@ impl UsageLog {
     }
 
     /// A model's colour: by the order models first appear.
-    pub(crate) fn color(&self, model: &str) -> Color {
+    pub(crate) fn color(&self, model: &str) -> Rgb {
         let mut seen: Vec<&str> = Vec::new();
         for s in &self.samples {
             if !seen.contains(&s.model.as_str()) {
