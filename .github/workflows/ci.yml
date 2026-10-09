@@ -65,10 +65,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # The ref is the toolchain: this installs Rust 1.89. Keep it in step with
+      # The ref is the toolchain: this installs Rust 1.95. Keep it in step with
       # rust-version in Cargo.toml, which is the value that binds. Dependabot
       # is told to leave it alone in dependabot.yml.
-      - uses: dtolnay/rust-toolchain@1.89
+      - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
 
       # The ref above and rust-version state the same fact in two places, and two

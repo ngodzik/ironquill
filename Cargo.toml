@@ -15,7 +15,7 @@ version     = "0.1.0"
 edition     = "2024"
 # The oldest toolchain the code is known to build on. CI holds it to this, so
 # the promise is checked rather than asserted.
-rust-version = "1.89"
+rust-version = "1.95"
 authors     = ["Nicolas Godzik"]
 license     = "MIT"
 
@@ -50,7 +50,7 @@ similar    = "3.2.0"
 toml       = "1.1.6"
 # The directory walker of ripgrep: it skips what .gitignore skips.
 ignore     = "0.4.33"
-# Parsers for the code map. 0.26 keeps the oldest supported Rust at 1.89.
+# Parsers for the code map.
 tree-sitter            = "0.26.13"
 tree-sitter-rust       = "0.24.2"
 tree-sitter-python     = "0.25.0"
