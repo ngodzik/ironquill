@@ -208,11 +208,28 @@ fn thousands(n: usize) -> String {
 }
 
 fn name_font(scale: f32) -> FontId {
-    FontId::proportional(16.0 * scale)
+    FontId::proportional(text_size(16.0 * scale))
 }
 
 fn small_font(scale: f32) -> FontId {
-    FontId::proportional(12.0 * scale)
+    FontId::proportional(text_size(12.0 * scale))
+}
+
+/// The sizes text is drawn at as the plan zooms. egui draws each size's
+/// letters into one texture, and makes it anew, whole, once full: a size
+/// for every step of the wheel filled it within a few turns, and the frame
+/// it is made anew in is drawn empty, a flash of what is behind.
+const TEXT_SIZES: [f32; 12] = [
+    7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 19.0, 22.0, 26.0, 30.0,
+];
+
+/// The size of `TEXT_SIZES` nearest to `size`.
+fn text_size(size: f32) -> f32 {
+    TEXT_SIZES
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - size).abs().total_cmp(&(b - size).abs()))
+        .unwrap_or(size)
 }
 
 /// A layer's colour: cool for the foundations, warm for what sits on top.
@@ -1023,6 +1040,10 @@ mod tests {
         assert_eq!(layer_colour(2, 3), ACCENT);
         assert_eq!(layer_colour(0, 1), CYAN);
         assert_eq!(thousands(980), "980");
+        // However far the plan zooms, text takes a few sizes only.
+        assert!((text_size(15.2) - 16.0).abs() < f32::EPSILON);
+        assert!((text_size(3.0) - 7.0).abs() < f32::EPSILON);
+        assert!((text_size(64.0) - 30.0).abs() < f32::EPSILON);
         assert_eq!(thousands(10_662), "10.7k");
         let down = [
             pos2(0.0, 0.0),

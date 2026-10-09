@@ -266,21 +266,31 @@ fn panels_camera(mut commands: Commands) {
 }
 
 /// Shows the panels over the universe while it is shown, over a cleared
-/// window otherwise.
-fn keep_panels_over(universe: &Universe, camera: &mut Mut<Camera>) {
+/// window otherwise: the theme's background when the window is opaque, so
+/// that a frame egui misses (it skips one while its font texture is made
+/// anew) shows the background rather than the desktop behind the window.
+fn keep_panels_over(universe: &Universe, opaque: bool, camera: &mut Mut<Camera>) {
+    let wanted = if universe.shown {
+        None
+    } else if opaque {
+        let [r, g, b, _] = theme::BACKGROUND.to_array();
+        Some(Color::srgb_u8(r, g, b))
+    } else {
+        Some(Color::NONE)
+    };
     let CameraOutputMode::Write { clear_color, .. } = &camera.output_mode else {
         return;
     };
+    let current = match clear_color {
+        ClearColorConfig::Custom(colour) => Some(*colour),
+        _ => None,
+    };
     // Checked before writing: a write would mark the camera changed.
-    if matches!(clear_color, ClearColorConfig::None) == universe.shown {
+    if current == wanted {
         return;
     }
     if let CameraOutputMode::Write { clear_color, .. } = &mut camera.output_mode {
-        *clear_color = if universe.shown {
-            ClearColorConfig::None
-        } else {
-            ClearColorConfig::Custom(Color::NONE)
-        };
+        *clear_color = wanted.map_or(ClearColorConfig::None, ClearColorConfig::Custom);
     }
 }
 
@@ -396,7 +406,7 @@ fn drive<M, D>(
         universe.shown = shown;
     }
     if let Ok(mut camera) = panels.single_mut() {
-        keep_panels_over(&universe, &mut camera);
+        keep_panels_over(&universe, shell.app.opacity() >= 1.0, &mut camera);
     }
     // Written only when it changes: a write wakes the loop, and a write
     // every frame would keep it from ever sleeping. The universe moves all
