@@ -47,6 +47,18 @@ pub struct Operation {
     pub path: String,
     /// What it does, in a line, as the spec says.
     pub summary: String,
+    /// What it does, at length, as the spec says.
+    pub description: String,
+    /// What it is asked with: in its path, its query, its headers.
+    pub parameters: Vec<Parameter>,
+    /// What it is sent, if anything.
+    pub body: Option<Body>,
+    /// What it may answer, by status, in the spec's order.
+    pub responses: Vec<Response>,
+    /// Whether it asks for credentials.
+    pub secured: bool,
+    /// Where the API is, as the spec says, if it does.
+    pub server: Option<String>,
     /// The spec's tags for it: the resource it is about, mostly.
     pub tags: Vec<String>,
     /// Whether the spec says it is deprecated.
@@ -58,6 +70,53 @@ pub struct Operation {
     /// The front end's files that call it.
     pub callers: Vec<usize>,
 }
+
+/// Something an operation is asked with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parameter {
+    /// Its name.
+    pub name: String,
+    /// Where it goes: `path`, `query`, `header` or `cookie`.
+    pub location: String,
+    /// Whether it must be given.
+    pub required: bool,
+    /// Its type, as read: `string`, `integer`, `string[]`, `DagRunState`.
+    pub kind: String,
+    /// What it is, as the spec says.
+    pub description: String,
+    /// A value it may take, as the spec gives one, if it does.
+    pub example: Option<String>,
+}
+
+/// What an operation is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Body {
+    /// Its media type: `application/json`.
+    pub media: String,
+    /// The name of its schema, when it is one of the spec's.
+    pub schema: Option<String>,
+    /// Whether it must be sent.
+    pub required: bool,
+    /// An example of it: the spec's, or made from its schema.
+    pub example: Option<String>,
+}
+
+/// An answer an operation may give.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Response {
+    /// Its status: `200`, `404`, `default`.
+    pub status: String,
+    /// What it means, as the spec says.
+    pub description: String,
+    /// The name of its schema, when it is one of the spec's.
+    pub schema: Option<String>,
+    /// An example of it: the spec's, or made from its schema.
+    pub example: Option<String>,
+}
+
+/// How deep an example is made from nested schemas before it stops: deep
+/// enough to show the shape, short enough to read.
+const EXAMPLE_DEPTH: usize = 4;
 
 /// The methods an OpenAPI path item may hold.
 const METHODS: [&str; 8] = [
@@ -202,14 +261,20 @@ fn operations_of(spec: usize, text: &str) -> Vec<Operation> {
     let Ok(documents) = YamlLoader::load_from_str(text) else {
         return Vec::new();
     };
-    let Some(Yaml::Hash(paths)) = documents.first().map(|d| &d["paths"]) else {
+    let Some(doc) = documents.first() else {
         return Vec::new();
     };
+    let Yaml::Hash(paths) = &doc["paths"] else {
+        return Vec::new();
+    };
+    let server = doc["servers"][0]["url"].as_str().map(str::to_owned);
+    let secured_by_default = doc["security"].as_vec().is_some_and(|s| !s.is_empty());
     let mut operations = Vec::new();
     for (path, item) in paths {
         let Some(path) = path.as_str() else {
             continue;
         };
+        let item = resolve(doc, item);
         for method in METHODS {
             let operation = &item[method];
             if operation.is_badvalue() {
@@ -226,11 +291,34 @@ fn operations_of(spec: usize, text: &str) -> Vec<Operation> {
                 id if id.is_empty() => format!("{} {path}", method.to_uppercase()),
                 id => id,
             };
+            // The path's own parameters, then the operation's, which win.
+            let mut parameters: Vec<Parameter> = Vec::new();
+            for list in [&item["parameters"], &operation["parameters"]] {
+                for parameter in list.as_vec().into_iter().flatten() {
+                    let Some(parameter) = parameter_of(doc, parameter) else {
+                        continue;
+                    };
+                    parameters.retain(|p| {
+                        !(p.name == parameter.name && p.location == parameter.location)
+                    });
+                    parameters.push(parameter);
+                }
+            }
+            let secured = match operation["security"].as_vec() {
+                Some(list) => !list.is_empty(),
+                None => secured_by_default,
+            };
             operations.push(Operation {
                 id,
                 method: method.to_uppercase(),
                 path: path.to_owned(),
                 summary: text("summary"),
+                description: text("description"),
+                parameters,
+                body: body_of(doc, &operation["requestBody"]),
+                responses: responses_of(doc, &operation["responses"]),
+                secured,
+                server: server.clone(),
                 tags: operation["tags"]
                     .as_vec()
                     .into_iter()
@@ -245,6 +333,325 @@ fn operations_of(spec: usize, text: &str) -> Vec<Operation> {
         }
     }
     operations
+}
+
+/// What `node` stands for: itself, or what its `$ref` names in the same
+/// spec, followed a few times.
+fn resolve<'a>(doc: &'a Yaml, node: &'a Yaml) -> &'a Yaml {
+    let mut node = node;
+    for _ in 0..8 {
+        let Some(reference) = node["$ref"].as_str() else {
+            return node;
+        };
+        let Some(pointer) = reference.strip_prefix("#/") else {
+            return node;
+        };
+        let mut target = doc;
+        for part in pointer.split('/') {
+            target = &target[part.replace("~1", "/").replace("~0", "~").as_str()];
+        }
+        if target.is_badvalue() {
+            return node;
+        }
+        node = target;
+    }
+    node
+}
+
+/// The name of the spec's schema `schema` refers to, if it does.
+fn schema_name(schema: &Yaml) -> Option<String> {
+    let reference = schema["$ref"].as_str()?;
+    Some(reference.rsplit('/').next().unwrap_or(reference).to_owned())
+}
+
+fn parameter_of(doc: &Yaml, parameter: &Yaml) -> Option<Parameter> {
+    let parameter = resolve(doc, parameter);
+    let name = parameter["name"].as_str()?.to_owned();
+    let location = parameter["in"].as_str().unwrap_or("query").to_owned();
+    let schema = &parameter["schema"];
+    let example = parameter["example"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| plain(&resolve(doc, schema)["example"]))
+        .or_else(|| plain(&resolve(doc, schema)["default"]));
+    Some(Parameter {
+        required: parameter["required"]
+            .as_bool()
+            .unwrap_or(location == "path"),
+        // A path's parameter is text, whatever the spec leaves unsaid.
+        kind: match kind(schema) {
+            any if any == "any" && location == "path" => "string".to_owned(),
+            kind => kind,
+        },
+        description: parameter["description"]
+            .as_str()
+            .or_else(|| resolve(doc, schema)["description"].as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+        name,
+        location,
+        example,
+    })
+}
+
+/// A scalar of YAML as text, for a parameter's example.
+fn plain(value: &Yaml) -> Option<String> {
+    match value {
+        Yaml::String(s) | Yaml::Real(s) => Some(s.clone()),
+        Yaml::Integer(i) => Some(i.to_string()),
+        Yaml::Boolean(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// A schema's type, in a word or two: `string`, `integer`, `DagRun[]`,
+/// `string | null`.
+fn kind(schema: &Yaml) -> String {
+    if let Some(name) = schema_name(schema) {
+        return name;
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(options) = schema[key].as_vec() {
+            let kinds: Vec<String> = options.iter().map(kind).collect();
+            return kinds.join(" | ");
+        }
+    }
+    match schema["type"].as_str() {
+        Some("array") => format!("{}[]", kind(&schema["items"])),
+        Some(kind) => match schema["format"].as_str() {
+            Some(format) => format!("{kind} ({format})"),
+            None => kind.to_owned(),
+        },
+        None if schema["enum"].as_vec().is_some() => "enum".to_owned(),
+        None => "any".to_owned(),
+    }
+}
+
+/// The media type to show of a `content`: JSON when there is.
+fn media_of(content: &Yaml) -> Option<(String, &Yaml)> {
+    let Yaml::Hash(content) = content else {
+        return None;
+    };
+    let mut first = None;
+    for (media, value) in content {
+        let Some(media) = media.as_str() else {
+            continue;
+        };
+        if media.contains("json") {
+            return Some((media.to_owned(), value));
+        }
+        first.get_or_insert((media.to_owned(), value));
+    }
+    first
+}
+
+fn body_of(doc: &Yaml, body: &Yaml) -> Option<Body> {
+    if body.is_badvalue() {
+        return None;
+    }
+    let body = resolve(doc, body);
+    let (media, value) = media_of(&body["content"])?;
+    Some(Body {
+        schema: schema_name(&value["schema"]),
+        required: body["required"].as_bool().unwrap_or(false),
+        example: example_of(doc, value),
+        media,
+    })
+}
+
+fn responses_of(doc: &Yaml, responses: &Yaml) -> Vec<Response> {
+    let Yaml::Hash(responses) = responses else {
+        return Vec::new();
+    };
+    let mut found: Vec<Response> = responses
+        .iter()
+        .map(|(status, response)| {
+            let status = match status {
+                Yaml::Integer(code) => code.to_string(),
+                other => other.as_str().unwrap_or_default().to_owned(),
+            };
+            let response = resolve(doc, response);
+            let media = media_of(&response["content"]);
+            Response {
+                status,
+                description: response["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+                schema: media
+                    .as_ref()
+                    .and_then(|(_, value)| schema_name(&value["schema"])),
+                example: media.and_then(|(_, value)| example_of(doc, value)),
+            }
+        })
+        .collect();
+    // Successes first, then the errors, each in the order of their codes.
+    found.sort_by(|a, b| a.status.cmp(&b.status));
+    found
+}
+
+/// An example of what a media type holds, as pretty JSON: the spec's own,
+/// or one made from its schema.
+fn example_of(doc: &Yaml, media: &Yaml) -> Option<String> {
+    let given = if media["example"].is_badvalue() {
+        media["examples"]
+            .as_hash()
+            .and_then(|examples| examples.values().next())
+            .map(|example| &resolve(doc, example)["value"])
+            .filter(|value| !value.is_badvalue())
+    } else {
+        Some(&media["example"])
+    };
+    let value = match given {
+        Some(value) => json(value),
+        None => {
+            let schema = &media["schema"];
+            if schema.is_badvalue() {
+                return None;
+            }
+            made(doc, schema, 0)
+        }
+    };
+    serde_json::to_string_pretty(&value).ok()
+}
+
+/// YAML as JSON.
+fn json(value: &Yaml) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Yaml::String(s) => Value::String(s.clone()),
+        Yaml::Integer(i) => Value::from(*i),
+        Yaml::Real(r) => r.parse::<f64>().map_or(Value::Null, Value::from),
+        Yaml::Boolean(b) => Value::Bool(*b),
+        Yaml::Array(items) => Value::Array(items.iter().map(json).collect()),
+        Yaml::Hash(hash) => Value::Object(
+            hash.iter()
+                .filter_map(|(k, v)| Some((k.as_str()?.to_owned(), json(v))))
+                .collect(),
+        ),
+        _ => Value::Null,
+    }
+}
+
+/// A value of the shape `schema` describes: its example, default or first
+/// choice where it gives one, a placeholder of its type otherwise.
+fn made(doc: &Yaml, schema: &Yaml, depth: usize) -> serde_json::Value {
+    use serde_json::Value;
+    let schema = resolve(doc, schema);
+    for key in ["example", "default"] {
+        if !schema[key].is_badvalue() {
+            return json(&schema[key]);
+        }
+    }
+    if let Some(first) = schema["enum"].as_vec().and_then(|e| e.first()) {
+        return json(first);
+    }
+    if depth > EXAMPLE_DEPTH {
+        return Value::Null;
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(options) = schema[key].as_vec() {
+            // The first that is not null.
+            let option = options
+                .iter()
+                .find(|o| resolve(doc, o)["type"].as_str() != Some("null"))
+                .or(options.first());
+            return option.map_or(Value::Null, |o| made(doc, o, depth + 1));
+        }
+    }
+    if let Some(parts) = schema["allOf"].as_vec() {
+        let mut merged = serde_json::Map::new();
+        for part in parts {
+            if let Value::Object(fields) = made(doc, part, depth + 1) {
+                merged.extend(fields);
+            }
+        }
+        return Value::Object(merged);
+    }
+    match schema["type"].as_str() {
+        Some("object") | None if schema["properties"].as_hash().is_some() => {
+            let fields = schema["properties"]
+                .as_hash()
+                .into_iter()
+                .flatten()
+                .filter_map(|(name, property)| {
+                    Some((name.as_str()?.to_owned(), made(doc, property, depth + 1)))
+                })
+                .collect();
+            Value::Object(fields)
+        }
+        Some("object") => Value::Object(serde_json::Map::new()),
+        Some("array") => Value::Array(vec![made(doc, &schema["items"], depth + 1)]),
+        Some("integer") => Value::from(0),
+        Some("number") => Value::from(0.0),
+        Some("boolean") => Value::Bool(true),
+        Some("string") => Value::String(
+            match schema["format"].as_str() {
+                Some("date-time") => "2025-01-01T00:00:00Z",
+                Some("date") => "2025-01-01",
+                Some("uuid") => "00000000-0000-0000-0000-000000000000",
+                Some("uri" | "url") => "https://example.com",
+                Some("email") => "someone@example.com",
+                _ => "string",
+            }
+            .to_owned(),
+        ),
+        _ => Value::Null,
+    }
+}
+
+impl Operation {
+    /// A request to it with `curl`: its parameters as placeholders, unless
+    /// the spec gives an example, and its body made from its schema.
+    #[must_use]
+    pub fn curl(&self) -> String {
+        let base = self
+            .server
+            .as_deref()
+            .filter(|s| s.starts_with("http"))
+            .unwrap_or("http://localhost:8080")
+            .trim_end_matches('/');
+        let mut path = self.path.clone();
+        for parameter in self.parameters.iter().filter(|p| p.location == "path") {
+            let value = parameter
+                .example
+                .clone()
+                .unwrap_or_else(|| format!("<{}>", parameter.name));
+            path = path.replace(&format!("{{{}}}", parameter.name), &value);
+        }
+        let query: Vec<String> = self
+            .parameters
+            .iter()
+            .filter(|p| p.location == "query" && p.required)
+            .map(|p| {
+                let value = p.example.clone().unwrap_or_else(|| format!("<{}>", p.name));
+                format!("{}={value}", p.name)
+            })
+            .collect();
+        if !query.is_empty() {
+            path = format!("{path}?{}", query.join("&"));
+        }
+        let mut lines = vec![format!("curl -X {} \"{base}{path}\"", self.method)];
+        if self.secured {
+            lines.push("  -H \"Authorization: Bearer $TOKEN\"".to_owned());
+        }
+        for header in self
+            .parameters
+            .iter()
+            .filter(|p| p.location == "header" && p.required)
+        {
+            lines.push(format!("  -H \"{}: <{}>\"", header.name, header.name));
+        }
+        if let Some(body) = &self.body {
+            lines.push(format!("  -H \"Content-Type: {}\"", body.media));
+            if let Some(example) = &body.example {
+                lines.push(format!("  -d '{}'", example.replace('\'', "'\\''")));
+            }
+        }
+        lines.join(" \\\n")
+    }
 }
 
 /// Whether a settings file is an OpenAPI (or Swagger) spec: said near its
@@ -463,5 +870,132 @@ mod tests {
         assert!(!called("forgetDag").contains(&"GetDag"));
         assert!(is_spec("{\n  \"openapi\": \"3.0.0\""));
         assert!(!is_spec("name: provider\n"));
+    }
+
+    #[test]
+    fn what_an_operation_takes_and_answers_and_a_request_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = r#"openapi: 3.1.0
+servers:
+- url: https://airflow.example.com
+security:
+- HTTPBearer: []
+paths:
+  /dags/{dag_id}/dagRuns:
+    parameters:
+    - name: dag_id
+      in: path
+      required: true
+      schema:
+        type: string
+    post:
+      summary: Trigger Dag Run
+      description: Trigger a Dag.
+      operationId: trigger_dag_run
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TriggerBody'
+      responses:
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example: {dag_run_id: manual_1}
+components:
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        default: 50
+  schemas:
+    TriggerBody:
+      type: object
+      properties:
+        logical_date:
+          anyOf:
+          - type: 'null'
+          - type: string
+            format: date-time
+        conf:
+          type: object
+        note:
+          type: string
+          example: it's late
+    Error:
+      type: object
+      properties:
+        detail:
+          type: string
+"#;
+        write(dir.path(), "openapi.yaml", spec);
+        let map = map(dir.path(), 100);
+        let operation = &map.operations[0];
+        assert_eq!(operation.description, "Trigger a Dag.");
+        let parameters: Vec<(&str, &str, bool, &str)> = operation
+            .parameters
+            .iter()
+            .map(|p| {
+                (
+                    p.name.as_str(),
+                    p.location.as_str(),
+                    p.required,
+                    p.kind.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            parameters,
+            [
+                ("dag_id", "path", true, "string"),
+                ("limit", "query", false, "integer")
+            ]
+        );
+        assert_eq!(operation.parameters[1].example.as_deref(), Some("50"));
+        let body = operation.body.as_ref().unwrap();
+        assert_eq!(body.schema.as_deref(), Some("TriggerBody"));
+        assert!(body.required);
+        let example: serde_json::Value =
+            serde_json::from_str(body.example.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            example,
+            serde_json::json!({"logical_date": "2025-01-01T00:00:00Z", "conf": {}, "note": "it's late"})
+        );
+        let statuses: Vec<&str> = operation
+            .responses
+            .iter()
+            .map(|r| r.status.as_str())
+            .collect();
+        assert_eq!(statuses, ["200", "404"]);
+        assert_eq!(operation.responses[1].schema.as_deref(), Some("Error"));
+        assert!(
+            operation.responses[0]
+                .example
+                .as_deref()
+                .unwrap()
+                .contains("manual_1")
+        );
+        assert!(operation.secured);
+
+        let curl = operation.curl();
+        assert!(
+            curl.starts_with("curl -X POST \"https://airflow.example.com/dags/<dag_id>/dagRuns\"")
+        );
+        assert!(curl.contains("Authorization: Bearer $TOKEN"));
+        assert!(curl.contains("-H \"Content-Type: application/json\""));
+        // A quote in the body is escaped for the shell.
+        assert!(curl.contains("it'\\''s late"));
     }
 }

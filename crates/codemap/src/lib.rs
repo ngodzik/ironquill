@@ -15,7 +15,7 @@ mod imports;
 mod layout;
 mod map;
 
-pub use api::Operation;
+pub use api::{Body, Operation, Parameter, Response};
 pub use architecture::{Architecture, Component, ComponentKind, Link, architecture};
 pub use layout::Layout;
 pub use map::{CodeMap, Edge, EdgeKind, Language, Node, NodeKind, map};

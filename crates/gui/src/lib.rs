@@ -534,7 +534,13 @@ where
                     universe_view(ui, &mut universe, &mut shell.app);
                 }
                 MapView::Plan => plan::show(ui, &mut shell.plan, &mut shell.app),
-                MapView::Api => api_view::show(ui, &mut shell.api, &shell.plan, &mut shell.app),
+                MapView::Api => api_view::show(
+                    ui,
+                    &mut shell.api,
+                    &shell.plan,
+                    &mut shell.app,
+                    &mut shell.effects,
+                ),
             });
     } else if shell.app.tree().is_some() {
         egui::Panel::left("tree")
