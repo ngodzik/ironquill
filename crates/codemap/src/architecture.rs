@@ -1,16 +1,21 @@
-//! The design of a project, read from its map: its components (the
-//! packages it is split into, or its top folders when it is one package),
-//! what uses what, and the layers that follow, foundations first.
+//! The design of a project, read from its map, one level at a time: the
+//! parts of a folder (its subfolders and files, past the folders that only
+//! lead somewhere), what uses what, and the layers that follow, foundations
+//! first. A part can be opened, to read its own design the same way.
 //!
-//! A component is found by its manifest (`Cargo.toml` beside a crate root,
-//! `package.json`, `pyproject.toml`, `setup.py`, `go.mod`), never by its
-//! name. A dependency is an import from a file of one component to a file
-//! of another, counted, so that a link shows how much one leans on the
-//! other. Components that use each other, directly or around a loop, share
-//! a layer and their links are marked: a cycle is what a layered design
-//! forbids, and the drawing shows it.
+//! Packages are found by their manifests (`Cargo.toml` beside a crate root,
+//! `package.json`, `pyproject.toml`, `setup.py`, `go.mod`), never by their
+//! names: a folder that only holds a few packages (`crates/`) shows them
+//! rather than itself, one that holds many (`providers/`) shows as one part
+//! to open. Only the code counts: tests, documents and examples are left out,
+//! as they lean on everything and are not the design. A dependency is an
+//! import from a file of one part to a file of another, counted, so that a
+//! link shows how much one leans on the other. Parts that use each other,
+//! directly or around a loop, share a layer and their links are marked: a
+//! cycle is what a layered design forbids, and the drawing shows it.
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 
 use crate::map::{CodeMap, EdgeKind, Language, NodeKind};
 
@@ -19,6 +24,26 @@ use crate::map::{CodeMap, EdgeKind, Language, NodeKind};
 /// same project.
 const SWEEPS: usize = 8;
 
+/// The most packages a folder that holds nothing else shows in its place;
+/// beyond, it shows as one part, to open.
+const INLINE_PACKAGES: usize = 12;
+
+/// What a part is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentKind {
+    /// A source file.
+    File,
+    /// A folder.
+    Folder,
+    /// A package, with a manifest of its own.
+    Package,
+    /// A folder holding several packages.
+    Group {
+        /// How many.
+        packages: usize,
+    },
+}
+
 /// A part of the project, as its design sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Component {
@@ -26,6 +51,8 @@ pub struct Component {
     pub name: String,
     /// Its folder, or its file when it is one, from the project's root.
     pub path: String,
+    /// What it is.
+    pub kind: ComponentKind,
     /// Its source files, as nodes of the map, longest first.
     pub files: Vec<usize>,
     /// How many lines its source files have.
@@ -49,9 +76,13 @@ pub struct Link {
     pub cyclic: bool,
 }
 
-/// The project's components, their links, and their layers.
+/// The parts of one level of the project, their links, and their layers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Architecture {
+    /// The folder whose parts these are, from the project's root: the one
+    /// asked for, or a folder below it when the way there holds nothing
+    /// else.
+    pub level: String,
     /// The components, by path.
     pub components: Vec<Component>,
     /// What uses what.
@@ -78,7 +109,8 @@ impl Architecture {
     }
 }
 
-/// The design of the project `map` was read from.
+/// The design of folder `scope` of the project `map` was read from, `""`
+/// for the whole.
 ///
 /// # Examples
 ///
@@ -92,7 +124,7 @@ impl Architecture {
 /// write("app/main.py", "import lib.tools\n");
 /// write("lib/tools.py", "");
 /// let map = ironquill_codemap::map(dir.path(), 100);
-/// let design = ironquill_codemap::architecture(&map);
+/// let design = ironquill_codemap::architecture(&map, "");
 /// let names: Vec<&str> = design.components.iter().map(|c| c.name.as_str()).collect();
 /// assert_eq!(names, ["app", "lib"]);
 /// // lib uses nothing, so it is the foundation; app sits above it.
@@ -100,24 +132,22 @@ impl Architecture {
 /// assert_eq!(design.components[0].layer, 1);
 /// ```
 #[must_use]
-pub fn architecture(map: &CodeMap) -> Architecture {
+pub fn architecture(map: &CodeMap, scope: &str) -> Architecture {
+    let scope = scope.trim_matches('/');
     let code: Vec<usize> = (0..map.nodes.len())
-        .filter(|&n| is_code(map.nodes[n].kind))
+        .filter(|&n| is_design(map, n) && rest(&map.nodes[n].path, scope).is_some())
         .collect();
     let packages = packages(map);
-    let mut roots: Vec<(String, bool)> = if packages.iter().any(|p| !p.is_empty()) {
-        packages.into_iter().map(|p| (p, false)).collect()
-    } else {
-        top_parts(map, &code)
-    };
+    let (level, parts) = parts(map, &code, &packages, scope);
+    let mut roots: Vec<(String, ComponentKind)> = parts;
     // Longest first, so that a file belongs to the deepest that holds it.
     roots.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
     let holder = |path: &str| {
-        roots.iter().position(|(root, file)| {
-            if *file {
+        roots.iter().position(|(root, kind)| {
+            if *kind == ComponentKind::File {
                 path == root
             } else {
-                root.is_empty() || path == root || path.starts_with(&format!("{root}/"))
+                rest(path, root).is_some()
             }
         })
     };
@@ -134,18 +164,32 @@ pub fn architecture(map: &CodeMap) -> Architecture {
     let mut components: Vec<Component> = held
         .iter()
         .map(|root| {
-            let path = roots[*root].0.clone();
+            let (path, kind) = roots[*root].clone();
             let mut files = members.remove(root).unwrap_or_default();
             files.sort_by(|a, b| lines(map, *b).cmp(&lines(map, *a)).then(a.cmp(b)));
             Component {
-                name: path.rsplit('/').next().unwrap_or_default().to_owned(),
+                name: name(&path, &level, &packages),
                 lines: files.iter().map(|f| lines(map, *f)).sum(),
                 files,
                 path,
+                kind,
                 layer: 0,
             }
         })
         .collect();
+    // Two parts of the same name (`dbt/cloud`, `google/cloud`) are told
+    // apart by their way from the level shown.
+    let mut counts_by_name: BTreeMap<String, usize> = BTreeMap::new();
+    for component in &components {
+        *counts_by_name.entry(component.name.clone()).or_default() += 1;
+    }
+    for component in &mut components {
+        if counts_by_name[&component.name] > 1 {
+            component.name = rest(&component.path, &level)
+                .unwrap_or(&component.path)
+                .to_owned();
+        }
+    }
     let owners: Vec<Option<usize>> = map
         .nodes
         .iter()
@@ -157,7 +201,7 @@ pub fn architecture(map: &CodeMap) -> Architecture {
 
     let mut counts: BTreeMap<(usize, usize), usize> = BTreeMap::new();
     for edge in map.edges.iter().filter(|e| e.kind == EdgeKind::Imports) {
-        if !is_code(map.nodes[edge.from].kind) || !is_code(map.nodes[edge.to].kind) {
+        if !is_design(map, edge.from) || !is_design(map, edge.to) {
             continue;
         }
         if let (Some(from), Some(to)) = (owners[edge.from], owners[edge.to])
@@ -210,6 +254,7 @@ pub fn architecture(map: &CodeMap) -> Architecture {
         .collect();
     let layers = order(&components, &links);
     Architecture {
+        level,
         components,
         links,
         layers,
@@ -269,12 +314,27 @@ fn packages(map: &CodeMap) -> Vec<String> {
     found
 }
 
-/// For a project that is one package: where its code starts, past the
-/// folders that only lead to it (`src`), then each folder and each file
-/// there, the latter marked as files.
-fn top_parts(map: &CodeMap, code: &[usize]) -> Vec<(String, bool)> {
-    let mut level = String::new();
-    loop {
+/// Whether a node is code of the design: a source file, not a test, a
+/// document or an example.
+fn is_design(map: &CodeMap, node: usize) -> bool {
+    let path = &map.nodes[node].path;
+    // `setup.py` names a package, so it is read first, but builds it.
+    is_code(map.nodes[node].kind)
+        && crate::map::worth(Path::new(path)) == 0
+        && !path.ends_with("setup.py")
+}
+
+/// The parts of `scope` and the folder they are in: past the folders that
+/// only lead to the code, each folder and file there, a folder that only
+/// holds a few packages giving way to them.
+fn parts(
+    map: &CodeMap,
+    code: &[usize],
+    packages: &[String],
+    scope: &str,
+) -> (String, Vec<(String, ComponentKind)>) {
+    let mut level = scope.to_owned();
+    let (firsts, below) = loop {
         let below: Vec<&str> = code
             .iter()
             .map(|&n| map.nodes[n].path.as_str())
@@ -286,17 +346,68 @@ fn top_parts(map: &CodeMap, code: &[usize]) -> Vec<(String, bool)> {
         let loose = below.iter().any(|p| !p.contains('/'));
         match firsts.as_slice() {
             [only] if !loose => level = child(&level, only),
-            _ => {
-                return firsts
-                    .iter()
-                    .map(|name| {
-                        let path = child(&level, name);
-                        let file = below.contains(name);
-                        (path, file)
-                    })
-                    .collect();
-            }
+            _ => break (firsts, below),
         }
+    };
+    let mut parts = Vec::new();
+    for name in firsts {
+        let path = child(&level, name);
+        if below.contains(&name) {
+            parts.push((path, ComponentKind::File));
+            continue;
+        }
+        let inside: Vec<&String> = packages
+            .iter()
+            .filter(|p| rest(p, &path).is_some_and(|r| !r.is_empty()))
+            .collect();
+        // The packages not inside another of them.
+        let tops: Vec<&String> = inside
+            .iter()
+            .filter(|p| !inside.iter().any(|q| q != *p && rest(p, q).is_some()))
+            .copied()
+            .collect();
+        let covered = code
+            .iter()
+            .map(|&n| map.nodes[n].path.as_str())
+            .filter(|f| rest(f, &path).is_some())
+            .all(|f| tops.iter().any(|t| rest(f, t).is_some()));
+        let own = packages.contains(&path);
+        if !own && covered && !tops.is_empty() && tops.len() <= INLINE_PACKAGES {
+            parts.extend(
+                tops.into_iter()
+                    .map(|t| (t.clone(), ComponentKind::Package)),
+            );
+        } else if own {
+            parts.push((path, ComponentKind::Package));
+        } else if inside.len() >= 2 {
+            parts.push((
+                path,
+                ComponentKind::Group {
+                    packages: inside.len(),
+                },
+            ));
+        } else {
+            parts.push((path, ComponentKind::Folder));
+        }
+    }
+    // Only parts that hold code of the design.
+    parts.retain(|(path, kind)| {
+        *kind == ComponentKind::File
+            || code
+                .iter()
+                .any(|&n| rest(&map.nodes[n].path, path).is_some_and(|r| !r.is_empty()))
+    });
+    (level, parts)
+}
+
+/// A part's name: its folder's or file's, and for the `src` of a package
+/// the package's own.
+fn name(path: &str, level: &str, packages: &[String]) -> String {
+    let last = path.rsplit('/').next().unwrap_or_default();
+    if last == "src" && packages.iter().any(|p| p == level) {
+        level.rsplit('/').next().unwrap_or_default().to_owned()
+    } else {
+        last.to_owned()
     }
 }
 
@@ -477,7 +588,7 @@ mod tests {
         );
         write(root, "README.md", "# hi\n");
         let map = crate::map(root, 100);
-        let design = architecture(&map);
+        let design = architecture(&map, "");
 
         let names: Vec<&str> = design.components.iter().map(|c| c.name.as_str()).collect();
         // The workspace's own Cargo.toml is no package, and Markdown no code.
@@ -508,7 +619,7 @@ mod tests {
         write(root, "src/c/z.py", "from ..a.x import f\n");
         write(root, "src/main.py", "from .c.z import f\n");
         let map = crate::map(root, 100);
-        let design = architecture(&map);
+        let design = architecture(&map, "");
 
         let paths: Vec<&str> = design.components.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, ["src/a", "src/b", "src/c", "src/main.py"]);
@@ -532,7 +643,7 @@ mod tests {
         write(root, "d/w.py", "");
         write(root, "e/w.py", "import c.w\nimport d.w\n");
         let map = crate::map(root, 100);
-        let design = architecture(&map);
+        let design = architecture(&map, "");
         let name = |c: usize| design.components[c].name.as_str();
         let top: Vec<&str> = design.layers[1].iter().map(|&c| name(c)).collect();
         let bottom: Vec<&str> = design.layers[0].iter().map(|&c| name(c)).collect();

@@ -3302,6 +3302,7 @@ version = "0.1.0"
 dependencies = [
  "ignore",
  "regex",
+ "serde_json",
  "tempfile",
 ]
 

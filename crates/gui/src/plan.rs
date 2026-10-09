@@ -9,19 +9,24 @@
 //! asks for frames while something on it moves.
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use bevy_egui::egui::epaint::{CubicBezierShape, Shadow};
 use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Painter, Pos2, Rect, RichText,
     ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
-use ironquill_codemap::{Architecture, CodeMap};
+use ironquill_codemap::{Architecture, CodeMap, ComponentKind};
 use ironquill_ui::{App, Entry, MapView};
 
 use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, PANEL, RAISED, RED, TEXT};
 
-/// The most files mapped, as in the universe.
-const MAX_FILES: usize = 1_200;
+/// The most files mapped: the code first, so that a monorepo's shows
+/// whole; read away from the window, which shows the last plan meanwhile.
+const MAX_FILES: usize = 40_000;
+
+/// The most cards in a row: a layer with more wraps onto more rows.
+const ROW_CARDS: usize = 8;
 
 /// A card's height, the least width, and the room around it, at a zoom
 /// of 1.
@@ -29,6 +34,8 @@ const CARD_HEIGHT: f32 = 68.0;
 const CARD_WIDTH: f32 = 150.0;
 const ROW_GAP: f32 = 78.0;
 const COLUMN_GAP: f32 = 34.0;
+/// Between the rows of one layer that wraps.
+const WRAP_GAP: f32 = 26.0;
 
 /// How long a read and an edit by the agent show on a card, in seconds.
 const READ_SHOWS: f64 = 1.8;
@@ -42,6 +49,10 @@ const RISE_STAGGER: f64 = 0.09;
 /// How far from the conversation's border dragging leaves the plan alone:
 /// the border's own grip reaches that far into the plan.
 pub(crate) const EDGE_GRIP: f32 = 8.0;
+
+/// How long a second click may wait to make a double click, in seconds:
+/// egui's own.
+const DOUBLE_CLICK: f64 = 0.3;
 
 /// The width of the card listing a chosen component's files.
 const DETAILS_WIDTH: f32 = 340.0;
@@ -58,6 +69,10 @@ pub(crate) struct Plan {
     root: PathBuf,
     map: Option<CodeMap>,
     design: Option<Architecture>,
+    /// The project being read again, on a thread of its own.
+    reading: Option<Receiver<CodeMap>>,
+    /// The folder whose parts show: opened by a double click.
+    scope: String,
     /// Whether it showed last frame: opening it reads the project again.
     shown: bool,
     /// When it opened, for the cards to rise.
@@ -70,6 +85,9 @@ pub(crate) struct Plan {
     zoom: f32,
     hovered: Option<usize>,
     chosen: Option<usize>,
+    /// When the part was chosen: its files show a double click's time
+    /// later, so that the card they show on does not take the second click.
+    chosen_at: f64,
 }
 
 impl Plan {
@@ -78,6 +96,8 @@ impl Plan {
             root,
             map: None,
             design: None,
+            reading: None,
+            scope: String::new(),
             shown: false,
             opened_at: 0.0,
             seen: 0,
@@ -86,6 +106,7 @@ impl Plan {
             zoom: 1.0,
             hovered: None,
             chosen: None,
+            chosen_at: 0.0,
         }
     }
 
@@ -93,19 +114,69 @@ impl Plan {
     /// project is read again, as the agent may have changed it, and what
     /// the agent did before is not replayed.
     pub(crate) fn showing(&mut self, shown: bool, now: f64, transcript: &[Entry]) {
-        if shown && !self.shown {
-            let map = ironquill_codemap::map(&self.root, MAX_FILES);
-            let design = ironquill_codemap::architecture(&map);
-            self.touches = (0..design.components.len()).map(|_| None).collect();
-            if self.chosen.is_some_and(|c| c >= design.components.len()) {
-                self.chosen = None;
-            }
-            self.map = Some(map);
-            self.design = Some(design);
+        if shown && !self.shown && self.reading.is_none() {
+            let (send, receive) = mpsc::channel();
+            let root = self.root.clone();
+            std::thread::spawn(move || {
+                // The plan may be gone by then: nothing to tell.
+                let _ = send.send(ironquill_codemap::map(&root, MAX_FILES));
+            });
+            self.reading = Some(receive);
             self.opened_at = now;
             self.seen = transcript.len();
         }
         self.shown = shown;
+    }
+
+    /// Takes the project read, once read, and draws its plan at the level
+    /// shown.
+    pub(crate) fn take_read(&mut self, now: f64) {
+        let Some(reading) = &self.reading else {
+            return;
+        };
+        match reading.try_recv() {
+            Ok(map) => {
+                self.reading = None;
+                self.map = Some(map);
+                self.redesign(now);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.reading = None,
+        }
+    }
+
+    /// Whether the project is being read.
+    pub(crate) fn is_reading(&self) -> bool {
+        self.reading.is_some()
+    }
+
+    /// Shows the parts of `folder`, or of the whole with `""`.
+    pub(crate) fn open(&mut self, folder: &str, now: f64) {
+        self.scope = folder.to_owned();
+        self.chosen = None;
+        self.hovered = None;
+        self.pan = Vec2::ZERO;
+        self.zoom = 1.0;
+        self.redesign(now);
+    }
+
+    /// Draws the design again at the level shown, from the project read.
+    fn redesign(&mut self, now: f64) {
+        let Some(map) = &self.map else {
+            return;
+        };
+        let mut design = ironquill_codemap::architecture(map, &self.scope);
+        // A folder gone since: the whole instead.
+        if design.components.is_empty() && !self.scope.is_empty() {
+            self.scope.clear();
+            design = ironquill_codemap::architecture(map, "");
+        }
+        self.touches = (0..design.components.len()).map(|_| None).collect();
+        if self.chosen.is_some_and(|c| c >= design.components.len()) {
+            self.chosen = None;
+        }
+        self.design = Some(design);
+        self.opened_at = now;
     }
 
     /// Marks the components whose files the agent read or edited since
@@ -142,7 +213,6 @@ impl Plan {
 /// the whole is.
 fn arrange(painter: &Painter, design: &Architecture, project: &str) -> (Vec<Rect>, Vec2) {
     let mut cards = vec![Rect::NOTHING; design.components.len()];
-    let height = design.layers.len();
     let mut widest: f32 = 0.0;
     let rows: Vec<Vec<(usize, f32)>> = design
         .layers
@@ -165,24 +235,34 @@ fn arrange(painter: &Painter, design: &Architecture, project: &str) -> (Vec<Rect
                 .collect()
         })
         .collect();
-    for (layer, row) in rows.iter().enumerate() {
-        let width: f32 = row.iter().map(|(_, w)| w).sum::<f32>()
-            + COLUMN_GAP * row.len().saturating_sub(1) as f32;
-        widest = widest.max(width);
-        // The foundations at the bottom.
-        let y = (height - 1 - layer) as f32 * (CARD_HEIGHT + ROW_GAP);
-        let mut x = -width / 2.0;
-        for &(c, w) in row {
-            cards[c] = Rect::from_min_size(pos2(x, y), vec2(w, CARD_HEIGHT));
-            x += w + COLUMN_GAP;
+    // From the top layer down, the foundations at the bottom; a layer of
+    // many cards wraps onto rows of its own.
+    let mut y = 0.0;
+    for row in rows.iter().rev() {
+        let lines: Vec<&[(usize, f32)]> = row.chunks(ROW_CARDS).collect();
+        for (i, line) in lines.iter().enumerate() {
+            let width: f32 = line.iter().map(|(_, w)| w).sum::<f32>()
+                + COLUMN_GAP * line.len().saturating_sub(1) as f32;
+            widest = widest.max(width);
+            let mut x = -width / 2.0;
+            for &(c, w) in *line {
+                cards[c] = Rect::from_min_size(pos2(x, y), vec2(w, CARD_HEIGHT));
+                x += w + COLUMN_GAP;
+            }
+            y += CARD_HEIGHT
+                + if i + 1 < lines.len() {
+                    WRAP_GAP
+                } else {
+                    ROW_GAP
+                };
         }
     }
-    let tall = height as f32 * (CARD_HEIGHT + ROW_GAP) - ROW_GAP;
+    let tall = (y - ROW_GAP).max(0.0);
     // Centred on the origin.
     for card in &mut cards {
         *card = card.translate(vec2(0.0, -tall / 2.0));
     }
-    (cards, vec2(widest, tall.max(0.0)))
+    (cards, vec2(widest, tall))
 }
 
 fn title<'a>(component: &'a ironquill_codemap::Component, project: &'a str) -> &'a str {
@@ -195,11 +275,21 @@ fn title<'a>(component: &'a ironquill_codemap::Component, project: &'a str) -> &
 
 fn subtitle(component: &ironquill_codemap::Component) -> String {
     let files = component.files.len();
-    format!(
-        "{files} file{} · {} lines",
+    let size = format!(
+        "{} file{} · {} lines",
+        thousands(files),
         if files == 1 { "" } else { "s" },
         thousands(component.lines)
-    )
+    );
+    match component.kind {
+        ComponentKind::Group { packages } => format!("{packages} packages · {size}"),
+        _ => size,
+    }
+}
+
+/// Whether a part opens onto parts of its own.
+fn opens(component: &ironquill_codemap::Component) -> bool {
+    component.kind != ComponentKind::File
 }
 
 /// `1234` as `1.2k`: a card's size at a glance.
@@ -298,7 +388,22 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     let project = app.project().to_owned();
     let mut moving = false;
 
+    if plan.is_reading() {
+        // Something moves: the window draws until the project is read.
+        moving = true;
+        let dots = ".".repeat(1 + (now * 3.0) as usize % 3);
+        painter.text(
+            rect.center_bottom() - vec2(0.0, 70.0),
+            Align2::CENTER_CENTER,
+            format!("Reading the project{dots}"),
+            FontId::proportional(15.0),
+            DIM,
+        );
+    }
     let Some(design) = plan.design.as_ref() else {
+        if moving {
+            ui.ctx().request_repaint();
+        }
         return;
     };
     if design.components.is_empty() {
@@ -309,7 +414,9 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
             FontId::proportional(18.0),
             DIM,
         );
-        header(ui, &painter, rect, app, design, &project);
+        if let Some(folder) = header(ui, &painter, rect, app, design, &project) {
+            plan.open(&folder, now);
+        }
         return;
     }
 
@@ -317,7 +424,7 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     // files on the left: the plan slides aside rather than under it.
     let aside = ui.ctx().animate_value_with_time(
         Id::new("plan-aside"),
-        if plan.chosen.is_some() {
+        if plan.chosen.is_some() && now - plan.chosen_at > DOUBLE_CLICK {
             DETAILS_WIDTH + 24.0
         } else {
             0.0
@@ -359,9 +466,25 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     plan.hovered = response
         .hover_pos()
         .and_then(|p| cards.iter().position(|c| c.contains(p)));
-    if response.clicked() {
+    // A double click opens a part onto its own parts: the one its first
+    // click chose, as choosing slides the plan aside, from under the
+    // pointer.
+    let chosen_before = plan.chosen;
+    let mut opening = None;
+    if response.double_clicked()
+        && let Some(c) = chosen_before.or(plan.hovered)
+        && opens(&design.components[c])
+    {
+        opening = Some(design.components[c].path.clone());
+    } else if response.clicked() {
         plan.chosen = plan.hovered;
+        plan.chosen_at = now;
     }
+    let settled = now - plan.chosen_at > DOUBLE_CLICK;
+    if plan.chosen.is_some() && !settled {
+        moving = true;
+    }
+    let shown_chosen = plan.chosen.filter(|_| settled);
     let focus = plan.hovered.or(plan.chosen);
 
     // The cards rise into place layer by layer as the plan opens.
@@ -453,7 +576,9 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
             layer_colour(from_layer, layers)
         };
         let (colour, alpha) = match lit {
-            None => (base, if link.cyclic { 0.85 } else { 0.42 }),
+            // Loops stay red but quiet until pointed at: in a tangled level
+            // they would hide all else.
+            None => (base, if link.cyclic { 0.32 } else { 0.42 }),
             Some(c) if c == Color32::TRANSPARENT => (base, 0.07),
             Some(c) => (if link.cyclic { RED } else { c }, 0.95),
         };
@@ -526,6 +651,19 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
             color: Color32::from_black_alpha((150.0 * alpha) as u8),
         };
         painter.add(shadow.as_shape(card, radius));
+        // A part that opens onto more: a stack, the cards under it showing.
+        if opens(component) {
+            for depth in [2.0, 1.0] {
+                let under = card.translate(vec2(5.0, 5.0) * depth * scale.min(1.4));
+                painter.rect(
+                    under,
+                    radius,
+                    mix(theme::BACKGROUND, RAISED, alpha.max(0.6) * 0.8),
+                    Stroke::new(1.0, faded(colour, 0.25 * alpha)),
+                    StrokeKind::Inside,
+                );
+            }
+        }
         if picked {
             // A halo around the card pointed at or chosen.
             for (grow, a) in [(10.0, 0.06), (5.0, 0.12), (2.0, 0.25)] {
@@ -598,17 +736,22 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
         pill(&painter, at, &text, colour);
     }
 
-    header(ui, &painter, rect, app, design, &project);
+    if let Some(folder) = header(ui, &painter, rect, app, design, &project) {
+        opening = Some(folder);
+    }
     painter.text(
         rect.left_bottom() + vec2(24.0, -18.0),
         Align2::LEFT_BOTTOM,
-        "point at a part for its links · click it for its files · drag to move · scroll to zoom · Ctrl-N: the universe",
+        "point at a part for its links · click it for its files · double-click to open it · drag to move · scroll to zoom · Ctrl-N: the universe",
         FontId::proportional(12.0),
         DIM,
     );
 
-    if let Some(chosen) = plan.chosen {
+    if let Some(chosen) = shown_chosen {
         details(ui, rect, plan, chosen, app, &project);
+    }
+    if let Some(folder) = opening {
+        plan.open(&folder, now);
     }
     if moving {
         ui.ctx().request_repaint();
@@ -635,10 +778,10 @@ fn grid(painter: &Painter, rect: Rect, centre: Pos2, scale: f32) {
 fn layer_bands(painter: &Painter, design: &Architecture, cards: &[Rect], rect: Rect, scale: f32) {
     let layers = design.layers.len();
     for (layer, row) in design.layers.iter().enumerate() {
-        let Some(&first) = row.first() else {
+        // A layer that wraps spans all its rows.
+        let Some(card) = row.iter().map(|&c| cards[c]).reduce(|a, b| a.union(b)) else {
             continue;
         };
-        let card = cards[first];
         // Room above the cards for the layer's name.
         let band = Rect::from_min_max(
             pos2(rect.left(), card.top() - (22.0 * scale).max(17.0)),
@@ -751,6 +894,7 @@ fn agent_was_here(
 }
 
 /// The title, what the plan holds, and the switch between the views.
+/// Returns the folder of the way there clicked, to show its parts.
 fn header(
     ui: &mut Ui,
     painter: &Painter,
@@ -758,19 +902,30 @@ fn header(
     app: &mut App,
     design: &Architecture,
     project: &str,
-) {
+) -> Option<String> {
     let corner = rect.left_top() + vec2(24.0, 22.0);
-    painter.text(
+    let title = painter.text(
         corner,
         Align2::LEFT_TOP,
         "Plan",
         FontId::proportional(26.0),
         TEXT,
     );
+    let clicked = trail(
+        ui,
+        title.right_center() + vec2(16.0, 0.0),
+        &design.level,
+        project,
+    );
     let parts = design.components.len();
     let links = design.links.len();
     let summary = format!(
-        "{project} · {parts} part{} · {links} link{}",
+        "{} · {parts} part{} · {links} link{}",
+        if design.level.is_empty() {
+            project
+        } else {
+            design.level.as_str()
+        },
         if parts == 1 { "" } else { "s" },
         if links == 1 { "" } else { "s" },
     );
@@ -808,6 +963,47 @@ fn header(
         at.x += 24.0 + width + 20.0;
     }
     switch(ui, rect, app);
+    clicked
+}
+
+/// The way from the project to the level shown, each step a click away:
+/// `ironquill › providers › apache`. Returns the folder clicked.
+fn trail(ui: &mut Ui, at: Pos2, level: &str, project: &str) -> Option<String> {
+    let mut steps = vec![(project.to_owned(), String::new())];
+    let mut path = String::new();
+    for part in level.split('/').filter(|p| !p.is_empty()) {
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(part);
+        steps.push((part.to_owned(), path.clone()));
+    }
+    let mut clicked = None;
+    let area = Rect::from_min_size(at - vec2(0.0, 13.0), vec2(900.0, 26.0));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(area)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let last = steps.len() - 1;
+            for (i, (name, folder)) in steps.into_iter().enumerate() {
+                if i > 0 {
+                    ui.label(RichText::new("›").size(15.0).color(DIM));
+                }
+                if i == last {
+                    ui.label(RichText::new(name).size(15.0).color(ACCENT));
+                } else if ui
+                    .add(egui::Button::new(RichText::new(name).size(15.0).color(TEXT)).frame(false))
+                    .on_hover_text("show its parts")
+                    .clicked()
+                {
+                    clicked = Some(folder);
+                }
+            }
+        },
+    );
+    clicked
 }
 
 /// The two views of the codebase, top right, to pick with the mouse.
@@ -844,6 +1040,7 @@ fn details(ui: &mut Ui, rect: Rect, plan: &mut Plan, chosen: usize, app: &mut Ap
     let mut choose = None;
     let mut open = None;
     let mut close = false;
+    let mut dive = None;
     egui::Area::new(Id::new("plan-details"))
         .fixed_pos(top)
         .show(ui.ctx(), |ui| {
@@ -864,6 +1061,14 @@ fn details(ui: &mut Ui, rect: Rect, plan: &mut Plan, chosen: usize, app: &mut Ap
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("close").clicked() {
                                 close = true;
+                            }
+                            if opens(component)
+                                && ui
+                                    .small_button("open")
+                                    .on_hover_text("its own parts (double-click it)")
+                                    .clicked()
+                            {
+                                dive = Some(component.path.clone());
                             }
                         });
                     });
@@ -970,6 +1175,10 @@ fn details(ui: &mut Ui, rect: Rect, plan: &mut Plan, chosen: usize, app: &mut Ap
         app.open_path(plan.root.join(path));
         app.show_map(None);
     }
+    if let Some(folder) = dive {
+        let now = ui.input(|i| i.time);
+        plan.open(&folder, now);
+    }
 }
 
 fn lines(map: &CodeMap, node: usize) -> usize {
@@ -1019,6 +1228,12 @@ mod tests {
         let mut plan = Plan::new(dir.path().to_owned());
         let history = vec![tool("a/x.py", true)];
         plan.showing(true, 1.0, &history);
+        // Read on a thread of its own: taken once there.
+        let start = std::time::Instant::now();
+        while plan.is_reading() && start.elapsed().as_secs() < 10 {
+            plan.take_read(1.0);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(plan.design.as_ref().map(|d| d.components.len()), Some(2));
 
         plan.light_up(&history, 1.0);
@@ -1040,6 +1255,28 @@ mod tests {
         // A read right after an edit does not hide it.
         assert_eq!(touch(0), Some((true, "x.py")));
         assert_eq!(touch(1), Some((false, "y.py")));
+    }
+
+    #[test]
+    fn a_part_opens_onto_its_own_parts_and_the_way_back_leads_to_the_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "app/api/views.py", "import app.models.user\n");
+        write(dir.path(), "app/models/user.py", "");
+        write(dir.path(), "web/main.ts", "");
+        let mut plan = Plan::new(dir.path().to_owned());
+        plan.map = Some(ironquill_codemap::map(dir.path(), 100));
+        plan.open("", 0.0);
+        let names = |plan: &Plan| -> Vec<String> {
+            let design = plan.design.as_ref().unwrap();
+            design.components.iter().map(|c| c.name.clone()).collect()
+        };
+        assert_eq!(names(&plan), ["app", "web"]);
+        plan.open("app", 1.0);
+        assert_eq!(names(&plan), ["api", "models"]);
+        assert_eq!(plan.design.as_ref().map(|d| d.links.len()), Some(1));
+        // A folder gone: the whole again.
+        plan.open("gone", 2.0);
+        assert_eq!(names(&plan), ["app", "web"]);
     }
 
     #[test]

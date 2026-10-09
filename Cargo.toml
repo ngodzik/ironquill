@@ -117,3 +117,8 @@ overflow-checks = true
 # every key, while ironquill's own crates stay quick to rebuild.
 [profile.dev.package."*"]
 opt-level = 3
+
+# The map of a large project is read on every Ctrl-N: optimised in debug
+# builds too, it takes about a second for 15,000 files rather than many.
+[profile.dev.package.ironquill-codemap]
+opt-level = 3

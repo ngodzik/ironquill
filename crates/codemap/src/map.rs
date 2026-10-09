@@ -125,8 +125,63 @@ impl CodeMap {
     }
 }
 
+/// How much a file tells of the project's design, the most first: source
+/// code and the files that name packages and their aliases, then tests,
+/// examples and build scripts, then documents, settings and the rest.
+pub(crate) fn worth(path: &Path) -> u8 {
+    const TESTS: [&str; 6] = ["tests", "test", "__tests__", "testing", "spec", "e2e"];
+    const ASIDE: [&str; 9] = [
+        "docs", "doc", "examples", "example", "locales", "locale", "i18n", "fixtures", "vendor",
+    ];
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let folders: Vec<&str> = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    let names_packages = matches!(
+        name,
+        "Cargo.toml" | "pyproject.toml" | "setup.py" | "setup.cfg" | "package.json" | "go.mod"
+    ) || name.starts_with("tsconfig") && name.ends_with(".json");
+    if names_packages {
+        return 0;
+    }
+    let code = !matches!(
+        Language::of(path),
+        Language::Markdown | Language::Config | Language::Other
+    ) && !name.contains(".min.");
+    // By name or by part of it: `kubernetes-tests`, `docker-stack-docs`.
+    let test = folders
+        .iter()
+        .any(|f| TESTS.contains(f) || f.ends_with("-tests") || f.ends_with("_tests"))
+        || name.starts_with("test_")
+        || name.ends_with("_test.py")
+        || name.contains(".test.")
+        || name.contains(".spec.");
+    // Examples by any name (`example_dags`), and the scripts that build
+    // or configure rather than run (`setup.py`, `vite.config.ts`).
+    let aside = folders
+        .iter()
+        .any(|f| ASIDE.contains(f) || f.starts_with("example") || f.ends_with("-docs"))
+        || matches!(
+            name,
+            "setup.py" | "hatch_build.py" | "conftest.py" | "noxfile.py" | "build.rs"
+        )
+        || name.contains(".config.");
+    match (code, test || aside) {
+        (true, false) => 0,
+        (true, true) => 1,
+        (false, false) => 2,
+        (false, true) => 3,
+    }
+}
+
 /// Reads the project at `root`: the files git does not ignore, `limit` at
-/// most, and the folders that hold them.
+/// most, the code first, and the folders that hold them.
 ///
 /// # Examples
 ///
@@ -151,10 +206,13 @@ pub fn map(root: &Path, limit: usize) -> CodeMap {
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
         .filter_map(|e| e.path().strip_prefix(root).ok().map(Path::to_path_buf))
         .collect();
-    // Sorted, so that the same project always gives the same map.
-    files.sort();
+    // What tells most of the design first, when not all fits: the code and
+    // what names its packages, then its tests, then the rest. Sorted, so
+    // that the same project always gives the same map.
+    files.sort_by_cached_key(|f| (worth(f), f.clone()));
     let left_out = files.len().saturating_sub(limit);
     files.truncate(limit);
+    files.sort();
 
     let mut map = CodeMap {
         nodes: vec![Node {
@@ -214,19 +272,20 @@ pub fn map(root: &Path, limit: usize) -> CodeMap {
         }
     }
 
-    let crates = imports::rust_crates(root, &map);
+    let index = imports::Index::new(root, &map);
+    let mut seen = std::collections::HashSet::new();
     for (node, text) in sources {
         let path = map.nodes[node].path.clone();
         let NodeKind::File { language, .. } = map.nodes[node].kind else {
             continue;
         };
-        for target in imports::of(&path, language, &text, &map, &crates) {
+        for target in imports::of(&path, language, &text, &index) {
             let edge = Edge {
                 from: node,
                 to: target,
                 kind: EdgeKind::Imports,
             };
-            if target != node && !map.edges.contains(&edge) {
+            if target != node && seen.insert(edge) {
                 map.edges.push(edge);
             }
         }
@@ -271,6 +330,27 @@ mod tests {
                 .count();
             assert_eq!(holders, 1, "{}", map.nodes[node].path);
         }
+    }
+
+    #[test]
+    fn short_of_room_the_code_comes_before_its_tests_and_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a_docs/guide.md", "");
+        write(dir.path(), "docs/conf.py", "");
+        write(dir.path(), "src/tests/test_app.py", "");
+        write(dir.path(), "src/app.py", "");
+        write(dir.path(), "kubernetes-tests/k8s.py", "");
+        write(dir.path(), "zz/pyproject.toml", "");
+        let map = map(dir.path(), 2);
+        assert!(map.find("src/app.py").is_some());
+        assert!(map.find("zz/pyproject.toml").is_some());
+        assert_eq!(map.left_out, 4);
+        // Code aside (tests, docs) before what is not code at all.
+        let map = super::map(dir.path(), 5);
+        assert!(map.find("src/tests/test_app.py").is_some());
+        assert!(map.find("kubernetes-tests/k8s.py").is_some());
+        assert!(map.find("docs/conf.py").is_some());
+        assert!(map.find("a_docs/guide.md").is_none());
     }
 
     #[test]

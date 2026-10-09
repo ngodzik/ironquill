@@ -505,6 +505,7 @@ where
     shell
         .plan
         .showing(view == Some(MapView::Plan), now, shell.app.transcript());
+    shell.plan.take_read(now);
     shell.plan.light_up(shell.app.transcript(), now);
     if let Some(view) = view {
         // The conversation beside the codebase, translucent so that what

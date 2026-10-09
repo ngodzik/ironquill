@@ -9,6 +9,7 @@ description = "The shape of a codebase: its files, folders and imports as a grap
 [dependencies]
 ignore.workspace = true
 regex.workspace  = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
