@@ -149,14 +149,14 @@ async fn main() -> Result<()> {
         // No log subscriber here: anything written to the terminal while the
         // interface owns it would tear the screen.
         let start = if cli.continue_last {
-            ironquill_tui::Start::Continue
+            ironquill_ui::Start::Continue
         } else if let Some(resume) = cli.resume {
             match resume {
-                Some(id) => ironquill_tui::Start::Id(id),
-                None => ironquill_tui::Start::Pick,
+                Some(id) => ironquill_ui::Start::Id(id),
+                None => ironquill_ui::Start::Pick,
             }
         } else {
-            ironquill_tui::Start::New
+            ironquill_ui::Start::New
         };
         let choices = Choices {
             model: Pick::new(cli.model, typed("model")),
@@ -259,7 +259,7 @@ impl<T> Pick<T> {
 async fn interface(
     provider: OpenAiCompatible,
     choices: Choices,
-    start: ironquill_tui::Start,
+    start: ironquill_ui::Start,
 ) -> Result<()> {
     let workspace = Workspace::new(".")?;
     let defaults = match Defaults::path() {

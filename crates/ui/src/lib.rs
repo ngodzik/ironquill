@@ -16,6 +16,7 @@ mod command;
 pub mod defaults;
 pub mod editor;
 mod highlight;
+mod host;
 pub mod input;
 pub mod keymap;
 pub mod references;
@@ -30,3 +31,4 @@ pub use app::{
     SubAgent, parse_window, step_title,
 };
 pub use defaults::{Defaults, Images};
+pub use host::{Host, Incoming, Start, Waiting};
