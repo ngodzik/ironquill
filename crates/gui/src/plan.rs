@@ -1,6 +1,7 @@
 //! The codebase's plan (Ctrl-N): its components as cards in layers, the
 //! foundations at the bottom, each link what one uses of another, thicker
-//! for more imports, red when it closes a loop. Pointing at a card lights
+//! for more imports, magenta when it goes through an OpenAPI spec (a front
+//! end calling its back end), red when it closes a loop. Pointing at a card lights
 //! what it uses and what uses it; clicking one lists its files. A card
 //! ripples when the agent reads one of its files, and flares when it edits
 //! one.
@@ -19,7 +20,7 @@ use bevy_egui::egui::{
 use ironquill_codemap::{Architecture, CodeMap, ComponentKind};
 use ironquill_ui::{App, Entry, MapView};
 
-use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, PANEL, RAISED, RED, TEXT};
+use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, MAGENTA, PANEL, RAISED, RED, TEXT};
 
 /// The most files mapped: the code first, so that a monorepo's shows
 /// whole; read away from the window, which shows the last plan meanwhile.
@@ -287,6 +288,30 @@ fn subtitle(component: &ironquill_codemap::Component) -> String {
     }
 }
 
+/// What a link is made of: `12 imports · 3 API calls · loop`, a call being
+/// a file calling, through the spec, a file that serves it.
+fn counts(link: &ironquill_codemap::Link) -> String {
+    let mut said = Vec::new();
+    if link.imports > 0 {
+        said.push(format!(
+            "{} import{}",
+            link.imports,
+            if link.imports == 1 { "" } else { "s" }
+        ));
+    }
+    if link.calls > 0 {
+        said.push(format!(
+            "{} API call{}",
+            link.calls,
+            if link.calls == 1 { "" } else { "s" }
+        ));
+    }
+    if link.cyclic {
+        said.push("loop".to_owned());
+    }
+    said.join(" · ")
+}
+
 /// Whether a part opens onto parts of its own.
 fn opens(component: &ironquill_codemap::Component) -> bool {
     component.kind != ComponentKind::File
@@ -537,7 +562,7 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     let most = design
         .links
         .iter()
-        .map(|l| l.imports)
+        .map(|l| l.imports + l.calls)
         .max()
         .unwrap_or(1)
         .max(1) as f32;
@@ -570,20 +595,43 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
             Some(f) if link.to == f => Some(CYAN),
             Some(_) => Some(Color32::TRANSPARENT),
         };
+        // Only through the API: the front end calling its back end.
+        let through_api = link.imports == 0;
         let base = if link.cyclic {
             RED
+        } else if through_api {
+            MAGENTA
         } else {
             layer_colour(from_layer, layers)
         };
         let (colour, alpha) = match lit {
             // Loops stay red but quiet until pointed at: in a tangled level
             // they would hide all else.
-            None => (base, if link.cyclic { 0.32 } else { 0.42 }),
+            None => (
+                base,
+                if link.cyclic {
+                    0.32
+                } else if through_api {
+                    0.7
+                } else {
+                    0.42
+                },
+            ),
             Some(c) if c == Color32::TRANSPARENT => (base, 0.07),
-            Some(c) => (if link.cyclic { RED } else { c }, 0.95),
+            Some(c) => (
+                if link.cyclic {
+                    RED
+                } else if through_api {
+                    MAGENTA
+                } else {
+                    c
+                },
+                0.95,
+            ),
         };
         let alpha = alpha * rise;
-        let width = (1.0 + 2.6 * (link.imports as f32).ln_1p() / most.ln_1p()) * scale.sqrt();
+        let width = (1.0 + 2.6 * ((link.imports + link.calls) as f32).ln_1p() / most.ln_1p())
+            * scale.sqrt();
         // A wide faint stroke under a thin bright one: the link glows.
         for (w, a) in [(width * 5.0, 0.07), (width * 2.4, 0.16), (width, 1.0)] {
             painter.add(CubicBezierShape::from_points_stroke(
@@ -608,13 +656,7 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
                 };
                 bezier(points, at_height(points, y))
             };
-            let text = format!(
-                "{} import{}{}",
-                link.imports,
-                if link.imports == 1 { "" } else { "s" },
-                if link.cyclic { " · loop" } else { "" }
-            );
-            pills.push((middle, text, colour));
+            pills.push((middle, counts(link), colour));
         }
     }
 
@@ -952,7 +994,12 @@ fn header(
         colour,
     );
     let mut at = corner + vec2(0.0, 60.0);
-    for (colour, what) in [(ACCENT, "uses"), (CYAN, "used by"), (RED, "in a loop")] {
+    for (colour, what) in [
+        (ACCENT, "uses"),
+        (CYAN, "used by"),
+        (MAGENTA, "through the API"),
+        (RED, "in a loop"),
+    ] {
         painter.line_segment(
             [at + vec2(0.0, 7.0), at + vec2(18.0, 7.0)],
             Stroke::new(2.5, colour),
@@ -1105,18 +1152,19 @@ fn details(ui: &mut Ui, rect: Rect, plan: &mut Plan, chosen: usize, app: &mut Ap
                                 if links.is_empty() {
                                     return;
                                 }
-                                links.sort_by_key(|l| std::cmp::Reverse(l.imports));
+                                links.sort_by_key(|l| std::cmp::Reverse(l.imports + l.calls));
                                 ui.label(RichText::new(heading).size(12.0).color(tint));
                                 for link in links {
                                     let other = if uses { link.to } else { link.from };
                                     let name = title(&design.components[other], project);
-                                    let text = format!(
-                                        "{name}  ·  {} import{}{}",
-                                        link.imports,
-                                        if link.imports == 1 { "" } else { "s" },
-                                        if link.cyclic { " · loop" } else { "" }
-                                    );
-                                    let tint = if link.cyclic { RED } else { TEXT };
+                                    let text = format!("{name}  ·  {}", counts(link));
+                                    let tint = if link.cyclic {
+                                        RED
+                                    } else if link.imports == 0 {
+                                        MAGENTA
+                                    } else {
+                                        TEXT
+                                    };
                                     if ui
                                         .add(
                                             egui::Button::new(RichText::new(text).color(tint))

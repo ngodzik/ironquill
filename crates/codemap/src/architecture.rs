@@ -72,6 +72,9 @@ pub struct Link {
     pub to: usize,
     /// How many imports go from the one to the other.
     pub imports: usize,
+    /// How many of its files call, through an OpenAPI spec, files of the
+    /// other that serve them: a front end and its back end.
+    pub calls: usize,
     /// Whether the two use each other, directly or around a loop.
     pub cyclic: bool,
 }
@@ -199,15 +202,26 @@ pub fn architecture(map: &CodeMap, scope: &str) -> Architecture {
         })
         .collect();
 
-    let mut counts: BTreeMap<(usize, usize), usize> = BTreeMap::new();
-    for edge in map.edges.iter().filter(|e| e.kind == EdgeKind::Imports) {
+    // Imports and calls through the API, per pair of parts.
+    let mut counts: BTreeMap<(usize, usize), (usize, usize)> = BTreeMap::new();
+    for edge in &map.edges {
+        let calls = match edge.kind {
+            EdgeKind::Imports => false,
+            EdgeKind::Calls => true,
+            EdgeKind::Contains => continue,
+        };
         if !is_design(map, edge.from) || !is_design(map, edge.to) {
             continue;
         }
         if let (Some(from), Some(to)) = (owners[edge.from], owners[edge.to])
             && from != to
         {
-            *counts.entry((from, to)).or_default() += 1;
+            let count = counts.entry((from, to)).or_default();
+            if calls {
+                count.1 += 1;
+            } else {
+                count.0 += 1;
+            }
         }
     }
     let uses: Vec<Vec<usize>> = (0..components.len())
@@ -245,10 +259,11 @@ pub fn architecture(map: &CodeMap, scope: &str) -> Architecture {
 
     let links: Vec<Link> = counts
         .into_iter()
-        .map(|((from, to), imports)| Link {
+        .map(|((from, to), (imports, calls))| Link {
             from,
             to,
             imports,
+            calls,
             cyclic: group_of[from] == group_of[to],
         })
         .collect();

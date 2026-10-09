@@ -91,7 +91,7 @@ impl Layout {
         for edge in &map.edges {
             let (rest, pull) = match edge.kind {
                 EdgeKind::Contains => (HOLD_LENGTH, HOLD_PULL),
-                EdgeKind::Imports => (IMPORT_LENGTH, IMPORT_PULL),
+                EdgeKind::Imports | EdgeKind::Calls => (IMPORT_LENGTH, IMPORT_PULL),
             };
             let (a, b) = (edge.from, edge.to);
             if a >= n || b >= n {

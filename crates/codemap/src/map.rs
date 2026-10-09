@@ -8,8 +8,9 @@ use ignore::WalkBuilder;
 use crate::imports;
 
 /// Beyond this a file is not read: its lines are not counted and its
-/// imports not looked for. A generated file that big says nothing useful.
-const MAX_READ: u64 = 512 * 1024;
+/// imports not looked for. A generated file that big says nothing useful;
+/// an API's spec can come close (Airflow's is half a megabyte).
+const MAX_READ: u64 = 2 * 1024 * 1024;
 
 /// What a source file is written in, as far as the drawing cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,6 +92,9 @@ pub enum EdgeKind {
     Contains,
     /// A file imports another.
     Imports,
+    /// A file of a front end calls, through an OpenAPI spec, an operation
+    /// a file of the back end serves.
+    Calls,
 }
 
 /// An edge between two nodes, by their place in [`CodeMap::nodes`].
@@ -274,12 +278,13 @@ pub fn map(root: &Path, limit: usize) -> CodeMap {
 
     let index = imports::Index::new(root, &map);
     let mut seen = std::collections::HashSet::new();
-    for (node, text) in sources {
+    for (node, text) in &sources {
+        let (node, text) = (*node, text.as_str());
         let path = map.nodes[node].path.clone();
         let NodeKind::File { language, .. } = map.nodes[node].kind else {
             continue;
         };
-        for target in imports::of(&path, language, &text, &index) {
+        for target in imports::of(&path, language, text, &index) {
             let edge = Edge {
                 from: node,
                 to: target,
@@ -288,6 +293,15 @@ pub fn map(root: &Path, limit: usize) -> CodeMap {
             if target != node && seen.insert(edge) {
                 map.edges.push(edge);
             }
+        }
+    }
+    for (from, to) in crate::api::calls(&map, &sources) {
+        if from != to {
+            map.edges.push(Edge {
+                from,
+                to,
+                kind: EdgeKind::Calls,
+            });
         }
     }
     map

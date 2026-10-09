@@ -496,6 +496,12 @@ pub(crate) fn animate(
                 1.1 + lit * 6.0,
                 0.32 + lit * 0.6,
             ),
+            // Through the API, from the front end to the back: magenta.
+            EdgeKind::Calls => hdr(
+                LinearRgba::rgb(0.85, 0.35, 0.95),
+                1.4 + lit * 6.0,
+                0.45 + lit * 0.5,
+            ),
         };
         gizmos.line(a, b, Color::from(colour));
     }

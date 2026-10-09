@@ -9,6 +9,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod api;
 mod architecture;
 mod imports;
 mod layout;
