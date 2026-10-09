@@ -892,7 +892,7 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
 
 /// A line as styled runs: coloured by its language when known, plain otherwise.
 fn line_runs(file: &Editor, row: usize, text: &str) -> Vec<(Style, String)> {
-    match file.styled().and_then(|s| s.get(row)) {
+    match file.styled().as_deref().and_then(|s| s.get(row)) {
         Some(runs) => runs.iter().map(|(c, t)| (fg(rgb(*c)), t.clone())).collect(),
         None => vec![(Style::new(), text.to_owned())],
     }

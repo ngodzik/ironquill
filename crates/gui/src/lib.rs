@@ -1091,7 +1091,7 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             skip = 0;
             job.append(&text[from..], 0.0, format(colour));
         };
-        match styled.and_then(|s| s.get(i)) {
+        match styled.as_deref().and_then(|s| s.get(i)) {
             Some(styled) => {
                 for (colour, text) in styled {
                     runs(text, theme::rgb(*colour));
@@ -1147,6 +1147,8 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             clicked = Some((i - first, column as usize));
         }
     }
+    // The colours are borrowed from the editor, which the clicks change.
+    drop(styled);
     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
         let mode = match editor.mode() {
             EditorMode::Normal => "NORMAL".to_owned(),

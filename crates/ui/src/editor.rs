@@ -7,7 +7,7 @@
 //! redo, `:w`, `:q`, `:42`, `:s` with ranges, and `/` search. Not covered:
 //! counts, block visual mode, macros.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -179,7 +179,9 @@ pub struct Editor {
     trailing_newline: bool,
     /// Set for binary or unreadable files, which are shown but not edited.
     read_only: bool,
-    styled: Option<Highlighted>,
+    /// Coloured as the lines are shown: drawing them colours what comes
+    /// into sight.
+    styled: RefCell<Option<Highlighted>>,
     /// The file as of the last commit, `None` outside git.
     base: Option<Vec<String>>,
     /// The revision changes are shown against: the last commit unless set.
@@ -271,7 +273,7 @@ impl Editor {
             lines: loaded.lines,
             trailing_newline: loaded.trailing_newline,
             read_only: loaded.read_only,
-            styled: None,
+            styled: RefCell::new(None),
             base: None,
             base_rev: None,
             changes: LineChanges::default(),
@@ -370,7 +372,7 @@ impl Editor {
         }
         editor.read_only = false;
         editor.base = None;
-        editor.styled = None;
+        *editor.styled.get_mut() = None;
         editor.message = None;
         editor.fold_all();
         editor
@@ -388,7 +390,7 @@ impl Editor {
         editor.copies_out = true;
         editor.base = None;
         editor.message = None;
-        editor.styled = editor
+        *editor.styled.get_mut() = editor
             .highlighter
             .highlight(Path::new("chat.md"), &editor.lines);
         editor.row = editor.lines.len() - 1;
@@ -563,9 +565,19 @@ impl Editor {
         &self.lines
     }
 
-    /// The lines coloured by their language, when it is known.
-    pub fn styled(&self) -> Option<&[StyledLine]> {
-        self.styled.as_ref().map(Highlighted::lines)
+    /// The lines coloured by their language, when it is known: those in
+    /// view, and those seen before, coloured; the others plain until shown.
+    pub fn styled(&self) -> Option<Ref<'_, [StyledLine]>> {
+        {
+            let mut styled = self.styled.borrow_mut();
+            let end = self.scroll + self.view_height() + 1;
+            if let Some(highlighted) = styled.as_mut()
+                && !highlighted.colour_to(&self.highlighter, end)
+            {
+                *styled = None;
+            }
+        }
+        Ref::filter_map(self.styled.borrow(), |s| s.as_ref().map(Highlighted::lines)).ok()
     }
 
     /// How the lines differ from the last commit, while that is known and in
@@ -1805,16 +1817,16 @@ impl Editor {
         if let Some(base) = &self.base {
             self.changes = line_changes(base, &self.lines);
         }
+        let styled = self.styled.get_mut();
         if self.read_only {
-            self.styled = None;
+            *styled = None;
             return;
         }
-        let kept = self
-            .styled
+        let kept = styled
             .as_mut()
             .is_some_and(|s| s.update(&self.highlighter, &self.lines, budget));
         if !kept {
-            self.styled = self.highlighter.highlight(&self.path, &self.lines);
+            *styled = self.highlighter.highlight(&self.path, &self.lines);
         }
     }
 }

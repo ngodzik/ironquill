@@ -111,3 +111,9 @@ codegen-units = 1
 # wraps silently would print a number that looks like a bill; a panic is the
 # cheaper failure.
 overflow-checks = true
+
+# Dependencies are built optimised in a debug build too: syntect, egui and
+# Bevy run tens of times slower without, enough to make the window lag on
+# every key, while ironquill's own crates stay quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 3

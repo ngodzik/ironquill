@@ -12,9 +12,9 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 /// foreground colours are used: the terminal keeps its own background.
 const THEME: &str = "base16-ocean.dark";
 
-/// Beyond this a file is shown plain. Highlighting is done in one go when the
-/// file opens, and a huge generated file is not worth the wait.
-const MAX_LINES: usize = 20_000;
+/// Beyond this a file is shown plain: a generated file that long is not
+/// read for its colours.
+const MAX_LINES: usize = 100_000;
 
 /// A line as coloured runs of text.
 pub(crate) type StyledLine = Vec<(Rgb, String)>;
@@ -23,26 +23,36 @@ pub(crate) type StyledLine = Vec<(Rgb, String)>;
 /// colouring a line needs from the lines before it.
 type Start = (ParseState, HighlightState);
 
-/// A file's lines, coloured, with what it takes to colour them again from
-/// any line: an edit is coloured from its line on, and only as far as it
-/// changes how the lines after it read (an opened string, a comment).
+/// A file's lines, coloured as far as they were shown, with what it takes
+/// to colour them again from any line: a file opens with only what is in
+/// sight coloured, and an edit is coloured from its line on, only as far as
+/// it changes how the lines after it read (an opened string, a comment).
 pub(crate) struct Highlighted {
     /// The lines as they were coloured.
     texts: Vec<String>,
+    /// Each line as coloured runs; one plain run past `coloured`.
     styled: Vec<StyledLine>,
     /// The start of each line, and the end of the last, each the one the
     /// line before led to: colouring a line from its start gives the line
     /// shown and the next start, so equal starts mean all after is equal.
+    /// Past `coloured`, they mean nothing.
     starts: Vec<Start>,
+    /// How many lines, from the first, are coloured.
+    coloured: usize,
     /// The first line whose colours may be wrong, and the start it really
-    /// has. An edit that changes how the lines after it read (an opened
-    /// string or comment) colours only so many of them while typing, so
-    /// that no key waits on the whole file; the next keys carry on.
+    /// has. An edit that changes how the lines after it read colours only so
+    /// many of them while typing, so that no key waits on the whole file;
+    /// the next keys carry on.
     stale: Option<(usize, Start)>,
 }
 
+/// A line not coloured yet: its text, plain.
+fn plain(line: &str) -> StyledLine {
+    vec![(Rgb(192, 197, 206), line.to_owned())]
+}
+
 impl Highlighted {
-    /// The coloured lines.
+    /// The lines, coloured as far as [`Highlighted::colour_to`] was asked.
     pub(crate) fn lines(&self) -> &[StyledLine] {
         &self.styled
     }
@@ -53,10 +63,35 @@ impl Highlighted {
         self.stale.as_ref().map(|(line, _)| *line)
     }
 
+    /// Colours the lines up to `end`, for them to be shown. `false` when
+    /// the grammar fails on them, and they are better shown plain.
+    pub(crate) fn colour_to(&mut self, highlighter: &Highlighter, end: usize) -> bool {
+        let end = end.min(self.texts.len());
+        if self.coloured >= end {
+            return true;
+        }
+        // What is coloured is made right first: the rest follows from it.
+        if !self.catch_up(highlighter, None) {
+            return false;
+        }
+        let painter = Painter::new(&highlighter.theme);
+        let mut state = self.starts[self.coloured].clone();
+        for i in self.coloured..end {
+            let Some(line) = highlighter.colour(&painter, &self.texts[i], &mut state) else {
+                return false;
+            };
+            self.styled[i] = line;
+            self.starts[i + 1] = state.clone();
+        }
+        self.coloured = end;
+        true
+    }
+
     /// Colours `lines` again from the first that differs from those
     /// coloured, until the lines after it read as before; past the edit,
-    /// `budget` lines at most, all of them with `None`. `false` when the
-    /// grammar fails on them, and they are better shown plain.
+    /// `budget` lines at most, all of them with `None`. Lines not coloured
+    /// yet are only taken as they are. `false` when the grammar fails on
+    /// them, and they are better shown plain.
     pub(crate) fn update(
         &mut self,
         highlighter: &Highlighter,
@@ -84,11 +119,22 @@ impl Highlighted {
         // From here on the lines are the old ones, moved.
         let unchanged_from = new_n - suffix;
         let old = |i: usize| i + old_n - new_n;
-        let painter = Painter::new(&highlighter.theme);
+        let coloured = self.coloured;
 
+        // An edit past what is coloured: nothing to colour yet.
+        if prefix >= coloured {
+            let changed = lines[prefix..unchanged_from].iter();
+            self.styled
+                .splice(prefix..old_n - suffix, changed.clone().map(|l| plain(l)));
+            self.texts.splice(prefix..old_n - suffix, changed.cloned());
+            let filler = self.starts[coloured].clone();
+            self.starts.resize(new_n + 1, filler);
+            return true;
+        }
+
+        let painter = Painter::new(&highlighter.theme);
         // From the first line that may be wrong: the edit, or before it.
-        let stale = self.stale.take();
-        let (first, mut state, ahead) = match stale {
+        let (first, mut state, ahead) = match self.stale.take() {
             Some((line, start)) if line <= prefix => (line, start, None),
             // Past the edit: counted as the lines are now.
             Some((line, start)) if line >= old_n - suffix => (
@@ -103,26 +149,27 @@ impl Highlighted {
         let mut styled = Vec::new();
         let mut starts = Vec::new();
         let mut i = first;
-        let (end, stale) = loop {
+        let (end, stale, now_coloured) = loop {
             if i >= unchanged_from {
                 let j = old(i);
-                if j == old_n && i == new_n {
-                    break (old_n, None);
+                // What follows was never coloured: it stays so.
+                if j >= coloured {
+                    break (j, None, i);
                 }
                 // The lines after read as before: they are kept.
                 if self.starts[j] == state {
-                    break (j, ahead.filter(|(line, _)| *line > i));
+                    let ahead = ahead.filter(|(line, _)| *line > i);
+                    break (j, ahead, coloured + new_n - old_n);
                 }
                 if budget.is_some_and(|b| i - prefix >= b) {
                     // The start kept is the one its line was coloured from.
                     if let Some(last) = starts.last_mut() {
                         *last = self.starts[j].clone();
                     }
-                    break (j, Some((i, state)));
+                    break (j, Some((i, state)), coloured + new_n - old_n);
                 }
             }
             let Some(line) = highlighter.colour(&painter, &lines[i], &mut state) else {
-                self.stale = None;
                 return false;
             };
             styled.push(line);
@@ -134,6 +181,9 @@ impl Highlighted {
         self.styled.splice(first..end, styled);
         self.starts.splice(first + 1..=end, starts);
         self.starts[first] = initial;
+        let filler = self.starts[now_coloured].clone();
+        self.starts.resize(new_n + 1, filler);
+        self.coloured = now_coloured;
         self.stale = stale;
         match self.stale {
             Some((line, _)) if line > i => self.catch_up(highlighter, budget),
@@ -141,15 +191,15 @@ impl Highlighted {
         }
     }
 
-    /// Colours again the lines that may be wrong, as far as they differ
-    /// from what they were, `budget` lines at most.
+    /// Colours again the coloured lines that may be wrong, as far as they
+    /// differ from what they were, `budget` lines at most.
     fn catch_up(&mut self, highlighter: &Highlighter, budget: Option<usize>) -> bool {
         let Some((first, mut state)) = self.stale.take() else {
             return true;
         };
         let painter = Painter::new(&highlighter.theme);
         let mut i = first;
-        while i < self.texts.len() {
+        while i < self.coloured {
             if i > first && self.starts[i] == state {
                 return true;
             }
@@ -164,9 +214,7 @@ impl Highlighted {
             self.styled[i] = line;
             i += 1;
         }
-        if let Some(end) = self.starts.last_mut() {
-            *end = state;
-        }
+        self.starts[self.coloured] = state;
         true
     }
 }
@@ -200,32 +248,27 @@ impl Highlighter {
             .or_else(|| first_line.and_then(|l| self.syntaxes.find_syntax_by_first_line(l)))
     }
 
-    /// Colours `lines`, or returns `None` when the file is better shown plain:
-    /// no known grammar, too long, or a grammar that fails on this input.
+    /// `lines` ready to be coloured, none of them yet: they are as they are
+    /// shown, with [`Highlighted::colour_to`]. `None` when the file is
+    /// better shown plain: no known grammar, or too long.
     pub(crate) fn highlight(&self, path: &Path, lines: &[String]) -> Option<Highlighted> {
         if lines.len() > MAX_LINES {
             return None;
         }
         let syntax = self.syntax_for(path, lines.first().map(String::as_str))?;
         let painter = Painter::new(&self.theme);
-        let mut state = (
+        let start = (
             ParseState::new(syntax),
             HighlightState::new(&painter, ScopeStack::new()),
         );
-        let mut highlighted = Highlighted {
-            texts: Vec::with_capacity(lines.len()),
-            styled: Vec::with_capacity(lines.len()),
-            starts: vec![state.clone()],
+        // Nothing coloured yet: what is shown is, when it is.
+        Some(Highlighted {
+            texts: lines.to_vec(),
+            styled: lines.iter().map(|l| plain(l)).collect(),
+            starts: vec![start; lines.len() + 1],
+            coloured: 0,
             stale: None,
-        };
-        for line in lines {
-            highlighted
-                .styled
-                .push(self.colour(&painter, line, &mut state)?);
-            highlighted.texts.push(line.clone());
-            highlighted.starts.push(state.clone());
-        }
-        Some(highlighted)
+        })
     }
 
     /// Colours one line from `state`, the start of the line, which becomes
@@ -251,15 +294,21 @@ mod tests {
         text.lines().map(str::to_owned).collect()
     }
 
+    /// `lines` coloured whole, as a file shown from top to bottom.
+    fn whole(highlighter: &Highlighter, path: &Path, lines: &[String]) -> Highlighted {
+        let mut highlighted = highlighter.highlight(path, lines).unwrap();
+        assert!(highlighted.colour_to(highlighter, lines.len()));
+        highlighted
+    }
+
     #[test]
     fn python_keywords_and_strings_get_different_colours() {
         let highlighter = Highlighter::new();
-        let styled = highlighter
-            .highlight(
-                Path::new("hello.py"),
-                &lines("def greet():\n    return \"hi\""),
-            )
-            .unwrap();
+        let styled = whole(
+            &highlighter,
+            Path::new("hello.py"),
+            &lines("def greet():\n    return \"hi\""),
+        );
 
         let colour_of = |line: &StyledLine, word: &str| {
             line.iter()
@@ -304,7 +353,7 @@ mod tests {
         let path = Path::new("a.rs");
         let mut now =
             lines("fn a() {\n    let x = 1;\n}\n\nfn b() {\n    let y = \"s\";\n}\n// end");
-        let mut highlighted = highlighter.highlight(path, &now).unwrap();
+        let mut highlighted = whole(&highlighter, path, &now);
         type Edit<'a> = &'a dyn Fn(&mut Vec<String>);
         let edits: [Edit; 7] = [
             &|l| l[1].push_str(" // note"),
@@ -320,8 +369,10 @@ mod tests {
         for edit in edits {
             edit(&mut now);
             assert!(highlighted.update(&highlighter, &now, None));
-            let whole = highlighter.highlight(path, &now).unwrap();
-            assert_eq!(highlighted.lines(), whole.lines(), "{now:?}");
+            // Shown whole, as the view would.
+            assert!(highlighted.colour_to(&highlighter, now.len()));
+            let all = whole(&highlighter, path, &now);
+            assert_eq!(highlighted.lines(), all.lines(), "{now:?}");
             assert!(highlighted.stale_from().is_none());
         }
     }
@@ -333,22 +384,22 @@ mod tests {
         let highlighter = Highlighter::new();
         let path = Path::new("a.rs");
         let mut now: Vec<String> = (0..50).map(|i| format!("let v{i} = {i};")).collect();
-        let mut highlighted = highlighter.highlight(path, &now).unwrap();
+        let mut highlighted = whole(&highlighter, path, &now);
         now[2] = "/* opened".into();
         assert!(highlighted.update(&highlighter, &now, Some(10)));
         // The line edited, and ten more.
         assert_eq!(highlighted.stale_from(), Some(12));
-        let whole = highlighter.highlight(path, &now).unwrap();
-        assert_eq!(highlighted.lines()[..12], whole.lines()[..12]);
-        assert_ne!(highlighted.lines()[20], whole.lines()[20]);
+        let all = whole(&highlighter, path, &now);
+        assert_eq!(highlighted.lines()[..12], all.lines()[..12]);
+        assert_ne!(highlighted.lines()[20], all.lines()[20]);
         // Typed on a line of its own, far below: the lines in between
         // are not forgotten.
         now[40].push('x');
         for _ in 0..5 {
             assert!(highlighted.update(&highlighter, &now, Some(10)));
         }
-        let whole = highlighter.highlight(path, &now).unwrap();
-        assert_eq!(highlighted.lines(), whole.lines());
+        let all = whole(&highlighter, path, &now);
+        assert_eq!(highlighted.lines(), all.lines());
         assert!(highlighted.stale_from().is_none());
     }
 
@@ -370,7 +421,7 @@ mod tests {
             "'x'",
         ];
         let mut now: Vec<String> = (0..60).map(|i| format!("let v{i} = {i};")).collect();
-        let mut highlighted = highlighter.highlight(path, &now).unwrap();
+        let mut highlighted = whole(&highlighter, path, &now);
         // A small deterministic generator: the same run every time.
         let mut seed: u64 = 7;
         let mut next = |n: usize| {
@@ -390,6 +441,10 @@ mod tests {
                 _ => now.push(piece),
             }
             assert!(highlighted.update(&highlighter, &now, Some(3)));
+            // Shown here and there, as when scrolling.
+            if next(3) == 0 {
+                assert!(highlighted.colour_to(&highlighter, next(now.len() + 1)));
+            }
             // What is shown is always the text, whatever its colours.
             let shown: Vec<String> = highlighted
                 .lines()
@@ -399,8 +454,35 @@ mod tests {
             assert_eq!(shown, now);
         }
         assert!(highlighted.update(&highlighter, &now, None));
-        let whole = highlighter.highlight(path, &now).unwrap();
-        assert_eq!(highlighted.lines(), whole.lines());
-        assert_eq!(highlighted.starts, whole.starts);
+        assert!(highlighted.colour_to(&highlighter, now.len()));
+        let all = whole(&highlighter, path, &now);
+        assert_eq!(highlighted.lines(), all.lines());
+        assert_eq!(highlighted.starts, all.starts);
+    }
+
+    /// A file opens with nothing coloured; what is shown is coloured when
+    /// shown, edits past it are only taken in, and all ends as the whole.
+    #[test]
+    fn only_what_is_shown_is_coloured() {
+        let highlighter = Highlighter::new();
+        let path = Path::new("a.rs");
+        let mut now: Vec<String> = (0..100).map(|i| format!("let v{i} = {i};")).collect();
+        let mut highlighted = highlighter.highlight(path, &now).unwrap();
+        assert!(highlighted.colour_to(&highlighter, 10));
+        let all = whole(&highlighter, path, &now);
+        assert_eq!(highlighted.lines()[..10], all.lines()[..10]);
+        assert_eq!(highlighted.lines()[50], plain("let v50 = 50;"));
+
+        // Past what is coloured: taken as is.
+        now[60] = "/* far".into();
+        now.insert(70, "*/".into());
+        assert!(highlighted.update(&highlighter, &now, Some(3)));
+        assert_eq!(highlighted.lines()[60], plain("/* far"));
+        // Within it, reaching past it: coloured up to it.
+        now[5] = "/* near".into();
+        assert!(highlighted.update(&highlighter, &now, Some(3)));
+        assert_eq!(highlighted.coloured, 10);
+        assert!(highlighted.colour_to(&highlighter, now.len()));
+        assert_eq!(highlighted.lines(), whole(&highlighter, path, &now).lines());
     }
 }
