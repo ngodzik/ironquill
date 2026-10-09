@@ -29,6 +29,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The window links Wayland's client library, found with pkg-config.
+      - name: Wayland headers
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
 
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -57,6 +60,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The window links Wayland's client library, found with pkg-config.
+      - name: Wayland headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
       - name: Tests
         run: cargo test --workspace --all-features
 
@@ -70,6 +77,9 @@ jobs:
       # is told to leave it alone in dependabot.yml.
       - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
+      # The window links Wayland's client library, found with pkg-config.
+      - name: Wayland headers
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
 
       # The ref above and rust-version state the same fact in two places, and two
       # places drift. This makes them disagree loudly instead of leaving the job

@@ -138,6 +138,16 @@ impl UsageLog {
         out
     }
 
+    /// The share of the input read from the cache since `from`, over the
+    /// calls whose provider said; `None` when none did.
+    pub fn cache_share(&self, from: u64) -> Option<f64> {
+        let (read, input) = self
+            .since(from)
+            .filter_map(|s| s.cache_read.map(|read| (read, s.input)))
+            .fold((0, 0), |(r, i), (read, input)| (r + read, i + input));
+        (input > 0).then(|| read as f64 / input as f64)
+    }
+
     /// A model's cost added up since `from`, as the points of a line that
     /// steps up at each call: (seconds after `from`, dollars).
     pub fn cost_steps(&self, model: &str, from: u64) -> Vec<(f64, f64)> {
@@ -227,6 +237,16 @@ mod tests {
         assert_eq!(log.samples.len(), 3);
         // The window moved, the colour stays with the model while it shows.
         assert_eq!(log.models(0)[0].model, "opus");
+    }
+
+    #[test]
+    fn the_cache_share_counts_only_the_calls_that_said() {
+        let mut log = UsageLog::default();
+        log.push(sample(100, "glm", 0.01, Some(9_000), None));
+        log.push(sample(200, "opus", 0.10, Some(1_000), None));
+        log.push(sample(300, "tensorx", 0.01, None, None));
+        assert_eq!(log.cache_share(0), Some(0.5));
+        assert_eq!(log.cache_share(250), None);
     }
 
     #[test]

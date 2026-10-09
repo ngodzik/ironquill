@@ -1,0 +1,18 @@
+[package]
+name    = "ironquill-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The ironquill window: draws the interface's state on the GPU with Bevy and egui."
+
+[dependencies]
+ironquill-core.workspace  = true
+ironquill-tools.workspace = true
+ironquill-agent.workspace = true
+ironquill-ui.workspace    = true
+thiserror.workspace       = true
+bevy.workspace            = true
+bevy_egui.workspace       = true
+egui_plot.workspace       = true
+tokio = { workspace = true, features = ["rt", "time"] }

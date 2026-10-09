@@ -14,6 +14,11 @@ ignore = [
     # outside, so a flaw in it cannot be reached by a file being opened. To
     # revisit when syntect moves off bincode 1.
     { id = "RUSTSEC-2025-0141", reason = "syntect decodes only its own embedded dumps with it" },
+    # ttf-parser is unmaintained, with no replacement released. winit reaches
+    # it through sctk-adwaita, which draws the window's title bar on Wayland
+    # with a font of the system; no font from outside is ever parsed with it.
+    # To revisit when winit or sctk-adwaita moves off it.
+    { id = "RUSTSEC-2026-0192", reason = "winit parses only system fonts with it, for the Wayland title bar" },
 ]
 
 [licenses]
@@ -35,8 +40,16 @@ allow = [
     "Unlicense",
     # foldhash, through ratatui's hash maps. Permissive and OSI approved.
     "Zlib",
+    # arrayref, through the drawing of the window's title bar on Wayland.
+    # Permissive and OSI approved, as BSD-3-Clause is.
+    "BSD-2-Clause",
 ]
 confidence-threshold = 0.9
+# egui's own fonts, compiled into the window. Both licences let the fonts
+# ship inside a program; only that crate may use them.
+exceptions = [
+    { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
+]
 
 [bans]
 multiple-versions = "warn"

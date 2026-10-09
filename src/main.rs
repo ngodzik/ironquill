@@ -83,7 +83,13 @@ struct Cli {
     #[arg(short = 'r', long, num_args = 0..=1, value_name = "ID")]
     resume: Option<Option<String>>,
 
-    /// Without a subcommand, ironquill opens its terminal interface.
+    /// Open the window instead of the terminal interface: the same
+    /// conversation, keys and commands, drawn on the GPU.
+    #[arg(long)]
+    gui: bool,
+
+    /// Without a subcommand, ironquill opens its terminal interface, or its
+    /// window with --gui.
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -166,7 +172,12 @@ async fn main() -> Result<()> {
             budget: Pick::new(cli.budget, typed("budget")),
             effort: Pick::new(cli.effort, typed("effort")),
         };
-        return interface(provider, choices, start).await;
+        let screen = if cli.gui {
+            Screen::Window
+        } else {
+            Screen::Terminal
+        };
+        return interface(provider, choices, start, screen).await;
     };
 
     tracing_subscriber::fmt()
@@ -256,10 +267,18 @@ impl<T> Pick<T> {
     }
 }
 
+/// Where the interface is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Terminal,
+    Window,
+}
+
 async fn interface(
     provider: OpenAiCompatible,
     choices: Choices,
     start: ironquill_ui::Start,
+    screen: Screen,
 ) -> Result<()> {
     let workspace = Workspace::new(".")?;
     let defaults = match Defaults::path() {
@@ -398,14 +417,33 @@ async fn interface(
         claude: claude.unwrap_or_else(|| ClaudeCode::new("claude")),
         codex: codex.unwrap_or_else(|| Codex::new("codex")),
     };
-    ironquill_tui::run(
-        Arc::new(provider),
-        Arc::new(agents),
-        workspace,
-        settings,
-        start,
-    )
-    .await?;
+    match screen {
+        Screen::Terminal => {
+            ironquill_tui::run(
+                Arc::new(provider),
+                Arc::new(agents),
+                workspace,
+                settings,
+                start,
+            )
+            .await?;
+        }
+        Screen::Window => {
+            // The window needs the main thread, which this task runs on:
+            // the runtime's other threads carry its work meanwhile.
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                ironquill_gui::run(
+                    runtime,
+                    Arc::new(provider),
+                    Arc::new(agents),
+                    workspace,
+                    settings,
+                    start,
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 
