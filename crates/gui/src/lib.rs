@@ -594,7 +594,10 @@ where
 /// touched.
 fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
     let rect = ui.max_rect();
-    let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+    let response = ui.allocate_rect(
+        rect.with_max_x(rect.max.x - plan::EDGE_GRIP),
+        egui::Sense::click_and_drag(),
+    );
     if response.dragged() {
         let delta = response.drag_delta();
         universe.drag += Vec2::new(delta.x, delta.y);
@@ -755,11 +758,14 @@ fn conversation<M, D>(ui: &mut Ui, shell: &mut Shell<M, D>) {
     let back = shell.app.scroll_back();
     let delta = back as f32 - shell.scroll_seen as f32;
     shell.scroll_seen = back;
-    // No wider than its pane: a line too long to wrap (a path, a command)
-    // is cut rather than widen the pane, which would then not keep the
-    // width it is dragged to.
-    let output = ScrollArea::vertical()
-        .max_width(ui.available_width())
+    // A line too long to wrap (a command, a path, code) scrolls sideways
+    // rather than widen the pane: a scroll area that cannot scroll across
+    // grows to its widest line, and the pane with it, back to that width
+    // whenever it is dragged narrower. Text still wraps at the pane's width.
+    // Short of the scroll bar, which a scroll area across leaves to its
+    // content otherwise.
+    let width = ui.available_width() - ui.spacing().scroll.allocated_width();
+    let output = ScrollArea::both()
         .id_salt("transcript")
         .stick_to_bottom(true)
         .auto_shrink(false)
@@ -767,7 +773,7 @@ fn conversation<M, D>(ui: &mut Ui, shell: &mut Shell<M, D>) {
             if delta != 0.0 {
                 ui.scroll_with_delta(egui::vec2(0.0, delta * row));
             }
-            ui.set_max_width(ui.available_width().min(980.0));
+            ui.set_max_width(width.min(980.0));
             transcript::show(ui, &shell.app, &mut shell.effects);
         });
     shell.transcript_rows =

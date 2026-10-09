@@ -39,6 +39,10 @@ const EDIT_SHOWS: f64 = 3.2;
 const RISE: f64 = 0.45;
 const RISE_STAGGER: f64 = 0.09;
 
+/// How far from the conversation's border dragging leaves the plan alone:
+/// the border's own grip reaches that far into the plan.
+pub(crate) const EDGE_GRIP: f32 = 8.0;
+
 /// The width of the card listing a chosen component's files.
 const DETAILS_WIDTH: f32 = 340.0;
 
@@ -284,7 +288,11 @@ fn at_height(p: [Pos2; 4], y: f32) -> f32 {
 /// Draws the plan in `ui`, and handles the mouse over it.
 pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     let rect = ui.max_rect();
-    let response = ui.allocate_rect(rect, Sense::click_and_drag());
+    // Short of the right edge, where the conversation's border is dragged.
+    let response = ui.allocate_rect(
+        rect.with_max_x(rect.max.x - EDGE_GRIP),
+        Sense::click_and_drag(),
+    );
     let painter = ui.painter_at(rect);
     let now = ui.input(|i| i.time);
     let project = app.project().to_owned();

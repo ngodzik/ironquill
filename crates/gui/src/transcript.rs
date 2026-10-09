@@ -166,10 +166,13 @@ fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<Effect>) {
             };
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(step_title(*number, *of, name, model.as_ref(), *effort))
-                        .color(colour)
-                        .strong(),
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(step_title(*number, *of, name, model.as_ref(), *effort))
+                            .color(colour)
+                            .strong(),
+                    )
+                    .truncate(),
                 );
                 let rest = ui.available_width();
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(rest, 2.0), egui::Sense::hover());
@@ -282,13 +285,33 @@ fn wrapped(ui: &mut Ui, text: RichText) {
 }
 
 /// A step a model took: a coloured bullet, its name in bold, what it acted on.
+///
+/// The name and what it acted on wrap, as all text here does: one line
+/// wider than the pane (a long command) widens all that comes after it,
+/// which then wraps past the pane's edge, and the pane springs back to that
+/// width when dragged narrower.
 fn action(ui: &mut Ui, colour: Color32, name: &str, argument: &str) {
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
         ui.label(RichText::new("●").color(colour));
-        ui.label(RichText::new(name).strong());
+        let mut job = LayoutJob::default();
+        let style = ui.style().clone();
+        RichText::new(name).strong().color(TEXT).append_to(
+            &mut job,
+            &style,
+            egui::FontSelection::Default,
+            Align::Min,
+        );
         if !argument.is_empty() {
-            ui.label(RichText::new(argument).color(DIM));
+            RichText::new(format!("  {argument}")).color(DIM).append_to(
+                &mut job,
+                &style,
+                egui::FontSelection::Default,
+                Align::Min,
+            );
         }
+        ui.vertical(|ui| {
+            ui.add(egui::Label::new(job).wrap());
+        });
     });
 }
 
