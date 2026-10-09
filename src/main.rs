@@ -424,6 +424,7 @@ async fn interface(
         tick: defaults.tick,
         see_through: defaults.see_through,
         opacity: defaults.opacity,
+        chat_width: defaults.chat_width,
         images: defaults.images.unwrap_or_default(),
         mermaid: defaults.mermaid.clone(),
         detect_checks,

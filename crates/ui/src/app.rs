@@ -133,6 +133,9 @@ pub struct Settings {
     /// How opaque the window is while see-through, as configured; `None`
     /// takes [`DEFAULT_OPACITY`].
     pub opacity: Option<f32>,
+    /// How wide the window's conversation is beside a file or the
+    /// codebase, as last dragged; `None` leaves it to the window.
+    pub chat_width: Option<f32>,
     /// Whether replies show images, and in which terminals.
     pub images: Images,
     /// The command that draws Mermaid diagrams, as configured; `None` finds
@@ -3137,6 +3140,7 @@ impl App {
             see_through: self.settings.see_through,
             // Set in the file only: kept as written there.
             opacity: self.settings.opacity,
+            chat_width: self.settings.chat_width,
             images: (self.settings.images != Images::Auto).then_some(self.settings.images),
             mermaid: self.settings.mermaid.clone(),
         }
@@ -3374,6 +3378,18 @@ impl App {
             None => return,
         };
         self.notice = Some(notice.to_owned());
+    }
+
+    /// How wide the window's conversation is beside a file or the
+    /// codebase, as last dragged.
+    pub fn chat_width(&self) -> Option<f32> {
+        self.settings.chat_width
+    }
+
+    /// Keeps the width the conversation was dragged to, for this session
+    /// and the next, in whole points.
+    pub fn set_chat_width(&mut self, width: f32) {
+        self.settings.chat_width = Some(width.round());
     }
 
     /// How opaque the window's background is now: 1 unless see-through.
@@ -3951,6 +3967,17 @@ mod tests {
         assert_eq!(app.map_view(), None);
         app.show_map(Some(MapView::Universe));
         assert_eq!(app.map_view(), Some(MapView::Universe));
+    }
+
+    #[test]
+    fn the_conversation_s_width_as_dragged_is_kept_for_the_next_session() {
+        let mut app = ready();
+        assert_eq!(app.chat_width(), None);
+        let _ = app.defaults_to_keep();
+        app.set_chat_width(377.6);
+        assert_eq!(app.chat_width(), Some(378.0));
+        let kept = app.defaults_to_keep();
+        assert_eq!(kept.and_then(|d| d.chat_width), Some(378.0));
     }
 
     #[test]
@@ -4612,6 +4639,7 @@ mod tests {
                 tick: false,
                 see_through: false,
                 opacity: None,
+                chat_width: None,
                 images: None,
                 mermaid: None,
             }

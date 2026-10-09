@@ -80,13 +80,17 @@ pub struct Defaults {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tick: bool,
     /// Whether the window lets what is behind it show through, as a
-    /// terminal can, as Ctrl-L left it.
+    /// terminal can, as Ctrl-M left it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub see_through: bool,
     /// How opaque the window is while see-through, from 0.2 to 1. Set in
     /// the file only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
+    /// How wide the window's conversation is beside a file or the
+    /// codebase, in points, as last dragged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_width: Option<f32>,
     /// Whether replies show images: `auto` in a terminal known to draw
     /// them, `kitty` with Kitty's protocol whatever the terminal, `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,6 +194,7 @@ mod tests {
             tick: true,
             see_through: true,
             opacity: Some(0.7),
+            chat_width: Some(420.0),
             images: Some(Images::Off),
             mermaid: Some(vec!["mmdr".into(), "-i".into(), "{input}".into()]),
         };

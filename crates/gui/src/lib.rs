@@ -509,13 +509,12 @@ where
     if let Some(view) = view {
         // The conversation beside the codebase, translucent so that what
         // is drawn behind shows through; the codebase takes the rest.
-        // Held to a share of the window: its long lines would otherwise
-        // widen it until the codebase had no room left.
-        let chat = egui::Panel::right("chat-beside-map")
-            .default_size(480.0)
-            .max_size(ctx.content_rect().width() * 0.45)
-            .frame(pane.fill(theme::see(PANEL, 0.62 * opacity)))
-            .show(&mut root, |ui| conversation(ui, shell));
+        let chat = chat_beside(
+            &mut root,
+            &ctx,
+            shell,
+            pane.fill(theme::see(PANEL, 0.62 * opacity)),
+        );
         let window = ctx.content_rect().width().max(1.0);
         universe.covered = (window - chat.response.rect.left()).max(0.0) / window;
         egui::CentralPanel::default()
@@ -539,10 +538,7 @@ where
     }
     if view.is_some() {
     } else if shell.app.file().is_some() {
-        egui::Panel::right("chat-beside-file")
-            .default_size(520.0)
-            .frame(pane)
-            .show(&mut root, |ui| conversation(ui, shell));
+        chat_beside(&mut root, &ctx, shell, pane);
         egui::CentralPanel::default()
             .frame(pane.fill(background))
             .show(&mut root, |ui| {
@@ -559,6 +555,37 @@ where
         ctx.request_repaint();
     }
     Ok(())
+}
+
+/// The conversation's width beside a file or the codebase, until dragged.
+const CHAT_WIDTH: f32 = 440.0;
+
+/// The conversation on the right, beside a file or the codebase, as wide
+/// as it was last dragged, in this session or the last.
+fn chat_beside<M, D>(
+    root: &mut Ui,
+    ctx: &egui::Context,
+    shell: &mut Shell<M, D>,
+    frame: Frame,
+) -> egui::InnerResponse<()>
+where
+    M: ChatModel + 'static,
+    D: Delegate + 'static,
+{
+    let window = ctx.content_rect().width();
+    let wanted = shell.app.chat_width().unwrap_or(CHAT_WIDTH);
+    let chat = egui::Panel::right("chat-beside")
+        .default_size(wanted)
+        .size_range(260.0..=(window * 0.75).max(260.0))
+        .frame(frame)
+        .show(root, |ui| conversation(ui, shell));
+    // Kept once let go: while dragged, it changes every frame.
+    let width = chat.response.rect.width();
+    let held = ctx.input(|i| i.pointer.any_down());
+    if !held && (width - wanted).abs() >= 1.0 {
+        shell.app.set_chat_width(width);
+    }
+    chat
 }
 
 /// The universe's own controls: dragging turns it, the wheel comes closer,
@@ -728,7 +755,11 @@ fn conversation<M, D>(ui: &mut Ui, shell: &mut Shell<M, D>) {
     let back = shell.app.scroll_back();
     let delta = back as f32 - shell.scroll_seen as f32;
     shell.scroll_seen = back;
+    // No wider than its pane: a line too long to wrap (a path, a command)
+    // is cut rather than widen the pane, which would then not keep the
+    // width it is dragged to.
     let output = ScrollArea::vertical()
+        .max_width(ui.available_width())
         .id_salt("transcript")
         .stick_to_bottom(true)
         .auto_shrink(false)
