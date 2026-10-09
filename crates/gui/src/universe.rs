@@ -1,4 +1,4 @@
-//! The codebase as a universe (Ctrl-N): each file a star coloured by its
+//! The codebase as a universe (Ctrl-N, twice): each file a star coloured by its
 //! language and sized by its length, each folder a dimmer one, the links
 //! between them what holds what and what imports what. The stars spread out
 //! from the centre as the layout finds their places, and light up as the
@@ -15,7 +15,6 @@ use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use ironquill_codemap::{CodeMap, EdgeKind, Language, Layout, NodeKind};
-use ironquill_tools::ToolSummary;
 use ironquill_ui::Entry;
 
 /// The most files mapped: beyond, the layout would take too long to settle
@@ -353,27 +352,10 @@ pub(crate) fn light_up(
     let Some(map) = universe.map.as_ref() else {
         return;
     };
-    let mut lit = Vec::new();
-    for entry in &transcript[from..] {
-        let entry = match entry {
-            Entry::Member { entry, .. } => entry,
-            entry => entry,
-        };
-        let Entry::Tool { path, outcome, .. } = entry else {
-            continue;
-        };
-        let (path, edited) = match outcome {
-            Ok(ToolSummary::Changed { path, .. }) => (path.as_str(), true),
-            Ok(ToolSummary::Read { path, .. }) => (path.as_str(), false),
-            _ => match path {
-                Some(path) => (path.as_str(), false),
-                None => continue,
-            },
-        };
-        if let Some(node) = map.find(path) {
-            lit.push((node, edited));
-        }
-    }
+    let lit: Vec<(usize, bool)> = crate::activity::touched(&transcript[from..])
+        .into_iter()
+        .filter_map(|(path, edited)| Some((map.find(path)?, edited)))
+        .collect();
     for (node, edited) in lit {
         universe.flash[node] = if edited {
             (EDIT_FLASH, LinearRgba::rgb(1.0, 0.55, 0.2))
@@ -567,6 +549,7 @@ pub(crate) fn animate(
 mod tests {
     use bevy::ecs::world::CommandQueue;
     use ironquill_codemap::Node;
+    use ironquill_tools::ToolSummary;
 
     use super::*;
 

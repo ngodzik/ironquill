@@ -9,9 +9,11 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod architecture;
 mod imports;
 mod layout;
 mod map;
 
+pub use architecture::{Architecture, Component, Link, architecture};
 pub use layout::Layout;
 pub use map::{CodeMap, Edge, EdgeKind, Language, Node, NodeKind, map};

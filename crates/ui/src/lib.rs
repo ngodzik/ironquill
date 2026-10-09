@@ -27,8 +27,8 @@ pub mod tree;
 pub mod usage;
 
 pub use app::{
-    AgentMessage, App, CompactRow, DEFAULT_OPACITY, DockerPane, Effect, Entry, LineEditor, Panes,
-    Settings, SubAgent, parse_window, step_title,
+    AgentMessage, App, CompactRow, DEFAULT_OPACITY, DockerPane, Effect, Entry, LineEditor, MapView,
+    Panes, Settings, SubAgent, parse_window, step_title,
 };
 pub use defaults::{Defaults, Images};
 pub use host::{Host, Incoming, Start, Waiting};

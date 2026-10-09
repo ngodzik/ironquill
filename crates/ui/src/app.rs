@@ -52,6 +52,15 @@ pub struct Panes {
     pub sub: Option<Rect>,
 }
 
+/// How the window draws the codebase instead of the panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapView {
+    /// Its design, flat: the components, what uses what, in layers.
+    Plan,
+    /// Its files as stars in space, lit as the agent works.
+    Universe,
+}
+
 /// The Docker pane: what `docker ps` said last.
 #[derive(Debug, Default)]
 pub struct DockerPane {
@@ -685,8 +694,8 @@ pub struct App {
     /// Whether the screen draws pictures, so that a cited PNG shows in the
     /// conversation rather than open as a file.
     pictures_shown: bool,
-    /// Whether the window shows the codebase as a universe of files.
-    universe: bool,
+    /// How the window shows the codebase, if it does.
+    map: Option<MapView>,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -796,7 +805,7 @@ impl App {
             link_marks: RefCell::new(Vec::new()),
             known_references: RefCell::new(HashMap::new()),
             pictures_shown: false,
-            universe: false,
+            map: None,
             zoomed: false,
             zoom_focus: None,
             completion: None,
@@ -1086,15 +1095,13 @@ impl App {
                 }
             }
             Action::ToggleUsage => self.usage_open = !self.usage_open,
-            Action::ToggleUniverse => {
-                self.universe = !self.universe;
-                if self.universe {
-                    self.notice = Some(
-                        "The universe: drag to turn, scroll to come closer, click a star to open \
-                         it (in the terminal, it shows only in the window)"
-                            .to_owned(),
-                    );
-                }
+            Action::NextMap => {
+                let next = match self.map {
+                    None => Some(MapView::Plan),
+                    Some(MapView::Plan) => Some(MapView::Universe),
+                    Some(MapView::Universe) => None,
+                };
+                self.show_map(next);
             }
             Action::ToggleSeeThrough => {
                 self.settings.see_through = !self.settings.see_through;
@@ -3306,9 +3313,28 @@ impl App {
         }
     }
 
-    /// Whether the window shows the codebase as a universe of files.
-    pub fn universe_shown(&self) -> bool {
-        self.universe
+    /// How the window shows the codebase, if it does.
+    pub fn map_view(&self) -> Option<MapView> {
+        self.map
+    }
+
+    /// Shows the codebase as `view`, or the panes again with `None`: what
+    /// Ctrl-N steps through, and what the window's own buttons pick.
+    pub fn show_map(&mut self, view: Option<MapView>) {
+        self.map = view;
+        let notice = match view {
+            Some(MapView::Plan) => {
+                "The plan: what uses what, foundations at the bottom. Click a part to see its \
+                 files; Ctrl-N again for the universe (in the terminal, it shows only in the \
+                 window)"
+            }
+            Some(MapView::Universe) => {
+                "The universe: drag to turn, scroll to come closer, click a star to centre it; \
+                 Ctrl-N again to go back"
+            }
+            None => return,
+        };
+        self.notice = Some(notice.to_owned());
     }
 
     /// How opaque the window's background is now: 1 unless see-through.
@@ -3856,6 +3882,21 @@ mod tests {
         app.on_key(ctrl('p'));
         // Kept for the next session.
         assert_eq!(app.defaults().usage_window.as_deref(), Some("6h"));
+    }
+
+    #[test]
+    fn ctrl_n_shows_the_plan_then_the_universe_then_the_panes() {
+        let mut app = ready();
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(app.map_view(), None);
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), Some(MapView::Plan));
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), Some(MapView::Universe));
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), None);
+        app.show_map(Some(MapView::Universe));
+        assert_eq!(app.map_view(), Some(MapView::Universe));
     }
 
     #[test]

@@ -16,6 +16,10 @@ static RUST_MOD: LazyLock<Option<Regex>> =
 static RUST_USE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([A-Za-z_]\w*)((?:::[A-Za-z_]\w*)*)").ok()
 });
+/// A path through a crate written in code rather than imported:
+/// `ironquill_gui::run(..)`.
+static RUST_PATH: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?:^|[^\w:])([A-Za-z_]\w*)::").ok());
 static PY_FROM: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*from\s+(\.*)([\w.]*)\s+import\b").ok());
 static PY_IMPORT: LazyLock<Option<Regex>> =
@@ -126,6 +130,25 @@ fn rust(path: &str, text: &str, map: &CodeMap, crates: &HashMap<String, String>)
             }
         }
         found.push(target);
+    }
+    // A workspace crate named in a path, not imported: the crate itself,
+    // unless something of it was imported already.
+    if let Some(re) = RUST_PATH.as_ref() {
+        // Outside comments: a doc naming a crate is no use of it.
+        let code: String = text
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for c in re.captures_iter(&code) {
+            let Some(start) = crates.get(&c[1]) else {
+                continue;
+            };
+            let folder = format!("{}/", parent(parent(start)));
+            if !found.iter().any(|f| f.starts_with(&folder)) {
+                found.push(start.clone());
+            }
+        }
     }
     found
 }
@@ -306,7 +329,12 @@ mod tests {
         write(
             root,
             "b/src/main.rs",
-            "use my_ui::view::Thing;\nuse std::io;\n",
+            "use my_ui::view::Thing;\nuse std::io;\nfn main() { my_ui::run(); }\n",
+        );
+        write(
+            root,
+            "b/src/cli.rs",
+            "/// Not `my_ui::view::Thing`.\nfn f() { my_ui::run(); } // my_ui::view\n",
         );
         assert_eq!(
             imports(root, "a/src/lib.rs"),
@@ -317,6 +345,7 @@ mod tests {
             ["a/src/keys/mod.rs", "a/src/view/parts.rs"]
         );
         assert_eq!(imports(root, "b/src/main.rs"), ["a/src/view.rs"]);
+        assert_eq!(imports(root, "b/src/cli.rs"), ["a/src/lib.rs"]);
     }
 
     #[test]

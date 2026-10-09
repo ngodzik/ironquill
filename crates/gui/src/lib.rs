@@ -13,8 +13,10 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod activity;
 mod error;
 mod keys;
+mod plan;
 mod theme;
 mod transcript;
 mod universe;
@@ -44,14 +46,15 @@ use ironquill_codemap::NodeKind;
 use ironquill_core::{ChatModel, Delegate};
 use ironquill_tools::Workspace;
 use ironquill_ui::editor::EditorMode;
-use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
+use ironquill_ui::input::KeyEvent;
 use ironquill_ui::keymap::{Focus, Mode, Pending};
-use ironquill_ui::{App, Effect, Host, Settings, Start, Waiting, clipboard};
+use ironquill_ui::{App, Effect, Host, MapView, Settings, Start, Waiting, clipboard};
 use tokio::runtime::Handle;
 
 pub use error::GuiError;
 
 use crate::keys::{Held, Pressed};
+use crate::plan::Plan;
 use crate::theme::{ACCENT, DIM, EDGE, PANEL, RAISED, SELECTED, TEXT, YELLOW};
 use crate::universe::{Assets3d, Universe};
 use crate::usage::UsageView;
@@ -102,7 +105,9 @@ where
     runtime.block_on(host.start(&mut app, start));
     let title = format!("{} · ironquill", app.name());
     let universe = Universe::new(app.root().to_owned());
+    let plan = Plan::new(app.root().to_owned());
     let shell = Shell {
+        plan,
         app,
         host,
         runtime,
@@ -186,6 +191,8 @@ struct Shell<M, D> {
     /// Keys typed by a button, for the state on the next frame.
     keys: Vec<KeyEvent>,
     usage: UsageView,
+    /// The codebase's plan, drawn by egui alone.
+    plan: Plan,
     /// The conversation's scroll as the state last had it, in lines: a key
     /// that scrolls changes it, and the view follows by the difference.
     scroll_seen: usize,
@@ -380,7 +387,7 @@ fn drive<M, D>(
     } else {
         IDLE_WAIT
     };
-    let shown = shell.app.universe_shown();
+    let shown = shell.app.map_view() == Some(MapView::Universe);
     if universe.shown != shown {
         universe.shown = shown;
     }
@@ -479,19 +486,34 @@ where
         }
     }
 
-    if shell.app.universe_shown() {
-        // The conversation beside the universe, translucent so that the
-        // stars glow through it; the universe takes the rest.
-        let chat = egui::Panel::right("chat-beside-universe")
-            .default_size(500.0)
+    let now = ctx.input(|i| i.time);
+    let view = shell.app.map_view();
+    shell
+        .plan
+        .showing(view == Some(MapView::Plan), now, shell.app.transcript());
+    shell.plan.light_up(shell.app.transcript(), now);
+    if let Some(view) = view {
+        // The conversation beside the codebase, translucent so that what
+        // is drawn behind shows through; the codebase takes the rest.
+        // Held to a share of the window: its long lines would otherwise
+        // widen it until the codebase had no room left.
+        let chat = egui::Panel::right("chat-beside-map")
+            .default_size(480.0)
+            .max_size(ctx.content_rect().width() * 0.45)
             .frame(pane.fill(theme::see(PANEL, 0.62 * opacity)))
             .show(&mut root, |ui| conversation(ui, shell));
         let window = ctx.content_rect().width().max(1.0);
         universe.covered = (window - chat.response.rect.left()).max(0.0) / window;
         egui::CentralPanel::default()
-            .frame(Frame::NONE)
-            .show(&mut root, |ui| {
-                universe_view(ui, &mut universe, &mut shell.app, &mut shell.keys);
+            .frame(match view {
+                MapView::Universe => Frame::NONE,
+                MapView::Plan => Frame::NONE.fill(background),
+            })
+            .show(&mut root, |ui| match view {
+                MapView::Universe => {
+                    universe_view(ui, &mut universe, &mut shell.app);
+                }
+                MapView::Plan => plan::show(ui, &mut shell.plan, &mut shell.app),
             });
     } else if shell.app.tree().is_some() {
         egui::Panel::left("tree")
@@ -499,7 +521,7 @@ where
             .frame(pane)
             .show(&mut root, |ui| tree(ui, &shell.app));
     }
-    if shell.app.universe_shown() {
+    if view.is_some() {
     } else if shell.app.file().is_some() {
         egui::Panel::right("chat-beside-file")
             .default_size(520.0)
@@ -525,7 +547,7 @@ where
 /// a click centres a star, a double click opens its file. Names show for
 /// the star under the pointer, the one chosen, and those the agent just
 /// touched.
-fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App, keys: &mut Vec<KeyEvent>) {
+fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
     let rect = ui.max_rect();
     let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
     if response.dragged() {
@@ -553,7 +575,7 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App, keys: &mut
     {
         let path = universe.root().join(&map.nodes[node].path);
         app.open_path(path);
-        keys.push(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        app.show_map(None);
     } else if response.clicked() {
         universe.chosen = universe.hovered;
     }
@@ -677,6 +699,7 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App, keys: &mut
         egui::FontId::proportional(12.0),
         DIM,
     );
+    plan::switch(ui, rect, app);
 }
 
 /// The conversation, following new output unless a key scrolled it back.
@@ -693,7 +716,7 @@ fn conversation<M, D>(ui: &mut Ui, shell: &mut Shell<M, D>) {
             if delta != 0.0 {
                 ui.scroll_with_delta(egui::vec2(0.0, delta * row));
             }
-            ui.set_max_width(980.0);
+            ui.set_max_width(ui.available_width().min(980.0));
             transcript::show(ui, &shell.app, &mut shell.effects);
         });
     shell.transcript_rows =
