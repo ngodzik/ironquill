@@ -19,7 +19,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::graphics::Images;
+/// Whether replies show images, as `images` in `~/.ironquill/config.toml`
+/// says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Images {
+    /// In a terminal known to draw them.
+    #[default]
+    Auto,
+    /// With Kitty's protocol, whatever the terminal seems to be: for a
+    /// terminal that speaks it but is not recognised.
+    Kitty,
+    /// Never.
+    Off,
+}
 
 /// What a new session starts with, unless the command line says otherwise.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

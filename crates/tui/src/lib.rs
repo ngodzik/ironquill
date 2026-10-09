@@ -12,6 +12,7 @@
 #![warn(missing_docs)]
 
 mod app;
+mod blocks;
 mod clipboard;
 mod command;
 mod defaults;
@@ -53,7 +54,7 @@ use crate::sessions::Store;
 
 pub use app::{Settings, parse_window};
 pub use defaults::Defaults;
-pub use graphics::Images;
+pub use defaults::Images;
 
 /// How the interface starts.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

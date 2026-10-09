@@ -11,22 +11,8 @@ use std::collections::HashMap;
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use serde::{Deserialize, Serialize};
 
-/// Whether replies show images, as `images` in `~/.ironquill/config.toml`
-/// says.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Images {
-    /// In a terminal known to draw them.
-    #[default]
-    Auto,
-    /// With Kitty's protocol, whatever the terminal seems to be: for a
-    /// terminal that speaks it but is not recognised.
-    Kitty,
-    /// Never.
-    Off,
-}
+use crate::defaults::Images;
 
 /// How a terminal is told to draw an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

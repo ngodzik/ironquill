@@ -12,16 +12,15 @@ use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd}
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use tokio::sync::oneshot;
 
+use crate::blocks;
 use crate::command::{self, Command};
-use crate::defaults::Defaults;
+use crate::defaults::{Defaults, Images};
 use crate::editor::{Editor, Outcome as EditorOutcome};
-use crate::graphics::Images;
 use crate::highlight::Highlighter;
 use crate::input::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, Position, Rect,
 };
 use crate::keymap::{self, Action, Focus, Mode, Pending};
-use crate::markdown;
 use crate::references::{self, Reference};
 use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
@@ -1844,7 +1843,7 @@ impl App {
                     self.error("No reply to take changes from");
                     return None;
                 };
-                let blocks = markdown::diff_blocks(&reply);
+                let blocks = blocks::diff_blocks(&reply);
                 let mut patches = Vec::new();
                 for n in &numbers {
                     match blocks.iter().find(|(b, _)| b == n) {

@@ -1763,7 +1763,7 @@ fn render_transcript(frame: &mut Frame, app: &App, pictures: &dyn Pictures, area
         }
         // The copy marks of a reply's code blocks, as far as shown.
         if let Entry::Said(text) = entry {
-            let codes = markdown::code_blocks(text);
+            let codes = crate::blocks::code_blocks(text);
             let marked = block.iter().enumerate().filter(|(_, line)| {
                 line.spans
                     .iter()

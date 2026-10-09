@@ -401,7 +401,7 @@ mod tests {
     }
 
     fn kitty() -> Option<Terminal> {
-        graphics::detect(graphics::Images::Kitty, |_| None)
+        graphics::detect(crate::defaults::Images::Kitty, |_| None)
     }
 
     #[test]
