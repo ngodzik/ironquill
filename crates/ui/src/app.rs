@@ -978,12 +978,28 @@ impl App {
             && let Some(editor) = &mut self.file
         {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            // Stopping a request and the tree work from anywhere; Tab, Ctrl-W
-            // and the leader leave the file only when Vim is not mid-command.
+            // The shortcuts that work anywhere work here too, rather than
+            // reach Vim as the letter they hold (Ctrl-O would open a line);
+            // Tab, Ctrl-W and the leader leave the file only when Vim is not
+            // mid-command.
             let global = ctrl
                 && matches!(
                     key.code,
-                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a' | 'z' | 't')
+                    KeyCode::Char(
+                        'c' | 'b'
+                            | 'g'
+                            | 'k'
+                            | 'e'
+                            | 'q'
+                            | 's'
+                            | 'a'
+                            | 'z'
+                            | 't'
+                            | 'o'
+                            | 'p'
+                            | 'm'
+                            | 'n'
+                    )
                 );
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
@@ -1590,12 +1606,7 @@ impl App {
                 } else {
                     WHEEL_LINES
                 };
-                // The wheel scrolls what is under the pointer without moving
-                // the focus, as in most editors.
-                let focus = self.focus;
-                self.focus = hit;
-                self.move_focused(lines);
-                self.focus = focus;
+                self.wheel(hit, lines);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if hit == Focus::Chat {
@@ -1664,20 +1675,48 @@ impl App {
                     file.click(row, column);
                 }
                 if hit == Focus::Tree
-                    && let (Some(area), Some(tree)) = (panes.tree, &mut self.tree)
+                    && let (Some(area), Some(tree)) = (panes.tree, &self.tree)
                 {
                     // One row of border above the first entry.
                     let row = usize::from(mouse.row.saturating_sub(area.y + 1));
-                    let index = tree.offset() + row;
-                    if index < tree.rows().len() {
-                        tree.select(index);
-                        self.open_selected();
-                    }
+                    self.click_tree(tree.offset() + row);
                 }
             }
             _ => {}
         }
         None
+    }
+
+    /// Scrolls `pane` by `lines`, down when positive, without moving the
+    /// focus: the wheel scrolls what is under the pointer, as in most
+    /// editors.
+    pub fn wheel(&mut self, pane: Focus, lines: i32) {
+        let focus = self.focus;
+        self.focus = pane;
+        self.move_focused(lines);
+        self.focus = focus;
+    }
+
+    /// A click on the tree's entry `index`: it is chosen, a folder opens or
+    /// closes, a file opens.
+    pub fn click_tree(&mut self, index: usize) {
+        self.focus_on(Focus::Tree);
+        if let Some(tree) = &mut self.tree
+            && index < tree.rows().len()
+        {
+            tree.select(index);
+            self.open_selected();
+        }
+    }
+
+    /// A click on the open file, `row` lines below the first shown and
+    /// `column` characters into its text: the cursor goes there.
+    pub fn click_file(&mut self, row: usize, column: usize) {
+        self.focus_on(Focus::File);
+        if let Some(file) = &mut self.file {
+            let gutter = file.gutter();
+            file.click(row, column + gutter);
+        }
     }
 
     fn scroll(&mut self, down: i32) {
@@ -3636,7 +3675,9 @@ impl App {
 
     /// Closes the open file unless it has unsaved edits, which stay on screen
     /// with a note saying how to keep or drop them.
-    fn close_file(&mut self, next: Focus) {
+    /// Closes the open file and moves the focus to `next`; a file with
+    /// unsaved changes stays open and says so.
+    pub fn close_file(&mut self, next: Focus) {
         if let Some(file) = &mut self.file
             && file.is_modified()
         {
@@ -3882,6 +3923,19 @@ mod tests {
         app.on_key(ctrl('p'));
         // Kept for the next session.
         assert_eq!(app.defaults().usage_window.as_deref(), Some("6h"));
+    }
+
+    #[test]
+    fn the_window_wide_shortcuts_work_from_an_open_file_and_leave_it_unchanged() {
+        let (_dir, mut app) = project();
+        app.open_path(app.root.join("src/lib.rs"));
+        assert_eq!(app.focus, Focus::File);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('n'));
+        assert_eq!(app.map_view(), Some(MapView::Plan));
+        app.on_key(ctrl('o'));
+        assert!(app.usage_open);
+        assert!(app.file.as_ref().is_some_and(|f| !f.is_modified()));
     }
 
     #[test]

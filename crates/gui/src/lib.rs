@@ -46,7 +46,7 @@ use ironquill_codemap::NodeKind;
 use ironquill_core::{ChatModel, Delegate};
 use ironquill_tools::Workspace;
 use ironquill_ui::editor::EditorMode;
-use ironquill_ui::input::KeyEvent;
+use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use ironquill_ui::keymap::{Focus, Mode, Pending};
 use ironquill_ui::{App, Effect, Host, MapView, Settings, Start, Waiting, clipboard};
 use tokio::runtime::Handle;
@@ -115,6 +115,7 @@ where
         keys: Vec::new(),
         usage: UsageView::default(),
         scroll_seen: 0,
+        wheel_rest: 0.0,
         transcript_rows: 0,
     };
 
@@ -198,6 +199,9 @@ struct Shell<M, D> {
     scroll_seen: usize,
     /// How many lines the conversation scrolls through, as last drawn.
     transcript_rows: usize,
+    /// What the wheel or the touchpad moved short of a whole line, kept for
+    /// the next move: a touchpad sends many small ones.
+    wheel_rest: f32,
 }
 
 impl<M, D> Shell<M, D>
@@ -519,7 +523,9 @@ where
         egui::Panel::left("tree")
             .default_size(280.0)
             .frame(pane)
-            .show(&mut root, |ui| tree(ui, &shell.app));
+            .show(&mut root, |ui| {
+                tree(ui, &mut shell.app, &mut shell.wheel_rest, &mut shell.keys);
+            });
     }
     if view.is_some() {
     } else if shell.app.file().is_some() {
@@ -529,7 +535,9 @@ where
             .show(&mut root, |ui| conversation(ui, shell));
         egui::CentralPanel::default()
             .frame(pane.fill(background))
-            .show(&mut root, |ui| file(ui, &shell.app));
+            .show(&mut root, |ui| {
+                file(ui, &mut shell.app, &mut shell.wheel_rest, &mut shell.keys);
+            });
     } else {
         egui::CentralPanel::default()
             .frame(pane.fill(background))
@@ -577,7 +585,9 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
         app.open_path(path);
         app.show_map(None);
     } else if response.clicked() {
+        // A click frames again: the star chosen, or the whole.
         universe.chosen = universe.hovered;
+        universe.zoomed = false;
     }
 
     let painter = ui.painter_at(rect);
@@ -899,19 +909,31 @@ fn status(ui: &mut Ui, app: &App) {
 }
 
 /// The file tree, the selected row kept in view.
-fn tree(ui: &mut Ui, app: &App) {
+fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     let Some(tree) = app.tree() else {
         return;
     };
     let focused = app.focus() == Focus::Tree;
-    ui.label(
-        RichText::new("Files")
-            .strong()
-            .color(if focused { ACCENT } else { DIM }),
-    );
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Files")
+                .strong()
+                .color(if focused { ACCENT } else { DIM }),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .small_button("hide")
+                .on_hover_text("Ctrl-B shows or hides the files")
+                .clicked()
+            {
+                keys.push(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+            }
+        });
+    });
     ui.add_space(4.0);
     let row = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
     let visible = ((ui.available_height() / row) as usize).max(1);
+    let area = ui.available_rect_before_wrap();
     let selected = tree.selected();
     let mut offset = tree.offset();
     if selected < offset {
@@ -920,6 +942,7 @@ fn tree(ui: &mut Ui, app: &App) {
         offset = selected + 1 - visible;
     }
     tree.set_offset(offset);
+    let mut clicked = None;
     for (i, entry) in tree.rows().iter().enumerate().skip(offset).take(visible) {
         let icon = if entry.is_dir {
             if tree.is_expanded(&entry.path) {
@@ -939,7 +962,7 @@ fn tree(ui: &mut Ui, app: &App) {
             } else {
                 DIM
             });
-        Frame::new()
+        let shown = Frame::new()
             .fill(if i == selected && focused {
                 SELECTED
             } else {
@@ -949,18 +972,53 @@ fn tree(ui: &mut Ui, app: &App) {
             .inner_margin(Margin::symmetric(4, 1))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(text);
+                ui.add(egui::Label::new(text).selectable(false));
             });
+        let response = shown.response.interact(egui::Sense::click());
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(response.rect, 4, Color32::from_white_alpha(6));
+        }
+        if response.clicked() {
+            clicked = Some(i);
+        }
     }
+    // The wheel moves the choice, as the arrows do, so that what is chosen
+    // stays in sight.
+    let lines = wheel_lines(ui, area, rest, row);
+    if lines != 0 {
+        app.wheel(Focus::Tree, lines);
+    }
+    if let Some(index) = clicked {
+        app.click_tree(index);
+    }
+}
+
+/// The wheel's or the touchpad's move over `area` since last frame, in
+/// whole rows of `row` points, down when positive; what is left over waits
+/// in `rest`.
+fn wheel_lines(ui: &Ui, area: egui::Rect, rest: &mut f32, row: f32) -> i32 {
+    if !ui.rect_contains_pointer(area) {
+        return 0;
+    }
+    let delta = ui.input(|i| i.smooth_scroll_delta.y);
+    if delta == 0.0 {
+        return 0;
+    }
+    *rest -= delta / row.max(1.0);
+    let lines = rest.trunc();
+    *rest -= lines;
+    lines as i32
 }
 
 /// The open file, its lines numbered and coloured by its language, the
 /// cursor's line lit; the editor's mode and message under it.
-fn file(ui: &mut Ui, app: &App) {
+fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     let Some(editor) = app.file() else {
         return;
     };
     let focused = app.focus() == Focus::File;
+    let mut close = false;
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(editor.path().display().to_string())
@@ -970,6 +1028,23 @@ fn file(ui: &mut Ui, app: &App) {
         if editor.is_modified() {
             ui.label(RichText::new("modified").small().color(YELLOW));
         }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .small_button("close")
+                .on_hover_text("back to the conversation (, then c)")
+                .clicked()
+            {
+                close = true;
+            }
+            if app.tree().is_none()
+                && ui
+                    .small_button("files")
+                    .on_hover_text("the file tree (Ctrl-A)")
+                    .clicked()
+            {
+                keys.push(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+            }
+        });
     });
     ui.add_space(6.0);
     let row = ui.text_style_height(&egui::TextStyle::Monospace) + 2.0;
@@ -980,6 +1055,9 @@ fn file(ui: &mut Ui, app: &App) {
     editor.set_viewport(rows, columns);
     let (cursor_row, cursor_column) = editor.cursor();
     let styled = editor.styled();
+    let text_area = ui.available_rect_before_wrap();
+    let first = editor.scroll();
+    let mut clicked = None;
     for (i, line) in editor
         .lines()
         .iter()
@@ -988,7 +1066,7 @@ fn file(ui: &mut Ui, app: &App) {
         .take(rows)
     {
         let current = i == cursor_row;
-        Frame::new()
+        let shown = Frame::new()
             .fill(if current {
                 SELECTED
             } else {
@@ -1020,6 +1098,15 @@ fn file(ui: &mut Ui, app: &App) {
                     }
                 });
             });
+        let response = shown.response.interact(egui::Sense::click());
+        if response.clicked()
+            && let Some(at) = response.interact_pointer_pos()
+        {
+            // Past the line numbers, in characters.
+            let gutter = 7.0 * glyph;
+            let column = ((at.x - response.rect.left() - gutter) / glyph.max(1.0)).max(0.0);
+            clicked = Some((i - first, column as usize));
+        }
     }
     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
         let mode = match editor.mode() {
@@ -1041,4 +1128,14 @@ fn file(ui: &mut Ui, app: &App) {
             }
         });
     });
+    let lines = wheel_lines(ui, text_area, rest, row);
+    if lines != 0 {
+        app.wheel(Focus::File, lines);
+    }
+    if let Some((row, column)) = clicked {
+        app.click_file(row, column);
+    }
+    if close {
+        app.close_file(Focus::Chat);
+    }
 }

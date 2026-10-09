@@ -39,6 +39,10 @@ const SPARKS: usize = 36;
 const SPARK_SPEED: f32 = 3.2;
 const SPARK_LIFE: f32 = 1.4;
 
+/// The camera's nearest to what it looks at: closer, a star would pass
+/// through it and its glow fill the window.
+const NEAREST: f32 = 3.5;
+
 /// The far stars of the background.
 const SKY_STARS: usize = 1_400;
 
@@ -70,6 +74,9 @@ pub(crate) struct Universe {
     distance: f32,
     /// How far the camera is heading: it glides there.
     target_distance: f32,
+    /// Whether the wheel set the distance since the view last framed
+    /// something: it is then left alone.
+    pub(crate) zoomed: bool,
     /// What the panels report of the mouse, for the next frame.
     pub(crate) drag: Vec2,
     pub(crate) zoom: f32,
@@ -99,6 +106,7 @@ impl Universe {
             pitch: 0.35,
             distance: 90.0,
             target_distance: 90.0,
+            zoomed: false,
             drag: Vec2::ZERO,
             zoom: 0.0,
             hovered: None,
@@ -293,6 +301,7 @@ pub(crate) fn show_or_hide(
         if shown {
             // Each time it opens, the camera glides in from afar.
             universe.distance = 90.0;
+            universe.zoomed = false;
         }
     }
     let Some(assets) = assets else {
@@ -506,20 +515,20 @@ pub(crate) fn animate(
         Some(node) => (positions.get(node).copied().unwrap_or(Vec3::ZERO), 7.0),
         None => (Vec3::ZERO, whole),
     };
-    universe.target_distance = if zoom == 0.0 {
-        universe.target_distance
-    } else {
-        (universe.target_distance * (1.0 - zoom * 0.0015)).clamp(2.0, 200.0)
-    };
-    if zoom == 0.0 && universe.chosen.is_none() {
-        universe.target_distance = universe.target_distance.max(whole * 0.5);
-    }
-    if universe.chosen.is_some() && zoom == 0.0 {
+    // Until the wheel moves it, the camera frames the whole universe, or
+    // the star chosen; after, it stays where the wheel left it. The wheel
+    // scales the distance, so that a touchpad's burst cannot fly the camera
+    // through the stars, where their glow would fill the window.
+    if zoom != 0.0 {
+        universe.zoomed = true;
+        universe.target_distance *= (-zoom * 0.0015).clamp(-1.5, 1.5).exp();
+    } else if !universe.zoomed {
         universe.target_distance = goal.1;
     }
+    universe.target_distance = universe.target_distance.clamp(NEAREST, whole * 1.4);
     let ease = 1.0 - (-3.0 * dt).exp();
     universe.focus = universe.focus.lerp(goal.0, ease);
-    universe.distance += (universe.target_distance.min(whole * 1.4) - universe.distance) * ease;
+    universe.distance += (universe.target_distance - universe.distance) * ease;
     let Ok((mut transform, camera, global)) = camera.single_mut() else {
         return;
     };
