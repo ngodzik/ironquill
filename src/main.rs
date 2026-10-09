@@ -148,8 +148,13 @@ async fn main() -> Result<()> {
     // sessions; one from the environment does not, so that a variable set
     // long ago does not undo what was picked since.
     let typed = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
-    let api_key = cli.api_key.context("no API key: set IRONQUILL_API_KEY")?;
-    let provider = OpenAiCompatible::new(cli.base_url, api_key);
+    // The interface runs without a key: Claude Code and Codex bring their
+    // own credentials, and a call to the provider says the key is missing.
+    let keyed = cli.api_key.is_some();
+    let provider = match cli.api_key {
+        Some(key) => OpenAiCompatible::new(cli.base_url, key),
+        None => OpenAiCompatible::without_key(cli.base_url),
+    };
 
     let Some(command) = cli.command else {
         // No log subscriber here: anything written to the terminal while the
@@ -177,8 +182,13 @@ async fn main() -> Result<()> {
         } else {
             Screen::Terminal
         };
-        return interface(provider, choices, start, screen).await;
+        return interface(provider, keyed, choices, start, screen).await;
     };
+
+    // The commands below only call the provider.
+    if !keyed {
+        anyhow::bail!("no API key: set IRONQUILL_API_KEY");
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -276,6 +286,7 @@ enum Screen {
 
 async fn interface(
     provider: OpenAiCompatible,
+    keyed: bool,
     choices: Choices,
     start: ironquill_ui::Start,
     screen: Screen,
@@ -289,6 +300,13 @@ async fn interface(
     // A model typed at the command line replaces the one kept: say so, a
     // command recalled from the history would hide it otherwise.
     let mut notes = Vec::new();
+    if !keyed {
+        notes.push(
+            "No IRONQUILL_API_KEY: the provider's models cannot answer. Claude Code and Codex \
+             can, with their own sign-in: Ctrl-E to pick claude-code/... or codex/..."
+                .to_owned(),
+        );
+    }
     if let (Some(typed), Some(kept)) = (&choices.model.typed, &defaults.model)
         && typed != kept
     {

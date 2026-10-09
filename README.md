@@ -71,7 +71,7 @@ The interface follows my editor habits: Vim-like modes, a leader key, files open
 ## Usage
 
 ```bash
-export IRONQUILL_API_KEY=...        # your provider key
+export IRONQUILL_API_KEY=...        # your provider key; without one, only Claude Code and Codex answer
 cd your-project
 ironquill --model <cheap-model> --escalate <strong-model>
 ```
