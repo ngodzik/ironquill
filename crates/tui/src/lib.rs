@@ -19,6 +19,7 @@ mod editor;
 mod error;
 mod graphics;
 mod highlight;
+pub mod input;
 pub mod keymap;
 mod markdown;
 mod pictures;
@@ -216,12 +217,12 @@ where
         } else {
             tokio::select! {
                 key = keys.next() => match key {
-                    Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(from_terminal_key(key)),
                     Some(Ok(TermEvent::Paste(text))) => {
                         app.on_paste(&text);
                         None
                     }
-                    Some(Ok(TermEvent::Mouse(mouse))) => app.on_mouse(mouse),
+                    Some(Ok(TermEvent::Mouse(mouse))) => app.on_mouse(from_terminal_mouse(mouse)),
                     Some(Ok(TermEvent::Resize(..))) => {
                         set_cell_size(&app);
                         None
@@ -650,6 +651,64 @@ where
         };
         let _ = tx.send(message);
     })
+}
+
+/// A key as the terminal reports it, as the state reads it.
+fn from_terminal_key(key: ratatui::crossterm::event::KeyEvent) -> input::KeyEvent {
+    use input::KeyCode;
+    use ratatui::crossterm::event::KeyCode as Term;
+    let code = match key.code {
+        Term::Char(c) => KeyCode::Char(c),
+        Term::Enter => KeyCode::Enter,
+        Term::Esc => KeyCode::Esc,
+        Term::Tab => KeyCode::Tab,
+        Term::Backspace => KeyCode::Backspace,
+        Term::Delete => KeyCode::Delete,
+        Term::Up => KeyCode::Up,
+        Term::Down => KeyCode::Down,
+        Term::Left => KeyCode::Left,
+        Term::Right => KeyCode::Right,
+        Term::Home => KeyCode::Home,
+        Term::End => KeyCode::End,
+        Term::PageUp => KeyCode::PageUp,
+        Term::PageDown => KeyCode::PageDown,
+        _ => KeyCode::Other,
+    };
+    input::KeyEvent::new(code, from_terminal_modifiers(key.modifiers))
+}
+
+/// A click or a turn of the wheel as the terminal reports it, as the state
+/// reads it.
+fn from_terminal_mouse(mouse: ratatui::crossterm::event::MouseEvent) -> input::MouseEvent {
+    use input::{MouseButton, MouseEventKind};
+    use ratatui::crossterm::event::{MouseButton as Button, MouseEventKind as Kind};
+    let kind = match mouse.kind {
+        Kind::Down(Button::Left) => MouseEventKind::Down(MouseButton::Left),
+        Kind::Down(Button::Right) => MouseEventKind::Down(MouseButton::Right),
+        Kind::Down(Button::Middle) => MouseEventKind::Down(MouseButton::Middle),
+        Kind::ScrollUp => MouseEventKind::ScrollUp,
+        Kind::ScrollDown => MouseEventKind::ScrollDown,
+        _ => MouseEventKind::Other,
+    };
+    input::MouseEvent {
+        kind,
+        column: mouse.column,
+        row: mouse.row,
+        modifiers: from_terminal_modifiers(mouse.modifiers),
+    }
+}
+
+fn from_terminal_modifiers(held: ratatui::crossterm::event::KeyModifiers) -> input::KeyModifiers {
+    use input::KeyModifiers;
+    use ratatui::crossterm::event::KeyModifiers as Term;
+    [
+        (Term::SHIFT, KeyModifiers::SHIFT),
+        (Term::CONTROL, KeyModifiers::CONTROL),
+        (Term::ALT, KeyModifiers::ALT),
+    ]
+    .into_iter()
+    .filter(|(term, _)| held.contains(*term))
+    .fold(KeyModifiers::NONE, |all, (_, ours)| all | ours)
 }
 
 /// An error and its causes on one line, so that "the request failed" says why.

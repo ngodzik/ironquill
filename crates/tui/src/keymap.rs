@@ -7,7 +7,7 @@
 //! Movement is on the arrow keys everywhere. Vim's spirit is kept in the modes,
 //! the `,` leader and the `Ctrl-W` window prefix, not in `hjkl`.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The editing mode, as in Vim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

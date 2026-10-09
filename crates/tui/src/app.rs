@@ -10,10 +10,6 @@ use ironquill_agent::{
 };
 use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
-use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use ratatui::layout::{Position, Rect};
 use tokio::sync::oneshot;
 
 use crate::command::{self, Command};
@@ -21,6 +17,9 @@ use crate::defaults::Defaults;
 use crate::editor::{Editor, Outcome as EditorOutcome};
 use crate::graphics::Images;
 use crate::highlight::Highlighter;
+use crate::input::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, Position, Rect,
+};
 use crate::keymap::{self, Action, Focus, Mode, Pending};
 use crate::markdown;
 use crate::pictures::{Gallery, Picture, Pictures};
@@ -3610,7 +3609,7 @@ impl Pictures for App {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    use crate::input::{KeyCode, KeyModifiers};
 
     use super::*;
 
@@ -3875,7 +3874,7 @@ mod tests {
 
     #[test]
     fn a_code_block_copies_with_a_click_and_only_its_mark_folds() {
-        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use crate::input::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = ready();
         let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
         app.transcript.push(Entry::Said(format!(
@@ -3954,7 +3953,7 @@ mod tests {
 
     #[test]
     fn a_cited_file_opens_at_its_line_with_a_click() {
-        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use crate::input::{MouseButton, MouseEvent, MouseEventKind};
         let (_dir, mut app) = project();
         app.transcript.push(Entry::Said(
             "The second line is in src/lib.rs:2, not in nowhere.rs:1.".into(),

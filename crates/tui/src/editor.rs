@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use regex::RegexBuilder;
 
 use ironquill_tools::{LineChanges, committed_lines, line_changes};

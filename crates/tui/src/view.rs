@@ -532,8 +532,8 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
         // Only the conversation; the other panes keep their state, unseen.
         let sub = render_chat(frame, app, area, false);
         app.set_panes(Panes {
-            chat: area,
-            sub,
+            chat: cells(area),
+            sub: sub.map(cells),
             ..Panes::default()
         });
         return;
@@ -582,10 +582,10 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
 
     let alone = app.tree().is_none() && app.file().is_none();
     let mut panes = Panes {
-        tree: (tree_width > 0).then_some(tree),
+        tree: (tree_width > 0).then_some(cells(tree)),
         file: None,
-        chat: center,
-        docker,
+        chat: cells(center),
+        docker: docker.map(cells),
         sub: None,
     };
     if let Some(docker) = docker {
@@ -598,17 +598,22 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
         // The command frame sits under the file, as Vim's command line does.
         let [file, command] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(center);
-        panes.file = Some(file);
+        panes.file = Some(cells(file));
         render_file(frame, app, file);
         render_command_frame(frame, app, command);
-        panes.chat = side;
+        panes.chat = cells(side);
         if side_width > 0 {
-            panes.sub = render_chat(frame, app, side, true);
+            panes.sub = render_chat(frame, app, side, true).map(cells);
         }
     } else {
-        panes.sub = render_chat(frame, app, center, !alone);
+        panes.sub = render_chat(frame, app, center, !alone).map(cells);
     }
     app.set_panes(panes);
+}
+
+/// Where a pane was drawn, as the state reads it to match a click.
+fn cells(area: Rect) -> crate::input::Rect {
+    crate::input::Rect::new(area.x, area.y, area.width, area.height)
 }
 
 /// The border of a pane, bright when it has the focus.
@@ -1786,7 +1791,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
 
     let back = app.scroll_back().min(max_scroll);
     let top = max_scroll - back;
-    app.set_entry_lines(ranges, top, area);
+    app.set_entry_lines(ranges, top, cells(area));
     app.set_marks(fold_marks, copy_marks, link_marks);
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
