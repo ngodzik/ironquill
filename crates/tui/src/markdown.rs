@@ -241,8 +241,8 @@ fn fill(out: &mut Vec<Line<'static>>, pieces: &[Piece], width: usize, lead: &str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::code_blocks;
     use crate::pictures::NoPictures;
+    use ironquill_ui::blocks::code_blocks;
 
     fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
         super::render(text, width, base, &NoPictures)

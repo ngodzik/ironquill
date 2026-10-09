@@ -10,17 +10,20 @@ const SKIPPED: [&str; 3] = ["target", "node_modules", "__pycache__"];
 
 /// One visible line of the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Row {
+pub struct Row {
     /// Relative to the project root.
-    pub(crate) path: PathBuf,
-    pub(crate) name: String,
-    pub(crate) depth: usize,
-    pub(crate) is_dir: bool,
+    pub path: PathBuf,
+    /// The file or folder's name.
+    pub name: String,
+    /// How deep it is, the project's top level being 0.
+    pub depth: usize,
+    /// Whether it is a folder.
+    pub is_dir: bool,
 }
 
 /// The project's files as a tree, with the directories the person opened.
 #[derive(Debug)]
-pub(crate) struct FileTree {
+pub struct FileTree {
     root: PathBuf,
     expanded: BTreeSet<PathBuf>,
     rows: Vec<Row>,
@@ -46,21 +49,24 @@ impl FileTree {
         tree
     }
 
-    pub(crate) fn rows(&self) -> &[Row] {
+    /// The rows shown, folders unfolded.
+    pub fn rows(&self) -> &[Row] {
         &self.rows
     }
 
-    pub(crate) fn selected(&self) -> usize {
+    /// The row selected, by its place in the rows.
+    pub fn selected(&self) -> usize {
         self.selected
     }
 
-    pub(crate) fn is_expanded(&self, path: &Path) -> bool {
+    /// Whether this folder is unfolded.
+    pub fn is_expanded(&self, path: &Path) -> bool {
         self.expanded.contains(path)
     }
 
     /// Git's letter for a file (`M`, `A`, `?`, `D`, `R`), or for a folder the
     /// strongest of its files': changes to tracked files before new files.
-    pub(crate) fn git_status(&self, path: &Path, is_dir: bool) -> Option<char> {
+    pub fn git_status(&self, path: &Path, is_dir: bool) -> Option<char> {
         let path = path.to_string_lossy();
         if !is_dir {
             return self.git.get(path.as_ref()).copied();
@@ -78,11 +84,13 @@ impl FileTree {
         found
     }
 
-    pub(crate) fn offset(&self) -> usize {
+    /// The first row in view.
+    pub fn offset(&self) -> usize {
         self.offset.get()
     }
 
-    pub(crate) fn set_offset(&self, offset: usize) {
+    /// Records the first row in view, as the view scrolled it.
+    pub fn set_offset(&self, offset: usize) {
         self.offset.set(offset);
     }
 

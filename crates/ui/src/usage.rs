@@ -51,20 +51,25 @@ impl Sample {
 
 /// The samples of the last day.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct UsageLog {
+pub struct UsageLog {
     pub(crate) samples: Vec<Sample>,
 }
 
 /// What one model used in a window.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ModelUse {
-    pub(crate) model: String,
-    pub(crate) color: Rgb,
-    pub(crate) calls: usize,
-    pub(crate) cost: f64,
+pub struct ModelUse {
+    /// The model's name.
+    pub model: String,
+    /// Its colour, the same whatever the window shows.
+    pub color: Rgb,
+    /// How many calls it made.
+    pub calls: usize,
+    /// What they cost, where known, in dollars.
+    pub cost: f64,
     /// Cache read, as a share of the input, over the calls that said.
-    pub(crate) cache_share: Option<f64>,
-    pub(crate) rebuilds: usize,
+    pub cache_share: Option<f64>,
+    /// How many calls rebuilt their cache, which had expired.
+    pub rebuilds: usize,
 }
 
 impl UsageLog {
@@ -99,7 +104,7 @@ impl UsageLog {
     }
 
     /// Each model's use since `from`, in the order they first appear.
-    pub(crate) fn models(&self, from: u64) -> Vec<ModelUse> {
+    pub fn models(&self, from: u64) -> Vec<ModelUse> {
         let mut out: Vec<ModelUse> = Vec::new();
         let mut cached: Vec<(u64, u64)> = Vec::new();
         for s in self.since(from) {
@@ -135,7 +140,7 @@ impl UsageLog {
 
     /// A model's cost added up since `from`, as the points of a line that
     /// steps up at each call: (seconds after `from`, dollars).
-    pub(crate) fn cost_steps(&self, model: &str, from: u64) -> Vec<(f64, f64)> {
+    pub fn cost_steps(&self, model: &str, from: u64) -> Vec<(f64, f64)> {
         let mut total = 0.0;
         let mut points = vec![(0.0, 0.0)];
         for s in self.since(from).filter(|s| s.model == model) {
@@ -148,7 +153,7 @@ impl UsageLog {
     }
 
     /// The conversation's context over time: (seconds after `from`, tokens).
-    pub(crate) fn context_line(&self, from: u64) -> Vec<(f64, f64)> {
+    pub fn context_line(&self, from: u64) -> Vec<(f64, f64)> {
         self.since(from)
             .filter_map(|s| s.context.map(|c| ((s.at - from) as f64, c as f64)))
             .collect()
@@ -156,7 +161,7 @@ impl UsageLog {
 
     /// The calls that rebuilt their cache: (seconds after `from`, tokens
     /// written).
-    pub(crate) fn rebuilds(&self, from: u64) -> Vec<(f64, f64)> {
+    pub fn rebuilds(&self, from: u64) -> Vec<(f64, f64)> {
         self.since(from)
             .filter(|s| s.rebuilt())
             .map(|s| ((s.at - from) as f64, s.cache_written.unwrap_or(0) as f64))
@@ -165,7 +170,7 @@ impl UsageLog {
 }
 
 /// A window in seconds as a person writes it: `90m`, `6h`, `1d`.
-pub(crate) fn window_name(secs: u64) -> String {
+pub fn window_name(secs: u64) -> String {
     match secs {
         s if s % (24 * 3600) == 0 => format!("{}d", s / (24 * 3600)),
         s if s % 3600 == 0 => format!("{}h", s / 3600),

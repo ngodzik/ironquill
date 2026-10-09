@@ -1,35 +1,20 @@
 //! The ironquill terminal interface.
 //!
-//! Split so that each part can change without the others:
-//! - [`keymap`] turns keys into actions; rebinding a key touches only it.
-//! - `App` holds the state and decides what each action does. It performs
-//!   no I/O: it returns an `Effect` for the loop to carry out, which is what
-//!   makes it testable without a terminal.
-//! - `view` draws the state and changes nothing.
-//! - The loop below wires the terminal, the keyboard and the agent together.
+//! The state, the keys and what each does live in `ironquill-ui`, which
+//! knows nothing of terminals. This crate only:
+//! - draws that state with Ratatui (`view`), changing nothing;
+//! - shows pictures with Kitty's protocol (`graphics`, `pictures`);
+//! - runs the loop below, which turns the terminal's events into the
+//!   state's own, carries out the `Effect`s the state returns and wires the
+//!   agent in.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-mod app;
-mod blocks;
-mod clipboard;
-mod command;
-mod defaults;
-mod editor;
 mod error;
 mod graphics;
-mod highlight;
-pub mod input;
-pub mod keymap;
 mod markdown;
 mod pictures;
-mod references;
-mod review;
-mod sessions;
-pub mod style;
-mod tree;
-mod usage;
 mod view;
 mod wrap;
 
@@ -49,12 +34,8 @@ use ratatui::crossterm::execute;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::app::{AgentMessage, App, Effect};
-use crate::sessions::Store;
-
-pub use app::{Settings, parse_window};
-pub use defaults::Defaults;
-pub use defaults::Images;
+use ironquill_ui::sessions::Store;
+use ironquill_ui::{AgentMessage, App, Defaults, Effect, Settings, clipboard, input, review};
 
 /// How the interface starts.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

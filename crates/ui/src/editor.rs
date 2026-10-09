@@ -41,11 +41,14 @@ const UNNAMED: char = '"';
 
 /// The editor's own mode, as in Vim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EditorMode {
+pub enum EditorMode {
+    /// Moving around, as in Vim.
     Normal,
+    /// Typing text.
     Insert,
     /// `v` selects characters, `V` whole lines.
     Visual {
+        /// Whether whole lines are selected, as with `V`.
         line: bool,
     },
     /// Typing a `:` command in the frame under the file.
@@ -122,7 +125,7 @@ impl Register {
 
 /// The selected region, ends included, start before end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Selection {
+pub struct Selection {
     pub(crate) start: (usize, usize),
     pub(crate) end: (usize, usize),
     pub(crate) line: bool,
@@ -131,7 +134,7 @@ pub(crate) struct Selection {
 impl Selection {
     /// The selected characters of `row`, as a half-open range of columns,
     /// or `None` when the row is outside the selection.
-    pub(crate) fn columns(&self, row: usize, len: usize) -> Option<(usize, usize)> {
+    pub fn columns(&self, row: usize, len: usize) -> Option<(usize, usize)> {
         if row < self.start.0 || row > self.end.0 {
             return None;
         }
@@ -157,7 +160,7 @@ struct Snapshot {
 
 /// What the editor holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
+pub enum Kind {
     /// A file of the project, written to disk by `:w`.
     File,
     /// The conversation's context, handed back to the interface by `:w`.
@@ -165,7 +168,7 @@ pub(crate) enum Kind {
 }
 
 /// One open file, or the conversation's context.
-pub(crate) struct Editor {
+pub struct Editor {
     kind: Kind,
     /// Relative to the project root.
     path: PathBuf,
@@ -406,12 +409,12 @@ impl Editor {
     }
 
     /// How many lines a closed fold at `row` hides, if `row` is one.
-    pub(crate) fn folded(&self, row: usize) -> Option<usize> {
+    pub fn folded(&self, row: usize) -> Option<usize> {
         (self.closed.contains(&row) && self.is_header(row)).then(|| self.block_end(row) - row - 1)
     }
 
     /// Which rows a closed fold hides, one flag per line.
-    pub(crate) fn hidden(&self) -> Vec<bool> {
+    pub fn hidden(&self) -> Vec<bool> {
         let mut mask = vec![false; self.lines.len()];
         for &header in &self.closed {
             if self.is_header(header) {
@@ -515,7 +518,8 @@ impl Editor {
         self.folded(row).map_or(row, |hidden| row + hidden)
     }
 
-    pub(crate) fn kind(&self) -> Kind {
+    /// What the editor holds: a file, or the conversation's context.
+    pub fn kind(&self) -> Kind {
         self.kind
     }
 
@@ -547,63 +551,72 @@ impl Editor {
 
     // Read access for the view.
 
-    pub(crate) fn path(&self) -> &Path {
+    /// The file's path.
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn lines(&self) -> &[String] {
+    /// The lines, as edited.
+    pub fn lines(&self) -> &[String] {
         &self.lines
     }
 
-    pub(crate) fn styled(&self) -> Option<&[StyledLine]> {
+    /// The lines coloured by their language, when it is known.
+    pub fn styled(&self) -> Option<&[StyledLine]> {
         self.styled.as_deref()
     }
 
     /// How the lines differ from the last commit, while that is known and in
     /// step with the lines; `None` outside git or while it is being redone.
-    pub(crate) fn changes(&self) -> Option<&LineChanges> {
+    pub fn changes(&self) -> Option<&LineChanges> {
         (self.base.is_some() && self.changes.marks.len() == self.lines.len())
             .then_some(&self.changes)
     }
 
     /// Records which line each drawn row shows.
-    pub(crate) fn set_rows(&self, rows: Vec<Option<usize>>) {
+    pub fn set_rows(&self, rows: Vec<Option<usize>>) {
         *self.rows.borrow_mut() = rows;
     }
 
-    pub(crate) fn cursor(&self) -> (usize, usize) {
+    /// The cursor, as a row and a column in characters.
+    pub fn cursor(&self) -> (usize, usize) {
         (self.row, self.col)
     }
 
-    pub(crate) fn scroll(&self) -> usize {
+    /// The first line in view.
+    pub fn scroll(&self) -> usize {
         self.scroll
     }
 
     /// Records the size of the text area, line numbers excluded.
-    pub(crate) fn set_viewport(&self, height: usize, width: usize) {
+    pub fn set_viewport(&self, height: usize, width: usize) {
         self.height.set(height);
         self.width.set(width);
     }
 
-    pub(crate) fn mode(&self) -> EditorMode {
+    /// The editing mode.
+    pub fn mode(&self) -> EditorMode {
         self.mode
     }
 
-    pub(crate) fn prompt(&self) -> &str {
+    /// What is typed after `:` or `/`, while it is.
+    pub fn prompt(&self) -> &str {
         &self.prompt
     }
 
-    pub(crate) fn message(&self) -> Option<(&str, bool)> {
+    /// A message for the person, and whether it is an error.
+    pub fn message(&self) -> Option<(&str, bool)> {
         self.message.as_ref().map(|(m, e)| (m.as_str(), *e))
     }
 
-    pub(crate) fn is_modified(&self) -> bool {
+    /// Whether there are changes not written yet.
+    pub fn is_modified(&self) -> bool {
         self.modified
     }
 
     /// Keys typed so far of a command not yet complete, as Vim's `showcmd`
     /// shows them: `"+`, `d`, `"+y`.
-    pub(crate) fn partial_command(&self) -> String {
+    pub fn partial_command(&self) -> String {
         let mut shown = String::new();
         if let Some(name) = self.register {
             shown.push('"');
@@ -617,7 +630,8 @@ impl Editor {
         shown
     }
 
-    pub(crate) fn selection(&self) -> Option<Selection> {
+    /// The selection, in visual mode.
+    pub fn selection(&self) -> Option<Selection> {
         let EditorMode::Visual { line } = self.mode else {
             return None;
         };
@@ -639,14 +653,14 @@ impl Editor {
     }
 
     /// Width of the line number column, gutter spaces included.
-    pub(crate) fn gutter(&self) -> usize {
+    pub fn gutter(&self) -> usize {
         // The number, a space, the change mark, a space.
         self.lines.len().max(1).to_string().len() + 3
     }
 
     /// The first column shown, so that the cursor stays on screen in long
     /// lines. Every line is shifted by the same amount, as in Vim with `nowrap`.
-    pub(crate) fn left_offset(&self) -> usize {
+    pub fn left_offset(&self) -> usize {
         (self.col + 1).saturating_sub(self.width.get().max(1))
     }
 

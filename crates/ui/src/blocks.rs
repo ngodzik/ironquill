@@ -32,7 +32,7 @@ pub(crate) fn diff_blocks(text: &str) -> Vec<(usize, String)> {
 
 /// The code blocks of `text`, as written, in order: what each copy mark
 /// copies.
-pub(crate) fn code_blocks(text: &str) -> Vec<String> {
+pub fn code_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current: Option<Vec<&str>> = None;
     for line in text.lines() {

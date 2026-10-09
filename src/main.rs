@@ -18,7 +18,7 @@ use ironquill_llm::{
     Ranking, find_ranking,
 };
 use ironquill_tools::{Check, ToolSummary, Toolbox, Workspace};
-use ironquill_tui::Defaults;
+use ironquill_ui::Defaults;
 use tracing_subscriber::EnvFilter;
 
 /// How many tracked file names go to the model up front. Enough to orient it
@@ -359,7 +359,7 @@ async fn interface(
         })
         .collect();
 
-    let settings = ironquill_tui::Settings {
+    let settings = ironquill_ui::Settings {
         tiers,
         checks,
         rounds: 2,
@@ -378,7 +378,7 @@ async fn interface(
         usage_window: defaults
             .usage_window
             .as_deref()
-            .and_then(ironquill_tui::parse_window),
+            .and_then(ironquill_ui::parse_window),
         allowed_secrets: defaults.allowed_secrets.clone(),
         strict_commands: !defaults.lenient_commands,
         allowed_hosts: defaults.allowed_hosts.clone(),

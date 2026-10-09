@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-use crate::defaults::Images;
+use ironquill_ui::defaults::Images;
 
 /// How a terminal is told to draw an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

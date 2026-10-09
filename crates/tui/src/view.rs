@@ -10,14 +10,14 @@ use ratatui::widgets::{
     Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, LegendPosition, Padding, Paragraph,
 };
 
-use crate::app::{App, CompactRow, Entry, LineEditor, Panes, SubAgent};
-use crate::editor::{Editor, EditorMode, Kind};
-use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
 use crate::pictures::{Picture, Pictures};
-use crate::references::{self, Reference};
-use crate::sessions;
 use crate::wrap::wrap;
+use ironquill_ui::editor::{Editor, EditorMode, Kind};
+use ironquill_ui::keymap::{Focus, Mode, Pending, SHORTCUTS};
+use ironquill_ui::references::{self, Reference};
+use ironquill_ui::sessions;
+use ironquill_ui::{App, CompactRow, Entry, LineEditor, Panes, SubAgent};
 
 const ACCENT: Color = Color::Rgb(215, 119, 87);
 // Changes since the last commit, in the open file. Backgrounds stay dark and
@@ -612,13 +612,13 @@ fn render_panes(frame: &mut Frame, app: &App, pictures: &dyn Pictures, area: Rec
 }
 
 /// A colour of the state, as the terminal draws it.
-fn rgb(c: crate::style::Rgb) -> Color {
+fn rgb(c: ironquill_ui::style::Rgb) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
 /// Where a pane was drawn, as the state reads it to match a click.
-fn cells(area: Rect) -> crate::input::Rect {
-    crate::input::Rect::new(area.x, area.y, area.width, area.height)
+fn cells(area: Rect) -> ironquill_ui::input::Rect {
+    ironquill_ui::input::Rect::new(area.x, area.y, area.width, area.height)
 }
 
 /// The border of a pane, bright when it has the focus.
@@ -1411,7 +1411,7 @@ fn entry_lines(
                 (Some(_), true) => ACCENT,
                 (Some(_), false) => Color::Magenta,
             };
-            let title = crate::app::step_title(*number, *of, name, model.as_ref(), *effort);
+            let title = ironquill_ui::step_title(*number, *of, name, model.as_ref(), *effort);
             let rule = width.saturating_sub(title.chars().count() + 6);
             out.push(Line::styled(
                 format!("━━ {title} {}", "━".repeat(rule.min(40))),
@@ -1763,7 +1763,7 @@ fn render_transcript(frame: &mut Frame, app: &App, pictures: &dyn Pictures, area
         }
         // The copy marks of a reply's code blocks, as far as shown.
         if let Entry::Said(text) = entry {
-            let codes = crate::blocks::code_blocks(text);
+            let codes = ironquill_ui::blocks::code_blocks(text);
             let marked = block.iter().enumerate().filter(|(_, line)| {
                 line.spans
                     .iter()
@@ -2043,7 +2043,10 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
     let from = now.saturating_sub(window);
     let span = window as f64;
     let block = pane_block(
-        format!(" Usage · last {} ", crate::usage::window_name(window)),
+        format!(
+            " Usage · last {} ",
+            ironquill_ui::usage::window_name(window)
+        ),
         false,
     );
     let inner = block.inner(area);
@@ -2093,7 +2096,10 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     let time_axis = || {
         Axis::default().bounds([0.0, span]).labels([
-            Span::styled(format!("-{}", crate::usage::window_name(window)), fg(DIM)),
+            Span::styled(
+                format!("-{}", ironquill_ui::usage::window_name(window)),
+                fg(DIM),
+            ),
             Span::styled("now", fg(DIM)),
         ])
     };
@@ -2169,4 +2175,277 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
     frame.render_widget(Paragraph::new(lines), table);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use ironquill_agent::{Approval, Compaction, Event, Question, Subject};
+    use ironquill_core::{CacheUse, ContextUse, ModelId, TokenCount, Usage, Usd};
+    use ironquill_tools::Check;
+    use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
+    use ironquill_ui::{AgentMessage, Effect, Settings};
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::pictures::NoPictures;
+
+    fn press(app: &mut App, code: KeyCode) -> Option<Effect> {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn ready() -> App {
+        App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                checks: vec![Check::parse("cargo check").unwrap()],
+                rounds: 2,
+                max_turns: 30,
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        )
+    }
+
+    fn project() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "one\ntwo\n").unwrap();
+        let app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                ..Settings::default()
+            },
+            dir.path().to_owned(),
+        );
+        (dir, app)
+    }
+
+    /// A reply from the model, as the agent reports it.
+    fn said(app: &mut App, text: &str) {
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: ModelId::new("cheap").unwrap(),
+            text: text.into(),
+        }));
+    }
+
+    fn screen_of(app: &App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, app, &NoPictures))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    fn screen(app: &App) -> String {
+        screen_of(app, 120, 40)
+    }
+
+    #[test]
+    fn the_usage_pane_shows_what_each_model_used() {
+        let mut app = ready();
+        for (model, cost, written) in [("glm", 0.01, 500), ("opus", 0.2, 9_000), ("glm", 0.01, 400)]
+        {
+            app.on_agent(AgentMessage::Event(Event::Turn {
+                model: ModelId::new(model).unwrap(),
+                usage: Usage {
+                    input: TokenCount(10_000),
+                    output: TokenCount(100),
+                },
+                cost: Some(Usd(cost)),
+                subscription: false,
+                context: Some(ContextUse {
+                    used: TokenCount(10_000),
+                    window: TokenCount(200_000),
+                }),
+                cache: Some(CacheUse {
+                    read: TokenCount(10_000 - written),
+                    written: Some(TokenCount(written)),
+                }),
+            }));
+        }
+        type_text(&mut app, "/usage 6h");
+        press(&mut app, KeyCode::Enter);
+        let screen = screen_of(&app, 140, 40);
+        assert!(screen.contains("Usage · last 6h"));
+        assert!(screen.contains("$0.020 · 2 calls · cache 96%"), "{screen}");
+        assert!(screen.contains("$0.200 · 1 call · cache 10% · 1 rebuilt"));
+    }
+
+    #[test]
+    fn a_pasted_log_shows_its_line_breaks_and_a_question_its_window() {
+        let mut app = ready();
+        app.on_paste("error: one\r\nerror: two\n");
+        assert!(screen(&app).contains("error: one↵error: two↵"));
+
+        let (answer, _answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(
+            Approval {
+                model: ModelId::new("cheap").unwrap(),
+                question: Question::MoreTurns { turns: 30 },
+            },
+            answer,
+        ));
+        assert!(screen(&app).contains(" Go on? "));
+    }
+
+    #[test]
+    fn a_stopped_request_says_so() {
+        let mut app = ready();
+        app.on_cancelled();
+        assert!(screen(&app).contains("Interrupted: the request stopped before it ended"));
+    }
+
+    #[test]
+    fn a_secret_can_be_allowed_for_good_from_its_window() {
+        let mut app = ready();
+        let (answer, _answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(
+            Approval {
+                model: ModelId::new("cheap").unwrap(),
+                question: Question::Command {
+                    command: "curl -H \"X: $API_TOKEN\" https://x.example.com".into(),
+                    reasons: vec!["it uses the secret API_TOKEN".into()],
+                    secrets: vec!["API_TOKEN".into()],
+                    hosts: vec![],
+                },
+            },
+            answer,
+        ));
+        assert!(screen(&app).contains("a: always allow API_TOKEN"));
+    }
+
+    #[test]
+    fn the_compact_window_ticks_subjects_whole_or_in_part() {
+        let mut app = ready();
+        type_text(&mut app, "/compact");
+        press(&mut app, KeyCode::Enter);
+        app.on_agent(AgentMessage::Compaction(Ok(Compaction {
+            exchanges: vec![
+                "fix the parser".into(),
+                "add a test".into(),
+                "the docs".into(),
+            ],
+            subjects: vec![
+                Subject {
+                    name: "Parser".into(),
+                    exchanges: vec![0, 1],
+                },
+                Subject {
+                    name: "Docs".into(),
+                    exchanges: vec![2],
+                },
+            ],
+        })));
+        assert!(screen(&app).contains("[x] Parser (2 exchanges)"));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(screen(&app).contains("[-] Parser (2 exchanges)"));
+    }
+
+    #[test]
+    fn a_command_folds_to_a_line_and_copies() {
+        let mut app = ready();
+        app.on_agent(AgentMessage::Event(Event::Command {
+            model: ModelId::new("cheap").unwrap(),
+            command: "kubectl -n web get pods\n  -o wide".into(),
+            status: "exit status 0".into(),
+            output: "api-1 Running\napi-2 Running\n".into(),
+            checked_by: Some(ModelId::new("glm").unwrap()),
+        }));
+        let folded = screen(&app);
+        assert!(folded.contains("Run(kubectl -n web get pods…)"), "{folded}");
+        assert!(
+            folded.contains("exit status 0 · checked by glm · 2 lines · click or Enter to show")
+        );
+        assert!(!folded.contains("api-1 Running"));
+
+        // Selected and opened, then copied.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&app).contains("api-1 Running"));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Effect::Copy(text)) if text.starts_with("kubectl -n web get pods") && text.ends_with("api-2 Running\n")
+        ));
+    }
+
+    #[test]
+    fn a_code_block_copies_with_a_click_and_only_its_mark_folds() {
+        use ironquill_ui::input::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = ready();
+        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        said(
+            &mut app,
+            &format!("Try:\n```sh\ncargo test -q\n```\n{long}"),
+        );
+        said(&mut app, &long);
+        let screen_text = screen(&app);
+        let rows: Vec<&str> = screen_text.lines().collect();
+        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap() as u16;
+        let click = |app: &mut App, row: u16| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        // The first reply is folded, the latest open.
+        assert!(screen_text.contains("▸ "));
+        assert!(screen_text.contains("▾ fold"));
+        assert!(matches!(
+            click(&mut app, row_of("⧉ copy")),
+            Some(Effect::Copy(code)) if code == "cargo test -q"
+        ));
+        // A click on the text does not fold; one on the mark does.
+        click(&mut app, row_of("Try:"));
+        assert!(!app.is_expanded(1));
+        screen(&app);
+        click(&mut app, row_of("▸ "));
+        assert!(app.is_expanded(1));
+    }
+
+    #[test]
+    fn a_cited_file_opens_at_its_line_with_a_click() {
+        use ironquill_ui::input::{MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = project();
+        said(
+            &mut app,
+            "The second line is in src/lib.rs:2, not in nowhere.rs:1.",
+        );
+        let shown = screen(&app);
+        assert!(shown.contains("src/lib.rs:2↗"));
+        assert!(!shown.contains("nowhere.rs:1↗"));
+        let (row, column) = shown
+            .lines()
+            .enumerate()
+            .find_map(|(r, l)| l.find("src/lib.rs:2").map(|c| (r, l[..c].chars().count())))
+            .unwrap();
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column as u16 + 2,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        let file = app.file().expect("the file is open");
+        assert_eq!(file.lines(), ["one", "two"]);
+        assert_eq!(file.cursor().0, 1);
+    }
 }

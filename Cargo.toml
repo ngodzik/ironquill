@@ -4,6 +4,7 @@ members = [
     "crates/llm",
     "crates/tools",
     "crates/agent",
+    "crates/ui",
     "crates/tui",
     ".",
 ]
@@ -23,6 +24,7 @@ ironquill-core = { path = "crates/core", version = "0.1.0" }
 ironquill-llm  = { path = "crates/llm", version = "0.1.0" }
 ironquill-tools = { path = "crates/tools", version = "0.1.0" }
 ironquill-agent = { path = "crates/agent", version = "0.1.0" }
+ironquill-ui    = { path = "crates/ui", version = "0.1.0" }
 ironquill-tui   = { path = "crates/tui", version = "0.1.0" }
 
 thiserror  = "2.0.21"
@@ -75,6 +77,7 @@ ironquill-core.workspace     = true
 ironquill-llm.workspace      = true
 ironquill-tools.workspace    = true
 ironquill-agent.workspace    = true
+ironquill-ui.workspace       = true
 ironquill-tui.workspace      = true
 anyhow.workspace             = true
 clap.workspace               = true

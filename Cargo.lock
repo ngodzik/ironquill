@@ -1230,6 +1230,7 @@ dependencies = [
  "ironquill-llm",
  "ironquill-tools",
  "ironquill-tui",
+ "ironquill-ui",
  "serde",
  "serde_json",
  "tokio",
@@ -1303,13 +1304,25 @@ dependencies = [
  "ironquill-agent",
  "ironquill-core",
  "ironquill-tools",
+ "ironquill-ui",
  "ratatui",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "ironquill-ui"
+version = "0.1.0"
+dependencies = [
+ "ironquill-agent",
+ "ironquill-core",
+ "ironquill-tools",
  "regex",
  "serde",
  "serde_json",
  "syntect",
  "tempfile",
- "thiserror 2.0.21",
  "tokio",
  "toml",
 ]

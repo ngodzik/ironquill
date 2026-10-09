@@ -401,7 +401,7 @@ mod tests {
     }
 
     fn kitty() -> Option<Terminal> {
-        graphics::detect(crate::defaults::Images::Kitty, |_| None)
+        graphics::detect(ironquill_ui::defaults::Images::Kitty, |_| None)
     }
 
     #[test]

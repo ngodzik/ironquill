@@ -32,22 +32,30 @@ const WHEEL_LINES: i32 = 3;
 /// Where each pane was drawn, written by the view so that a mouse click can be
 /// matched to a pane. Areas include the pane's border.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Panes {
-    pub(crate) tree: Option<Rect>,
-    pub(crate) file: Option<Rect>,
-    pub(crate) chat: Rect,
-    pub(crate) docker: Option<Rect>,
-    pub(crate) sub: Option<Rect>,
+pub struct Panes {
+    /// The file tree, when open.
+    pub tree: Option<Rect>,
+    /// The open file, when one is.
+    pub file: Option<Rect>,
+    /// The conversation.
+    pub chat: Rect,
+    /// The Docker pane, when open.
+    pub docker: Option<Rect>,
+    /// The sub-agent pane, when a task handed over is shown.
+    pub sub: Option<Rect>,
 }
 
 /// The Docker pane: what `docker ps` said last.
 #[derive(Debug, Default)]
-pub(crate) struct DockerPane {
-    pub(crate) containers: Vec<Container>,
-    pub(crate) error: Option<String>,
+pub struct DockerPane {
+    /// The running containers, as last listed.
+    pub containers: Vec<Container>,
+    /// Why docker could not list them, when it could not.
+    pub error: Option<String>,
     /// False until the first answer arrives.
-    pub(crate) loaded: bool,
-    pub(crate) selected: usize,
+    pub loaded: bool,
+    /// The container selected, by its place in the list.
+    pub selected: usize,
 }
 
 /// Lines moved by a half page scroll. Fixed rather than measured, so that the
@@ -113,11 +121,11 @@ pub struct Settings {
 
 /// Tokens and cost of one part of a request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Spent {
-    pub(crate) usage: Usage,
-    pub(crate) cost: Usd,
+pub struct Spent {
+    pub usage: Usage,
+    pub cost: Usd,
     /// Some turns ran on a subscription, which costs nothing per request.
-    pub(crate) subscription: bool,
+    pub subscription: bool,
 }
 
 impl std::fmt::Display for Spent {
@@ -133,40 +141,44 @@ impl std::fmt::Display for Spent {
 }
 
 /// A task handed to a model of the team, as the sub-agent pane shows it.
-pub(crate) struct SubAgent<'a> {
-    pub(crate) from: &'a ModelId,
-    pub(crate) to: &'a ModelId,
-    pub(crate) task: &'a str,
-    pub(crate) spent: Spent,
+pub struct SubAgent<'a> {
+    /// The model that handed the task over.
+    pub from: &'a ModelId,
+    /// The model of the team working on it.
+    pub to: &'a ModelId,
+    /// The task, as it was handed over.
+    pub task: &'a str,
+    /// What the work cost so far.
+    pub spent: Spent,
     /// What it did, in order.
-    pub(crate) work: Vec<&'a Entry>,
+    pub work: Vec<&'a Entry>,
     /// Still working on it.
-    pub(crate) working: bool,
+    pub working: bool,
 }
 
 /// The model picker (Ctrl-E) while it is open.
 #[derive(Debug, Default)]
-pub(crate) struct ModelPicker {
+pub struct ModelPicker {
     /// What was typed to search the provider's models.
-    pub(crate) filter: String,
-    pub(crate) selected: usize,
+    pub filter: String,
+    pub selected: usize,
     /// The effort when it opened, to say so when ← → changed it.
     pub(crate) effort_at_open: Effort,
 }
 
 /// One row of the model picker.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ModelRow {
-    pub(crate) model: ModelId,
-    pub(crate) note: String,
+pub struct ModelRow {
+    pub model: ModelId,
+    pub note: String,
     /// Among the models offered every time, not only found by the search.
-    pub(crate) offered: bool,
-    pub(crate) in_team: bool,
+    pub offered: bool,
+    pub in_team: bool,
 }
 
 /// Something only the event loop can do, asked for by the state.
 #[derive(Debug)]
-pub(crate) enum Effect {
+pub enum Effect {
     /// Put this text on the system clipboard.
     Copy(String),
     /// Show what a commit did, as a reply cited it.
@@ -181,12 +193,20 @@ pub(crate) enum Effect {
     PlanCompaction(AgentConfig),
     /// Compact the conversation to the exchanges kept.
     Compact {
+        /// What the summary is written with.
         config: AgentConfig,
+        /// The exchanges kept, by their place in the conversation.
         keep: Vec<usize>,
+        /// Whether the last exchange stays as it was rather than summed up.
         last_as_is: bool,
     },
     /// Send this message to the conversation.
-    Send { text: String, config: AgentConfig },
+    Send {
+        /// The message.
+        text: String,
+        /// How the agent works on it.
+        config: AgentConfig,
+    },
     /// Stop the request in progress.
     Cancel,
     /// Start a new conversation.
@@ -215,7 +235,8 @@ pub(crate) enum Effect {
 
 /// What the agent task sends back to the interface.
 #[derive(Debug)]
-pub(crate) enum AgentMessage {
+pub enum AgentMessage {
+    /// Something the agent did, as it happened.
     Event(Event),
     /// A command held for the person, and where to send their answer.
     Approve(Approval, oneshot::Sender<Answer>),
@@ -227,14 +248,17 @@ pub(crate) enum AgentMessage {
     Compaction(Result<Compaction, String>),
     /// The conversation was compacted: about how many tokens before, after.
     Compacted(Result<(TokenCount, TokenCount), String>),
+    /// The request ended: how, or why it failed.
     Done(Result<Outcome, String>),
 }
 
 /// One item in the transcript. Saved with the conversation, so that a
 /// resumed one shows what it showed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum Entry {
+pub enum Entry {
+    /// The greeting a new conversation opens with.
     Welcome,
+    /// A note from ironquill itself.
     Info(String),
     /// How a pair ended, who did what and what changed, in one line.
     Ended(String),
@@ -242,37 +266,61 @@ pub(crate) enum Entry {
     Refused(String),
     /// A command a model ran, folded to its first line until opened.
     Command {
+        /// The model that ran it.
         model: ModelId,
+        /// The command as written.
         command: String,
+        /// How it ended.
         status: String,
+        /// What it printed.
         output: String,
+        /// The model that read it first, when it was held because it could not be read.
         checked_by: Option<ModelId>,
     },
     /// The person stopped the request before it ended.
     Interrupted,
+    /// Something went wrong, said in the conversation.
     Error(String),
+    /// What the person wrote.
     User(String),
+    /// What a model answered.
     Said(String),
+    /// A tool a model called.
     Tool {
+        /// The tool.
         name: String,
+        /// The path it acted on, when it has one.
         path: Option<String>,
+        /// What it did, or the error the model was told.
         outcome: Result<ToolSummary, String>,
     },
+    /// The checks about to run, in order.
     Checks(Vec<String>),
+    /// The checks passed.
     Passed,
+    /// A check failed.
     Failed {
+        /// The command that failed.
         command: String,
+        /// The part of its output worth reading.
         excerpt: String,
     },
+    /// A stronger model takes over.
     Escalating {
+        /// The model that gave up.
         from: ModelId,
+        /// The model taking over.
         to: ModelId,
     },
+    /// Every model gave up.
     GaveUp,
     /// The model handed a task to another of the team.
     Delegating {
+        /// The model that handed the task over.
         from: ModelId,
+        /// The model of the team it went to.
         to: ModelId,
+        /// The task.
         task: String,
         /// What the member's work cost, as it accrues.
         #[serde(default)]
@@ -280,28 +328,41 @@ pub(crate) enum Entry {
     },
     /// The request spent its budget and stopped.
     OverBudget {
+        /// What it spent.
         spent: Usd,
+        /// What it was allowed to spend.
         budget: Usd,
     },
     /// A step of a request worked on in a pair: what, by whom.
     Step {
+        /// The step's number, from 1.
         number: u8,
+        /// How many steps the request has.
         of: u8,
+        /// What the step does: plan, code, review.
         name: String,
+        /// The model doing it, when known.
         model: Option<ModelId>,
+        /// The effort it works at, for a model that reasons.
         effort: Option<Effort>,
     },
     /// What a model of the team did on a task handed to it, shown apart
     /// from the model that answers.
     Member {
+        /// The model of the team.
         model: ModelId,
+        /// What it did.
         entry: Box<Entry>,
     },
     /// What one request cost, shown under it.
     Cost {
+        /// The tokens the request used.
         usage: Usage,
+        /// What it cost.
         cost: Usd,
+        /// Whether every call reported its cost: when not, the cost is a floor.
         complete: bool,
+        /// How long it took, in seconds.
         seconds: u64,
         /// Ran on a subscription (Claude Code): no cost is owed for it.
         #[serde(default)]
@@ -321,7 +382,7 @@ pub(crate) enum Entry {
 
 impl Entry {
     /// A model's reply, which folds when long.
-    pub(crate) fn is_reply(&self) -> bool {
+    pub fn is_reply(&self) -> bool {
         match self {
             Entry::Said(_) => true,
             Entry::Member { entry, .. } => entry.is_reply(),
@@ -353,27 +414,29 @@ impl Entry {
 
 /// What /compact keeps: subjects, each open or not, ticked exchanges.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CompactPicker {
-    pub(crate) compaction: Compaction,
+pub struct CompactPicker {
+    pub compaction: Compaction,
     /// Whether each exchange is kept, summed up.
-    pub(crate) kept: Vec<bool>,
+    pub kept: Vec<bool>,
     /// The subject shown with its exchanges.
     pub(crate) open: Option<usize>,
-    pub(crate) cursor: usize,
+    pub cursor: usize,
     /// Whether the last exchange stays as it was rather than summed up.
-    pub(crate) last_as_is: bool,
+    pub last_as_is: bool,
 }
 
 /// A row of the /compact window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompactRow {
+pub enum CompactRow {
+    /// A subject, by its place in the list of subjects.
     Subject(usize),
+    /// An exchange, by its place in the conversation.
     Exchange(usize),
 }
 
 impl CompactPicker {
     /// The rows shown: each subject, and the exchanges of the open one.
-    pub(crate) fn rows(&self) -> Vec<CompactRow> {
+    pub fn rows(&self) -> Vec<CompactRow> {
         let mut rows = Vec::new();
         for (s, subject) in self.compaction.subjects.iter().enumerate() {
             rows.push(CompactRow::Subject(s));
@@ -430,17 +493,19 @@ impl History {
 
 /// A single line of text being edited, with a cursor counted in characters.
 #[derive(Debug, Default)]
-pub(crate) struct LineEditor {
+pub struct LineEditor {
     text: String,
     cursor: usize,
 }
 
 impl LineEditor {
-    pub(crate) fn text(&self) -> &str {
+    /// The text being edited.
+    pub fn text(&self) -> &str {
         &self.text
     }
 
-    pub(crate) fn cursor(&self) -> usize {
+    /// Where the cursor is, in characters from the start.
+    pub fn cursor(&self) -> usize {
         self.cursor
     }
 
@@ -509,7 +574,7 @@ impl LineEditor {
 }
 
 /// The whole state of the interface.
-pub(crate) struct App {
+pub struct App {
     settings: Settings,
     root: PathBuf,
     project: String,
@@ -628,13 +693,14 @@ pub(crate) struct App {
 
 /// The list of saved conversations shown by `/resume`.
 #[derive(Debug)]
-pub(crate) struct Picker {
-    pub(crate) items: Vec<Summary>,
-    pub(crate) selected: usize,
+pub struct Picker {
+    pub items: Vec<Summary>,
+    pub selected: usize,
 }
 
 impl App {
-    pub(crate) fn new(mut settings: Settings, root: PathBuf) -> Self {
+    /// The state of a new conversation in the project at `root`.
+    pub fn new(mut settings: Settings, root: PathBuf) -> Self {
         // The picker offers every model known at startup, the ones in use
         // first, and keeps offering them whatever is picked later.
         let mut models = settings.tiers.clone();
@@ -731,58 +797,69 @@ impl App {
 
     // Read access for the view.
 
-    pub(crate) fn mode(&self) -> Mode {
+    /// The editing mode.
+    pub fn mode(&self) -> Mode {
         self.mode
     }
 
-    pub(crate) fn input(&self) -> &LineEditor {
+    /// The message box.
+    pub fn input(&self) -> &LineEditor {
         &self.input
     }
 
-    pub(crate) fn command_line(&self) -> &LineEditor {
+    /// The `:` command line.
+    pub fn command_line(&self) -> &LineEditor {
         &self.command
     }
 
-    pub(crate) fn transcript(&self) -> &[Entry] {
+    /// Everything the conversation shows, in order.
+    pub fn transcript(&self) -> &[Entry] {
         &self.transcript
     }
 
-    pub(crate) fn scroll_back(&self) -> usize {
+    /// How many lines the conversation is scrolled up from its end: 0 follows new output.
+    pub fn scroll_back(&self) -> usize {
         self.scroll_back.get()
     }
 
     /// Scrolls the conversation so that a given line range is in view. Called
     /// by the view, the only part that knows where an entry's lines are.
-    pub(crate) fn set_scroll_back(&self, back: usize) {
+    pub fn set_scroll_back(&self, back: usize) {
         self.scroll_back.set(back);
     }
 
-    pub(crate) fn set_max_scroll(&self, max: usize) {
+    /// Records how far the conversation can scroll, which only the view knows.
+    pub fn set_max_scroll(&self, max: usize) {
         self.max_scroll.set(max);
     }
 
-    pub(crate) fn project(&self) -> &str {
+    /// The project's name, from its directory.
+    pub fn project(&self) -> &str {
         &self.project
     }
 
-    pub(crate) fn focus(&self) -> Focus {
+    /// The pane that receives movement keys.
+    pub fn focus(&self) -> Focus {
         self.focus
     }
 
-    pub(crate) fn pending(&self) -> Option<Pending> {
+    /// The first key of a two-key binding, while the second is awaited.
+    pub fn pending(&self) -> Option<Pending> {
         self.pending
     }
 
-    pub(crate) fn tree(&self) -> Option<&FileTree> {
+    /// The file tree, when open.
+    pub fn tree(&self) -> Option<&FileTree> {
         self.tree.as_ref()
     }
 
-    pub(crate) fn file(&self) -> Option<&Editor> {
+    /// The open file, when one is.
+    pub fn file(&self) -> Option<&Editor> {
         self.file.as_ref()
     }
 
     /// Whether the agent changed `path`, or a file under it, this conversation.
-    pub(crate) fn is_changed(&self, path: &Path, is_dir: bool) -> bool {
+    pub fn is_changed(&self, path: &Path, is_dir: bool) -> bool {
         let path = path.to_string_lossy();
         if is_dir {
             let prefix = format!("{path}/");
@@ -792,41 +869,48 @@ impl App {
         }
     }
 
-    pub(crate) fn set_panes(&self, panes: Panes) {
+    /// Records where each pane was drawn, so that a click finds its pane.
+    pub fn set_panes(&self, panes: Panes) {
         self.panes.set(panes);
     }
 
-    pub(crate) fn checks(&self) -> &[Check] {
+    /// The checks a request is judged by, for `ironquill do` and pairs.
+    pub fn checks(&self) -> &[Check] {
         &self.settings.checks
     }
 
-    pub(crate) fn spinner(&self) -> usize {
+    /// The spinner's frame, advanced while a request runs.
+    pub fn spinner(&self) -> usize {
         self.spinner
     }
 
-    pub(crate) fn elapsed(&self) -> Option<Duration> {
+    /// How long the current request has run, while one does.
+    pub fn elapsed(&self) -> Option<Duration> {
         self.running_since.map(|t| t.elapsed())
     }
 
-    pub(crate) fn totals(&self) -> (Usage, Usd, bool) {
+    /// What the conversation used and cost so far, and whether every cost was known.
+    pub fn totals(&self) -> (Usage, Usd, bool) {
         (self.usage, self.cost, self.cost_complete)
     }
 
     /// How full the context was on the latest call, when known.
-    pub(crate) fn context(&self) -> Option<ContextUse> {
+    pub fn context(&self) -> Option<ContextUse> {
         self.context
     }
 
-    pub(crate) fn is_running(&self) -> bool {
+    /// Whether a request is running.
+    pub fn is_running(&self) -> bool {
         self.running_since.is_some()
     }
 
-    pub(crate) fn should_quit(&self) -> bool {
+    /// Whether the person asked to quit.
+    pub fn should_quit(&self) -> bool {
         self.quit
     }
 
     /// The model chain as shown to the person: `cheap → strong`.
-    pub(crate) fn chain(&self) -> String {
+    pub fn chain(&self) -> String {
         if self.settings.tiers.is_empty() {
             return "no model".into();
         }
@@ -840,7 +924,8 @@ impl App {
 
     // Inputs.
 
-    pub(crate) fn on_key(&mut self, key: KeyEvent) -> Option<Effect> {
+    /// Does what a key asks for, and returns what only the loop can do.
+    pub fn on_key(&mut self, key: KeyEvent) -> Option<Effect> {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if !ctrl_c {
@@ -1213,12 +1298,13 @@ impl App {
         self.reveal.set(true);
     }
 
-    pub(crate) fn is_expanded(&self, entry: usize) -> bool {
+    /// Whether a long reply, by its place in the transcript, was unfolded by the person.
+    pub fn is_expanded(&self, entry: usize) -> bool {
         self.expanded.contains(&entry)
     }
 
     /// The selected reply, shown as such only in normal mode in the conversation.
-    pub(crate) fn selected_reply(&self) -> Option<usize> {
+    pub fn selected_reply(&self) -> Option<usize> {
         (self.focus == Focus::Chat && self.mode == Mode::Normal)
             .then_some(self.selected_reply)
             .flatten()
@@ -1226,11 +1312,12 @@ impl App {
 
     /// Whether the view should scroll the selected reply into sight; reading
     /// it clears it.
-    pub(crate) fn take_reveal(&self) -> bool {
+    pub fn take_reveal(&self) -> bool {
         self.reveal.replace(false)
     }
 
-    pub(crate) fn set_marks(
+    /// Records the conversation's lines that fold a reply, copy a block or open a reference, as the view drew them, so that a click finds them.
+    pub fn set_marks(
         &self,
         fold: Vec<usize>,
         copy: Vec<(usize, String)>,
@@ -1242,9 +1329,9 @@ impl App {
     }
 
     /// Whether `reference` exists: a file is looked at when first drawn; a
-    /// commit only as [`App::learn_commits`] found it, git staying off the
-    /// drawing.
-    pub(crate) fn reference_exists(&self, reference: &Reference) -> bool {
+    /// commit is known only once git was asked about it as its reply
+    /// arrived, so that drawing never runs git.
+    pub fn reference_exists(&self, reference: &Reference) -> bool {
         if let Some(known) = self.known_references.borrow().get(reference) {
             return *known;
         }
@@ -1280,7 +1367,7 @@ impl App {
     }
 
     /// Says whether the screen draws pictures.
-    pub(crate) fn show_pictures(&mut self, shown: bool) {
+    pub fn show_pictures(&mut self, shown: bool) {
         self.pictures_shown = shown;
     }
 
@@ -1307,17 +1394,14 @@ impl App {
         self.focus_on(Focus::File);
     }
 
-    pub(crate) fn set_entry_lines(
-        &self,
-        lines: Vec<(usize, usize, usize)>,
-        top: usize,
-        area: Rect,
-    ) {
+    /// Records where each entry was drawn, in lines of the whole transcript, the first line in view and the area it was drawn in, so that a click finds its entry.
+    pub fn set_entry_lines(&self, lines: Vec<(usize, usize, usize)>, top: usize, area: Rect) {
         *self.entry_lines.borrow_mut() = lines;
         self.transcript_view.set((top, area));
     }
 
-    pub(crate) fn is_zoomed(&self) -> bool {
+    /// Whether the conversation has the whole screen.
+    pub fn is_zoomed(&self) -> bool {
         self.zoomed
     }
 
@@ -1400,7 +1484,7 @@ impl App {
     }
 
     /// Opens a file in the editor, outside the project too.
-    pub(crate) fn open_path(&mut self, path: PathBuf) {
+    pub fn open_path(&mut self, path: PathBuf) {
         if self.file.as_ref().is_some_and(Editor::is_modified) {
             if let Some(file) = &mut self.file {
                 file.refuse_close();
@@ -1438,7 +1522,8 @@ impl App {
         self.focus_on(Focus::File);
     }
 
-    pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Effect> {
+    /// Does what a click or a turn of the wheel asks for, and returns what only the loop can do.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Effect> {
         let at = Position::new(mouse.column, mouse.row);
         let panes = self.panes.get();
         let hit = if panes.docker.is_some_and(|r| r.contains(at)) {
@@ -1644,7 +1729,8 @@ impl App {
         }
     }
 
-    pub(crate) fn info(&mut self, text: impl Into<String>) {
+    /// Adds a note to the conversation.
+    pub fn info(&mut self, text: impl Into<String>) {
         self.transcript.push(Entry::Info(text.into()));
     }
 
@@ -2027,7 +2113,7 @@ impl App {
 
     /// Applies what the agent reported. Returns whether a request ended,
     /// which is when the conversation is saved.
-    pub(crate) fn on_agent(&mut self, message: AgentMessage) -> bool {
+    pub fn on_agent(&mut self, message: AgentMessage) -> bool {
         match message {
             AgentMessage::Event(event) => {
                 self.on_event(event);
@@ -2124,7 +2210,7 @@ impl App {
 
     /// The conversation's name: the one given with `/name`, else the start
     /// of the first message.
-    pub(crate) fn name(&self) -> String {
+    pub fn name(&self) -> String {
         if let Some(name) = &self.session_name {
             return name.clone();
         }
@@ -2143,7 +2229,7 @@ impl App {
 
     /// The conversation as it should be written to disk, or `None` while
     /// nothing has been said: an empty conversation is not worth a file.
-    pub(crate) fn to_saved(&self, session: Session) -> Option<Saved> {
+    pub fn to_saved(&self, session: Session) -> Option<Saved> {
         if !self.transcript.iter().any(|e| matches!(e, Entry::User(_))) {
             return None;
         }
@@ -2164,7 +2250,7 @@ impl App {
     }
 
     /// Shows a saved conversation as it was, and continues it.
-    pub(crate) fn load_saved(&mut self, saved: Saved) {
+    pub fn load_saved(&mut self, saved: Saved) {
         self.session_id = saved.id;
         self.session_name = Some(saved.name.clone());
         self.created = saved.created;
@@ -2192,7 +2278,8 @@ impl App {
         self.picker = None;
     }
 
-    pub(crate) fn show_picker(&mut self, items: Vec<Summary>) {
+    /// Opens the list of saved conversations, to pick one; says so when there is none.
+    pub fn show_picker(&mut self, items: Vec<Summary>) {
         if items.is_empty() {
             self.info("No saved conversation for this project yet");
             return;
@@ -2200,7 +2287,8 @@ impl App {
         self.picker = Some(Picker { items, selected: 0 });
     }
 
-    pub(crate) fn picker(&self) -> Option<&Picker> {
+    /// The list of saved conversations, while open.
+    pub fn picker(&self) -> Option<&Picker> {
         self.picker.as_ref()
     }
 
@@ -2222,7 +2310,7 @@ impl App {
     }
 
     /// How far the list of shortcuts is scrolled, while it is open.
-    pub(crate) fn keys_open(&self) -> Option<usize> {
+    pub fn keys_open(&self) -> Option<usize> {
         self.keys_open
     }
 
@@ -2246,13 +2334,13 @@ impl App {
     }
 
     /// The models the first one may hand tasks to.
-    pub(crate) fn team(&self) -> &[ModelId] {
+    pub fn team(&self) -> &[ModelId] {
         &self.settings.team
     }
 
     /// The handover the sub-agent pane shows: who, the task, what it did,
     /// and whether it is still at it.
-    pub(crate) fn sub_agent(&self) -> Option<SubAgent<'_>> {
+    pub fn sub_agent(&self) -> Option<SubAgent<'_>> {
         let i = self.sub_view?;
         let Some(Entry::Delegating {
             from,
@@ -2285,11 +2373,12 @@ impl App {
 
     /// How far the sub-agent pane is scrolled up from its end, and the
     /// view's report of how far it can go.
-    pub(crate) fn sub_scroll(&self) -> usize {
+    pub fn sub_scroll(&self) -> usize {
         self.sub_scroll.get()
     }
 
-    pub(crate) fn set_sub_max(&self, max: usize) {
+    /// Records how far the sub-agent pane can scroll, which only the view knows.
+    pub fn set_sub_max(&self, max: usize) {
         self.sub_max.set(max);
         if self.sub_scroll.get() > max {
             self.sub_scroll.set(max);
@@ -2297,32 +2386,32 @@ impl App {
     }
 
     /// What the running request cost so far, its sub-agents apart.
-    pub(crate) fn request_spent(&self) -> Spent {
+    pub fn request_spent(&self) -> Spent {
         self.request_spent
     }
 
     /// Where the scores shown come from.
-    pub(crate) fn credits(&self) -> Option<&str> {
+    pub fn credits(&self) -> Option<&str> {
         self.settings.credits.as_deref()
     }
 
     /// The step of a request in a pair being worked on, while it runs.
-    pub(crate) fn step(&self) -> Option<&str> {
+    pub fn step(&self) -> Option<&str> {
         self.step.as_deref().filter(|_| self.is_running())
     }
 
     /// The project's root directory.
-    pub(crate) fn root(&self) -> &Path {
+    pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// Whether the project's own checks are found when checking.
-    pub(crate) fn detects_checks(&self) -> bool {
+    pub fn detects_checks(&self) -> bool {
         self.settings.detect_checks
     }
 
     /// How hard models think before answering.
-    pub(crate) fn effort(&self) -> Effort {
+    pub fn effort(&self) -> Effort {
         self.settings.effort
     }
 
@@ -2342,18 +2431,18 @@ impl App {
     }
 
     /// The most one request may cost.
-    pub(crate) fn budget(&self) -> Option<Usd> {
+    pub fn budget(&self) -> Option<Usd> {
         self.settings.budget
     }
 
     /// The model picker, while it is open.
-    pub(crate) fn model_picker(&self) -> Option<&ModelPicker> {
+    pub fn model_picker(&self) -> Option<&ModelPicker> {
         self.model_picker.as_ref()
     }
 
     /// The rows of the model picker: the offered models that match what was
     /// typed, then the provider's other models that do.
-    pub(crate) fn model_rows(&self) -> Vec<ModelRow> {
+    pub fn model_rows(&self) -> Vec<ModelRow> {
         let filter = self
             .model_picker
             .as_ref()
@@ -2619,12 +2708,12 @@ impl App {
     }
 
     /// The effect raised outside a key, to run next.
-    pub(crate) fn take_queued(&mut self) -> Option<Effect> {
+    pub fn take_queued(&mut self) -> Option<Effect> {
         self.queued.take()
     }
 
     /// The /compact window while it is open.
-    pub(crate) fn compact_picker(&self) -> Option<&CompactPicker> {
+    pub fn compact_picker(&self) -> Option<&CompactPicker> {
         self.compact_picker.as_ref()
     }
 
@@ -2644,12 +2733,12 @@ impl App {
     }
 
     /// The model the first request goes to.
-    pub(crate) fn current_model(&self) -> Option<&ModelId> {
+    pub fn current_model(&self) -> Option<&ModelId> {
         self.settings.tiers.first()
     }
 
     /// The model working right now, while a request runs.
-    pub(crate) fn working_model(&self) -> Option<&ModelId> {
+    pub fn working_model(&self) -> Option<&ModelId> {
         self.working_model.as_ref().filter(|_| self.is_running())
     }
 
@@ -2674,7 +2763,7 @@ impl App {
     /// Whether the warm sessions should be read now: `/tick` is on, no
     /// request runs, four minutes went by since the last time. After half an
     /// hour without a request, the person is asked first.
-    pub(crate) fn keep_warm_due(&mut self) -> bool {
+    pub fn keep_warm_due(&mut self) -> bool {
         if !self.settings.tick || self.is_running() || self.ask_keep_warm {
             return false;
         }
@@ -2692,7 +2781,7 @@ impl App {
     }
 
     /// The question asked after a long wait, while it is.
-    pub(crate) fn keep_warm_question(&self) -> Option<Approval> {
+    pub fn keep_warm_question(&self) -> Option<Approval> {
         self.ask_keep_warm.then(|| Approval {
             model: self
                 .current_model()
@@ -2765,13 +2854,13 @@ impl App {
     }
 
     /// The usage samples, and the pane's window while it shows.
-    pub(crate) fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
+    pub fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
         self.usage_open
             .then_some((&self.usage_log, self.usage_window))
     }
 
     /// The command waiting for the person's answer, if any.
-    pub(crate) fn approval(&self) -> Option<&Approval> {
+    pub fn approval(&self) -> Option<&Approval> {
         self.approval.as_ref().map(|(approval, _)| approval)
     }
 
@@ -2972,7 +3061,7 @@ impl App {
     /// The choices, when they changed since they were last kept: the model,
     /// the models offered, the team and the budget carry over to the next
     /// session without having to ask.
-    pub(crate) fn defaults_to_keep(&mut self) -> Option<Defaults> {
+    pub fn defaults_to_keep(&mut self) -> Option<Defaults> {
         let now = self.defaults();
         (now != self.kept).then(|| {
             self.kept = now.clone();
@@ -3094,7 +3183,7 @@ impl App {
     }
 
     /// Opens the conversation's context in the editor, in place of a file.
-    pub(crate) fn open_context(&mut self, text: &str) {
+    pub fn open_context(&mut self, text: &str) {
         if let Some(file) = self.file.as_mut().filter(|f| f.is_modified()) {
             if file.kind() == crate::editor::Kind::Context {
                 file.say_pending_context();
@@ -3112,7 +3201,7 @@ impl App {
     }
 
     /// Reports how applying an edited context went.
-    pub(crate) fn on_context_applied(&mut self, result: Result<(u64, u64), String>) {
+    pub fn on_context_applied(&mut self, result: Result<(u64, u64), String>) {
         match result {
             Ok((before, after)) => self.info(format!(
                 "Context applied: about {} tokens, from {}. The next request is sent with it",
@@ -3153,15 +3242,17 @@ impl App {
     }
 
     /// The candidates of a completion in progress, to show them.
-    pub(crate) fn completions(&self) -> Option<&[String]> {
+    pub fn completions(&self) -> Option<&[String]> {
         self.completion.as_ref().map(|c| c.matches.as_slice())
     }
 
-    pub(crate) fn docker(&self) -> Option<&DockerPane> {
+    /// The Docker pane, when open.
+    pub fn docker(&self) -> Option<&DockerPane> {
         self.docker.as_ref()
     }
 
-    pub(crate) fn on_docker(&mut self, result: Result<Vec<Container>, String>) {
+    /// Shows what `docker ps` answered, unless the pane was closed meanwhile.
+    pub fn on_docker(&mut self, result: Result<Vec<Container>, String>) {
         let Some(pane) = &mut self.docker else {
             // Closed while docker was answering.
             return;
@@ -3177,22 +3268,25 @@ impl App {
         }
     }
 
-    pub(crate) fn notice(&self) -> Option<&str> {
+    /// The one-line note in the status line, until the next key.
+    pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }
 
     /// The conversation's name in the status line: only one given with
     /// /name. The first message, which names it in the /resume list, is
     /// not repeated there.
-    pub(crate) fn session_label(&self) -> String {
+    pub fn session_label(&self) -> String {
         self.session_name.clone().unwrap_or_default()
     }
 
-    pub(crate) fn report_info(&mut self, text: &str) {
+    /// Says something in the conversation.
+    pub fn report_info(&mut self, text: &str) {
         self.info(text);
     }
 
-    pub(crate) fn report_error(&mut self, text: String) {
+    /// Says in the conversation that something went wrong.
+    pub fn report_error(&mut self, text: String) {
         self.error(text);
     }
 
@@ -3486,7 +3580,8 @@ impl App {
         }
     }
 
-    pub(crate) fn on_cancelled(&mut self) {
+    /// The request was stopped: the conversation says so and stops waiting for it.
+    pub fn on_cancelled(&mut self) {
         self.running_since = None;
         // Its answer would reach nobody.
         self.approval = None;
@@ -3497,7 +3592,7 @@ impl App {
     /// Text pasted in one piece: into the message box whole, line breaks
     /// kept, so that a pasted log is not sent at its first line; on the
     /// command line, on one line.
-    pub(crate) fn on_paste(&mut self, text: &str) {
+    pub fn on_paste(&mut self, text: &str) {
         if self.approval.is_some()
             || self.picker.is_some()
             || self.model_picker.is_some()
@@ -3522,11 +3617,13 @@ impl App {
         }
     }
 
-    pub(crate) fn on_diff(&mut self, text: &str) {
+    /// Shows what changed since the last commit.
+    pub fn on_diff(&mut self, text: &str) {
         self.info(text);
     }
 
-    pub(crate) fn on_tick(&mut self) {
+    /// Advances the spinner.
+    pub fn on_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
     }
 }
@@ -3559,7 +3656,7 @@ fn first_sentence(text: &str) -> &str {
 }
 
 /// `3/4 Planning · tensorx/glm-5.3 · effort high`, or `by ironquill`.
-pub(crate) fn step_title(
+pub fn step_title(
     number: u8,
     of: u8,
     name: &str,
@@ -3645,21 +3742,6 @@ mod tests {
         assert_eq!(window, 6 * 3600);
         assert_eq!(log.samples.len(), 3);
 
-        let backend = ratatui::backend::TestBackend::new(140, 40);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| crate::view::render(frame, &app, &crate::pictures::NoPictures))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let screen: String = buffer
-            .content()
-            .chunks(usize::from(buffer.area.width))
-            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
-            .collect();
-        assert!(screen.contains("Usage · last 6h"));
-        assert!(screen.contains("$0.020 · 2 calls · cache 96%"), "{screen}");
-        assert!(screen.contains("$0.200 · 1 call · cache 10% · 1 rebuilt"));
-
         // Kept with the conversation.
         app.transcript.push(Entry::User("hi".into()));
         let saved = app.to_saved(Session::new()).unwrap();
@@ -3669,26 +3751,11 @@ mod tests {
         assert!(app.usage_pane().is_none());
     }
 
-    fn screen(app: &App) -> String {
-        let backend = ratatui::backend::TestBackend::new(120, 40);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| crate::view::render(frame, app, &crate::pictures::NoPictures))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        buffer
-            .content()
-            .chunks(usize::from(buffer.area.width))
-            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
-            .collect()
-    }
-
     #[test]
     fn a_pasted_log_is_typed_whole_and_not_sent() {
         let mut app = ready();
         app.on_paste("error: one\r\nerror: two\n");
         assert_eq!(app.input().text(), "error: one\nerror: two\n");
-        assert!(screen(&app).contains("error: one↵error: two↵"));
         // Sent as it was pasted.
         type_text(&mut app, "fix it");
         assert!(matches!(
@@ -3714,35 +3781,7 @@ mod tests {
         ));
         app.on_paste("y");
         assert_eq!(app.input().text(), "");
-        assert!(screen(&app).contains(" Go on? "));
-    }
-
-    #[test]
-    fn a_command_folds_to_a_line_and_copies() {
-        let mut app = ready();
-        app.on_agent(AgentMessage::Event(Event::Command {
-            model: ModelId::new("cheap").unwrap(),
-            command: "kubectl -n web get pods\n  -o wide".into(),
-            status: "exit status 0".into(),
-            output: "api-1 Running\napi-2 Running\n".into(),
-            checked_by: Some(ModelId::new("glm").unwrap()),
-        }));
-        let folded = screen(&app);
-        assert!(folded.contains("Run(kubectl -n web get pods…)"), "{folded}");
-        assert!(
-            folded.contains("exit status 0 · checked by glm · 2 lines · click or Enter to show")
-        );
-        assert!(!folded.contains("api-1 Running"));
-
-        // Selected and opened, then copied.
-        press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Up);
-        press(&mut app, KeyCode::Enter);
-        assert!(screen(&app).contains("api-1 Running"));
-        assert!(matches!(
-            press(&mut app, KeyCode::Char('y')),
-            Some(Effect::Copy(text)) if text.starts_with("kubectl -n web get pods") && text.ends_with("api-2 Running\n")
-        ));
+        assert!(app.approval().is_some());
     }
 
     #[test]
@@ -3769,7 +3808,6 @@ mod tests {
         let mut app = ready();
         app.on_cancelled();
         assert!(app.transcript.contains(&Entry::Interrupted));
-        assert!(screen(&app).contains("Interrupted: the request stopped before it ended"));
     }
 
     #[test]
@@ -3788,7 +3826,6 @@ mod tests {
             },
             answer,
         ));
-        assert!(screen(&app).contains("a: always allow API_TOKEN"));
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(answered.try_recv(), Ok(Answer::Always));
         assert_eq!(app.defaults().allowed_secrets, ["API_TOKEN"]);
@@ -3833,7 +3870,13 @@ mod tests {
             .checked_sub(Duration::from_secs(31 * 60))
             .unwrap();
         assert!(!app.keep_warm_due());
-        assert!(screen(&app).contains("Keep the sessions warm?"));
+        assert!(matches!(
+            app.keep_warm_question(),
+            Some(Approval {
+                question: Question::KeepWarm { .. },
+                ..
+            })
+        ));
         press(&mut app, KeyCode::Char('n'));
         assert!(!app.settings.tick);
         assert!(app.keep_warm_question().is_none());
@@ -3849,41 +3892,6 @@ mod tests {
         assert_eq!(app.input().text(), "fix it");
         assert!(!app.is_running());
         assert!(!app.transcript.contains(&Entry::User("fix it".into())));
-    }
-
-    #[test]
-    fn a_code_block_copies_with_a_click_and_only_its_mark_folds() {
-        use crate::input::{MouseButton, MouseEvent, MouseEventKind};
-        let mut app = ready();
-        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
-        app.transcript.push(Entry::Said(format!(
-            "Try:\n```sh\ncargo test -q\n```\n{long}"
-        )));
-        app.transcript.push(Entry::Said(long.clone()));
-        let screen_text = screen(&app);
-        let rows: Vec<&str> = screen_text.lines().collect();
-        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap() as u16;
-        let click = |app: &mut App, row: u16| {
-            app.on_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 5,
-                row,
-                modifiers: KeyModifiers::NONE,
-            })
-        };
-        // The first reply is folded, the latest open.
-        assert!(screen_text.contains("▸ "));
-        assert!(screen_text.contains("▾ fold"));
-        assert!(matches!(
-            click(&mut app, row_of("⧉ copy")),
-            Some(Effect::Copy(code)) if code == "cargo test -q"
-        ));
-        // A click on the text does not fold; one on the mark does.
-        click(&mut app, row_of("Try:"));
-        assert!(!app.is_expanded(1));
-        screen(&app);
-        click(&mut app, row_of("▸ "));
-        assert!(app.is_expanded(1));
     }
 
     #[test]
@@ -3912,13 +3920,13 @@ mod tests {
                 },
             ],
         })));
-        assert!(screen(&app).contains("[x] Parser (2 exchanges)"));
+        assert_eq!(app.compact_picker().unwrap().kept, [true, true, true]);
         // Open the parser, untick its test.
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char(' '));
-        assert!(screen(&app).contains("[-] Parser (2 exchanges)"));
+        assert_eq!(app.compact_picker().unwrap().kept, [true, false, true]);
         // The docs go as well; the last exchange is not kept as it was.
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char(' '));
@@ -3928,32 +3936,6 @@ mod tests {
             Some(Effect::Compact { keep, last_as_is: false, .. }) if keep == [0]
         ));
         assert!(app.compact_picker().is_none());
-    }
-
-    #[test]
-    fn a_cited_file_opens_at_its_line_with_a_click() {
-        use crate::input::{MouseButton, MouseEvent, MouseEventKind};
-        let (_dir, mut app) = project();
-        app.transcript.push(Entry::Said(
-            "The second line is in src/lib.rs:2, not in nowhere.rs:1.".into(),
-        ));
-        let shown = screen(&app);
-        assert!(shown.contains("src/lib.rs:2↗"));
-        assert!(!shown.contains("nowhere.rs:1↗"));
-        let (row, column) = shown
-            .lines()
-            .enumerate()
-            .find_map(|(r, l)| l.find("src/lib.rs:2").map(|c| (r, l[..c].chars().count())))
-            .unwrap();
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: column as u16 + 2,
-            row: row as u16,
-            modifiers: KeyModifiers::NONE,
-        });
-        let file = app.file().expect("the file is open");
-        assert_eq!(file.lines(), ["one", "two"]);
-        assert_eq!(file.cursor().0, 1);
     }
 
     #[test]

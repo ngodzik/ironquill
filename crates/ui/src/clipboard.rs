@@ -25,7 +25,7 @@ const PASTE: [(&str, &[&str]); 4] = [
 ];
 
 /// Puts `text` on the system clipboard. Returns how, for the status message.
-pub(crate) fn copy(text: &str) -> Result<&'static str, String> {
+pub fn copy(text: &str) -> Result<&'static str, String> {
     for (program, args) in COPY {
         let Ok(mut child) = Command::new(program)
             .args(args)

@@ -20,7 +20,7 @@ use crate::usage::UsageLog;
 
 /// A whole conversation as written to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Saved {
+pub struct Saved {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) project: PathBuf,
@@ -32,7 +32,8 @@ pub(crate) struct Saved {
     pub(crate) cost: Usd,
     pub(crate) cost_complete: bool,
     pub(crate) transcript: Vec<Entry>,
-    pub(crate) session: Session,
+    /// The agent's conversation, to resume it.
+    pub session: Session,
     /// The calls of the last day, for the usage pane.
     #[serde(default)]
     pub(crate) usage_log: UsageLog,
@@ -41,24 +42,29 @@ pub(crate) struct Saved {
 /// What the resume list shows of a conversation. Read from the same file:
 /// serde skips the fields it does not name, so the history is not decoded.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub(crate) struct Summary {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) updated: u64,
-    pub(crate) requests: usize,
-    pub(crate) cost: Usd,
+pub struct Summary {
+    /// Its id, the name of its file.
+    pub id: String,
+    /// Its name: given, or taken from its first request.
+    pub name: String,
+    /// When it was last saved, in seconds since 1970.
+    pub updated: u64,
+    /// How many requests it holds.
+    pub requests: usize,
+    /// What it cost.
+    pub cost: Usd,
 }
 
 /// The conversations of one project.
 #[derive(Debug, Clone)]
-pub(crate) struct Store {
+pub struct Store {
     dir: PathBuf,
 }
 
 impl Store {
     /// The store for `project`, or `None` when there is no home directory
     /// to put it in.
-    pub(crate) fn for_project(project: &Path) -> Option<Self> {
+    pub fn for_project(project: &Path) -> Option<Self> {
         let base = match std::env::var_os("IRONQUILL_HOME") {
             Some(home) => PathBuf::from(home),
             None => PathBuf::from(std::env::var_os("HOME")?).join(".ironquill"),
@@ -72,7 +78,7 @@ impl Store {
 
     /// Writes `saved`, replacing any earlier version of the same conversation.
     /// Write then rename, so that a crash never leaves half a file.
-    pub(crate) fn save(&self, saved: &Saved) -> io::Result<()> {
+    pub fn save(&self, saved: &Saved) -> io::Result<()> {
         fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec_pretty(saved).map_err(io::Error::other)?;
         let path = self.dir.join(format!("{}.json", saved.id));
@@ -83,7 +89,7 @@ impl Store {
 
     /// The project's conversations, most recently used first. Files that
     /// cannot be read are skipped rather than failing the whole list.
-    pub(crate) fn list(&self) -> Vec<Summary> {
+    pub fn list(&self) -> Vec<Summary> {
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return Vec::new();
         };
@@ -97,7 +103,7 @@ impl Store {
     }
 
     /// The id of the conversation whose id is `id` or starts with it.
-    pub(crate) fn find(&self, id: &str) -> Result<String, String> {
+    pub fn find(&self, id: &str) -> Result<String, String> {
         // An id names a file in this directory: nothing that could leave it.
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Err(format!("{id:?} is not a conversation id"));
@@ -120,7 +126,8 @@ impl Store {
         }
     }
 
-    pub(crate) fn load(&self, id: &str) -> Result<Saved, String> {
+    /// Reads the conversation with this id.
+    pub fn load(&self, id: &str) -> Result<Saved, String> {
         let path = self.dir.join(format!("{id}.json"));
         let bytes = fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
         serde_json::from_slice(&bytes).map_err(|e| format!("Cannot read {}: {e}", path.display()))
@@ -144,7 +151,7 @@ fn project_key(project: &Path) -> String {
 }
 
 /// Seconds since the Unix epoch.
-pub(crate) fn now() -> u64 {
+pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -160,7 +167,7 @@ pub(crate) fn new_id() -> String {
 }
 
 /// `just now`, `5 min ago`, `3 h ago`, `2 days ago`.
-pub(crate) fn ago(then: u64, now: u64) -> String {
+pub fn ago(then: u64, now: u64) -> String {
     let secs = now.saturating_sub(then);
     match secs {
         0..60 => "just now".into(),
