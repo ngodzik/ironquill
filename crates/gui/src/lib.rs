@@ -1047,7 +1047,7 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
         });
     });
     ui.add_space(6.0);
-    let row = ui.text_style_height(&egui::TextStyle::Monospace) + 2.0;
+    let row = ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y;
     let glyph =
         ui.fonts_mut(|f| f.glyph_width(&egui::TextStyle::Monospace.resolve(ui.style()), 'm'));
     let rows = ((ui.available_height() - 40.0) / row).max(1.0) as usize;
@@ -1058,6 +1058,11 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     let text_area = ui.available_rect_before_wrap();
     let first = editor.scroll();
     let mut clicked = None;
+    // Long lines shift left together to keep the cursor in sight, as in
+    // Vim with `nowrap`.
+    let left = editor.left_offset();
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let insert = editor.mode() == EditorMode::Insert;
     for (i, line) in editor
         .lines()
         .iter()
@@ -1066,6 +1071,36 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
         .take(rows)
     {
         let current = i == cursor_row;
+        // One piece of text per line, its runs coloured: a widget per run
+        // made every key cost a frame of hundreds of them.
+        let mut job = egui::text::LayoutJob::default();
+        let format = |colour: Color32| egui::TextFormat::simple(font.clone(), colour);
+        job.append(
+            &format!("{:>5}  ", i + 1),
+            0.0,
+            format(if current { ACCENT } else { DIM }),
+        );
+        let mut skip = left;
+        let mut runs = |text: &str, colour: Color32| {
+            let count = text.chars().count();
+            if skip >= count {
+                skip -= count;
+                return;
+            }
+            let from = text.char_indices().nth(skip).map_or(text.len(), |(b, _)| b);
+            skip = 0;
+            job.append(&text[from..], 0.0, format(colour));
+        };
+        match styled.and_then(|s| s.get(i)) {
+            Some(styled) => {
+                for (colour, text) in styled {
+                    runs(text, theme::rgb(*colour));
+                }
+            }
+            None => runs(line, TEXT),
+        }
+        job.wrap.max_rows = 1;
+        job.wrap.max_width = f32::INFINITY;
         let shown = Frame::new()
             .fill(if current {
                 SELECTED
@@ -1074,37 +1109,41 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(
-                        RichText::new(format!("{:>5}  ", i + 1))
-                            .monospace()
-                            .color(if current { ACCENT } else { DIM }),
-                    );
-                    match styled.and_then(|s| s.get(i)) {
-                        Some(runs) => {
-                            for (colour, text) in runs {
-                                ui.label(
-                                    RichText::new(text).monospace().color(theme::rgb(*colour)),
-                                );
-                            }
-                        }
-                        None => {
-                            ui.label(RichText::new(line).monospace().color(TEXT));
-                        }
-                    }
-                    if current && focused && line.chars().count() <= cursor_column {
-                        ui.label(RichText::new("▏").monospace().color(ACCENT));
-                    }
-                });
+                ui.add(egui::Label::new(job).selectable(false).extend());
             });
+        let rect = shown.response.rect;
+        if current && focused {
+            // The cursor: a bar while typing, a block otherwise, as in Vim.
+            let x = rect.left() + (7 + cursor_column.saturating_sub(left)) as f32 * glyph;
+            let caret = if insert {
+                egui::Rect::from_min_size(
+                    egui::pos2(x - 1.0, rect.top()),
+                    egui::vec2(2.0, rect.height()),
+                )
+            } else {
+                egui::Rect::from_min_size(
+                    egui::pos2(x, rect.top()),
+                    egui::vec2(glyph, rect.height()),
+                )
+            };
+            ui.painter().rect_filled(
+                caret,
+                1,
+                if insert {
+                    ACCENT
+                } else {
+                    theme::see(ACCENT, 0.45)
+                },
+            );
+        }
         let response = shown.response.interact(egui::Sense::click());
         if response.clicked()
             && let Some(at) = response.interact_pointer_pos()
         {
-            // Past the line numbers, in characters.
+            // Past the line numbers, in characters on screen: the editor
+            // adds the shift.
             let gutter = 7.0 * glyph;
-            let column = ((at.x - response.rect.left() - gutter) / glyph.max(1.0)).max(0.0);
+            let column = ((at.x - rect.left() - gutter) / glyph.max(1.0)).max(0.0);
             clicked = Some((i - first, column as usize));
         }
     }

@@ -20,15 +20,17 @@ use ironquill_tools::{LineChanges, committed_lines, line_changes};
 
 use crate::clipboard;
 use crate::command;
-use crate::highlight::{Highlighter, StyledLine};
+use crate::highlight::{Highlighted, Highlighter, StyledLine};
 
 /// Spaces typed by the Tab key in insert mode, and added by `>`. Spaces
 /// rather than a tab character, as most Python and Rust code wants.
 const TAB: &str = "    ";
 
-/// Above this many lines, colours are recomputed when insert mode ends
-/// rather than after every key, so that typing stays instant.
-const LIVE_HIGHLIGHT_LINES: usize = 3_000;
+/// While typing, how many lines past an edit are coloured again at most
+/// when the edit changes how they read (an opened string or comment): the
+/// next keys, and leaving insert mode, carry on, so that no key waits on
+/// the whole file.
+const TYPING_RECOLOUR: usize = 40;
 
 /// First and last row of a line range, both included.
 type Rows = (usize, usize);
@@ -177,7 +179,7 @@ pub struct Editor {
     trailing_newline: bool,
     /// Set for binary or unreadable files, which are shown but not edited.
     read_only: bool,
-    styled: Option<Vec<StyledLine>>,
+    styled: Option<Highlighted>,
     /// The file as of the last commit, `None` outside git.
     base: Option<Vec<String>>,
     /// The revision changes are shown against: the last commit unless set.
@@ -563,7 +565,7 @@ impl Editor {
 
     /// The lines coloured by their language, when it is known.
     pub fn styled(&self) -> Option<&[StyledLine]> {
-        self.styled.as_deref()
+        self.styled.as_ref().map(Highlighted::lines)
     }
 
     /// How the lines differ from the last commit, while that is known and in
@@ -1293,11 +1295,8 @@ impl Editor {
 
     fn changed(&mut self) {
         self.modified = true;
-        if self.mode != EditorMode::Insert || self.lines.len() <= LIVE_HIGHLIGHT_LINES {
-            self.restyle();
-        } else {
-            self.styled = None;
-        }
+        let budget = (self.mode == EditorMode::Insert).then_some(TYPING_RECOLOUR);
+        self.recolour(budget);
     }
 
     fn start_insert(&mut self, col: usize) {
@@ -1797,14 +1796,26 @@ impl Editor {
     }
 
     fn restyle(&mut self) {
+        self.recolour(None);
+    }
+
+    /// Marks the lines against the last commit and colours them again: only
+    /// from the first changed, and `budget` lines past it at most.
+    fn recolour(&mut self, budget: Option<usize>) {
         if let Some(base) = &self.base {
             self.changes = line_changes(base, &self.lines);
         }
-        self.styled = if self.read_only {
-            None
-        } else {
-            self.highlighter.highlight(&self.path, &self.lines)
-        };
+        if self.read_only {
+            self.styled = None;
+            return;
+        }
+        let kept = self
+            .styled
+            .as_mut()
+            .is_some_and(|s| s.update(&self.highlighter, &self.lines, budget));
+        if !kept {
+            self.styled = self.highlighter.highlight(&self.path, &self.lines);
+        }
     }
 }
 
