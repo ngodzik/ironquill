@@ -9,7 +9,7 @@ use ironquill_agent::Question;
 use ironquill_core::{Effort, TokenCount};
 use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use ironquill_ui::keymap::SHORTCUTS;
-use ironquill_ui::{App, CompactRow, sessions};
+use ironquill_ui::{App, ChatState, CompactRow, sessions};
 
 use crate::theme::{ACCENT, CYAN, DIM, RAISED, RED, SELECTED, TEXT, YELLOW};
 
@@ -27,6 +27,12 @@ pub(crate) fn show(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
     }
     if app.compact_picker().is_some() {
         compact(ctx, app);
+    }
+    if app.chats_open().is_some() {
+        chats(ctx, app);
+    }
+    if app.tasks_open().is_some() {
+        tasks(ctx, app);
     }
     if app.definition_choice().is_some() {
         definitions(ctx, app, keys);
@@ -193,6 +199,89 @@ fn resume(ctx: &Context, app: &App) {
             }
         });
         hint(ui, "↑ ↓ to move · Enter to choose · Esc to close");
+    });
+}
+
+/// The open conversations, for `/chats`: the one shown marked, those that
+/// run or wait for the person said so.
+fn chats(ctx: &Context, app: &App) {
+    let Some(selected) = app.chats_open() else {
+        return;
+    };
+    window(ctx, "Conversations", ACCENT, |ui| {
+        ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            for (i, chat) in app.chat_rows().into_iter().enumerate() {
+                let shown = row(ui, i == selected, |ui| {
+                    ui.label(RichText::new(if chat.shown { "●" } else { " " }).color(ACCENT));
+                    ui.label(RichText::new(&chat.name).color(TEXT));
+                    let (state, colour) = match chat.state {
+                        ChatState::Idle => ("", DIM),
+                        ChatState::Running => ("working", CYAN),
+                        ChatState::Waiting => ("waiting for you", YELLOW),
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "{} request{}",
+                            chat.requests,
+                            if chat.requests == 1 { "" } else { "s" }
+                        ))
+                        .small()
+                        .color(DIM),
+                    );
+                    if !state.is_empty() {
+                        ui.label(RichText::new(state).small().color(colour));
+                    }
+                });
+                if i == selected {
+                    shown.scroll_to_me(None);
+                }
+            }
+        });
+        hint(
+            ui,
+            "↑ ↓ to move · Enter to show · n for a new one · x to close one not shown · Esc to close",
+        );
+    });
+}
+
+/// The project's tasks, for `/tasks`: done ones struck through, each with
+/// the conversation it is tied to.
+fn tasks(ctx: &Context, app: &App) {
+    let Some(selected) = app.tasks_open() else {
+        return;
+    };
+    window(ctx, "Tasks", ACCENT, |ui| {
+        ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            for (i, task) in app.task_rows().into_iter().enumerate() {
+                let shown = row(ui, i == selected, |ui| {
+                    ui.label(RichText::new(if task.done { "[x]" } else { "[ ]" }).monospace());
+                    let title = RichText::new(&task.title);
+                    ui.label(if task.done {
+                        title.strikethrough().color(DIM)
+                    } else {
+                        title.color(TEXT)
+                    });
+                    if let Some((name, open)) = &task.chat {
+                        ui.label(
+                            RichText::new(if *open {
+                                format!("· {name}")
+                            } else {
+                                format!("· saved {name}")
+                            })
+                            .small()
+                            .color(DIM),
+                        );
+                    }
+                });
+                if i == selected {
+                    shown.scroll_to_me(None);
+                }
+            }
+        });
+        hint(
+            ui,
+            "Space to tick done · Enter to open its conversation · t to tie it here · d to delete · Esc to close",
+        );
     });
 }
 

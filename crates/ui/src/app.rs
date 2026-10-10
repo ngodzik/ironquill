@@ -26,6 +26,10 @@ use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
 use crate::usage::{Sample, UsageLog};
 
+mod chats;
+
+pub use chats::{ChatRow, ChatState, TaskRow};
+
 /// How opaque a see-through window is unless `opacity` says otherwise:
 /// enough to read on any wallpaper, little enough to see it.
 pub const DEFAULT_OPACITY: f32 = 0.78;
@@ -243,6 +247,9 @@ pub enum Effect {
     },
     /// Drop the exchanges not kept, with no summary and no model.
     DropExchanges(Vec<usize>),
+    /// Open the saved conversation with this id beside the others, and show
+    /// it.
+    OpenSaved(String),
     /// Send this message to the conversation.
     Send {
         /// The message.
@@ -727,23 +734,19 @@ impl LineEditor {
     }
 }
 
-/// The whole state of the interface.
-pub struct App {
-    settings: Settings,
-    root: PathBuf,
-    project: String,
-    mode: Mode,
-    focus: Focus,
-    pending: Option<Pending>,
-    input: LineEditor,
-    /// The messages sent before, for Up and Down in the message box.
-    history: History,
+/// One open conversation: what it shows, what it is doing, what it cost.
+/// The one shown is the `App`'s; the others wait beside it, each running
+/// on its own.
+/// Tells the open conversations apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChatId(pub(crate) u64);
+
+pub(crate) struct Chat {
+    /// Which conversation this is while the window is open: the host
+    /// tells them apart by it.
+    id: ChatId,
     /// Each call to a model of the last day, for the usage pane.
     usage_log: UsageLog,
-    /// The usage pane's window, in seconds, kept while it is hidden.
-    usage_window: u64,
-    /// Whether the usage pane shows.
-    usage_open: bool,
     /// A command held for the person, and where their answer goes.
     approval: Option<(Approval, oneshot::Sender<Answer>)>,
     /// The subjects to keep or drop, while /compact asks.
@@ -760,37 +763,16 @@ pub struct App {
     ticking: bool,
     /// When a warm session was last read, in seconds since 1970.
     last_read: Option<u64>,
-    /// Whether the machine is kept from idle sleep now.
-    kept_awake: bool,
-    command: LineEditor,
-    /// The search of the codebase's maps, kept after Enter; and the mode
-    /// it was started from, to go back to.
-    search: LineEditor,
-    search_from: Mode,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
     scroll_back: Cell<usize>,
     /// The largest useful `scroll_back`, written by the view, which is the
     /// only part that knows how many lines the transcript wraps to.
     max_scroll: Cell<usize>,
-    tree: Option<FileTree>,
-    /// The branch's changes, while a review or a piece of work is looked at.
-    changes: Option<crate::changes::ChangeSet>,
-    file: Option<Editor>,
-    /// Files the agent changed during this conversation, relative to the root.
-    changed: BTreeSet<String>,
-    panes: Cell<Panes>,
-    /// Loaded on the first file opened: the grammars take a moment, and a
-    /// session that never opens a file should not pay for them.
-    highlighter: OnceCell<Rc<Highlighter>>,
     running_since: Option<Instant>,
-    spinner: usize,
     usage: Usage,
     cost: Usd,
     cost_complete: bool,
-    quit: bool,
-    /// The first Ctrl-C was pressed: a second one quits.
-    quit_armed: bool,
     /// The model of the team working on a task handed to it, if one is.
     member: Option<ModelId>,
     /// The step of a request in a pair being worked on.
@@ -807,15 +789,120 @@ pub struct App {
     request_spent: Spent,
     /// The models of the current request in turn, with what each run cost.
     runs: Vec<(ModelId, Spent)>,
+    session_id: String,
+    session_name: Option<String>,
+    created: u64,
+    requests: usize,
+    /// Replies unfolded by the person, by transcript index. Long replies are
+    /// folded otherwise.
+    expanded: BTreeSet<usize>,
+    /// The reply selected in normal mode, by transcript index.
+    selected_reply: Option<usize>,
+    /// How full the context was on the latest call, for the status line.
+    context: Option<ContextUse>,
+    /// The model working on the current request, for the activity line.
+    working_model: Option<ModelId>,
+}
+
+impl Chat {
+    /// Its name: the one given with `/name`, else the start of the first
+    /// message.
+    fn name(&self) -> String {
+        if let Some(name) = &self.session_name {
+            return name.clone();
+        }
+        let first = self.transcript.iter().find_map(|e| match e {
+            Entry::User(text) => Some(text.as_str()),
+            _ => None,
+        });
+        match first {
+            Some(text) if text.chars().count() > 60 => {
+                format!("{}…", text.chars().take(60).collect::<String>())
+            }
+            Some(text) => text.to_owned(),
+            None => "new conversation".into(),
+        }
+    }
+
+    /// A new conversation, showing `transcript`.
+    fn new(id: ChatId, transcript: Vec<Entry>) -> Self {
+        Self {
+            id,
+            usage_log: UsageLog::default(),
+            approval: None,
+            compact_picker: None,
+            queued: None,
+            idle_since: Instant::now(),
+            ticks_paused: false,
+            ticking: false,
+            last_read: None,
+            transcript,
+            scroll_back: Cell::new(0),
+            max_scroll: Cell::new(0),
+            running_since: None,
+            usage: Usage::default(),
+            cost: Usd::default(),
+            cost_complete: true,
+            member: None,
+            step: None,
+            sub_view: None,
+            sub_scroll: Cell::new(0),
+            sub_max: Cell::new(0),
+            request_spent: Spent::default(),
+            runs: Vec::new(),
+            session_id: sessions::new_id(),
+            session_name: None,
+            created: sessions::now(),
+            requests: 0,
+            expanded: BTreeSet::new(),
+            selected_reply: None,
+            context: None,
+            working_model: None,
+        }
+    }
+}
+
+/// The whole state of the interface.
+pub struct App {
+    settings: Settings,
+    root: PathBuf,
+    project: String,
+    mode: Mode,
+    focus: Focus,
+    pending: Option<Pending>,
+    input: LineEditor,
+    /// The messages sent before, for Up and Down in the message box.
+    history: History,
+    /// The usage pane's window, in seconds, kept while it is hidden.
+    usage_window: u64,
+    /// Whether the usage pane shows.
+    usage_open: bool,
+    /// Whether the machine is kept from idle sleep now.
+    kept_awake: bool,
+    command: LineEditor,
+    /// The search of the codebase's maps, kept after Enter; and the mode
+    /// it was started from, to go back to.
+    search: LineEditor,
+    search_from: Mode,
+    tree: Option<FileTree>,
+    /// The branch's changes, while a review or a piece of work is looked at.
+    changes: Option<crate::changes::ChangeSet>,
+    file: Option<Editor>,
+    /// Files the agent changed during this conversation, relative to the root.
+    changed: BTreeSet<String>,
+    panes: Cell<Panes>,
+    /// Loaded on the first file opened: the grammars take a moment, and a
+    /// session that never opens a file should not pay for them.
+    highlighter: OnceCell<Rc<Highlighter>>,
+    spinner: usize,
+    quit: bool,
+    /// The first Ctrl-C was pressed: a second one quits.
+    quit_armed: bool,
     /// The choices as last kept for new sessions, to keep them again as
     /// soon as they change.
     kept: Defaults,
     /// A one-line note in the status line, cleared by the next key.
     notice: Option<String>,
-    session_id: String,
-    session_name: Option<String>,
-    created: u64,
-    requests: usize,
     picker: Option<Picker>,
     /// Several definitions of a name found, to choose one.
     definitions: Option<DefinitionChoice>,
@@ -823,11 +910,6 @@ pub struct App {
     /// where going back left from, what Alt-→ goes forward to.
     back: Vec<Place>,
     ahead: Vec<Place>,
-    /// Replies unfolded by the person, by transcript index. Long replies are
-    /// folded otherwise.
-    expanded: BTreeSet<usize>,
-    /// The reply selected in normal mode, by transcript index.
-    selected_reply: Option<usize>,
     /// Asks the view to scroll the selected reply into sight.
     reveal: Cell<bool>,
     /// Where each entry was drawn, as (entry, first line, last line) in the
@@ -858,11 +940,25 @@ pub struct App {
     keys_open: Option<usize>,
     /// The model picker, open on the row selected.
     model_picker: Option<ModelPicker>,
-    /// How full the context was on the latest call, for the status line.
-    context: Option<ContextUse>,
-    /// The model working on the current request, for the activity line.
-    working_model: Option<ModelId>,
     docker: Option<DockerPane>,
+    /// The conversation shown.
+    chat: Chat,
+    /// The other open conversations, in the order they were opened; each
+    /// goes on working while hidden.
+    others: Vec<Chat>,
+    /// The id the next conversation opened gets.
+    next_chat: u64,
+    /// Conversations closed, for the host to let go of.
+    closed: Vec<ChatId>,
+    /// The list of open conversations, on the row selected.
+    chats_open: Option<usize>,
+    /// The project's tasks.
+    tasks: Vec<crate::sessions::Task>,
+    /// The list of tasks, on the row selected.
+    tasks_open: Option<usize>,
+    /// What the project keeps, as last kept, to keep it again as soon as
+    /// it changes.
+    project_kept: Option<crate::sessions::ProjectState>,
 }
 
 /// The list of saved conversations shown by `/resume`.
@@ -932,55 +1028,27 @@ impl App {
             pending: None,
             input: LineEditor::default(),
             history: History::default(),
-            usage_log: UsageLog::default(),
             usage_window,
             usage_open: false,
-            approval: None,
-            compact_picker: None,
-            queued: None,
-            idle_since: Instant::now(),
-            ticks_paused: false,
-            ticking: false,
-            last_read: None,
             kept_awake: false,
             command: LineEditor::default(),
             search: LineEditor::default(),
             search_from: Mode::Insert,
-            transcript,
-            scroll_back: Cell::new(0),
-            max_scroll: Cell::new(0),
             tree: None,
             changes: None,
             file: None,
             changed: BTreeSet::new(),
             panes: Cell::new(Panes::default()),
             highlighter: OnceCell::new(),
-            running_since: None,
             spinner: 0,
-            usage: Usage::default(),
-            cost: Usd::default(),
-            cost_complete: true,
             quit: false,
             quit_armed: false,
-            member: None,
-            step: None,
-            sub_view: None,
-            sub_scroll: Cell::new(0),
-            sub_max: Cell::new(0),
-            request_spent: Spent::default(),
-            runs: Vec::new(),
             kept: Defaults::default(),
             notice: None,
-            session_id: sessions::new_id(),
-            session_name: None,
-            created: sessions::now(),
-            requests: 0,
             picker: None,
             definitions: None,
             back: Vec::new(),
             ahead: Vec::new(),
-            expanded: BTreeSet::new(),
-            selected_reply: None,
             reveal: Cell::new(false),
             entry_lines: RefCell::new(Vec::new()),
             transcript_view: Cell::new((0, Rect::default())),
@@ -995,9 +1063,16 @@ impl App {
             completion: None,
             keys_open: None,
             model_picker: None,
-            working_model: None,
-            context: None,
             docker: None,
+
+            chat: Chat::new(ChatId(0), transcript),
+            others: Vec::new(),
+            next_chat: 1,
+            closed: Vec::new(),
+            chats_open: None,
+            tasks: Vec::new(),
+            tasks_open: None,
+            project_kept: None,
         };
         app.kept = app.defaults();
         app
@@ -1058,23 +1133,23 @@ impl App {
 
     /// Everything the conversation shows, in order.
     pub fn transcript(&self) -> &[Entry] {
-        &self.transcript
+        &self.chat.transcript
     }
 
     /// How many lines the conversation is scrolled up from its end: 0 follows new output.
     pub fn scroll_back(&self) -> usize {
-        self.scroll_back.get()
+        self.chat.scroll_back.get()
     }
 
     /// Scrolls the conversation so that a given line range is in view. Called
     /// by the view, the only part that knows where an entry's lines are.
     pub fn set_scroll_back(&self, back: usize) {
-        self.scroll_back.set(back);
+        self.chat.scroll_back.set(back);
     }
 
     /// Records how far the conversation can scroll, which only the view knows.
     pub fn set_max_scroll(&self, max: usize) {
-        self.max_scroll.set(max);
+        self.chat.max_scroll.set(max);
     }
 
     /// The project's name, from its directory.
@@ -1138,7 +1213,7 @@ impl App {
             f.word_at(row, col)
         });
         if let Some(word) = word {
-            self.queued = self.look_up(&word, false);
+            self.chat.queued = self.look_up(&word, false);
         }
     }
 
@@ -1401,22 +1476,22 @@ impl App {
 
     /// How long the current request has run, while one does.
     pub fn elapsed(&self) -> Option<Duration> {
-        self.running_since.map(|t| t.elapsed())
+        self.chat.running_since.map(|t| t.elapsed())
     }
 
     /// What the conversation used and cost so far, and whether every cost was known.
     pub fn totals(&self) -> (Usage, Usd, bool) {
-        (self.usage, self.cost, self.cost_complete)
+        (self.chat.usage, self.chat.cost, self.chat.cost_complete)
     }
 
     /// How full the context was on the latest call, when known.
     pub fn context(&self) -> Option<ContextUse> {
-        self.context
+        self.chat.context
     }
 
     /// Whether a request is running.
     pub fn is_running(&self) -> bool {
-        self.running_since.is_some()
+        self.chat.running_since.is_some()
     }
 
     /// Whether the person asked to quit.
@@ -1452,6 +1527,12 @@ impl App {
                 return effect;
             }
             if let Some(effect) = self.compact_key(key) {
+                return effect;
+            }
+            if let Some(effect) = self.chats_key(key) {
+                return effect;
+            }
+            if let Some(effect) = self.tasks_key(key) {
                 return effect;
             }
             if let Some(effect) = self.picker_key(key) {
@@ -1580,9 +1661,9 @@ impl App {
                 }
                 if mode == Mode::Normal
                     && self.focus == Focus::Chat
-                    && self.selected_reply.is_none()
+                    && self.chat.selected_reply.is_none()
                 {
-                    self.selected_reply = self.replies().last().copied();
+                    self.chat.selected_reply = self.replies().last().copied();
                 }
                 // Typing always goes to the conversation.
                 if mode == Mode::Insert {
@@ -1630,8 +1711,9 @@ impl App {
             Action::Move(lines) => self.move_focused(lines),
             Action::CopySelected => {
                 if let Some(text) = self
+                    .chat
                     .selected_reply
-                    .and_then(|i| self.transcript.get(i))
+                    .and_then(|i| self.chat.transcript.get(i))
                     .and_then(Entry::copied)
                 {
                     return Some(Effect::Copy(text));
@@ -1672,7 +1754,7 @@ impl App {
                 };
                 self.usage_open = true;
             }
-            Action::Fold => match self.selected_reply {
+            Action::Fold => match self.chat.selected_reply {
                 Some(entry) => self.toggle_fold(entry),
                 // Nothing to fold: Enter keeps its old meaning.
                 None => {
@@ -1695,9 +1777,9 @@ impl App {
                         file.scroll_by(i32::MIN / 2);
                     }
                 }
-                Focus::Chat => self.scroll_back.set(self.max_scroll.get()),
+                Focus::Chat => self.chat.scroll_back.set(self.chat.max_scroll.get()),
                 Focus::Docker => self.move_focused(i32::MIN / 2),
-                Focus::SubAgent => self.sub_scroll.set(self.sub_max.get()),
+                Focus::SubAgent => self.chat.sub_scroll.set(self.chat.sub_max.get()),
             },
             Action::Bottom => match self.focus {
                 Focus::Tree => {
@@ -1710,9 +1792,9 @@ impl App {
                         file.scroll_by(i32::MAX / 2);
                     }
                 }
-                Focus::Chat => self.scroll_back.set(0),
+                Focus::Chat => self.chat.scroll_back.set(0),
                 Focus::Docker => self.move_focused(i32::MAX / 2),
-                Focus::SubAgent => self.sub_scroll.set(0),
+                Focus::SubAgent => self.chat.sub_scroll.set(0),
             },
             Action::Open => self.open_selected(),
             Action::Collapse => {
@@ -1738,14 +1820,15 @@ impl App {
             Action::ShowChat => self.close_file(Focus::Chat),
             Action::PickModel => self.open_model_picker(),
             Action::ToggleSubAgent => {
-                self.sub_scroll.set(0);
+                self.chat.sub_scroll.set(0);
                 if self.focus == Focus::SubAgent {
                     self.focus_on(Focus::Chat);
                 }
-                self.sub_view = match self.sub_view {
+                self.chat.sub_view = match self.chat.sub_view {
                     Some(_) => None,
                     None => {
                         let last = self
+                            .chat
                             .transcript
                             .iter()
                             .rposition(|e| matches!(e, Entry::Delegating { .. }));
@@ -1818,7 +1901,7 @@ impl App {
                     self.focus_on(Focus::Chat);
                 }
                 Focus::SubAgent => {
-                    self.sub_view = None;
+                    self.chat.sub_view = None;
                     self.focus_on(Focus::Chat);
                 }
                 Focus::Chat => {}
@@ -1858,7 +1941,8 @@ impl App {
 
     /// Transcript indices of the model's replies, the entries that fold.
     fn replies(&self) -> Vec<usize> {
-        self.transcript
+        self.chat
+            .transcript
             .iter()
             .enumerate()
             .filter(|(_, e)| e.folds())
@@ -1874,33 +1958,34 @@ impl App {
             return;
         };
         let at = match self
+            .chat
             .selected_reply
             .and_then(|e| replies.iter().position(|r| *r == e))
         {
             Some(at) => (at as i64 + i64::from(step)).clamp(0, last as i64) as usize,
             None => last,
         };
-        self.selected_reply = Some(replies[at]);
+        self.chat.selected_reply = Some(replies[at]);
         self.reveal.set(true);
     }
 
     fn toggle_fold(&mut self, entry: usize) {
-        if !self.expanded.remove(&entry) {
-            self.expanded.insert(entry);
+        if !self.chat.expanded.remove(&entry) {
+            self.chat.expanded.insert(entry);
         }
-        self.selected_reply = Some(entry);
+        self.chat.selected_reply = Some(entry);
         self.reveal.set(true);
     }
 
     /// Whether a long reply, by its place in the transcript, was unfolded by the person.
     pub fn is_expanded(&self, entry: usize) -> bool {
-        self.expanded.contains(&entry)
+        self.chat.expanded.contains(&entry)
     }
 
     /// The selected reply, shown as such only in normal mode in the conversation.
     pub fn selected_reply(&self) -> Option<usize> {
         (self.focus == Focus::Chat && self.mode == Mode::Normal)
-            .then_some(self.selected_reply)
+            .then_some(self.chat.selected_reply)
             .flatten()
     }
 
@@ -1941,7 +2026,7 @@ impl App {
 
     /// Finds out which commits the replies cite exist.
     fn learn_all_commits(&self) {
-        for entry in &self.transcript {
+        for entry in &self.chat.transcript {
             if let Entry::Said(text) = entry {
                 self.learn_commits(text);
             }
@@ -2019,7 +2104,7 @@ impl App {
             panes.push(Focus::File);
         }
         panes.push(Focus::Chat);
-        if self.sub_view.is_some() {
+        if self.chat.sub_view.is_some() {
             panes.push(Focus::SubAgent);
         }
         if self.docker.is_some() {
@@ -2063,9 +2148,10 @@ impl App {
             }
             Focus::Chat => self.scroll(lines),
             Focus::SubAgent => {
-                let up = self.sub_scroll.get() as i64 - i64::from(lines);
-                self.sub_scroll
-                    .set(up.clamp(0, self.sub_max.get() as i64) as usize);
+                let up = self.chat.sub_scroll.get() as i64 - i64::from(lines);
+                self.chat
+                    .sub_scroll
+                    .set(up.clamp(0, self.chat.sub_max.get() as i64) as usize);
             }
             Focus::Docker => {
                 if let Some(docker) = &mut self.docker {
@@ -2191,8 +2277,8 @@ impl App {
                             Some(Reference::File { path, .. })
                                 if self.pictures_shown && path.to_lowercase().ends_with(".png") =>
                             {
-                                self.transcript.push(Entry::Image(path));
-                                self.scroll_back.set(0);
+                                self.chat.transcript.push(Entry::Image(path));
+                                self.chat.scroll_back.set(0);
                                 return None;
                             }
                             Some(Reference::File { path, line }) => {
@@ -2273,9 +2359,9 @@ impl App {
     }
 
     fn scroll(&mut self, down: i32) {
-        let current = self.scroll_back.get().min(self.max_scroll.get()) as i64;
-        let next = (current - i64::from(down)).clamp(0, self.max_scroll.get() as i64);
-        self.scroll_back.set(next as usize);
+        let current = self.chat.scroll_back.get().min(self.chat.max_scroll.get()) as i64;
+        let next = (current - i64::from(down)).clamp(0, self.chat.max_scroll.get() as i64);
+        self.chat.scroll_back.set(next as usize);
     }
 
     fn submit(&mut self, text: String) -> Option<Effect> {
@@ -2308,7 +2394,7 @@ impl App {
             ));
         }
         if self.is_running() {
-            self.transcript.push(Entry::Error(
+            self.chat.transcript.push(Entry::Error(
                 "Still working on the last message. Wait, or stop it with Ctrl-C".into(),
             ));
             return None;
@@ -2342,26 +2428,26 @@ impl App {
                     .with_allowed_hosts(self.settings.allowed_hosts.clone())
                     .with_strict_commands(self.settings.strict_commands);
                 self.input.take();
-                self.transcript.push(Entry::User(text.clone()));
+                self.chat.transcript.push(Entry::User(text.clone()));
                 // A new request: the last sub-agent's work leaves the screen,
                 // Ctrl-T brings it back.
-                self.sub_view = None;
-                self.step = None;
-                self.request_spent = Spent::default();
-                self.runs.clear();
+                self.chat.sub_view = None;
+                self.chat.step = None;
+                self.chat.request_spent = Spent::default();
+                self.chat.runs.clear();
                 if self.focus == Focus::SubAgent {
                     self.focus = Focus::Chat;
                 }
-                self.running_since = Some(Instant::now());
-                self.working_model = tiers.first().cloned();
-                self.scroll_back.set(0);
+                self.chat.running_since = Some(Instant::now());
+                self.chat.working_model = tiers.first().cloned();
+                self.chat.scroll_back.set(0);
                 // A request starts the hour of ticks again.
-                self.ticks_paused = false;
-                self.idle_since = Instant::now();
+                self.chat.ticks_paused = false;
+                self.chat.idle_since = Instant::now();
                 Some(Effect::Send { text, config })
             }
             Err(e) => {
-                self.transcript.push(Entry::Error(e.to_string()));
+                self.chat.transcript.push(Entry::Error(e.to_string()));
                 None
             }
         }
@@ -2369,11 +2455,11 @@ impl App {
 
     /// Adds a note to the conversation.
     pub fn info(&mut self, text: impl Into<String>) {
-        self.transcript.push(Entry::Info(text.into()));
+        self.chat.transcript.push(Entry::Info(text.into()));
     }
 
     fn error(&mut self, text: impl Into<String>) {
-        self.transcript.push(Entry::Error(text.into()));
+        self.chat.transcript.push(Entry::Error(text.into()));
     }
 
     fn run_command(&mut self, line: &str) -> Option<Effect> {
@@ -2471,26 +2557,34 @@ impl App {
                     self.error("Still working on the last message: stop it with Ctrl-C first");
                     return None;
                 }
-                self.transcript = vec![Entry::Welcome];
-                self.scroll_back.set(0);
-                self.expanded.clear();
-                self.selected_reply = None;
+                self.chat.transcript = vec![Entry::Welcome];
+                self.chat.scroll_back.set(0);
+                self.chat.expanded.clear();
+                self.chat.selected_reply = None;
                 // A new conversation is a new file; the old one stays resumable.
-                self.session_id = sessions::new_id();
-                self.session_name = None;
-                self.created = sessions::now();
-                self.requests = 0;
-                self.usage = Usage::default();
-                self.cost = Usd::default();
-                self.cost_complete = true;
+                self.chat.session_id = sessions::new_id();
+                self.chat.session_name = None;
+                self.chat.created = sessions::now();
+                self.chat.requests = 0;
+                self.chat.usage = Usage::default();
+                self.chat.cost = Usd::default();
+                self.chat.cost_complete = true;
                 return Some(Effect::Reset);
             }
+            Command::Chats => self.show_chats(),
+            Command::NewChat => {
+                self.open_chat();
+            }
+            Command::Task(Some(title)) => {
+                self.add_task(title);
+            }
+            Command::Task(None) | Command::Tasks => self.show_tasks(),
             Command::Name(None) => {
                 let name = self.name();
                 self.info(format!("This conversation: {name}"));
             }
             Command::Name(Some(name)) => {
-                self.session_name = Some(name.clone());
+                self.chat.session_name = Some(name.clone());
                 self.info(format!("Named: {name}"));
                 return Some(Effect::Save);
             }
@@ -2499,10 +2593,10 @@ impl App {
                     self.error("Still working on the last message: stop it with Ctrl-C first");
                     return None;
                 }
-                return Some(match id {
-                    Some(id) => Effect::Resume(id),
-                    None => Effect::ListSessions,
-                });
+                return match id {
+                    Some(id) => self.resume_or_show(id),
+                    None => Some(Effect::ListSessions),
+                };
             }
             Command::Usage(window) => match window.as_deref() {
                 None => self.usage_open = !self.usage_open,
@@ -2546,7 +2640,7 @@ impl App {
                     self.error("/address takes the number of a pull request");
                     return None;
                 }
-                self.running_since = Some(Instant::now());
+                self.chat.running_since = Some(Instant::now());
                 self.info(format!("Reading the review comments of #{number}…"));
                 return Some(Effect::Address(number));
             }
@@ -2560,7 +2654,7 @@ impl App {
                     self.error("Say which changes: /apply 1 3");
                     return None;
                 }
-                let Some(reply) = self.transcript.iter().rev().find_map(|e| match e {
+                let Some(reply) = self.chat.transcript.iter().rev().find_map(|e| match e {
                     Entry::Said(text) => Some(text.clone()),
                     _ => None,
                 }) else {
@@ -2589,14 +2683,14 @@ impl App {
                     self.error("Pick a model first (Ctrl-E)");
                     return None;
                 };
-                self.running_since = Some(Instant::now());
+                self.chat.running_since = Some(Instant::now());
                 self.info("Grouping the conversation by subject…");
                 return Some(Effect::PlanCompaction(config));
             }
             Command::Tick => {
                 self.settings.tick = !self.settings.tick;
-                self.ticks_paused = false;
-                self.idle_since = Instant::now();
+                self.chat.ticks_paused = false;
+                self.chat.idle_since = Instant::now();
                 self.info(if self.settings.tick {
                     "Keeping Claude Code's warm sessions warm while the conversation waits: a one \
                      word read every four minutes, until an hour without a request"
@@ -2649,18 +2743,18 @@ impl App {
                 None => self.error("/secrets lists them; /secrets forget <name> takes one back"),
             },
             Command::Cost => {
-                let partial = if self.cost_complete {
+                let partial = if self.chat.cost_complete {
                     ""
                 } else {
                     " (some requests did not report a cost)"
                 };
                 let text = format!(
                     "This conversation: {} request{}, {} tokens in, {} out, {}{partial}",
-                    self.requests,
-                    if self.requests == 1 { "" } else { "s" },
-                    self.usage.input,
-                    self.usage.output,
-                    self.cost
+                    self.chat.requests,
+                    if self.chat.requests == 1 { "" } else { "s" },
+                    self.chat.usage.input,
+                    self.chat.usage.output,
+                    self.chat.cost
                 );
                 self.info(text);
             }
@@ -2764,12 +2858,12 @@ impl App {
                 false
             }
             AgentMessage::Compaction(Ok(compaction)) => {
-                self.running_since = None;
+                self.chat.running_since = None;
                 let kept = vec![true; compaction.exchanges.len()];
                 if kept.is_empty() {
                     self.info("Nothing to compact yet");
                 } else {
-                    self.compact_picker = Some(CompactPicker {
+                    self.chat.compact_picker = Some(CompactPicker {
                         compaction,
                         kept,
                         open: None,
@@ -2780,12 +2874,12 @@ impl App {
                 false
             }
             AgentMessage::Compaction(Err(e)) | AgentMessage::Compacted(Err(e)) => {
-                self.running_since = None;
+                self.chat.running_since = None;
                 self.error(e);
                 false
             }
             AgentMessage::Compacted(Ok((before, after))) => {
-                self.running_since = None;
+                self.chat.running_since = None;
                 self.info(format!(
                     "Compacted: about {before} → {after} tokens. The agents' sessions start again \
                      from the summary. /context shows it"
@@ -2805,19 +2899,19 @@ impl App {
                 false
             }
             AgentMessage::Addressed(Ok(request)) => {
-                self.running_since = None;
-                self.queued = self.submit(request);
+                self.chat.running_since = None;
+                self.chat.queued = self.submit(request);
                 false
             }
             AgentMessage::Addressed(Err(e)) => {
-                self.running_since = None;
+                self.chat.running_since = None;
                 self.error(e);
                 false
             }
             AgentMessage::NotSent(text) => {
-                self.running_since = None;
-                if matches!(self.transcript.last(), Some(Entry::User(t)) if *t == text) {
-                    self.transcript.pop();
+                self.chat.running_since = None;
+                if matches!(self.chat.transcript.last(), Some(Entry::User(t)) if *t == text) {
+                    self.chat.transcript.pop();
                 }
                 self.input.set(text);
                 self.info(
@@ -2827,36 +2921,38 @@ impl App {
             }
             AgentMessage::Approve(approval, answer) => {
                 // One at a time: the agent waits for the answer.
-                if let Some((_, earlier)) = self.approval.replace((approval, answer)) {
+                if let Some((_, earlier)) = self.chat.approval.replace((approval, answer)) {
                     let _ = earlier.send(Answer::No);
                 }
                 false
             }
             AgentMessage::Done(Ok(outcome)) => {
                 self.learn_all_commits();
-                self.idle_since = Instant::now();
+                self.chat.idle_since = Instant::now();
                 // The request read its session: the next tick is a full
                 // wait away.
-                self.last_read = Some(crate::sessions::now());
+                self.chat.last_read = Some(crate::sessions::now());
                 let seconds = self
+                    .chat
                     .running_since
                     .take()
                     .map_or(0, |t| t.elapsed().as_secs());
                 if let Verdict::GaveUp { .. } = outcome.verdict {
-                    self.transcript.push(Entry::GaveUp);
+                    self.chat.transcript.push(Entry::GaveUp);
                 }
-                self.requests += 1;
-                self.transcript.push(Entry::Cost {
+                self.chat.requests += 1;
+                self.chat.transcript.push(Entry::Cost {
                     usage: outcome.usage,
                     cost: outcome.cost,
                     complete: outcome.cost_complete,
                     seconds,
                     subscription: outcome.subscription,
                     context: outcome.context,
-                    runs: std::mem::take(&mut self.runs),
+                    runs: std::mem::take(&mut self.chat.runs),
                 });
                 let now = crate::sessions::now();
                 let saved = self
+                    .chat
                     .usage_log
                     .saved_by_ticks(now.saturating_sub(seconds), now);
                 if saved > 0.0 {
@@ -2867,8 +2963,8 @@ impl App {
                 true
             }
             AgentMessage::Done(Err(error)) => {
-                self.running_since = None;
-                self.requests += 1;
+                self.chat.running_since = None;
+                self.chat.requests += 1;
                 self.error(error);
                 true
             }
@@ -2878,70 +2974,62 @@ impl App {
     /// The conversation's name: the one given with `/name`, else the start
     /// of the first message.
     pub fn name(&self) -> String {
-        if let Some(name) = &self.session_name {
-            return name.clone();
-        }
-        let first = self.transcript.iter().find_map(|e| match e {
-            Entry::User(text) => Some(text.as_str()),
-            _ => None,
-        });
-        match first {
-            Some(text) if text.chars().count() > 60 => {
-                format!("{}…", text.chars().take(60).collect::<String>())
-            }
-            Some(text) => text.to_owned(),
-            None => "new conversation".into(),
-        }
+        self.chat.name()
     }
 
     /// The conversation as it should be written to disk, or `None` while
     /// nothing has been said: an empty conversation is not worth a file.
     pub fn to_saved(&self, session: Session) -> Option<Saved> {
-        if !self.transcript.iter().any(|e| matches!(e, Entry::User(_))) {
+        if !self
+            .chat
+            .transcript
+            .iter()
+            .any(|e| matches!(e, Entry::User(_)))
+        {
             return None;
         }
         Some(Saved {
-            id: self.session_id.clone(),
+            id: self.chat.session_id.clone(),
             name: self.name(),
             project: self.root.clone(),
-            created: self.created,
+            created: self.chat.created,
             updated: sessions::now(),
-            requests: self.requests,
-            usage: self.usage,
-            cost: self.cost,
-            cost_complete: self.cost_complete,
-            transcript: self.transcript.clone(),
+            requests: self.chat.requests,
+            usage: self.chat.usage,
+            cost: self.chat.cost,
+            cost_complete: self.chat.cost_complete,
+            transcript: self.chat.transcript.clone(),
             session,
-            usage_log: self.usage_log.clone(),
+            usage_log: self.chat.usage_log.clone(),
         })
     }
 
     /// Shows a saved conversation as it was, and continues it.
     pub fn load_saved(&mut self, saved: Saved) {
-        self.session_id = saved.id;
-        self.session_name = Some(saved.name.clone());
-        self.created = saved.created;
-        self.requests = saved.requests;
-        self.usage = saved.usage;
-        self.cost = saved.cost;
-        self.cost_complete = saved.cost_complete;
-        self.transcript = saved.transcript;
+        self.chat.session_id = saved.id;
+        self.chat.session_name = Some(saved.name.clone());
+        self.chat.created = saved.created;
+        self.chat.requests = saved.requests;
+        self.chat.usage = saved.usage;
+        self.chat.cost = saved.cost;
+        self.chat.cost_complete = saved.cost_complete;
+        self.chat.transcript = saved.transcript;
         self.learn_all_commits();
-        self.usage_log = saved.usage_log;
-        self.usage_log.prune(sessions::now());
+        self.chat.usage_log = saved.usage_log;
+        self.chat.usage_log.prune(sessions::now());
         self.history = History::default();
-        for entry in &self.transcript {
+        for entry in &self.chat.transcript {
             if let Entry::User(text) = entry {
                 self.history.push(text.clone());
             }
         }
-        self.expanded.clear();
-        self.selected_reply = None;
-        self.transcript.push(Entry::Info(format!(
+        self.chat.expanded.clear();
+        self.chat.selected_reply = None;
+        self.chat.transcript.push(Entry::Info(format!(
             "Resumed \"{}\" ({}): the conversation continues where it stopped",
-            saved.name, self.session_id
+            saved.name, self.chat.session_id
         )));
-        self.scroll_back.set(0);
+        self.chat.scroll_back.set(0);
         self.picker = None;
     }
 
@@ -3008,17 +3096,17 @@ impl App {
     /// The handover the sub-agent pane shows: who, the task, what it did,
     /// and whether it is still at it.
     pub fn sub_agent(&self) -> Option<SubAgent<'_>> {
-        let i = self.sub_view?;
+        let i = self.chat.sub_view?;
         let Some(Entry::Delegating {
             from,
             to,
             task,
             spent,
-        }) = self.transcript.get(i)
+        }) = self.chat.transcript.get(i)
         else {
             return None;
         };
-        let work: Vec<&Entry> = self.transcript[i + 1..]
+        let work: Vec<&Entry> = self.chat.transcript[i + 1..]
             .iter()
             .map_while(|e| match e {
                 Entry::Member { entry, .. } => Some(&**entry),
@@ -3026,8 +3114,8 @@ impl App {
             })
             .collect();
         let working = self.is_running()
-            && self.member.as_ref() == Some(to)
-            && i + 1 + work.len() == self.transcript.len();
+            && self.chat.member.as_ref() == Some(to)
+            && i + 1 + work.len() == self.chat.transcript.len();
         Some(SubAgent {
             from,
             to,
@@ -3041,20 +3129,20 @@ impl App {
     /// How far the sub-agent pane is scrolled up from its end, and the
     /// view's report of how far it can go.
     pub fn sub_scroll(&self) -> usize {
-        self.sub_scroll.get()
+        self.chat.sub_scroll.get()
     }
 
     /// Records how far the sub-agent pane can scroll, which only the view knows.
     pub fn set_sub_max(&self, max: usize) {
-        self.sub_max.set(max);
-        if self.sub_scroll.get() > max {
-            self.sub_scroll.set(max);
+        self.chat.sub_max.set(max);
+        if self.chat.sub_scroll.get() > max {
+            self.chat.sub_scroll.set(max);
         }
     }
 
     /// What the running request cost so far, its sub-agents apart.
     pub fn request_spent(&self) -> Spent {
-        self.request_spent
+        self.chat.request_spent
     }
 
     /// Where the scores shown come from.
@@ -3064,7 +3152,7 @@ impl App {
 
     /// The step of a request in a pair being worked on, while it runs.
     pub fn step(&self) -> Option<&str> {
-        self.step.as_deref().filter(|_| self.is_running())
+        self.chat.step.as_deref().filter(|_| self.is_running())
     }
 
     /// The project's root directory.
@@ -3325,7 +3413,7 @@ impl App {
     /// Keys while /compact asks what to keep. Returns `None` when the key
     /// was not for it.
     fn compact_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
-        let picker = self.compact_picker.as_mut()?;
+        let picker = self.chat.compact_picker.as_mut()?;
         let rows = picker.rows();
         let row = rows.get(picker.cursor).copied();
         match key.code {
@@ -3359,18 +3447,18 @@ impl App {
                     self.info("Every exchange is ticked: untick those to drop");
                     return Some(None);
                 }
-                self.compact_picker = None;
+                self.chat.compact_picker = None;
                 return Some(Some(Effect::DropExchanges(keep)));
             }
             KeyCode::Esc => {
-                self.compact_picker = None;
+                self.chat.compact_picker = None;
                 self.info("Not compacted");
             }
             KeyCode::Enter => {
-                let picker = self.compact_picker.take()?;
+                let picker = self.chat.compact_picker.take()?;
                 let keep: Vec<usize> = (0..picker.kept.len()).filter(|e| picker.kept[*e]).collect();
                 let config = self.small_job_config()?;
-                self.running_since = Some(Instant::now());
+                self.chat.running_since = Some(Instant::now());
                 self.info("Compacting…");
                 return Some(Some(Effect::Compact {
                     config,
@@ -3385,12 +3473,12 @@ impl App {
 
     /// The effect raised outside a key, to run next.
     pub fn take_queued(&mut self) -> Option<Effect> {
-        self.queued.take()
+        self.chat.queued.take()
     }
 
     /// The /compact window while it is open.
     pub fn compact_picker(&self) -> Option<&CompactPicker> {
-        self.compact_picker.as_ref()
+        self.chat.compact_picker.as_ref()
     }
 
     fn members(&self) -> Vec<Member> {
@@ -3415,7 +3503,10 @@ impl App {
 
     /// The model working right now, while a request runs.
     pub fn working_model(&self) -> Option<&ModelId> {
-        self.working_model.as_ref().filter(|_| self.is_running())
+        self.chat
+            .working_model
+            .as_ref()
+            .filter(|_| self.is_running())
     }
 
     fn open_model_picker(&mut self) {
@@ -3441,27 +3532,27 @@ impl App {
     /// Which are due, the session says. After an hour without a request
     /// they stop by themselves, until the next.
     pub fn keep_warm_due(&mut self) -> bool {
-        if !self.settings.tick || self.ticks_paused || self.is_running() || self.ticking {
+        if !self.settings.tick || self.chat.ticks_paused || self.is_running() || self.chat.ticking {
             return false;
         }
-        if self.idle_since.elapsed() >= TICKS_LAST {
-            self.ticks_paused = true;
+        if self.chat.idle_since.elapsed() >= TICKS_LAST {
+            self.chat.ticks_paused = true;
             self.info(
                 "Ticks stopped after an hour without a request, and the machine may sleep: they \
                  start again with your next request, which finds the cache cold",
             );
             return false;
         }
-        self.ticking = true;
+        self.chat.ticking = true;
         true
     }
 
     /// The ticks read the sessions, the last at `read`, if any did: the
     /// conversation is saved, so that a restart knows when.
     fn on_ticked(&mut self, read: Option<u64>) -> bool {
-        self.ticking = false;
+        self.chat.ticking = false;
         if let Some(at) = read {
-            self.last_read = Some(at);
+            self.chat.last_read = Some(at);
         }
         read.is_some()
     }
@@ -3474,10 +3565,10 @@ impl App {
         let now = crate::sessions::now();
         match last.filter(|at| now.saturating_sub(*at) < TICK_WARM_SECS) {
             Some(at) => {
-                self.last_read = Some(at);
-                self.ticks_paused = false;
+                self.chat.last_read = Some(at);
+                self.chat.ticks_paused = false;
             }
-            None => self.ticks_paused = last.is_some(),
+            None => self.chat.ticks_paused = last.is_some(),
         }
     }
 
@@ -3485,13 +3576,14 @@ impl App {
     pub fn tick_status(&self) -> TickStatus {
         if !self.settings.tick {
             TickStatus::Off
-        } else if self.ticking {
+        } else if self.chat.ticking {
             TickStatus::Reading
-        } else if self.ticks_paused {
+        } else if self.chat.ticks_paused {
             TickStatus::Paused
         } else {
             let now = crate::sessions::now();
             let next = self
+                .chat
                 .last_read
                 .map(|at| (at + TICK_EVERY_SECS).saturating_sub(now));
             TickStatus::On { next }
@@ -3503,7 +3595,7 @@ impl App {
     pub fn wants_awake(&self) -> bool {
         !self.settings.allow_sleep
             && self.settings.tick
-            && (!self.ticks_paused || self.is_running())
+            && (!self.chat.ticks_paused || self.is_running())
     }
 
     /// Where ticks stand, in a few words for a status line, and how long
@@ -3543,13 +3635,13 @@ impl App {
             return TICKS_LAST.as_secs() / 60;
         }
         TICKS_LAST
-            .saturating_sub(self.idle_since.elapsed())
+            .saturating_sub(self.chat.idle_since.elapsed())
             .as_secs()
             .div_ceil(60)
     }
 
     fn approval_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
-        let (approval, _) = self.approval.as_ref()?;
+        let (approval, _) = self.chat.approval.as_ref()?;
         let (secrets, hosts) = match &approval.question {
             Question::Command { secrets, hosts, .. } => (secrets.clone(), hosts.clone()),
             Question::MoreTurns { .. } | Question::KeepWarm { .. } | Question::ColdStart { .. } => {
@@ -3588,7 +3680,7 @@ impl App {
             }
             _ => return Some(None),
         };
-        if let Some((_, sender)) = self.approval.take() {
+        if let Some((_, sender)) = self.chat.approval.take() {
             // The agent may have been stopped meanwhile.
             let _ = sender.send(answer);
         }
@@ -3598,12 +3690,12 @@ impl App {
     /// The usage samples, and the pane's window while it shows.
     pub fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
         self.usage_open
-            .then_some((&self.usage_log, self.usage_window))
+            .then_some((&self.chat.usage_log, self.usage_window))
     }
 
     /// The command waiting for the person's answer, if any.
     pub fn approval(&self) -> Option<&Approval> {
-        self.approval.as_ref().map(|(approval, _)| approval)
+        self.chat.approval.as_ref().map(|(approval, _)| approval)
     }
 
     /// Closes the model picker, saying the effort when ← → changed it there:
@@ -3844,7 +3936,8 @@ impl App {
 
     /// The conversation as plain text, as it reads on screen.
     pub(crate) fn transcript_text(&self) -> String {
-        self.transcript
+        self.chat
+            .transcript
             .iter()
             .filter_map(Self::entry_text)
             .collect::<Vec<_>>()
@@ -4089,7 +4182,7 @@ impl App {
     /// /name. The first message, which names it in the /resume list, is
     /// not repeated there.
     pub fn session_label(&self) -> String {
-        self.session_name.clone().unwrap_or_default()
+        self.chat.session_name.clone().unwrap_or_default()
     }
 
     /// Says something in the conversation.
@@ -4115,7 +4208,7 @@ impl App {
             KeyCode::Enter => {
                 let id = picker.items[picker.selected].id.clone();
                 self.picker = None;
-                return Some(Some(Effect::Resume(id)));
+                return Some(self.resume_or_show(id));
             }
             KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
             _ => {}
@@ -4137,7 +4230,7 @@ impl App {
             } => {
                 // A point for the usage pane; the conversation's context
                 // only, not a member's.
-                self.usage_log.push(Sample {
+                self.chat.usage_log.push(Sample {
                     at: sessions::now(),
                     model: model.to_string(),
                     input: usage.input.0,
@@ -4145,21 +4238,23 @@ impl App {
                     cost: cost.map(|c| c.0),
                     cache_read: cache.map(|c| c.read.0),
                     cache_written: cache.and_then(|c| c.written.map(|w| w.0)),
-                    context: context.filter(|_| self.member.is_none()).map(|c| c.used.0),
+                    context: context
+                        .filter(|_| self.chat.member.is_none())
+                        .map(|c| c.used.0),
                     role: purpose.name().to_owned(),
                     rewrite_extra: cache.and_then(|c| c.rewrite_extra).map(|u| u.0),
                 });
                 // The model that answers is back: the member is done.
-                if self.member.as_ref().is_some_and(|m| *m != model) {
-                    self.member = None;
-                    self.working_model = Some(model.clone());
+                if self.chat.member.as_ref().is_some_and(|m| *m != model) {
+                    self.chat.member = None;
+                    self.chat.working_model = Some(model.clone());
                 }
                 // Who worked, in turn: a new run when the model changes.
-                let run = match self.runs.last_mut() {
+                let run = match self.chat.runs.last_mut() {
                     Some((last, spent)) if *last == model => spent,
                     _ => {
-                        self.runs.push((model.clone(), Spent::default()));
-                        &mut self.runs.last_mut().expect("just pushed").1
+                        self.chat.runs.push((model.clone(), Spent::default()));
+                        &mut self.chat.runs.last_mut().expect("just pushed").1
                     }
                 };
                 run.usage += usage;
@@ -4167,16 +4262,17 @@ impl App {
                     Some(c) => run.cost += c,
                     None => run.subscription |= subscription,
                 }
-                if self.member.is_none() {
-                    self.request_spent.usage += usage;
+                if self.chat.member.is_none() {
+                    self.chat.request_spent.usage += usage;
                     match cost {
-                        Some(c) => self.request_spent.cost += c,
-                        None => self.request_spent.subscription |= subscription,
+                        Some(c) => self.chat.request_spent.cost += c,
+                        None => self.chat.request_spent.subscription |= subscription,
                     }
                 }
                 // The member's turns count for its handover too, live.
-                if self.member.is_some()
+                if self.chat.member.is_some()
                     && let Some(Entry::Delegating { spent, .. }) = self
+                        .chat
                         .transcript
                         .iter_mut()
                         .rev()
@@ -4189,26 +4285,26 @@ impl App {
                     }
                 }
                 if context.is_some() {
-                    self.context = context;
+                    self.chat.context = context;
                 }
-                self.usage += usage;
+                self.chat.usage += usage;
                 match cost {
-                    Some(c) => self.cost += c,
+                    Some(c) => self.chat.cost += c,
                     // A subscription owes nothing per request: the total is
                     // not incomplete for lack of a cost here.
                     None if subscription => {}
-                    None => self.cost_complete = false,
+                    None => self.chat.cost_complete = false,
                 }
                 return;
             }
             Event::Saying {
                 text, new_block, ..
             } => {
-                let last = match self.transcript.last_mut() {
-                    Some(Entry::Member { entry, .. }) if self.member.is_some() => {
+                let last = match self.chat.transcript.last_mut() {
+                    Some(Entry::Member { entry, .. }) if self.chat.member.is_some() => {
                         Some(&mut **entry)
                     }
-                    Some(entry) if self.member.is_none() => Some(entry),
+                    Some(entry) if self.chat.member.is_none() => Some(entry),
                     _ => None,
                 };
                 match last {
@@ -4236,21 +4332,21 @@ impl App {
             Event::Passed => Entry::Passed,
             Event::Failed { command, excerpt } => Entry::Failed { command, excerpt },
             Event::Escalating { from, to } => {
-                self.working_model = Some(to.clone());
+                self.chat.working_model = Some(to.clone());
                 Entry::Escalating { from, to }
             }
             Event::Delegating { from, to, task } => {
-                self.transcript.push(Entry::Delegating {
+                self.chat.transcript.push(Entry::Delegating {
                     from,
                     to: to.clone(),
                     task,
                     spent: Spent::default(),
                 });
                 // The sub-agent pane opens on it, the status line names it.
-                self.sub_view = Some(self.transcript.len() - 1);
-                self.sub_scroll.set(0);
-                self.working_model = Some(to.clone());
-                self.member = Some(to);
+                self.chat.sub_view = Some(self.chat.transcript.len() - 1);
+                self.chat.sub_scroll.set(0);
+                self.chat.working_model = Some(to.clone());
+                self.chat.member = Some(to);
                 return;
             }
             Event::Step {
@@ -4260,8 +4356,8 @@ impl App {
                 model,
                 effort,
             } => {
-                self.step = Some(name.clone());
-                self.working_model = model.clone();
+                self.chat.step = Some(name.clone());
+                self.chat.working_model = model.clone();
                 Entry::Step {
                     number,
                     of,
@@ -4283,7 +4379,7 @@ impl App {
                 }
             )),
             Event::OverBudget { spent, budget } => {
-                self.member = None;
+                self.chat.member = None;
                 Entry::OverBudget { spent, budget }
             }
             Event::Tried { command, outcome } => {
@@ -4358,14 +4454,14 @@ impl App {
 
     /// Adds an entry, set apart under the member's name while one works.
     fn push_entry(&mut self, entry: Entry) {
-        let entry = match &self.member {
+        let entry = match &self.chat.member {
             Some(model) => Entry::Member {
                 model: model.clone(),
                 entry: Box::new(entry),
             },
             None => entry,
         };
-        self.transcript.push(entry);
+        self.chat.transcript.push(entry);
     }
 
     /// Closes the open file unless it has unsaved edits, which stay on screen
@@ -4399,10 +4495,10 @@ impl App {
 
     /// The request was stopped: the conversation says so and stops waiting for it.
     pub fn on_cancelled(&mut self) {
-        self.running_since = None;
+        self.chat.running_since = None;
         // Its answer would reach nobody.
-        self.approval = None;
-        self.transcript.push(Entry::Interrupted);
+        self.chat.approval = None;
+        self.chat.transcript.push(Entry::Interrupted);
         self.info("Files already edited stay edited: /diff shows them");
     }
 
@@ -4410,7 +4506,7 @@ impl App {
     /// kept, so that a pasted log is not sent at its first line; on the
     /// command line, on one line.
     pub fn on_paste(&mut self, text: &str) {
-        if self.approval.is_some()
+        if self.chat.approval.is_some()
             || self.picker.is_some()
             || self.model_picker.is_some()
             || (self.focus == Focus::File && self.mode != Mode::Search)
@@ -4587,7 +4683,7 @@ mod tests {
         assert_eq!(log.samples.len(), 3);
 
         // Kept with the conversation.
-        app.transcript.push(Entry::User("hi".into()));
+        app.chat.transcript.push(Entry::User("hi".into()));
         let saved = app.to_saved(Session::new()).unwrap();
         assert_eq!(saved.usage_log.samples.len(), 3);
         type_text(&mut app, "/usage");
@@ -4761,7 +4857,7 @@ mod tests {
     fn a_stopped_request_says_so() {
         let mut app = ready();
         app.on_cancelled();
-        assert!(app.transcript.contains(&Entry::Interrupted));
+        assert!(app.chat.transcript.contains(&Entry::Interrupted));
     }
 
     #[test]
@@ -4832,13 +4928,13 @@ mod tests {
 
         // An hour without a request: they stop, said once, and the
         // machine may sleep.
-        app.idle_since = Instant::now()
+        app.chat.idle_since = Instant::now()
             .checked_sub(Duration::from_secs(61 * 60))
             .unwrap();
         assert!(!app.keep_warm_due());
         assert_eq!(app.tick_status(), TickStatus::Paused);
         assert!(!app.wants_awake());
-        assert!(app.notice.is_none() || !app.transcript.is_empty());
+        assert!(app.notice.is_none() || !app.chat.transcript.is_empty());
 
         // The next request starts them again.
         type_text(&mut app, "go on");
@@ -4873,7 +4969,7 @@ mod tests {
         app.on_agent(AgentMessage::NotSent("fix it".into()));
         assert_eq!(app.input().text(), "fix it");
         assert!(!app.is_running());
-        assert!(!app.transcript.contains(&Entry::User("fix it".into())));
+        assert!(!app.chat.transcript.contains(&Entry::User("fix it".into())));
     }
 
     #[test]
@@ -5624,10 +5720,11 @@ mod tests {
     #[test]
     fn copy_opens_the_conversation_as_text_to_select_from() {
         let mut app = ready();
-        app.transcript.push(Entry::User("fix it".into()));
-        app.transcript
+        app.chat.transcript.push(Entry::User("fix it".into()));
+        app.chat
+            .transcript
             .push(Entry::Said("Here:\n```py\nprint(1)\n```".into()));
-        app.transcript.push(Entry::Tool {
+        app.chat.transcript.push(Entry::Tool {
             name: "replace".into(),
             path: Some("a.py".into()),
             outcome: Ok(ToolSummary::Changed {
@@ -5694,12 +5791,12 @@ mod tests {
             model: id("cheap"),
             text: "Done.".into(),
         }));
-        let n = app.transcript.len();
+        let n = app.chat.transcript.len();
         assert!(matches!(
-            &app.transcript[n - 2],
+            &app.chat.transcript[n - 2],
             Entry::Member { model, entry } if model.as_str() == "strong" && **entry == Entry::Said("a.py prints 1.".into())
         ));
-        assert_eq!(app.transcript[n - 1], Entry::Said("Done.".into()));
+        assert_eq!(app.chat.transcript[n - 1], Entry::Said("Done.".into()));
         assert!(app.transcript_text().contains("│ strong\n│ a.py prints 1."));
 
         // The sub-agent pane shows the handover and its work, Ctrl-T hides
@@ -5743,7 +5840,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.effort(), Effort::High);
         assert!(
-            matches!(app.transcript.last(), Some(Entry::Info(t)) if t.starts_with("Effort: high."))
+            matches!(app.chat.transcript.last(), Some(Entry::Info(t)) if t.starts_with("Effort: high."))
         );
         type_text(&mut app, "/effort low");
         press(&mut app, KeyCode::Enter);
@@ -5762,7 +5859,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         // Closing the picker says what it changed.
         assert!(
-            matches!(app.transcript.last(), Some(Entry::Info(t)) if t.starts_with("Effort: medium."))
+            matches!(app.chat.transcript.last(), Some(Entry::Info(t)) if t.starts_with("Effort: medium."))
         );
 
         // Kept with the other choices.
@@ -5797,7 +5894,9 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .is_none()
         );
-        assert!(matches!(app.transcript.last(), Some(Entry::Error(e)) if e.contains("two models")));
+        assert!(
+            matches!(app.chat.transcript.last(), Some(Entry::Error(e)) if e.contains("two models"))
+        );
 
         // The cheapest codes, the best scored plans, whoever answers.
         app.settings.team = ["cheap", "dear"]
@@ -5852,7 +5951,7 @@ mod tests {
         type_text(&mut app, "/pair add a feature");
         let effect = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(effect, Some(Effect::Send { ref text, .. }) if text == "add a feature"));
-        assert!(app.transcript.iter().any(|e| matches!(
+        assert!(app.chat.transcript.iter().any(|e| matches!(
             e,
             Entry::Info(t) if t.contains("smart plans and reviews (effort high)")
                 && t.contains("cheap codes (effort high)")
@@ -5898,7 +5997,7 @@ mod tests {
             context: None,
             changed: vec![],
         })));
-        let Some(Entry::Cost { runs, .. }) = app.transcript.last() else {
+        let Some(Entry::Cost { runs, .. }) = app.chat.transcript.last() else {
             panic!("a cost line ends the request");
         };
         let chain: Vec<(&str, Usd)> = runs.iter().map(|(m, s)| (m.as_str(), s.cost)).collect();

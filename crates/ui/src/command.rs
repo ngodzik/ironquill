@@ -26,6 +26,15 @@ pub(crate) enum Command {
     /// `/resume` lists saved conversations to pick one; `/resume <id>`
     /// continues the one with that id, or whose id starts so.
     Resume(Option<String>),
+    /// `/chats` lists the open conversations, to show or close one.
+    Chats,
+    /// `/newchat` opens an empty conversation beside the others.
+    NewChat,
+    /// `/task <what>` adds a task tied to this conversation; alone, lists
+    /// them.
+    Task(Option<String>),
+    /// `/tasks` lists the project's tasks.
+    Tasks,
     /// `/cost` shows what the conversation has cost so far.
     Cost,
     /// `/usage` shows or hides the usage pane; `/usage 6h` sets its window.
@@ -113,6 +122,10 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "clear" | "new" => Ok(Command::Clear),
         "name" | "rename" => Ok(Command::Name(rest_opt)),
         "resume" => Ok(Command::Resume(rest_opt)),
+        "chats" => Ok(Command::Chats),
+        "newchat" => Ok(Command::NewChat),
+        "task" => Ok(Command::Task(rest_opt)),
+        "tasks" => Ok(Command::Tasks),
         "cost" => Ok(Command::Cost),
         "usage" => Ok(Command::Usage(rest_opt)),
         "secrets" => Ok(Command::Secrets(rest_opt)),
@@ -149,6 +162,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
 /// parses, so that the list cannot drift from `parse`.
 pub(crate) const NAMES: &[&str] = &[
     "budget",
+    "chats",
     "check",
     "claude",
     "claude-reset",
@@ -175,6 +189,7 @@ pub(crate) const NAMES: &[&str] = &[
     "nocheck",
     "pair",
     "newpair",
+    "newchat",
     "tick",
     "compact",
     "address",
@@ -185,6 +200,8 @@ pub(crate) const NAMES: &[&str] = &[
     "rename",
     "resume",
     "rounds",
+    "task",
+    "tasks",
     "team",
     "review",
     "work",
@@ -297,7 +314,8 @@ Type a question or a change and press Enter. Changes are checked before they are
 /compact             sum the conversation up: pick the subjects to keep, the rest
                      goes; the agents start again from the summary
 /tick                keep Claude Code's warm sessions warm while you think: a one
-                     word read every four minutes, asking again after half an hour
+                     word read every four minutes, stopping after an hour without
+                     a request; the machine is kept awake meanwhile
 /planner <model>     the model that plans in a pair; by default the best scored,
                      or the dearest
 /effort <level>      how hard models think: low, medium, high (the default),
@@ -325,7 +343,13 @@ Type a question or a change and press Enter. Changes are checked before they are
                      /review off ends it
 /work [base]         the same, to go on with the work: files stay editable
 /diff                what changed since the last commit
-/clear               start a new conversation
+/clear               start a new conversation in place of this one
+/newchat             open a new conversation beside this one, which goes on
+/chats               the open conversations: Enter shows one, n opens a new one,
+                     x closes one not shown (its file stays); hidden ones go on
+/task <what>         add a task, tied to this conversation
+/tasks               the project's tasks: Space ticks one done, Enter opens its
+                     conversation, t ties it to this one, d deletes it
 /name <title>        name this conversation (it is saved after every request)
 /resume [id]         continue a saved conversation: pick it, or give its id or
                      the start of it (ironquill -c: the last one, -r <id>)

@@ -1333,6 +1333,15 @@ fn status(ui: &mut Ui, app: &App) {
             if let Some(model) = app.current_model() {
                 ui.label(RichText::new(model.to_string()).small().color(ACCENT));
             }
+            if let Some(chats) = app.chats_label() {
+                let colour = if app.hidden_waiting() > 0 {
+                    YELLOW
+                } else {
+                    DIM
+                };
+                ui.label(RichText::new(chats).small().color(colour))
+                    .on_hover_text("Other conversations go on while hidden: /chats lists them");
+            }
             if let Some(ticks) = app.tick_label() {
                 ui.label(RichText::new(ticks).small().color(theme::CYAN))
                     .on_hover_text(

@@ -134,6 +134,62 @@ impl Store {
     }
 }
 
+impl Store {
+    /// What the project keeps besides its conversations: those open and the
+    /// one shown, and its tasks. Nothing yet, or a file that cannot be read,
+    /// is an empty state rather than an error: it only costs the list.
+    pub fn project_state(&self) -> ProjectState {
+        fs::read(self.dir.join(PROJECT_STATE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Writes the project's state, write then rename as a conversation.
+    pub fn save_project_state(&self, state: &ProjectState) -> io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let json = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
+        let path = self.dir.join(PROJECT_STATE);
+        let tmp = path.with_extension("state.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(tmp, path)
+    }
+}
+
+/// The project's state beside its conversations: not a `.json`, so that
+/// the list of conversations does not try to read it as one.
+const PROJECT_STATE: &str = "project.state";
+
+/// What a project keeps besides its conversations.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ProjectState {
+    /// The conversations open in the window, by id, in the order they were
+    /// opened.
+    #[serde(default)]
+    pub open: Vec<String>,
+    /// The one shown.
+    #[serde(default)]
+    pub shown: Option<String>,
+    /// The project's tasks.
+    #[serde(default)]
+    pub tasks: Vec<Task>,
+}
+
+/// Something to do in the project, ticked by hand once done.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Task {
+    /// What to do.
+    pub title: String,
+    /// Whether it is done.
+    #[serde(default)]
+    pub done: bool,
+    /// The conversation it is tied to, by id.
+    #[serde(default)]
+    pub chat: Option<String>,
+    /// When it was added, in seconds since 1970.
+    pub created: u64,
+}
+
 /// `/home/me/code/app` becomes `-home-me-code-app`: one directory per
 /// project, readable at a glance.
 fn project_key(project: &Path) -> String {
@@ -199,6 +255,27 @@ mod tests {
             session: Session::new(),
             usage_log: UsageLog::default(),
         }
+    }
+
+    #[test]
+    fn the_project_state_is_kept_beside_the_conversations_not_among_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().to_owned());
+        assert_eq!(store.project_state(), ProjectState::default());
+        store.save(&saved("1759600000-0a1b2", "first", 1)).unwrap();
+        let state = ProjectState {
+            open: vec!["1759600000-0a1b2".into()],
+            shown: Some("1759600000-0a1b2".into()),
+            tasks: vec![Task {
+                title: "ship it".into(),
+                done: false,
+                chat: None,
+                created: 5,
+            }],
+        };
+        store.save_project_state(&state).unwrap();
+        assert_eq!(store.project_state(), state);
+        assert_eq!(store.list().len(), 1);
     }
 
     #[test]

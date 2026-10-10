@@ -17,7 +17,7 @@ use ironquill_ui::editor::{Editor, EditorMode, Kind, ScreenRow};
 use ironquill_ui::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use ironquill_ui::references::{self, Reference};
 use ironquill_ui::sessions;
-use ironquill_ui::{App, CompactRow, Entry, LineEditor, Panes, SubAgent};
+use ironquill_ui::{App, ChatState, CompactRow, Entry, LineEditor, Panes, SubAgent};
 
 const ACCENT: Color = Color::Rgb(215, 119, 87);
 // Changes since the last commit, in the open file. Backgrounds stay dark and
@@ -66,6 +66,57 @@ pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
     }
     if app.compact_picker().is_some() {
         render_compact(frame, app);
+    }
+    if let Some(selected) = app.chats_open() {
+        let rows = app
+            .chat_rows()
+            .into_iter()
+            .map(|chat| {
+                let state = match chat.state {
+                    ChatState::Idle => "",
+                    ChatState::Running => " · working",
+                    ChatState::Waiting => " · waiting for you",
+                };
+                format!(
+                    "{} {} · {}{state}",
+                    if chat.shown { "●" } else { " " },
+                    chat.name,
+                    plural(chat.requests, "request", "requests")
+                )
+            })
+            .collect();
+        render_list(
+            frame,
+            " Conversations ",
+            rows,
+            selected,
+            " ↑↓: move · Enter: show · n: new · x: close one not shown · Esc: close ",
+        );
+    }
+    if let Some(selected) = app.tasks_open() {
+        let rows = app
+            .task_rows()
+            .into_iter()
+            .map(|task| {
+                let chat = match &task.chat {
+                    Some((name, true)) => format!(" · {name}"),
+                    Some((id, false)) => format!(" · saved {id}"),
+                    None => String::new(),
+                };
+                format!(
+                    "{} {}{chat}",
+                    if task.done { "[x]" } else { "[ ]" },
+                    task.title
+                )
+            })
+            .collect();
+        render_list(
+            frame,
+            " Tasks ",
+            rows,
+            selected,
+            " Space: done · Enter: open its conversation · t: tie here · d: delete · Esc: close ",
+        );
     }
     if app.approval().is_some() {
         render_approval(frame, app);
@@ -242,6 +293,45 @@ fn command_details(status: &str, checked_by: Option<&ModelId>, output: &str) -> 
         plural(output.lines().count(), "line", "lines")
     ));
     details
+}
+
+/// A list window over the screen, the selected row lit and kept in sight.
+fn render_list(frame: &mut Frame, title: &str, rows: Vec<String>, selected: usize, keys: &str) {
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
+    let height = (rows.len() as u16 + 2).min(screen.height);
+    let shown = usize::from(height.saturating_sub(2)).max(1);
+    let first = selected
+        .saturating_sub(shown - 1)
+        .min(rows.len().saturating_sub(shown));
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .map(|(i, text)| {
+            let style = if i == selected {
+                fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(SELECTED_BG)
+            } else {
+                Style::new()
+            };
+            Line::styled(format!(" {text}"), style)
+        })
+        .collect();
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = pane_block(title.into(), true)
+        .title_bottom(Line::styled(keys.to_owned(), fg(DIM)).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The /compact window: the subjects, ticked to keep, one open with its
@@ -2045,10 +2135,20 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         .tick_label()
         .map(|t| format!("{t} · "))
         .unwrap_or_default();
+    let chats = app
+        .chats_label()
+        .map(|c| format!("{c} · "))
+        .unwrap_or_default();
+    let chats_colour = if app.hidden_waiting() > 0 {
+        Color::Yellow
+    } else {
+        Color::Gray
+    };
     let right = Line::from(vec![
         // Room between the conversation's name and the model, however long
         // the name.
         Span::raw("  "),
+        Span::styled(chats, fg(chats_colour)),
         Span::styled(ticks, fg(Color::Cyan)),
         Span::styled(current, fg(ACCENT)),
         Span::styled(
