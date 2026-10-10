@@ -1124,7 +1124,7 @@ mod tests {
             ],
             edges: Vec::new(),
             left_out: 0,
-            operations: Vec::new(),
+            ..CodeMap::default()
         };
         let mut universe = Universe::new(PathBuf::from("/p"));
         universe.layout = Some(Layout::new(&map));

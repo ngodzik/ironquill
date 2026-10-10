@@ -57,6 +57,9 @@ pub struct Panes {
 pub enum MapView {
     /// Its design, flat: the components, what uses what, in layers.
     Plan,
+    /// Its services: those it runs, what each serves, and who reaches
+    /// whom, through an API, over MCP or by HTTP.
+    Services,
     /// Its API: each route of its OpenAPI specs, what serves it and what
     /// calls it.
     Api,
@@ -1555,7 +1558,8 @@ impl App {
                 let next = match self.map {
                     None if reviewing => Some(MapView::Review),
                     None | Some(MapView::Review) => Some(MapView::Plan),
-                    Some(MapView::Plan) => Some(MapView::Api),
+                    Some(MapView::Plan) => Some(MapView::Services),
+                    Some(MapView::Services) => Some(MapView::Api),
                     Some(MapView::Api) => Some(MapView::Database),
                     Some(MapView::Database) => Some(MapView::Universe),
                     Some(MapView::Universe) => None,
@@ -3837,7 +3841,7 @@ impl App {
         let notice = match view {
             Some(MapView::Plan) => {
                 "The plan: what uses what, foundations at the bottom. Click a part to see its \
-                 files, double-click to open it; Ctrl-N again for the API (in the terminal, it \
+                 files, double-click to open it; Ctrl-N again for the services (in the terminal, it \
                  shows only in the window)"
             }
             Some(MapView::Api) => {
@@ -3847,6 +3851,10 @@ impl App {
             Some(MapView::Universe) => {
                 "The universe: drag to turn, scroll to come closer, click a star to centre it; \
                  Ctrl-N again to go back"
+            }
+            Some(MapView::Services) => {
+                "The services: who calls the one in the middle on the left, what it calls on \
+                 the right. Click a service or a link for what it holds; Ctrl-N again for the API"
             }
             Some(MapView::Database) => {
                 "The database: the tables the models define, foundations at the bottom, each \
@@ -4492,12 +4500,14 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_n_shows_the_plan_the_api_the_database_the_universe_then_the_panes() {
+    fn ctrl_n_shows_the_plan_the_services_the_api_the_database_the_universe_then_the_panes() {
         let mut app = ready();
         let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
         assert_eq!(app.map_view(), None);
         app.on_key(ctrl_n);
         assert_eq!(app.map_view(), Some(MapView::Plan));
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), Some(MapView::Services));
         app.on_key(ctrl_n);
         assert_eq!(app.map_view(), Some(MapView::Api));
         app.on_key(ctrl_n);

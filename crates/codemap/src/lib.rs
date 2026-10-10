@@ -17,6 +17,7 @@ mod layout;
 mod map;
 mod review;
 mod schema;
+mod services;
 
 pub use api::{Body, Operation, Parameter, Response};
 pub use architecture::{Architecture, Component, ComponentKind, Link, architecture};
@@ -28,3 +29,4 @@ pub use review::{
     review, route_changes,
 };
 pub use schema::{Column, ForeignKey, Index, Reference, Schema, Table, schema};
+pub use services::{Evidence, Service, ServiceLink, Services, Tool, ToolKind, Via};

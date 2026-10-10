@@ -120,7 +120,7 @@ fn rust_crates(root: &Path, index: &Index) -> HashMap<String, String> {
 /// Every Python module by its dotted name, as imported from the folders
 /// packages are imported from: each Python project's own, and its `src`
 /// when it has one, as in a monorepo of many packages sharing a namespace
-/// (`airflow.providers.amazon` beside `airflow.models`), then the root.
+/// (`app.providers.cloud` beside `app.models`), then the root.
 fn python_modules(index: &Index) -> HashMap<String, String> {
     let mut roots: Vec<String> = index
         .paths()
@@ -666,23 +666,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(root, "core/pyproject.toml", "");
-        write(root, "core/src/airflow/__init__.py", "");
-        write(root, "core/src/airflow/models/__init__.py", "");
-        write(root, "core/src/airflow/models/dag.py", "");
+        write(root, "core/src/app/__init__.py", "");
+        write(root, "core/src/app/models/__init__.py", "");
+        write(root, "core/src/app/models/dag.py", "");
         write(root, "providers/amazon/pyproject.toml", "");
         write(
             root,
-            "providers/amazon/src/airflow/providers/amazon/hooks.py",
-            "from airflow.models.dag import DAG\nimport airflow.models\nimport boto3\n",
+            "providers/cloud/src/app/providers/cloud/hooks.py",
+            "from app.models.dag import DAG\nimport app.models\nimport boto3\n",
         );
         assert_eq!(
-            imports(
-                root,
-                "providers/amazon/src/airflow/providers/amazon/hooks.py"
-            ),
+            imports(root, "providers/cloud/src/app/providers/cloud/hooks.py"),
             [
-                "core/src/airflow/models/__init__.py",
-                "core/src/airflow/models/dag.py"
+                "core/src/app/models/__init__.py",
+                "core/src/app/models/dag.py"
             ]
         );
     }
