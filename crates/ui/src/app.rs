@@ -10,24 +10,28 @@ use ironquill_agent::{
 };
 use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
-use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use ratatui::layout::{Position, Rect};
 use tokio::sync::oneshot;
 
+use crate::blocks;
 use crate::command::{self, Command};
-use crate::defaults::Defaults;
+use crate::defaults::{Defaults, Images};
 use crate::editor::{Editor, Outcome as EditorOutcome};
-use crate::graphics::Images;
 use crate::highlight::Highlighter;
+use crate::input::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, Position, Rect,
+};
 use crate::keymap::{self, Action, Focus, Mode, Pending};
-use crate::markdown;
-use crate::pictures::{Gallery, Picture, Pictures};
 use crate::references::{self, Reference};
 use crate::sessions::{self, Saved, Summary};
 use crate::tree::FileTree;
 use crate::usage::{Sample, UsageLog};
+
+/// How opaque a see-through window is unless `opacity` says otherwise:
+/// enough to read on any wallpaper, little enough to see it.
+pub const DEFAULT_OPACITY: f32 = 0.78;
+
+/// Below this, text on a busy wallpaper is lost.
+const MIN_OPACITY: f32 = 0.2;
 
 /// Lines moved by one turn of the mouse wheel.
 const WHEEL_LINES: i32 = 3;
@@ -35,22 +39,46 @@ const WHEEL_LINES: i32 = 3;
 /// Where each pane was drawn, written by the view so that a mouse click can be
 /// matched to a pane. Areas include the pane's border.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Panes {
-    pub(crate) tree: Option<Rect>,
-    pub(crate) file: Option<Rect>,
-    pub(crate) chat: Rect,
-    pub(crate) docker: Option<Rect>,
-    pub(crate) sub: Option<Rect>,
+pub struct Panes {
+    /// The file tree, when open.
+    pub tree: Option<Rect>,
+    /// The open file, when one is.
+    pub file: Option<Rect>,
+    /// The conversation.
+    pub chat: Rect,
+    /// The Docker pane, when open.
+    pub docker: Option<Rect>,
+    /// The sub-agent pane, when a task handed over is shown.
+    pub sub: Option<Rect>,
+}
+
+/// How the window draws the codebase instead of the panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapView {
+    /// Its design, flat: the components, what uses what, in layers.
+    Plan,
+    /// Its API: each route of its OpenAPI specs, what serves it and what
+    /// calls it.
+    Api,
+    /// Its files as stars in space, lit as the agent works.
+    Universe,
+    /// What a branch changed, read as a reviewer reads it: its routes, its
+    /// database, its files by area. Only while a review or a piece of work
+    /// is looked at.
+    Review,
 }
 
 /// The Docker pane: what `docker ps` said last.
 #[derive(Debug, Default)]
-pub(crate) struct DockerPane {
-    pub(crate) containers: Vec<Container>,
-    pub(crate) error: Option<String>,
+pub struct DockerPane {
+    /// The running containers, as last listed.
+    pub containers: Vec<Container>,
+    /// Why docker could not list them, when it could not.
+    pub error: Option<String>,
     /// False until the first answer arrives.
-    pub(crate) loaded: bool,
-    pub(crate) selected: usize,
+    pub loaded: bool,
+    /// The container selected, by its place in the list.
+    pub selected: usize,
 }
 
 /// Lines moved by a half page scroll. Fixed rather than measured, so that the
@@ -107,6 +135,14 @@ pub struct Settings {
     /// Whether the warm sessions are kept warm while the conversation
     /// waits, as `/tick` turns on.
     pub tick: bool,
+    /// Whether the window lets what is behind it show through.
+    pub see_through: bool,
+    /// How opaque the window is while see-through, as configured; `None`
+    /// takes [`DEFAULT_OPACITY`].
+    pub opacity: Option<f32>,
+    /// How wide the window's conversation is beside a file or the
+    /// codebase, as last dragged; `None` leaves it to the window.
+    pub chat_width: Option<f32>,
     /// Whether replies show images, and in which terminals.
     pub images: Images,
     /// The command that draws Mermaid diagrams, as configured; `None` finds
@@ -116,11 +152,11 @@ pub struct Settings {
 
 /// Tokens and cost of one part of a request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Spent {
-    pub(crate) usage: Usage,
-    pub(crate) cost: Usd,
+pub struct Spent {
+    pub usage: Usage,
+    pub cost: Usd,
     /// Some turns ran on a subscription, which costs nothing per request.
-    pub(crate) subscription: bool,
+    pub subscription: bool,
 }
 
 impl std::fmt::Display for Spent {
@@ -136,40 +172,44 @@ impl std::fmt::Display for Spent {
 }
 
 /// A task handed to a model of the team, as the sub-agent pane shows it.
-pub(crate) struct SubAgent<'a> {
-    pub(crate) from: &'a ModelId,
-    pub(crate) to: &'a ModelId,
-    pub(crate) task: &'a str,
-    pub(crate) spent: Spent,
+pub struct SubAgent<'a> {
+    /// The model that handed the task over.
+    pub from: &'a ModelId,
+    /// The model of the team working on it.
+    pub to: &'a ModelId,
+    /// The task, as it was handed over.
+    pub task: &'a str,
+    /// What the work cost so far.
+    pub spent: Spent,
     /// What it did, in order.
-    pub(crate) work: Vec<&'a Entry>,
+    pub work: Vec<&'a Entry>,
     /// Still working on it.
-    pub(crate) working: bool,
+    pub working: bool,
 }
 
 /// The model picker (Ctrl-E) while it is open.
 #[derive(Debug, Default)]
-pub(crate) struct ModelPicker {
+pub struct ModelPicker {
     /// What was typed to search the provider's models.
-    pub(crate) filter: String,
-    pub(crate) selected: usize,
+    pub filter: String,
+    pub selected: usize,
     /// The effort when it opened, to say so when ← → changed it.
     pub(crate) effort_at_open: Effort,
 }
 
 /// One row of the model picker.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ModelRow {
-    pub(crate) model: ModelId,
-    pub(crate) note: String,
+pub struct ModelRow {
+    pub model: ModelId,
+    pub note: String,
     /// Among the models offered every time, not only found by the search.
-    pub(crate) offered: bool,
-    pub(crate) in_team: bool,
+    pub offered: bool,
+    pub in_team: bool,
 }
 
 /// Something only the event loop can do, asked for by the state.
 #[derive(Debug)]
-pub(crate) enum Effect {
+pub enum Effect {
     /// Put this text on the system clipboard.
     Copy(String),
     /// Show what a commit did, as a reply cited it.
@@ -184,12 +224,20 @@ pub(crate) enum Effect {
     PlanCompaction(AgentConfig),
     /// Compact the conversation to the exchanges kept.
     Compact {
+        /// What the summary is written with.
         config: AgentConfig,
+        /// The exchanges kept, by their place in the conversation.
         keep: Vec<usize>,
+        /// Whether the last exchange stays as it was rather than summed up.
         last_as_is: bool,
     },
     /// Send this message to the conversation.
-    Send { text: String, config: AgentConfig },
+    Send {
+        /// The message.
+        text: String,
+        /// How the agent works on it.
+        config: AgentConfig,
+    },
     /// Stop the request in progress.
     Cancel,
     /// Start a new conversation.
@@ -214,11 +262,48 @@ pub(crate) enum Effect {
     SaveDefaults(Defaults),
     /// Open the person's instructions for every model, creating the file.
     OpenInstructions,
+    /// Find where a name is defined, or used: asked of the language
+    /// server, else read by patterns.
+    Find(Lookup),
+    /// Start the language servers for these files, from the project's
+    /// root, so that they read the project before they are asked.
+    WarmServers(Vec<PathBuf>),
+}
+
+/// A name to find, where it was asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lookup {
+    /// The name.
+    pub name: String,
+    /// The file it is in, from the project's root.
+    pub path: PathBuf,
+    /// Its line, from 0, and its column, in characters.
+    pub line: usize,
+    /// Its column.
+    pub column: usize,
+    /// The file's text, as it is in the editor.
+    pub text: String,
+    /// Where it is used, rather than where it is defined.
+    pub uses: bool,
+}
+
+/// What a lookup found, and who found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    /// The name looked up.
+    pub name: String,
+    /// Whether its uses were looked for, rather than its definition.
+    pub uses: bool,
+    /// The places, the likeliest first.
+    pub places: Vec<ironquill_tools::Definition>,
+    /// What found them: a language server, or `git grep`.
+    pub by: String,
 }
 
 /// What the agent task sends back to the interface.
 #[derive(Debug)]
-pub(crate) enum AgentMessage {
+pub enum AgentMessage {
+    /// Something the agent did, as it happened.
     Event(Event),
     /// A command held for the person, and where to send their answer.
     Approve(Approval, oneshot::Sender<Answer>),
@@ -226,18 +311,23 @@ pub(crate) enum AgentMessage {
     NotSent(String),
     /// A pull request's review comments, as a request to send.
     Addressed(Result<String, String>),
+    /// Where a name is defined or used.
+    Found(Found),
     /// The subjects of the conversation, for the person to pick from.
     Compaction(Result<Compaction, String>),
     /// The conversation was compacted: about how many tokens before, after.
     Compacted(Result<(TokenCount, TokenCount), String>),
+    /// The request ended: how, or why it failed.
     Done(Result<Outcome, String>),
 }
 
 /// One item in the transcript. Saved with the conversation, so that a
 /// resumed one shows what it showed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum Entry {
+pub enum Entry {
+    /// The greeting a new conversation opens with.
     Welcome,
+    /// A note from ironquill itself.
     Info(String),
     /// How a pair ended, who did what and what changed, in one line.
     Ended(String),
@@ -245,37 +335,61 @@ pub(crate) enum Entry {
     Refused(String),
     /// A command a model ran, folded to its first line until opened.
     Command {
+        /// The model that ran it.
         model: ModelId,
+        /// The command as written.
         command: String,
+        /// How it ended.
         status: String,
+        /// What it printed.
         output: String,
+        /// The model that read it first, when it was held because it could not be read.
         checked_by: Option<ModelId>,
     },
     /// The person stopped the request before it ended.
     Interrupted,
+    /// Something went wrong, said in the conversation.
     Error(String),
+    /// What the person wrote.
     User(String),
+    /// What a model answered.
     Said(String),
+    /// A tool a model called.
     Tool {
+        /// The tool.
         name: String,
+        /// The path it acted on, when it has one.
         path: Option<String>,
+        /// What it did, or the error the model was told.
         outcome: Result<ToolSummary, String>,
     },
+    /// The checks about to run, in order.
     Checks(Vec<String>),
+    /// The checks passed.
     Passed,
+    /// A check failed.
     Failed {
+        /// The command that failed.
         command: String,
+        /// The part of its output worth reading.
         excerpt: String,
     },
+    /// A stronger model takes over.
     Escalating {
+        /// The model that gave up.
         from: ModelId,
+        /// The model taking over.
         to: ModelId,
     },
+    /// Every model gave up.
     GaveUp,
     /// The model handed a task to another of the team.
     Delegating {
+        /// The model that handed the task over.
         from: ModelId,
+        /// The model of the team it went to.
         to: ModelId,
+        /// The task.
         task: String,
         /// What the member's work cost, as it accrues.
         #[serde(default)]
@@ -283,28 +397,41 @@ pub(crate) enum Entry {
     },
     /// The request spent its budget and stopped.
     OverBudget {
+        /// What it spent.
         spent: Usd,
+        /// What it was allowed to spend.
         budget: Usd,
     },
     /// A step of a request worked on in a pair: what, by whom.
     Step {
+        /// The step's number, from 1.
         number: u8,
+        /// How many steps the request has.
         of: u8,
+        /// What the step does: plan, code, review.
         name: String,
+        /// The model doing it, when known.
         model: Option<ModelId>,
+        /// The effort it works at, for a model that reasons.
         effort: Option<Effort>,
     },
     /// What a model of the team did on a task handed to it, shown apart
     /// from the model that answers.
     Member {
+        /// The model of the team.
         model: ModelId,
+        /// What it did.
         entry: Box<Entry>,
     },
     /// What one request cost, shown under it.
     Cost {
+        /// The tokens the request used.
         usage: Usage,
+        /// What it cost.
         cost: Usd,
+        /// Whether every call reported its cost: when not, the cost is a floor.
         complete: bool,
+        /// How long it took, in seconds.
         seconds: u64,
         /// Ran on a subscription (Claude Code): no cost is owed for it.
         #[serde(default)]
@@ -324,7 +451,7 @@ pub(crate) enum Entry {
 
 impl Entry {
     /// A model's reply, which folds when long.
-    pub(crate) fn is_reply(&self) -> bool {
+    pub fn is_reply(&self) -> bool {
         match self {
             Entry::Said(_) => true,
             Entry::Member { entry, .. } => entry.is_reply(),
@@ -356,27 +483,29 @@ impl Entry {
 
 /// What /compact keeps: subjects, each open or not, ticked exchanges.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CompactPicker {
-    pub(crate) compaction: Compaction,
+pub struct CompactPicker {
+    pub compaction: Compaction,
     /// Whether each exchange is kept, summed up.
-    pub(crate) kept: Vec<bool>,
+    pub kept: Vec<bool>,
     /// The subject shown with its exchanges.
     pub(crate) open: Option<usize>,
-    pub(crate) cursor: usize,
+    pub cursor: usize,
     /// Whether the last exchange stays as it was rather than summed up.
-    pub(crate) last_as_is: bool,
+    pub last_as_is: bool,
 }
 
 /// A row of the /compact window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompactRow {
+pub enum CompactRow {
+    /// A subject, by its place in the list of subjects.
     Subject(usize),
+    /// An exchange, by its place in the conversation.
     Exchange(usize),
 }
 
 impl CompactPicker {
     /// The rows shown: each subject, and the exchanges of the open one.
-    pub(crate) fn rows(&self) -> Vec<CompactRow> {
+    pub fn rows(&self) -> Vec<CompactRow> {
         let mut rows = Vec::new();
         for (s, subject) in self.compaction.subjects.iter().enumerate() {
             rows.push(CompactRow::Subject(s));
@@ -433,17 +562,19 @@ impl History {
 
 /// A single line of text being edited, with a cursor counted in characters.
 #[derive(Debug, Default)]
-pub(crate) struct LineEditor {
+pub struct LineEditor {
     text: String,
     cursor: usize,
 }
 
 impl LineEditor {
-    pub(crate) fn text(&self) -> &str {
+    /// The text being edited.
+    pub fn text(&self) -> &str {
         &self.text
     }
 
-    pub(crate) fn cursor(&self) -> usize {
+    /// Where the cursor is, in characters from the start.
+    pub fn cursor(&self) -> usize {
         self.cursor
     }
 
@@ -512,7 +643,7 @@ impl LineEditor {
 }
 
 /// The whole state of the interface.
-pub(crate) struct App {
+pub struct App {
     settings: Settings,
     root: PathBuf,
     project: String,
@@ -541,6 +672,10 @@ pub(crate) struct App {
     /// Asking whether to keep the sessions warm, after a long wait.
     ask_keep_warm: bool,
     command: LineEditor,
+    /// The search of the codebase's maps, kept after Enter; and the mode
+    /// it was started from, to go back to.
+    search: LineEditor,
+    search_from: Mode,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
     scroll_back: Cell<usize>,
@@ -548,6 +683,8 @@ pub(crate) struct App {
     /// only part that knows how many lines the transcript wraps to.
     max_scroll: Cell<usize>,
     tree: Option<FileTree>,
+    /// The branch's changes, while a review or a piece of work is looked at.
+    changes: Option<crate::changes::ChangeSet>,
     file: Option<Editor>,
     /// Files the agent changed during this conversation, relative to the root.
     changed: BTreeSet<String>,
@@ -589,6 +726,12 @@ pub(crate) struct App {
     created: u64,
     requests: usize,
     picker: Option<Picker>,
+    /// Several definitions of a name found, to choose one.
+    definitions: Option<DefinitionChoice>,
+    /// Where `gd` left from, the last last: what Ctrl-O goes back to; and
+    /// where going back left from, what Alt-→ goes forward to.
+    back: Vec<Place>,
+    ahead: Vec<Place>,
     /// Replies unfolded by the person, by transcript index. Long replies are
     /// folded otherwise.
     expanded: BTreeSet<usize>,
@@ -608,8 +751,11 @@ pub(crate) struct App {
     link_marks: RefCell<Vec<(usize, usize, usize, Reference)>>,
     /// Whether a cited file or commit exists, as found out.
     known_references: RefCell<HashMap<Reference, bool>>,
-    /// The pictures replies show, and what the terminal needs for them.
-    gallery: RefCell<Gallery>,
+    /// Whether the screen draws pictures, so that a cited PNG shows in the
+    /// conversation rather than open as a file.
+    pictures_shown: bool,
+    /// How the window shows the codebase, if it does.
+    map: Option<MapView>,
     /// The conversation has the whole screen; the other panes keep their
     /// state, hidden, until zooming back out.
     zoomed: bool,
@@ -630,13 +776,39 @@ pub(crate) struct App {
 
 /// The list of saved conversations shown by `/resume`.
 #[derive(Debug)]
-pub(crate) struct Picker {
-    pub(crate) items: Vec<Summary>,
-    pub(crate) selected: usize,
+pub struct Picker {
+    pub items: Vec<Summary>,
+    pub selected: usize,
+}
+
+/// The definitions of a name found in several places, or its uses, to
+/// choose one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionChoice {
+    /// The name.
+    pub name: String,
+    /// Whether these are its uses, rather than its definitions.
+    pub uses: bool,
+    /// What found them.
+    pub by: String,
+    /// Where it is defined, the most likely first.
+    pub items: Vec<ironquill_tools::Definition>,
+    /// The one chosen, by its place.
+    pub selected: usize,
+}
+
+/// A line of a file, to come back to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Place {
+    /// The file, from the project's root.
+    path: PathBuf,
+    /// The line, from 1.
+    line: usize,
 }
 
 impl App {
-    pub(crate) fn new(mut settings: Settings, root: PathBuf) -> Self {
+    /// The state of a new conversation in the project at `root`.
+    pub fn new(mut settings: Settings, root: PathBuf) -> Self {
         // The picker offers every model known at startup, the ones in use
         // first, and keeps offering them whatever is picked later.
         let mut models = settings.tiers.clone();
@@ -660,7 +832,6 @@ impl App {
             |name| name.to_string_lossy().into_owned(),
         );
         let usage_window = settings.usage_window.unwrap_or(3600);
-        let gallery = RefCell::new(Gallery::new(root.clone()));
         let mut app = Self {
             settings,
             root,
@@ -680,10 +851,13 @@ impl App {
             last_warm: None,
             ask_keep_warm: false,
             command: LineEditor::default(),
+            search: LineEditor::default(),
+            search_from: Mode::Insert,
             transcript,
             scroll_back: Cell::new(0),
             max_scroll: Cell::new(0),
             tree: None,
+            changes: None,
             file: None,
             changed: BTreeSet::new(),
             panes: Cell::new(Panes::default()),
@@ -709,6 +883,9 @@ impl App {
             created: sessions::now(),
             requests: 0,
             picker: None,
+            definitions: None,
+            back: Vec::new(),
+            ahead: Vec::new(),
             expanded: BTreeSet::new(),
             selected_reply: None,
             reveal: Cell::new(false),
@@ -718,7 +895,8 @@ impl App {
             copy_marks: RefCell::new(Vec::new()),
             link_marks: RefCell::new(Vec::new()),
             known_references: RefCell::new(HashMap::new()),
-            gallery,
+            pictures_shown: false,
+            map: None,
             zoomed: false,
             zoom_focus: None,
             completion: None,
@@ -734,58 +912,376 @@ impl App {
 
     // Read access for the view.
 
-    pub(crate) fn mode(&self) -> Mode {
+    /// The editing mode.
+    pub fn mode(&self) -> Mode {
         self.mode
     }
 
-    pub(crate) fn input(&self) -> &LineEditor {
+    /// The message box.
+    pub fn input(&self) -> &LineEditor {
         &self.input
     }
 
-    pub(crate) fn command_line(&self) -> &LineEditor {
+    /// The search of the codebase's maps, as typed so far.
+    pub fn search_line(&self) -> &LineEditor {
+        &self.search
+    }
+
+    /// What the codebase's maps are searched for: empty when they are not,
+    /// and they show everything.
+    pub fn map_search(&self) -> &str {
+        self.search.text().trim()
+    }
+
+    /// Starts typing a search of the codebase's maps, after what was kept:
+    /// what Ctrl-F does, and what a click on a map's search box does.
+    pub fn start_search(&mut self) {
+        if self.map.is_none() {
+            self.notice = Some(
+                "Ctrl-F searches the plan, the API and the universe: Ctrl-N shows them \
+                 (in the window)"
+                    .to_owned(),
+            );
+            return;
+        }
+        if self.mode != Mode::Search {
+            self.search_from = self.mode;
+            self.mode = Mode::Search;
+        }
+    }
+
+    /// Clears the search of the codebase's maps, and stops typing it.
+    pub fn clear_search(&mut self) {
+        self.search.take();
+        if self.mode == Mode::Search {
+            self.mode = self.search_from;
+        }
+    }
+
+    /// The `:` command line.
+    pub fn command_line(&self) -> &LineEditor {
         &self.command
     }
 
-    pub(crate) fn transcript(&self) -> &[Entry] {
+    /// Everything the conversation shows, in order.
+    pub fn transcript(&self) -> &[Entry] {
         &self.transcript
     }
 
-    pub(crate) fn scroll_back(&self) -> usize {
+    /// How many lines the conversation is scrolled up from its end: 0 follows new output.
+    pub fn scroll_back(&self) -> usize {
         self.scroll_back.get()
     }
 
     /// Scrolls the conversation so that a given line range is in view. Called
     /// by the view, the only part that knows where an entry's lines are.
-    pub(crate) fn set_scroll_back(&self, back: usize) {
+    pub fn set_scroll_back(&self, back: usize) {
         self.scroll_back.set(back);
     }
 
-    pub(crate) fn set_max_scroll(&self, max: usize) {
+    /// Records how far the conversation can scroll, which only the view knows.
+    pub fn set_max_scroll(&self, max: usize) {
         self.max_scroll.set(max);
     }
 
-    pub(crate) fn project(&self) -> &str {
+    /// The project's name, from its directory.
+    pub fn project(&self) -> &str {
         &self.project
     }
 
-    pub(crate) fn focus(&self) -> Focus {
+    /// The pane that receives movement keys.
+    pub fn focus(&self) -> Focus {
         self.focus
     }
 
-    pub(crate) fn pending(&self) -> Option<Pending> {
+    /// The first key of a two-key binding, while the second is awaited.
+    pub fn pending(&self) -> Option<Pending> {
         self.pending
     }
 
-    pub(crate) fn tree(&self) -> Option<&FileTree> {
+    /// The file tree, when open.
+    pub fn tree(&self) -> Option<&FileTree> {
         self.tree.as_ref()
     }
 
-    pub(crate) fn file(&self) -> Option<&Editor> {
+    /// The branch's changes, while a review or a piece of work is looked at.
+    pub fn change_set(&self) -> Option<&crate::changes::ChangeSet> {
+        self.changes.as_ref()
+    }
+
+    /// Shows the open file whole, or only its changes again: what `zR` and
+    /// `zM` do, for a button.
+    pub fn toggle_whole_file(&mut self) {
+        if let Some(file) = &mut self.file {
+            if file.shows_changes_only() {
+                file.unfold_unchanged();
+            } else {
+                file.fold_unchanged();
+            }
+        }
+    }
+
+    /// The definitions of a name to choose from, when several were found.
+    pub fn definition_choice(&self) -> Option<&DefinitionChoice> {
+        self.definitions.as_ref()
+    }
+
+    /// Goes to the definition at `index` of those to choose from, for a
+    /// click on it.
+    pub fn choose_definition(&mut self, index: usize) {
+        if let Some(choice) = self.definitions.take()
+            && let Some(found) = choice.items.get(index)
+        {
+            self.go_to_found(found.clone());
+        }
+    }
+
+    /// Goes to where the name under `column` of the drawn `row` of the open
+    /// file is defined: a Ctrl-click. The lookup is queued for the loop.
+    pub fn definition_at(&mut self, row: usize, column: usize) {
+        self.click_file(row, column);
+        let word = self.file.as_ref().and_then(|f| {
+            let (row, col) = f.cursor();
+            f.word_at(row, col)
+        });
+        if let Some(word) = word {
+            self.queued = self.look_up(&word, false);
+        }
+    }
+
+    /// Where the cursor of the open file is, as a place to come back to.
+    fn here(&self) -> Option<Place> {
+        let file = self.file.as_ref()?;
+        let path = file.path();
+        let path = path.strip_prefix(&self.root).unwrap_or(path).to_owned();
+        Some(Place {
+            path,
+            line: file.cursor().0 + 1,
+        })
+    }
+
+    /// Goes to `place`, opening its file unless it is open.
+    fn go_to_place(&mut self, place: &Place) {
+        if self.here().is_none_or(|here| here.path != place.path) {
+            self.open_path(place.path.clone());
+        }
+        let opened = self.here().is_some_and(|here| here.path == place.path);
+        if opened && let Some(file) = &mut self.file {
+            file.go_to_line(place.line);
+        }
+        self.focus_on(Focus::File);
+    }
+
+    /// Asks where `name`, under the cursor of the open file, is defined or,
+    /// with `uses`, used: of the loop, which asks the language server.
+    fn look_up(&mut self, name: &str, uses: bool) -> Option<Effect> {
+        let file = self.file.as_ref()?;
+        let path = file.path();
+        let path = path.strip_prefix(&self.root).unwrap_or(path).to_owned();
+        let (line, column) = file.cursor();
+        let lookup = Lookup {
+            name: name.to_owned(),
+            path,
+            line,
+            column,
+            text: file.lines().join("\n"),
+            uses,
+        };
+        self.notice = Some(format!(
+            "Looking for where {name} is {}…",
+            if uses { "used" } else { "defined" }
+        ));
+        Some(Effect::Find(lookup))
+    }
+
+    /// Goes to what a lookup found: at once when one place is the
+    /// likeliest definition, else to choose among them.
+    fn on_found(&mut self, found: Found) {
+        self.notice = None;
+        let what = if found.uses { "use" } else { "definition" };
+        match found.places.len() {
+            0 => self.info(format!("No {what} of {} found ({})", found.name, found.by)),
+            1 if !found.uses => self.go_to_found(found.places[0].clone()),
+            _ => {
+                self.definitions = Some(DefinitionChoice {
+                    name: found.name,
+                    uses: found.uses,
+                    by: found.by,
+                    items: found.places,
+                    selected: 0,
+                });
+            }
+        }
+    }
+
+    /// Goes to a definition found, remembering where it left from.
+    fn go_to_found(&mut self, found: ironquill_tools::Definition) {
+        if let Some(here) = self.here() {
+            self.back.push(here);
+            self.ahead.clear();
+        }
+        let place = Place {
+            path: PathBuf::from(found.path),
+            line: found.line,
+        };
+        self.go_to_place(&place);
+    }
+
+    /// Goes back to where the last `gd` left from.
+    fn go_back(&mut self) {
+        let Some(place) = self.back.pop() else {
+            self.info("Nowhere to go back to: gd goes to a definition, Ctrl-O comes back");
+            return;
+        };
+        if let Some(here) = self.here() {
+            self.ahead.push(here);
+        }
+        self.go_to_place(&place);
+    }
+
+    /// Goes forward again to where going back left from.
+    fn go_forward(&mut self) {
+        let Some(place) = self.ahead.pop() else {
+            return;
+        };
+        if let Some(here) = self.here() {
+            self.back.push(here);
+        }
+        self.go_to_place(&place);
+    }
+
+    /// Keys while definitions are offered: the arrows choose, Enter goes,
+    /// Esc gives up. Returns whether the key was theirs.
+    fn definition_key(&mut self, key: KeyEvent) -> bool {
+        let Some(choice) = &mut self.definitions else {
+            return false;
+        };
+        let last = choice.items.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => choice.selected = choice.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => choice.selected = (choice.selected + 1).min(last),
+            KeyCode::Enter => {
+                let index = choice.selected;
+                self.choose_definition(index);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.definitions = None,
+            _ => {}
+        }
+        true
+    }
+
+    /// Opens the run of unchanged lines folded at `line` of the open file,
+    /// for a click on it.
+    pub fn open_fold(&mut self, line: usize) {
+        self.focus_on(Focus::File);
+        if let Some(file) = &mut self.file {
+            file.open_unchanged(line);
+        }
+    }
+
+    /// The file tree, showing only the branch's changes while they are
+    /// looked at.
+    fn new_tree(&self) -> FileTree {
+        let mut tree = FileTree::new(self.root.clone());
+        if let Some(changes) = &self.changes {
+            tree.show_changes(changes.letters());
+        }
+        tree
+    }
+
+    /// Starts looking at the branch's changes through `lens`, against
+    /// `base` or where the branch left main; or stops with `off`.
+    fn look_at_changes(
+        &mut self,
+        lens: crate::changes::Lens,
+        argument: Option<String>,
+    ) -> Option<Effect> {
+        if argument.as_deref() == Some("off") {
+            if self.changes.take().is_some() {
+                if let Some(tree) = &mut self.tree {
+                    tree.show_everything();
+                }
+                if let Some(file) = &mut self.file {
+                    file.unfold_unchanged();
+                }
+                self.info("Back to the whole project");
+            }
+            return None;
+        }
+        match crate::changes::ChangeSet::read(&self.root, lens, argument.as_deref()) {
+            Err(e) => {
+                self.error(e);
+                None
+            }
+            Ok(changes) => {
+                let (added, removed) = changes.lines();
+                let count = changes.files.len();
+                self.info(format!(
+                    "{}: {count} file{} changed since {}, +{added} −{removed}. The tree shows \
+                     only them; a file opens folded to its changes (zR: whole, zM: back){}. \
+                     /{} off ends it",
+                    match lens {
+                        crate::changes::Lens::Review => "Reviewing",
+                        crate::changes::Lens::Work => "Working",
+                    },
+                    if count == 1 { "" } else { "s" },
+                    changes.base_line,
+                    match lens {
+                        crate::changes::Lens::Review => "; nothing can be edited",
+                        crate::changes::Lens::Work => "",
+                    },
+                    lens.command(),
+                ));
+                // The language servers start reading the project now, to
+                // answer at once when asked.
+                let files: Vec<PathBuf> = changes
+                    .files
+                    .iter()
+                    .map(|f| PathBuf::from(&f.path))
+                    .filter(|p| ironquill_tools::Servers::program_for(p).is_some())
+                    .collect();
+                self.changes = Some(changes);
+                self.unzoom();
+                self.tree = Some(self.new_tree());
+                self.focus_on(Focus::Tree);
+                (!files.is_empty()).then_some(Effect::WarmServers(files))
+            }
+        }
+    }
+
+    /// Shows the file just opened as the changes looked at want it:
+    /// compared with their base, folded to its changes, and read only in a
+    /// review.
+    fn as_changes_want(&mut self) {
+        let (Some(changes), Some(file)) = (&self.changes, &mut self.file) else {
+            return;
+        };
+        let path = file.path();
+        let path = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        match changes.find(&path).map(|f| &f.change) {
+            Some(ironquill_tools::Change::Deleted) => file.show_deleted(changes.base.clone()),
+            Some(ironquill_tools::Change::Renamed { from }) => {
+                file.compare_with_moved(changes.base.clone(), PathBuf::from(from));
+            }
+            _ => file.compare_with(changes.base.clone()),
+        }
+        file.fold_unchanged();
+        if changes.lens == crate::changes::Lens::Review {
+            file.lock("Read only while reviewing: /review off to edit");
+        }
+    }
+
+    /// The open file, when one is.
+    pub fn file(&self) -> Option<&Editor> {
         self.file.as_ref()
     }
 
     /// Whether the agent changed `path`, or a file under it, this conversation.
-    pub(crate) fn is_changed(&self, path: &Path, is_dir: bool) -> bool {
+    pub fn is_changed(&self, path: &Path, is_dir: bool) -> bool {
         let path = path.to_string_lossy();
         if is_dir {
             let prefix = format!("{path}/");
@@ -795,41 +1291,48 @@ impl App {
         }
     }
 
-    pub(crate) fn set_panes(&self, panes: Panes) {
+    /// Records where each pane was drawn, so that a click finds its pane.
+    pub fn set_panes(&self, panes: Panes) {
         self.panes.set(panes);
     }
 
-    pub(crate) fn checks(&self) -> &[Check] {
+    /// The checks a request is judged by, for `ironquill do` and pairs.
+    pub fn checks(&self) -> &[Check] {
         &self.settings.checks
     }
 
-    pub(crate) fn spinner(&self) -> usize {
+    /// The spinner's frame, advanced while a request runs.
+    pub fn spinner(&self) -> usize {
         self.spinner
     }
 
-    pub(crate) fn elapsed(&self) -> Option<Duration> {
+    /// How long the current request has run, while one does.
+    pub fn elapsed(&self) -> Option<Duration> {
         self.running_since.map(|t| t.elapsed())
     }
 
-    pub(crate) fn totals(&self) -> (Usage, Usd, bool) {
+    /// What the conversation used and cost so far, and whether every cost was known.
+    pub fn totals(&self) -> (Usage, Usd, bool) {
         (self.usage, self.cost, self.cost_complete)
     }
 
     /// How full the context was on the latest call, when known.
-    pub(crate) fn context(&self) -> Option<ContextUse> {
+    pub fn context(&self) -> Option<ContextUse> {
         self.context
     }
 
-    pub(crate) fn is_running(&self) -> bool {
+    /// Whether a request is running.
+    pub fn is_running(&self) -> bool {
         self.running_since.is_some()
     }
 
-    pub(crate) fn should_quit(&self) -> bool {
+    /// Whether the person asked to quit.
+    pub fn should_quit(&self) -> bool {
         self.quit
     }
 
     /// The model chain as shown to the person: `cheap → strong`.
-    pub(crate) fn chain(&self) -> String {
+    pub fn chain(&self) -> String {
         if self.settings.tiers.is_empty() {
             return "no model".into();
         }
@@ -843,7 +1346,8 @@ impl App {
 
     // Inputs.
 
-    pub(crate) fn on_key(&mut self, key: KeyEvent) -> Option<Effect> {
+    /// Does what a key asks for, and returns what only the loop can do.
+    pub fn on_key(&mut self, key: KeyEvent) -> Option<Effect> {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if !ctrl_c {
@@ -867,25 +1371,69 @@ impl App {
                 return None;
             }
         }
+        if self.definition_key(key) {
+            return None;
+        }
+        // In a file at rest, Ctrl-O and Alt-← go back to where `gd` left
+        // from, as in Vim; Alt-→ goes forward again.
+        if self.focus == Focus::File
+            && self.pending.is_none()
+            && self.mode != Mode::Search
+            && self.file.as_ref().is_some_and(Editor::is_idle)
+        {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            // Ctrl-O shows the usage pane otherwise, as everywhere.
+            let back = !self.back.is_empty() && ctrl && key.code == KeyCode::Char('o');
+            if back || (alt && key.code == KeyCode::Left) {
+                self.go_back();
+                return None;
+            }
+            if alt && key.code == KeyCode::Right {
+                self.go_forward();
+                return None;
+            }
+        }
         if self.focus == Focus::File
             && self.pending.is_none()
             && let Some(editor) = &mut self.file
         {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            // Stopping a request and the tree work from anywhere; Tab, Ctrl-W
-            // and the leader leave the file only when Vim is not mid-command.
+            // Over a map, Ctrl-F searches it; over the file alone, it is
+            // Vim's page down.
+            let search = ctrl && key.code == KeyCode::Char('f') && self.map.is_some();
+            // The shortcuts that work anywhere work here too, rather than
+            // reach Vim as the letter they hold (Ctrl-O would open a line);
+            // Tab, Ctrl-W and the leader leave the file only when Vim is not
+            // mid-command.
             let global = ctrl
                 && matches!(
                     key.code,
-                    KeyCode::Char('c' | 'b' | 'g' | 'k' | 'e' | 'q' | 's' | 'a' | 'z' | 't')
+                    KeyCode::Char(
+                        'c' | 'b'
+                            | 'g'
+                            | 'k'
+                            | 'e'
+                            | 'q'
+                            | 's'
+                            | 'a'
+                            | 'z'
+                            | 't'
+                            | 'o'
+                            | 'p'
+                            | 'm'
+                            | 'n'
+                    )
                 );
             let pane = editor.is_idle()
                 && (key.code == KeyCode::Tab
                     || key.code == KeyCode::Char(',')
                     || (ctrl && key.code == KeyCode::Char('w')));
-            if !global && !pane {
+            if !global && !pane && !search && self.mode != Mode::Search {
                 match editor.handle_key(key) {
                     EditorOutcome::Command(line) => return self.run_command(&line),
+                    EditorOutcome::Definition(name) => return self.look_up(&name, false),
+                    EditorOutcome::Uses(name) => return self.look_up(&name, true),
                     EditorOutcome::Context { text, close } => {
                         if close {
                             self.file = None;
@@ -930,6 +1478,9 @@ impl App {
 
     fn on_action(&mut self, action: Action) -> Option<Effect> {
         match action {
+            // Esc while searching: the search is cleared, and typing goes
+            // back to where it was.
+            Action::Enter(Mode::Normal) if self.mode == Mode::Search => self.clear_search(),
             Action::Enter(mode) => {
                 if mode == Mode::Command {
                     self.command.take();
@@ -967,6 +1518,11 @@ impl App {
                         self.mode = Mode::Normal;
                         self.run_command(&line)
                     }
+                    // Enter keeps the search, and goes back to where it was.
+                    Mode::Search => {
+                        self.mode = self.search_from;
+                        None
+                    }
                     Mode::Normal => None,
                 };
             }
@@ -989,6 +1545,30 @@ impl App {
                 }
             }
             Action::ToggleUsage => self.usage_open = !self.usage_open,
+            Action::Search => self.start_search(),
+            Action::NextMap => {
+                // Looking at a branch, its review comes first.
+                let reviewing = self.changes.is_some();
+                let next = match self.map {
+                    None if reviewing => Some(MapView::Review),
+                    None | Some(MapView::Review) => Some(MapView::Plan),
+                    Some(MapView::Plan) => Some(MapView::Api),
+                    Some(MapView::Api) => Some(MapView::Universe),
+                    Some(MapView::Universe) => None,
+                };
+                self.show_map(next);
+            }
+            Action::ToggleSeeThrough => {
+                self.settings.see_through = !self.settings.see_through;
+                self.notice = Some(
+                    if self.settings.see_through {
+                        "See-through window (in the terminal, its own settings do this)"
+                    } else {
+                        "Opaque window"
+                    }
+                    .to_owned(),
+                );
+            }
             Action::NextUsageWindow => {
                 self.usage_window = match self.usage_window {
                     w if w < 6 * 3600 => 6 * 3600,
@@ -1056,7 +1636,7 @@ impl App {
                         });
                     }
                 } else {
-                    self.tree = Some(FileTree::new(self.root.clone()));
+                    self.tree = Some(self.new_tree());
                     self.focus_on(Focus::Tree);
                 }
             }
@@ -1094,7 +1674,7 @@ impl App {
                 self.unzoom();
                 match &mut self.tree {
                     Some(tree) => tree.refresh(),
-                    None => self.tree = Some(FileTree::new(self.root.clone())),
+                    None => self.tree = Some(self.new_tree()),
                 }
                 self.focus_on(Focus::Tree);
             }
@@ -1174,6 +1754,7 @@ impl App {
             editing => match self.mode {
                 Mode::Insert => self.input.apply(&editing),
                 Mode::Command => self.command.apply(&editing),
+                Mode::Search => self.search.apply(&editing),
                 Mode::Normal => {}
             },
         }
@@ -1216,12 +1797,13 @@ impl App {
         self.reveal.set(true);
     }
 
-    pub(crate) fn is_expanded(&self, entry: usize) -> bool {
+    /// Whether a long reply, by its place in the transcript, was unfolded by the person.
+    pub fn is_expanded(&self, entry: usize) -> bool {
         self.expanded.contains(&entry)
     }
 
     /// The selected reply, shown as such only in normal mode in the conversation.
-    pub(crate) fn selected_reply(&self) -> Option<usize> {
+    pub fn selected_reply(&self) -> Option<usize> {
         (self.focus == Focus::Chat && self.mode == Mode::Normal)
             .then_some(self.selected_reply)
             .flatten()
@@ -1229,11 +1811,12 @@ impl App {
 
     /// Whether the view should scroll the selected reply into sight; reading
     /// it clears it.
-    pub(crate) fn take_reveal(&self) -> bool {
+    pub fn take_reveal(&self) -> bool {
         self.reveal.replace(false)
     }
 
-    pub(crate) fn set_marks(
+    /// Records the conversation's lines that fold a reply, copy a block or open a reference, as the view drew them, so that a click finds them.
+    pub fn set_marks(
         &self,
         fold: Vec<usize>,
         copy: Vec<(usize, String)>,
@@ -1245,9 +1828,9 @@ impl App {
     }
 
     /// Whether `reference` exists: a file is looked at when first drawn; a
-    /// commit only as [`App::learn_commits`] found it, git staying off the
-    /// drawing.
-    pub(crate) fn reference_exists(&self, reference: &Reference) -> bool {
+    /// commit is known only once git was asked about it as its reply
+    /// arrived, so that drawing never runs git.
+    pub fn reference_exists(&self, reference: &Reference) -> bool {
         if let Some(known) = self.known_references.borrow().get(reference) {
             return *known;
         }
@@ -1282,17 +1865,9 @@ impl App {
         }
     }
 
-    /// The pictures replies show.
-    pub(crate) fn gallery(&self) -> &RefCell<Gallery> {
-        &self.gallery
-    }
-
-    /// A diagram is drawn, or could not be: shown, or said why.
-    pub(crate) fn on_diagram(&mut self, key: u64, result: Result<PathBuf, String>) {
-        self.gallery.borrow_mut().drawn(key, &result);
-        if let Err(reason) = result {
-            self.report_error(format!("The diagram could not be drawn: {reason}"));
-        }
+    /// Says whether the screen draws pictures.
+    pub fn show_pictures(&mut self, shown: bool) {
+        self.pictures_shown = shown;
     }
 
     /// Opens a file a reply cited, at its line, showing what the branch
@@ -1318,17 +1893,14 @@ impl App {
         self.focus_on(Focus::File);
     }
 
-    pub(crate) fn set_entry_lines(
-        &self,
-        lines: Vec<(usize, usize, usize)>,
-        top: usize,
-        area: Rect,
-    ) {
+    /// Records where each entry was drawn, in lines of the whole transcript, the first line in view and the area it was drawn in, so that a click finds its entry.
+    pub fn set_entry_lines(&self, lines: Vec<(usize, usize, usize)>, top: usize, area: Rect) {
         *self.entry_lines.borrow_mut() = lines;
         self.transcript_view.set((top, area));
     }
 
-    pub(crate) fn is_zoomed(&self) -> bool {
+    /// Whether the conversation has the whole screen.
+    pub fn is_zoomed(&self) -> bool {
         self.zoomed
     }
 
@@ -1410,8 +1982,18 @@ impl App {
         }
     }
 
+    /// Opens a file at line `line`, counted from 1: where a route is
+    /// served, say.
+    pub fn open_path_at(&mut self, path: PathBuf, line: usize) {
+        self.open_path(path);
+        // Unless the file open was kept, with changes not written.
+        if let Some(file) = self.file.as_mut().filter(|f| !f.is_modified()) {
+            file.go_to_line(line);
+        }
+    }
+
     /// Opens a file in the editor, outside the project too.
-    pub(crate) fn open_path(&mut self, path: PathBuf) {
+    pub fn open_path(&mut self, path: PathBuf) {
         if self.file.as_ref().is_some_and(Editor::is_modified) {
             if let Some(file) = &mut self.file {
                 file.refuse_close();
@@ -1422,7 +2004,14 @@ impl App {
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
         self.unzoom();
         self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.as_changes_want();
         self.focus_on(Focus::File);
+    }
+
+    /// Opens the instructions every model is given, saying what saving
+    /// them does.
+    pub fn open_instructions(&mut self, path: PathBuf) {
+        self.open_path(path);
         self.info(
             "Your instructions for every model: :w saves them, they count from the next request",
         );
@@ -1446,10 +2035,12 @@ impl App {
         }
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
         self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.as_changes_want();
         self.focus_on(Focus::File);
     }
 
-    pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Effect> {
+    /// Does what a click or a turn of the wheel asks for, and returns what only the loop can do.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Effect> {
         let at = Position::new(mouse.column, mouse.row);
         let panes = self.panes.get();
         let hit = if panes.docker.is_some_and(|r| r.contains(at)) {
@@ -1473,12 +2064,7 @@ impl App {
                 } else {
                     WHEEL_LINES
                 };
-                // The wheel scrolls what is under the pointer without moving
-                // the focus, as in most editors.
-                let focus = self.focus;
-                self.focus = hit;
-                self.move_focused(lines);
-                self.focus = focus;
+                self.wheel(hit, lines);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if hit == Focus::Chat {
@@ -1508,8 +2094,7 @@ impl App {
                             // A picture shows in the conversation, where
                             // the terminal draws them.
                             Some(Reference::File { path, .. })
-                                if self.gallery.borrow().shows()
-                                    && path.to_lowercase().ends_with(".png") =>
+                                if self.pictures_shown && path.to_lowercase().ends_with(".png") =>
                             {
                                 self.transcript.push(Entry::Image(path));
                                 self.scroll_back.set(0);
@@ -1548,20 +2133,48 @@ impl App {
                     file.click(row, column);
                 }
                 if hit == Focus::Tree
-                    && let (Some(area), Some(tree)) = (panes.tree, &mut self.tree)
+                    && let (Some(area), Some(tree)) = (panes.tree, &self.tree)
                 {
                     // One row of border above the first entry.
                     let row = usize::from(mouse.row.saturating_sub(area.y + 1));
-                    let index = tree.offset() + row;
-                    if index < tree.rows().len() {
-                        tree.select(index);
-                        self.open_selected();
-                    }
+                    self.click_tree(tree.offset() + row);
                 }
             }
             _ => {}
         }
         None
+    }
+
+    /// Scrolls `pane` by `lines`, down when positive, without moving the
+    /// focus: the wheel scrolls what is under the pointer, as in most
+    /// editors.
+    pub fn wheel(&mut self, pane: Focus, lines: i32) {
+        let focus = self.focus;
+        self.focus = pane;
+        self.move_focused(lines);
+        self.focus = focus;
+    }
+
+    /// A click on the tree's entry `index`: it is chosen, a folder opens or
+    /// closes, a file opens.
+    pub fn click_tree(&mut self, index: usize) {
+        self.focus_on(Focus::Tree);
+        if let Some(tree) = &mut self.tree
+            && index < tree.rows().len()
+        {
+            tree.select(index);
+            self.open_selected();
+        }
+    }
+
+    /// A click on the open file, `row` lines below the first shown and
+    /// `column` characters into its text: the cursor goes there.
+    pub fn click_file(&mut self, row: usize, column: usize) {
+        self.focus_on(Focus::File);
+        if let Some(file) = &mut self.file {
+            let gutter = file.gutter();
+            file.click(row, column + gutter);
+        }
     }
 
     fn scroll(&mut self, down: i32) {
@@ -1656,7 +2269,8 @@ impl App {
         }
     }
 
-    pub(crate) fn info(&mut self, text: impl Into<String>) {
+    /// Adds a note to the conversation.
+    pub fn info(&mut self, text: impl Into<String>) {
         self.transcript.push(Entry::Info(text.into()));
     }
 
@@ -1855,7 +2469,7 @@ impl App {
                     self.error("No reply to take changes from");
                     return None;
                 };
-                let blocks = markdown::diff_blocks(&reply);
+                let blocks = blocks::diff_blocks(&reply);
                 let mut patches = Vec::new();
                 for n in &numbers {
                     match blocks.iter().find(|(b, _)| b == n) {
@@ -1968,6 +2582,12 @@ impl App {
                 return Some(Effect::ForgetDelegate(agent));
             }
             Command::Keys => self.keys_open = Some(0),
+            Command::Review(argument) => {
+                return self.look_at_changes(crate::changes::Lens::Review, argument);
+            }
+            Command::Work(argument) => {
+                return self.look_at_changes(crate::changes::Lens::Work, argument);
+            }
             Command::Budget(None) => match self.settings.budget {
                 Some(budget) => self.info(format!("Budget: {budget} per request")),
                 None => self.info("No budget: requests may cost any amount"),
@@ -2039,7 +2659,7 @@ impl App {
 
     /// Applies what the agent reported. Returns whether a request ended,
     /// which is when the conversation is saved.
-    pub(crate) fn on_agent(&mut self, message: AgentMessage) -> bool {
+    pub fn on_agent(&mut self, message: AgentMessage) -> bool {
         match message {
             AgentMessage::Event(event) => {
                 self.on_event(event);
@@ -2073,6 +2693,10 @@ impl App {
                      from the summary. /context shows it"
                 ));
                 true
+            }
+            AgentMessage::Found(found) => {
+                self.on_found(found);
+                false
             }
             AgentMessage::Addressed(Ok(request)) => {
                 self.running_since = None;
@@ -2136,7 +2760,7 @@ impl App {
 
     /// The conversation's name: the one given with `/name`, else the start
     /// of the first message.
-    pub(crate) fn name(&self) -> String {
+    pub fn name(&self) -> String {
         if let Some(name) = &self.session_name {
             return name.clone();
         }
@@ -2155,7 +2779,7 @@ impl App {
 
     /// The conversation as it should be written to disk, or `None` while
     /// nothing has been said: an empty conversation is not worth a file.
-    pub(crate) fn to_saved(&self, session: Session) -> Option<Saved> {
+    pub fn to_saved(&self, session: Session) -> Option<Saved> {
         if !self.transcript.iter().any(|e| matches!(e, Entry::User(_))) {
             return None;
         }
@@ -2176,7 +2800,7 @@ impl App {
     }
 
     /// Shows a saved conversation as it was, and continues it.
-    pub(crate) fn load_saved(&mut self, saved: Saved) {
+    pub fn load_saved(&mut self, saved: Saved) {
         self.session_id = saved.id;
         self.session_name = Some(saved.name.clone());
         self.created = saved.created;
@@ -2204,7 +2828,8 @@ impl App {
         self.picker = None;
     }
 
-    pub(crate) fn show_picker(&mut self, items: Vec<Summary>) {
+    /// Opens the list of saved conversations, to pick one; says so when there is none.
+    pub fn show_picker(&mut self, items: Vec<Summary>) {
         if items.is_empty() {
             self.info("No saved conversation for this project yet");
             return;
@@ -2212,7 +2837,8 @@ impl App {
         self.picker = Some(Picker { items, selected: 0 });
     }
 
-    pub(crate) fn picker(&self) -> Option<&Picker> {
+    /// The list of saved conversations, while open.
+    pub fn picker(&self) -> Option<&Picker> {
         self.picker.as_ref()
     }
 
@@ -2234,7 +2860,7 @@ impl App {
     }
 
     /// How far the list of shortcuts is scrolled, while it is open.
-    pub(crate) fn keys_open(&self) -> Option<usize> {
+    pub fn keys_open(&self) -> Option<usize> {
         self.keys_open
     }
 
@@ -2258,13 +2884,13 @@ impl App {
     }
 
     /// The models the first one may hand tasks to.
-    pub(crate) fn team(&self) -> &[ModelId] {
+    pub fn team(&self) -> &[ModelId] {
         &self.settings.team
     }
 
     /// The handover the sub-agent pane shows: who, the task, what it did,
     /// and whether it is still at it.
-    pub(crate) fn sub_agent(&self) -> Option<SubAgent<'_>> {
+    pub fn sub_agent(&self) -> Option<SubAgent<'_>> {
         let i = self.sub_view?;
         let Some(Entry::Delegating {
             from,
@@ -2297,11 +2923,12 @@ impl App {
 
     /// How far the sub-agent pane is scrolled up from its end, and the
     /// view's report of how far it can go.
-    pub(crate) fn sub_scroll(&self) -> usize {
+    pub fn sub_scroll(&self) -> usize {
         self.sub_scroll.get()
     }
 
-    pub(crate) fn set_sub_max(&self, max: usize) {
+    /// Records how far the sub-agent pane can scroll, which only the view knows.
+    pub fn set_sub_max(&self, max: usize) {
         self.sub_max.set(max);
         if self.sub_scroll.get() > max {
             self.sub_scroll.set(max);
@@ -2309,32 +2936,32 @@ impl App {
     }
 
     /// What the running request cost so far, its sub-agents apart.
-    pub(crate) fn request_spent(&self) -> Spent {
+    pub fn request_spent(&self) -> Spent {
         self.request_spent
     }
 
     /// Where the scores shown come from.
-    pub(crate) fn credits(&self) -> Option<&str> {
+    pub fn credits(&self) -> Option<&str> {
         self.settings.credits.as_deref()
     }
 
     /// The step of a request in a pair being worked on, while it runs.
-    pub(crate) fn step(&self) -> Option<&str> {
+    pub fn step(&self) -> Option<&str> {
         self.step.as_deref().filter(|_| self.is_running())
     }
 
     /// The project's root directory.
-    pub(crate) fn root(&self) -> &Path {
+    pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// Whether the project's own checks are found when checking.
-    pub(crate) fn detects_checks(&self) -> bool {
+    pub fn detects_checks(&self) -> bool {
         self.settings.detect_checks
     }
 
     /// How hard models think before answering.
-    pub(crate) fn effort(&self) -> Effort {
+    pub fn effort(&self) -> Effort {
         self.settings.effort
     }
 
@@ -2354,18 +2981,18 @@ impl App {
     }
 
     /// The most one request may cost.
-    pub(crate) fn budget(&self) -> Option<Usd> {
+    pub fn budget(&self) -> Option<Usd> {
         self.settings.budget
     }
 
     /// The model picker, while it is open.
-    pub(crate) fn model_picker(&self) -> Option<&ModelPicker> {
+    pub fn model_picker(&self) -> Option<&ModelPicker> {
         self.model_picker.as_ref()
     }
 
     /// The rows of the model picker: the offered models that match what was
     /// typed, then the provider's other models that do.
-    pub(crate) fn model_rows(&self) -> Vec<ModelRow> {
+    pub fn model_rows(&self) -> Vec<ModelRow> {
         let filter = self
             .model_picker
             .as_ref()
@@ -2631,12 +3258,12 @@ impl App {
     }
 
     /// The effect raised outside a key, to run next.
-    pub(crate) fn take_queued(&mut self) -> Option<Effect> {
+    pub fn take_queued(&mut self) -> Option<Effect> {
         self.queued.take()
     }
 
     /// The /compact window while it is open.
-    pub(crate) fn compact_picker(&self) -> Option<&CompactPicker> {
+    pub fn compact_picker(&self) -> Option<&CompactPicker> {
         self.compact_picker.as_ref()
     }
 
@@ -2656,12 +3283,12 @@ impl App {
     }
 
     /// The model the first request goes to.
-    pub(crate) fn current_model(&self) -> Option<&ModelId> {
+    pub fn current_model(&self) -> Option<&ModelId> {
         self.settings.tiers.first()
     }
 
     /// The model working right now, while a request runs.
-    pub(crate) fn working_model(&self) -> Option<&ModelId> {
+    pub fn working_model(&self) -> Option<&ModelId> {
         self.working_model.as_ref().filter(|_| self.is_running())
     }
 
@@ -2686,7 +3313,7 @@ impl App {
     /// Whether the warm sessions should be read now: `/tick` is on, no
     /// request runs, four minutes went by since the last time. After half an
     /// hour without a request, the person is asked first.
-    pub(crate) fn keep_warm_due(&mut self) -> bool {
+    pub fn keep_warm_due(&mut self) -> bool {
         if !self.settings.tick || self.is_running() || self.ask_keep_warm {
             return false;
         }
@@ -2704,7 +3331,7 @@ impl App {
     }
 
     /// The question asked after a long wait, while it is.
-    pub(crate) fn keep_warm_question(&self) -> Option<Approval> {
+    pub fn keep_warm_question(&self) -> Option<Approval> {
         self.ask_keep_warm.then(|| Approval {
             model: self
                 .current_model()
@@ -2777,13 +3404,13 @@ impl App {
     }
 
     /// The usage samples, and the pane's window while it shows.
-    pub(crate) fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
+    pub fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
         self.usage_open
             .then_some((&self.usage_log, self.usage_window))
     }
 
     /// The command waiting for the person's answer, if any.
-    pub(crate) fn approval(&self) -> Option<&Approval> {
+    pub fn approval(&self) -> Option<&Approval> {
         self.approval.as_ref().map(|(approval, _)| approval)
     }
 
@@ -2975,7 +3602,10 @@ impl App {
             allowed_hosts: self.settings.allowed_hosts.clone(),
             pair_mode: Some(self.settings.pair_mode),
             tick: self.settings.tick,
+            see_through: self.settings.see_through,
             // Set in the file only: kept as written there.
+            opacity: self.settings.opacity,
+            chat_width: self.settings.chat_width,
             images: (self.settings.images != Images::Auto).then_some(self.settings.images),
             mermaid: self.settings.mermaid.clone(),
         }
@@ -2984,7 +3614,7 @@ impl App {
     /// The choices, when they changed since they were last kept: the model,
     /// the models offered, the team and the budget carry over to the next
     /// session without having to ask.
-    pub(crate) fn defaults_to_keep(&mut self) -> Option<Defaults> {
+    pub fn defaults_to_keep(&mut self) -> Option<Defaults> {
         let now = self.defaults();
         (now != self.kept).then(|| {
             self.kept = now.clone();
@@ -3106,7 +3736,7 @@ impl App {
     }
 
     /// Opens the conversation's context in the editor, in place of a file.
-    pub(crate) fn open_context(&mut self, text: &str) {
+    pub fn open_context(&mut self, text: &str) {
         if let Some(file) = self.file.as_mut().filter(|f| f.is_modified()) {
             if file.kind() == crate::editor::Kind::Context {
                 file.say_pending_context();
@@ -3124,7 +3754,7 @@ impl App {
     }
 
     /// Reports how applying an edited context went.
-    pub(crate) fn on_context_applied(&mut self, result: Result<(u64, u64), String>) {
+    pub fn on_context_applied(&mut self, result: Result<(u64, u64), String>) {
         match result {
             Ok((before, after)) => self.info(format!(
                 "Context applied: about {} tokens, from {}. The next request is sent with it",
@@ -3165,15 +3795,17 @@ impl App {
     }
 
     /// The candidates of a completion in progress, to show them.
-    pub(crate) fn completions(&self) -> Option<&[String]> {
+    pub fn completions(&self) -> Option<&[String]> {
         self.completion.as_ref().map(|c| c.matches.as_slice())
     }
 
-    pub(crate) fn docker(&self) -> Option<&DockerPane> {
+    /// The Docker pane, when open.
+    pub fn docker(&self) -> Option<&DockerPane> {
         self.docker.as_ref()
     }
 
-    pub(crate) fn on_docker(&mut self, result: Result<Vec<Container>, String>) {
+    /// Shows what `docker ps` answered, unless the pane was closed meanwhile.
+    pub fn on_docker(&mut self, result: Result<Vec<Container>, String>) {
         let Some(pane) = &mut self.docker else {
             // Closed while docker was answering.
             return;
@@ -3189,22 +3821,81 @@ impl App {
         }
     }
 
-    pub(crate) fn notice(&self) -> Option<&str> {
+    /// How the window shows the codebase, if it does.
+    pub fn map_view(&self) -> Option<MapView> {
+        self.map
+    }
+
+    /// Shows the codebase as `view`, or the panes again with `None`: what
+    /// Ctrl-N steps through, and what the window's own buttons pick.
+    pub fn show_map(&mut self, view: Option<MapView>) {
+        self.map = view;
+        let notice = match view {
+            Some(MapView::Plan) => {
+                "The plan: what uses what, foundations at the bottom. Click a part to see its \
+                 files, double-click to open it; Ctrl-N again for the API (in the terminal, it \
+                 shows only in the window)"
+            }
+            Some(MapView::Api) => {
+                "The API: each route of the OpenAPI specs, what serves it and what calls it. \
+                 Click a route for its way through; Ctrl-N again for the universe"
+            }
+            Some(MapView::Universe) => {
+                "The universe: drag to turn, scroll to come closer, click a star to centre it; \
+                 Ctrl-N again to go back"
+            }
+            Some(MapView::Review) => {
+                "The review: the routes, the database and the files the branch changed. Click \
+                 one to open it; Ctrl-N again for the plan"
+            }
+            None => return,
+        };
+        self.notice = Some(notice.to_owned());
+    }
+
+    /// How wide the window's conversation is beside a file or the
+    /// codebase, as last dragged.
+    pub fn chat_width(&self) -> Option<f32> {
+        self.settings.chat_width
+    }
+
+    /// Keeps the width the conversation was dragged to, for this session
+    /// and the next, in whole points.
+    pub fn set_chat_width(&mut self, width: f32) {
+        self.settings.chat_width = Some(width.round());
+    }
+
+    /// How opaque the window's background is now: 1 unless see-through.
+    pub fn opacity(&self) -> f32 {
+        if self.settings.see_through {
+            self.settings
+                .opacity
+                .unwrap_or(DEFAULT_OPACITY)
+                .clamp(MIN_OPACITY, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// The one-line note in the status line, until the next key.
+    pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }
 
     /// The conversation's name in the status line: only one given with
     /// /name. The first message, which names it in the /resume list, is
     /// not repeated there.
-    pub(crate) fn session_label(&self) -> String {
+    pub fn session_label(&self) -> String {
         self.session_name.clone().unwrap_or_default()
     }
 
-    pub(crate) fn report_info(&mut self, text: &str) {
+    /// Says something in the conversation.
+    pub fn report_info(&mut self, text: &str) {
         self.info(text);
     }
 
-    pub(crate) fn report_error(&mut self, text: String) {
+    /// Says in the conversation that something went wrong.
+    pub fn report_error(&mut self, text: String) {
         self.error(text);
     }
 
@@ -3473,7 +4164,9 @@ impl App {
 
     /// Closes the open file unless it has unsaved edits, which stay on screen
     /// with a note saying how to keep or drop them.
-    fn close_file(&mut self, next: Focus) {
+    /// Closes the open file and moves the focus to `next`; a file with
+    /// unsaved changes stays open and says so.
+    pub fn close_file(&mut self, next: Focus) {
         if let Some(file) = &mut self.file
             && file.is_modified()
         {
@@ -3498,7 +4191,8 @@ impl App {
         }
     }
 
-    pub(crate) fn on_cancelled(&mut self) {
+    /// The request was stopped: the conversation says so and stops waiting for it.
+    pub fn on_cancelled(&mut self) {
         self.running_since = None;
         // Its answer would reach nobody.
         self.approval = None;
@@ -3509,11 +4203,11 @@ impl App {
     /// Text pasted in one piece: into the message box whole, line breaks
     /// kept, so that a pasted log is not sent at its first line; on the
     /// command line, on one line.
-    pub(crate) fn on_paste(&mut self, text: &str) {
+    pub fn on_paste(&mut self, text: &str) {
         if self.approval.is_some()
             || self.picker.is_some()
             || self.model_picker.is_some()
-            || self.focus == Focus::File
+            || (self.focus == Focus::File && self.mode != Mode::Search)
         {
             return;
         }
@@ -3530,15 +4224,22 @@ impl App {
                     self.command.insert(if c == '\n' { ' ' } else { c });
                 }
             }
+            Mode::Search => {
+                for c in text.chars() {
+                    self.search.insert(if c == '\n' { ' ' } else { c });
+                }
+            }
             Mode::Normal => {}
         }
     }
 
-    pub(crate) fn on_diff(&mut self, text: &str) {
+    /// Shows what changed since the last commit.
+    pub fn on_diff(&mut self, text: &str) {
         self.info(text);
     }
 
-    pub(crate) fn on_tick(&mut self) {
+    /// Advances the spinner.
+    pub fn on_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
     }
 }
@@ -3571,7 +4272,7 @@ fn first_sentence(text: &str) -> &str {
 }
 
 /// `3/4 Planning · tensorx/glm-5.3 · effort high`, or `by ironquill`.
-pub(crate) fn step_title(
+pub fn step_title(
     number: u8,
     of: u8,
     name: &str,
@@ -3598,19 +4299,9 @@ fn command_name(agent: Agent) -> &'static str {
     }
 }
 
-impl Pictures for App {
-    fn lines(
-        &self,
-        picture: Picture<'_>,
-        width: usize,
-    ) -> Option<Vec<ratatui::text::Line<'static>>> {
-        self.gallery.borrow_mut().lines(picture, width)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    use crate::input::{KeyCode, KeyModifiers};
 
     use super::*;
 
@@ -3667,21 +4358,6 @@ mod tests {
         assert_eq!(window, 6 * 3600);
         assert_eq!(log.samples.len(), 3);
 
-        let backend = ratatui::backend::TestBackend::new(140, 40);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| crate::view::render(frame, &app))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let screen: String = buffer
-            .content()
-            .chunks(usize::from(buffer.area.width))
-            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
-            .collect();
-        assert!(screen.contains("Usage · last 6h"));
-        assert!(screen.contains("$0.020 · 2 calls · cache 96%"), "{screen}");
-        assert!(screen.contains("$0.200 · 1 call · cache 10% · 1 rebuilt"));
-
         // Kept with the conversation.
         app.transcript.push(Entry::User("hi".into()));
         let saved = app.to_saved(Session::new()).unwrap();
@@ -3691,26 +4367,11 @@ mod tests {
         assert!(app.usage_pane().is_none());
     }
 
-    fn screen(app: &App) -> String {
-        let backend = ratatui::backend::TestBackend::new(120, 40);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| crate::view::render(frame, app))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        buffer
-            .content()
-            .chunks(usize::from(buffer.area.width))
-            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
-            .collect()
-    }
-
     #[test]
     fn a_pasted_log_is_typed_whole_and_not_sent() {
         let mut app = ready();
         app.on_paste("error: one\r\nerror: two\n");
         assert_eq!(app.input().text(), "error: one\nerror: two\n");
-        assert!(screen(&app).contains("error: one↵error: two↵"));
         // Sent as it was pasted.
         type_text(&mut app, "fix it");
         assert!(matches!(
@@ -3736,35 +4397,7 @@ mod tests {
         ));
         app.on_paste("y");
         assert_eq!(app.input().text(), "");
-        assert!(screen(&app).contains(" Go on? "));
-    }
-
-    #[test]
-    fn a_command_folds_to_a_line_and_copies() {
-        let mut app = ready();
-        app.on_agent(AgentMessage::Event(Event::Command {
-            model: ModelId::new("cheap").unwrap(),
-            command: "kubectl -n web get pods\n  -o wide".into(),
-            status: "exit status 0".into(),
-            output: "api-1 Running\napi-2 Running\n".into(),
-            checked_by: Some(ModelId::new("glm").unwrap()),
-        }));
-        let folded = screen(&app);
-        assert!(folded.contains("Run(kubectl -n web get pods…)"), "{folded}");
-        assert!(
-            folded.contains("exit status 0 · checked by glm · 2 lines · click or Enter to show")
-        );
-        assert!(!folded.contains("api-1 Running"));
-
-        // Selected and opened, then copied.
-        press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Up);
-        press(&mut app, KeyCode::Enter);
-        assert!(screen(&app).contains("api-1 Running"));
-        assert!(matches!(
-            press(&mut app, KeyCode::Char('y')),
-            Some(Effect::Copy(text)) if text.starts_with("kubectl -n web get pods") && text.ends_with("api-2 Running\n")
-        ));
+        assert!(app.approval().is_some());
     }
 
     #[test]
@@ -3787,11 +4420,116 @@ mod tests {
     }
 
     #[test]
+    fn the_window_wide_shortcuts_work_from_an_open_file_and_leave_it_unchanged() {
+        let (_dir, mut app) = project();
+        app.open_path(app.root.join("src/lib.rs"));
+        assert_eq!(app.focus, Focus::File);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('n'));
+        assert_eq!(app.map_view(), Some(MapView::Plan));
+        app.on_key(ctrl('o'));
+        assert!(app.usage_open);
+        assert!(app.file.as_ref().is_some_and(|f| !f.is_modified()));
+    }
+
+    #[test]
+    fn ctrl_f_searches_the_maps_enter_keeps_the_search_and_esc_clears_it() {
+        let mut app = ready();
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // No map shown: nothing to search, and the way to one is said.
+        app.on_key(ctrl('f'));
+        assert_eq!(app.mode(), Mode::Insert);
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("Ctrl-N")));
+
+        app.on_key(ctrl('n'));
+        app.on_key(ctrl('f'));
+        assert_eq!(app.mode(), Mode::Search);
+        for c in "gui ".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        // Kept as it is typed, without its trailing space; the message box
+        // is left alone.
+        assert_eq!(app.map_search(), "gui");
+        assert_eq!(app.input().text(), "");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode(), Mode::Insert);
+        assert_eq!(app.map_search(), "gui");
+        // Across the views.
+        app.on_key(ctrl('n'));
+        assert_eq!(app.map_search(), "gui");
+
+        // Typed on from where it was: its trailing space, then a letter.
+        app.on_key(ctrl('f'));
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.map_search(), "gu");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode(), Mode::Insert);
+        assert_eq!(app.map_search(), "");
+    }
+
+    #[test]
+    fn over_a_map_ctrl_f_searches_it_rather_than_scroll_the_open_file() {
+        let (_dir, mut app) = project();
+        app.open_path(app.root.join("src/lib.rs"));
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('n'));
+        app.on_key(ctrl('f'));
+        assert_eq!(app.mode(), Mode::Search);
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.map_search(), "x");
+        assert!(app.file.as_ref().is_some_and(|f| !f.is_modified()));
+    }
+
+    #[test]
+    fn ctrl_n_shows_the_plan_the_api_the_universe_then_the_panes() {
+        let mut app = ready();
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(app.map_view(), None);
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), Some(MapView::Plan));
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), Some(MapView::Api));
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), Some(MapView::Universe));
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), None);
+        app.show_map(Some(MapView::Universe));
+        assert_eq!(app.map_view(), Some(MapView::Universe));
+    }
+
+    #[test]
+    fn the_conversation_s_width_as_dragged_is_kept_for_the_next_session() {
+        let mut app = ready();
+        assert_eq!(app.chat_width(), None);
+        let _ = app.defaults_to_keep();
+        app.set_chat_width(377.6);
+        assert_eq!(app.chat_width(), Some(378.0));
+        let kept = app.defaults_to_keep();
+        assert_eq!(kept.and_then(|d| d.chat_width), Some(378.0));
+    }
+
+    #[test]
+    fn ctrl_m_makes_the_window_see_through_and_keeps_it() {
+        let mut app = ready();
+        assert!((app.opacity() - 1.0).abs() < f32::EPSILON);
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL));
+        assert!((app.opacity() - DEFAULT_OPACITY).abs() < f32::EPSILON);
+        assert!(app.defaults().see_through);
+        // An opacity from the file is held to what stays readable.
+        app.settings.opacity = Some(0.05);
+        assert!((app.opacity() - MIN_OPACITY).abs() < f32::EPSILON);
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL));
+        assert!((app.opacity() - 1.0).abs() < f32::EPSILON);
+        assert!(!app.defaults().see_through);
+    }
+
+    #[test]
     fn a_stopped_request_says_so() {
         let mut app = ready();
         app.on_cancelled();
         assert!(app.transcript.contains(&Entry::Interrupted));
-        assert!(screen(&app).contains("Interrupted: the request stopped before it ended"));
     }
 
     #[test]
@@ -3810,7 +4548,6 @@ mod tests {
             },
             answer,
         ));
-        assert!(screen(&app).contains("a: always allow API_TOKEN"));
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(answered.try_recv(), Ok(Answer::Always));
         assert_eq!(app.defaults().allowed_secrets, ["API_TOKEN"]);
@@ -3855,7 +4592,13 @@ mod tests {
             .checked_sub(Duration::from_secs(31 * 60))
             .unwrap();
         assert!(!app.keep_warm_due());
-        assert!(screen(&app).contains("Keep the sessions warm?"));
+        assert!(matches!(
+            app.keep_warm_question(),
+            Some(Approval {
+                question: Question::KeepWarm { .. },
+                ..
+            })
+        ));
         press(&mut app, KeyCode::Char('n'));
         assert!(!app.settings.tick);
         assert!(app.keep_warm_question().is_none());
@@ -3871,41 +4614,6 @@ mod tests {
         assert_eq!(app.input().text(), "fix it");
         assert!(!app.is_running());
         assert!(!app.transcript.contains(&Entry::User("fix it".into())));
-    }
-
-    #[test]
-    fn a_code_block_copies_with_a_click_and_only_its_mark_folds() {
-        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let mut app = ready();
-        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
-        app.transcript.push(Entry::Said(format!(
-            "Try:\n```sh\ncargo test -q\n```\n{long}"
-        )));
-        app.transcript.push(Entry::Said(long.clone()));
-        let screen_text = screen(&app);
-        let rows: Vec<&str> = screen_text.lines().collect();
-        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap() as u16;
-        let click = |app: &mut App, row: u16| {
-            app.on_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 5,
-                row,
-                modifiers: KeyModifiers::NONE,
-            })
-        };
-        // The first reply is folded, the latest open.
-        assert!(screen_text.contains("▸ "));
-        assert!(screen_text.contains("▾ fold"));
-        assert!(matches!(
-            click(&mut app, row_of("⧉ copy")),
-            Some(Effect::Copy(code)) if code == "cargo test -q"
-        ));
-        // A click on the text does not fold; one on the mark does.
-        click(&mut app, row_of("Try:"));
-        assert!(!app.is_expanded(1));
-        screen(&app);
-        click(&mut app, row_of("▸ "));
-        assert!(app.is_expanded(1));
     }
 
     #[test]
@@ -3934,13 +4642,13 @@ mod tests {
                 },
             ],
         })));
-        assert!(screen(&app).contains("[x] Parser (2 exchanges)"));
+        assert_eq!(app.compact_picker().unwrap().kept, [true, true, true]);
         // Open the parser, untick its test.
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char(' '));
-        assert!(screen(&app).contains("[-] Parser (2 exchanges)"));
+        assert_eq!(app.compact_picker().unwrap().kept, [true, false, true]);
         // The docs go as well; the last exchange is not kept as it was.
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char(' '));
@@ -3950,32 +4658,6 @@ mod tests {
             Some(Effect::Compact { keep, last_as_is: false, .. }) if keep == [0]
         ));
         assert!(app.compact_picker().is_none());
-    }
-
-    #[test]
-    fn a_cited_file_opens_at_its_line_with_a_click() {
-        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let (_dir, mut app) = project();
-        app.transcript.push(Entry::Said(
-            "The second line is in src/lib.rs:2, not in nowhere.rs:1.".into(),
-        ));
-        let shown = screen(&app);
-        assert!(shown.contains("src/lib.rs:2↗"));
-        assert!(!shown.contains("nowhere.rs:1↗"));
-        let (row, column) = shown
-            .lines()
-            .enumerate()
-            .find_map(|(r, l)| l.find("src/lib.rs:2").map(|c| (r, l[..c].chars().count())))
-            .unwrap();
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: column as u16 + 2,
-            row: row as u16,
-            modifiers: KeyModifiers::NONE,
-        });
-        let file = app.file().expect("the file is open");
-        assert_eq!(file.lines(), ["one", "two"]);
-        assert_eq!(file.cursor().0, 1);
     }
 
     #[test]
@@ -4148,6 +4830,187 @@ mod tests {
             dir.path().to_owned(),
         );
         (dir, app)
+    }
+
+    /// A project in git where `b.py` uses `f`, defined in `a.py` and, as a
+    /// decoy, in `c.py`.
+    fn defined() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n\ndef f():\n    pass\n").unwrap();
+        std::fs::write(dir.path().join("c.py"), "def f():\n    pass\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), "from a import f\n\nf()\n").unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                ..Settings::default()
+            },
+            dir.path().to_owned(),
+        );
+        (dir, app)
+    }
+
+    #[test]
+    fn a_review_shows_only_the_branch_and_its_files_against_their_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        let write = |path: &str, text: &str| std::fs::write(dir.path().join(path), text).unwrap();
+        git(&["init", "-q"]);
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        write("a.py", &body);
+        write("old.py", "kept\n");
+        write("gone.py", "one\ntwo\n");
+        write("same.py", "x\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        git(&["mv", "old.py", "new.py"]);
+        git(&["rm", "-q", "gone.py"]);
+        git(&["commit", "-q", "-m", "work"]);
+        write("a.py", &body.replace("line 10\n", "line ten\n"));
+
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                ..Settings::default()
+            },
+            dir.path().to_owned(),
+        );
+        app.run_command(&format!("review {base}"));
+        let changes = app.change_set().unwrap();
+        let files: Vec<&str> = changes.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(files, ["a.py", "gone.py", "new.py"]);
+        let rows: Vec<&str> = app
+            .tree()
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(rows, ["a.py", "gone.py", "new.py", "+1 unchanged"]);
+
+        // The changed file, folded to its change, read only.
+        app.open_path(PathBuf::from("a.py"));
+        let file = app.file().unwrap();
+        assert!(file.shows_changes_only());
+        assert_eq!(file.folded(0), Some(5));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.file().unwrap().is_modified());
+        // The deleted one, all removed; the moved one, the same as before.
+        app.open_path(PathBuf::from("gone.py"));
+        let gone = app.file().unwrap().changes().unwrap();
+        assert_eq!(gone.removed.values().map(Vec::len).sum::<usize>(), 2);
+        app.open_path(PathBuf::from("new.py"));
+        assert!(app.file().unwrap().changes().unwrap().is_empty());
+
+        app.run_command("review off");
+        assert!(app.change_set().is_none());
+        assert!(
+            app.tree()
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|r| r.name == "same.py")
+        );
+    }
+
+    #[test]
+    fn gd_goes_to_the_definition_imported_ctrl_o_comes_back_alt_right_goes_again() {
+        let (_dir, mut app) = defined();
+        app.open_path_at(PathBuf::from("b.py"), 3);
+        let here = |app: &App| {
+            let file = app.file().unwrap();
+            (
+                file.path().to_string_lossy().into_owned(),
+                file.cursor().0 + 1,
+            )
+        };
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::File);
+        press(&mut app, KeyCode::Char('g'));
+        // gd asks the loop, which asks the language server, else git grep:
+        // here, git grep, as the loop's fallback would.
+        let effect = app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let Some(Effect::Find(lookup)) = effect else {
+            panic!("gd asks the loop to find, not {effect:?}");
+        };
+        assert_eq!(
+            (lookup.name.as_str(), lookup.line, lookup.uses),
+            ("f", 2, false)
+        );
+        assert_eq!(lookup.path, PathBuf::from("b.py"));
+        let lines: Vec<String> = lookup.text.lines().map(str::to_owned).collect();
+        let places = ironquill_tools::definitions(&app.root, "f", &lookup.path, &lines);
+        app.on_agent(AgentMessage::Found(Found {
+            name: "f".into(),
+            uses: false,
+            places,
+            by: "git grep".into(),
+        }));
+        // Two definitions, the one b.py imports first: offered to choose.
+        let choice = app.definition_choice().unwrap();
+        assert_eq!(choice.name, "f");
+        assert_eq!(
+            choice
+                .items
+                .iter()
+                .map(|d| d.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a.py", "c.py"]
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(app.definition_choice().is_none());
+        assert_eq!(here(&app), ("a.py".to_owned(), 3));
+
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('o'));
+        assert_eq!(here(&app), ("b.py".to_owned(), 3));
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(here(&app), ("a.py".to_owned(), 3));
+        // Nothing further: a word, and the place stays.
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(here(&app), ("a.py".to_owned(), 3));
+
+        // gr: the uses, offered to choose even when there is one.
+        press(&mut app, KeyCode::Char('g'));
+        let effect = app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        let Some(Effect::Find(lookup)) = effect else {
+            panic!("gr asks the loop to find, not {effect:?}");
+        };
+        assert!(lookup.uses);
+        let places = ironquill_tools::uses(&app.root, "f");
+        assert_eq!(places.len(), 4);
+        app.on_agent(AgentMessage::Found(Found {
+            name: "f".into(),
+            uses: true,
+            places: places[..1].to_vec(),
+            by: "pyright-langserver".into(),
+        }));
+        let choice = app.definition_choice().unwrap();
+        assert!(choice.uses);
+        assert_eq!(choice.by, "pyright-langserver");
     }
 
     #[test]
@@ -4485,6 +5348,9 @@ mod tests {
                 allowed_hosts: vec![],
                 pair_mode: Some(false),
                 tick: false,
+                see_through: false,
+                opacity: None,
+                chat_width: None,
                 images: None,
                 mermaid: None,
             }

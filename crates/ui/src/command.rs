@@ -78,6 +78,10 @@ pub(crate) enum Command {
     Help,
     /// `/keys` lists every shortcut, as Ctrl-S does.
     Keys,
+    /// `/review [base|off]`: read the branch's changes, nothing editable.
+    Review(Option<String>),
+    /// `/work [base|off]`: the branch's changes, to go on with.
+    Work(Option<String>),
 }
 
 /// Parses the text typed after `:`. Errors are messages for the person.
@@ -134,6 +138,8 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "codex-reset" => Ok(Command::Reset(Agent::Codex)),
         "help" | "h" => Ok(Command::Help),
         "keys" | "shortcuts" => Ok(Command::Keys),
+        "review" => Ok(Command::Review(rest_opt)),
+        "work" => Ok(Command::Work(rest_opt)),
         "" => Err("Empty command".into()),
         other => Err(format!("Unknown command /{other}, see /help")),
     }
@@ -180,6 +186,8 @@ pub(crate) const NAMES: &[&str] = &[
     "resume",
     "rounds",
     "team",
+    "review",
+    "work",
 ];
 
 /// Commands of the Vim editor, completed on top of ironquill's inside a file.
@@ -311,6 +319,11 @@ Type a question or a change and press Enter. Changes are checked before they are
                      /check alone lists them. A request in the chat runs none
 /nocheck             remove every check
 /rounds <n>          tries per model before handing over
+/review [base]       read the branch's changes: the tree shows only the files it
+                     changed, each opens folded to its changes (zR: whole, zM: back),
+                     nothing can be edited; against where it left main, or <base>.
+                     /review off ends it
+/work [base]         the same, to go on with the work: files stay editable
 /diff                what changed since the last commit
 /clear               start a new conversation
 /name <title>        name this conversation (it is saved after every request)

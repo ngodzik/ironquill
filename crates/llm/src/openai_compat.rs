@@ -22,7 +22,10 @@ const CONNECT_RETRIES: u32 = 2;
 pub struct OpenAiCompatible {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    /// `None` when none was given: the interface still runs, for the agents
+    /// that bring their own credentials, and a call to the provider fails
+    /// saying why rather than reaching it unauthenticated.
+    api_key: Option<String>,
     /// Context windows and prices by model, read once from the model list.
     known: Arc<Mutex<Option<HashMap<String, Known>>>>,
 }
@@ -40,12 +43,29 @@ impl fmt::Debug for OpenAiCompatible {
 impl OpenAiCompatible {
     /// A provider at `base_url`, authenticated with `api_key` as a bearer token.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self::with_key(base_url, Some(api_key.into()))
+    }
+
+    /// A provider at `base_url` with no key: every call to it fails with
+    /// [`LlmError::NoKey`], before any request is sent.
+    pub fn without_key(base_url: impl Into<String>) -> Self {
+        Self::with_key(base_url, None)
+    }
+
+    fn with_key(base_url: impl Into<String>, api_key: Option<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-            api_key: api_key.into(),
+            api_key,
             known: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The key, or why there is none to call `url` with.
+    fn key(&self, url: &str) -> Result<&str, LlmError> {
+        self.api_key.as_deref().ok_or_else(|| LlmError::NoKey {
+            url: url.to_owned(),
+        })
     }
 
     /// Whether the endpoint is Requesty, which takes options of its own.
@@ -85,10 +105,11 @@ impl OpenAiCompatible {
     }
 
     async fn get(&self, url: &str) -> Result<String, LlmError> {
+        let key = self.key(url)?;
         let response = self
             .http
             .get(url)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(key)
             .send()
             .await
             .map_err(|source| transport(url, source))?;
@@ -101,6 +122,7 @@ impl ChatModel for OpenAiCompatible {
 
     async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
+        let key = self.key(&url)?;
         let mut payload = wire_request(request);
         // Only to models the list does not say cannot reason: a provider may
         // refuse the field from one that cannot.
@@ -124,7 +146,7 @@ impl ChatModel for OpenAiCompatible {
             match self
                 .http
                 .post(&url)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(key)
                 .json(&payload)
                 .send()
                 .await
@@ -512,6 +534,23 @@ mod tests {
         assert_eq!(response.tool_calls[0].name, "read_file");
         assert_eq!(response.tool_calls[0].arguments, r#"{"path": "a.rs"}"#);
         assert_eq!(response.cost, Some(Usd(0.00042)));
+    }
+
+    #[tokio::test]
+    async fn without_a_key_nothing_is_sent_and_the_error_says_what_to_do() {
+        // Nothing listens on port 9: had a request been sent, the error would
+        // be a transport one.
+        let provider = OpenAiCompatible::without_key("http://127.0.0.1:9");
+        let request = ChatRequest {
+            model: ModelId::new("m").unwrap(),
+            messages: vec![Message::user("go")],
+            tools: vec![],
+            effort: None,
+        };
+        let error = provider.complete(&request).await.unwrap_err();
+        assert!(matches!(error, LlmError::NoKey { .. }), "{error:?}");
+        assert!(error.to_string().contains("claude-code/"));
+        assert!(matches!(provider.list().await, Err(LlmError::NoKey { .. })));
     }
 
     #[test]

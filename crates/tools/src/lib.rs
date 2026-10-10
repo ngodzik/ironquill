@@ -11,12 +11,14 @@
 
 mod check;
 mod command;
+mod definitions;
 mod detect;
 mod diff;
 mod docker;
 mod error;
 mod git;
 mod gitview;
+mod lsp;
 mod outline;
 mod rules;
 mod search;
@@ -28,15 +30,17 @@ pub use check::{Check, CheckFailure, CheckReport, Trial};
 pub use command::{
     Assessment, CommandOutput, Policy, assess, known_hosts, redact_secrets, run_command, unreadable,
 };
+pub use definitions::{Definition, definitions, uses};
 pub use detect::detect_checks;
 pub use diff::{DiffLine, line_diff};
 pub use docker::{Container, running_containers};
 pub use error::ToolError;
 pub use git::{changes_text, diff_stat, is_clean, project_context, project_files, tracked_files};
 pub use gitview::{
-    LineChanges, LineMark, branch_base, committed_lines, file_status, is_commit, line_changes,
-    lines_at,
+    Change, ChangedFile, LineChanges, LineMark, branch_base, changed_files, commit_line,
+    committed_lines, file_status, is_commit, line_changes, lines_at,
 };
+pub use lsp::{Location, LspError, Servers};
 pub use outline::project_map;
 pub use rules::project_instructions;
 pub use snapshot::Snapshot;

@@ -26,8 +26,12 @@ Separation of concerns is **enforced by the crate dependency graph**, not by con
           ↑               ↑
           |         crates/agent  (core + tools, never llm)
           |               ↑
-          |         crates/tui    (core + tools + agent, never llm)
-          |               ↑
+          |         crates/ui     (core + tools + agent, never llm, never a terminal or window library)
+          |           ↑         ↑
+          |   crates/tui       crates/gui   (each: core + tools + agent + ui, never llm, never the other;
+          |                         ↑        gui also: codemap)
+          |                    crates/codemap  (no internal dependencies, no rendering)
+          |           ↑         ↑
           ironquill  (bin, depends on all)
 ```
 
@@ -37,10 +41,13 @@ Separation of concerns is **enforced by the crate dependency graph**, not by con
 | `ironquill-llm`   | Model providers, one `impl ChatModel` per protocol, and the Claude Code `Delegate` |
 | `ironquill-tools` | Deterministic tools: sandboxed workspace, file edits, checks, git          |
 | `ironquill-agent` | The loop: edit, check, retry, escalate. Generic over `ChatModel`           |
-| `ironquill-tui`   | The terminal interface. Generic over `ChatModel`                           |
+| `ironquill-ui`    | The interface's state: modes, keys, commands, the editor. Draws nothing    |
+| `ironquill-tui`   | Draws `ironquill-ui`'s state in the terminal and runs its loop. Generic over `ChatModel` |
+| `ironquill-gui`   | Draws `ironquill-ui`'s state in a window, with egui on Bevy (`--gui`). Generic over `ChatModel` |
+| `ironquill-codemap` | The codebase as a graph (folders, files, imports read by patterns, Python packages and TypeScript aliases resolved, a front end's calls to its back end through an OpenAPI spec), its design one level at a time (parts, packages found by their manifests, what uses what, layers, loops), its files grouped by module, language, layer or role, a branch's changes read for review (routes from the OpenAPI specs before and after, Alembic migrations, models' tables, files by area), and a force-directed layout that gathers groups into galaxies. Draws nothing |
 | `ironquill`       | CLI entry point                                                            |
 
-In `ironquill-tui`, keys become actions only in `keymap.rs`, `App` turns actions into state changes and returns an `Effect` for the loop instead of doing I/O, and `view.rs` draws without changing anything. A new key binding touches `keymap.rs` only; a new `:` command touches `command.rs` and `App::run_command`.
+In `ironquill-ui`, keys become actions only in `keymap.rs`, and `App` turns actions into state changes and returns an `Effect` for the loop instead of doing I/O. It reads keys, clicks and areas in its own types (`input.rs`) and colours as RGB (`style.rs`), never a terminal's or a window's: a backend translates its events into them. Effects are carried out by `ironquill-ui`'s `Host`, the same for every backend, never by a backend itself. `ironquill-tui`'s `view.rs` draws the state without changing anything, and so does `ironquill-gui`, which drives the `Host` once a frame without ever waiting on it. The window sleeps between keys: nothing in it may ask egui to repaint unless something moves, since bevy_egui takes any request, even one for later, as one for now. A new key binding touches `keymap.rs` only; a new `:` command touches `command.rs` and `App::run_command`.
 
 `ironquill-agent` does not depend on `ironquill-llm`: it is generic over `ChatModel`, which is what lets its tests run against a scripted model with no network.
 

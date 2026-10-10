@@ -47,6 +47,16 @@ pub enum LlmError {
     #[error("{0}")]
     Delegate(String),
 
+    /// No key was given for the provider, so its models cannot be called.
+    /// Claude Code and Codex, which bring their own credentials, still can.
+    #[error(
+        "no API key for {url}: set IRONQUILL_API_KEY, or pick a claude-code/ or codex/ model with Ctrl-E"
+    )]
+    NoKey {
+        /// The endpoint that would have been called.
+        url: String,
+    },
+
     /// The provider does not list the requested model.
     #[error("model {0} is not listed by the provider")]
     UnknownModel(String),

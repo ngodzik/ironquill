@@ -130,6 +130,126 @@ pub fn branch_base(root: &Path) -> Option<String> {
         .filter(|base| *base != head.trim())
 }
 
+/// How a file differs from a base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// It is new: not in the base, tracked or not yet.
+    Added,
+    /// It is in both, and differs.
+    Modified,
+    /// It was in the base, and is gone.
+    Deleted,
+    /// It moved here from `from`, maybe changed too.
+    Renamed {
+        /// Where it was in the base, from the project's root.
+        from: String,
+    },
+}
+
+/// A file that differs from a base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    /// Where it is, from the project's root; where it was, when deleted.
+    pub path: String,
+    /// How it differs.
+    pub change: Change,
+    /// How many lines it gained and lost; 0 and 0 for a binary file.
+    pub added: usize,
+    /// How many lines it lost.
+    pub removed: usize,
+}
+
+/// The files of the project at `root` that differ between `base` and what
+/// is on disk: committed since, changed and not committed, or new and not
+/// tracked yet, sorted by path. `None` outside a repository, or when `base`
+/// names no commit.
+///
+/// # Examples
+///
+/// ```no_run
+/// let root = std::path::Path::new(".");
+/// if let Some(base) = ironquill_tools::branch_base(root) {
+///     for file in ironquill_tools::changed_files(root, &base).unwrap_or_default() {
+///         println!("{} +{} -{}", file.path, file.added, file.removed);
+///     }
+/// }
+/// ```
+pub fn changed_files(root: &Path, base: &str) -> Option<Vec<ChangedFile>> {
+    // Statuses and counts come from two passes of the same diff, renames
+    // found in both, separated by NULs so that no name needs unquoting.
+    let names = git(
+        root,
+        &["diff", "--relative", "--name-status", "-M", "-z", base],
+    )?;
+    let counts = git(root, &["diff", "--relative", "--numstat", "-M", "-z", base])?;
+    let mut lines: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut fields = counts.split('\0');
+    while let Some(field) = fields.next() {
+        let mut parts = field.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        // A rename leaves the path empty, and gives the old one, then the
+        // new one, as fields of their own.
+        let path = if path.is_empty() {
+            fields.next();
+            fields.next().unwrap_or_default().to_owned()
+        } else {
+            path.to_owned()
+        };
+        lines.insert(
+            path,
+            (added.parse().unwrap_or(0), removed.parse().unwrap_or(0)),
+        );
+    }
+    let mut files = Vec::new();
+    let mut fields = names.split('\0').filter(|f| !f.is_empty());
+    while let Some(status) = fields.next() {
+        let Some(path) = fields.next() else {
+            break;
+        };
+        let (path, change) = match status.chars().next() {
+            Some('A') => (path.to_owned(), Change::Added),
+            Some('D') => (path.to_owned(), Change::Deleted),
+            Some('R' | 'C') => {
+                let to = fields.next().unwrap_or_default().to_owned();
+                (
+                    to,
+                    Change::Renamed {
+                        from: path.to_owned(),
+                    },
+                )
+            }
+            _ => (path.to_owned(), Change::Modified),
+        };
+        let (added, removed) = lines.get(&path).copied().unwrap_or((0, 0));
+        files.push(ChangedFile {
+            path,
+            change,
+            added,
+            removed,
+        });
+    }
+    let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    for path in untracked.split('\0').filter(|p| !p.is_empty()) {
+        let added = std::fs::read_to_string(root.join(path)).map_or(0, |t| t.lines().count());
+        files.push(ChangedFile {
+            path: path.to_owned(),
+            change: Change::Added,
+            added,
+            removed: 0,
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Some(files)
+}
+
+/// A commit, as one line: its short hash and its title.
+pub fn commit_line(root: &Path, rev: &str) -> Option<String> {
+    git(root, &["log", "-1", "--format=%h %s", rev]).map(|line| line.trim().to_owned())
+}
+
 /// Whether `hash` names a commit of the repository at `root`.
 pub fn is_commit(root: &Path, hash: &str) -> bool {
     hash.chars().all(|c| c.is_ascii_hexdigit())
@@ -243,6 +363,66 @@ mod tests {
             "init",
         ]);
         dir
+    }
+
+    #[test]
+    fn changed_files_since_a_base_count_commits_edits_and_new_files() {
+        let dir = repo();
+        let base = git(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        let base = base.trim();
+        // Committed since the base: a rename and a deletion.
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+        };
+        run(&["mv", "b.py", "c.py"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "move",
+        ]);
+        // Not committed: an edit, and a new file.
+        std::fs::write(dir.path().join("src/a.py"), "one\n2\nthree\n").unwrap();
+        std::fs::write(dir.path().join("new.py"), "y\nz\n").unwrap();
+
+        let files = changed_files(dir.path(), base).unwrap();
+        let found: Vec<(&str, &Change, usize, usize)> = files
+            .iter()
+            .map(|f| (f.path.as_str(), &f.change, f.added, f.removed))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    "c.py",
+                    &Change::Renamed {
+                        from: "b.py".into()
+                    },
+                    0,
+                    0
+                ),
+                ("new.py", &Change::Added, 2, 0),
+                ("src/a.py", &Change::Modified, 2, 1),
+            ]
+        );
+        // From a folder of the project, paths are the folder's.
+        let inside = changed_files(&dir.path().join("src"), base).unwrap();
+        assert_eq!(inside.len(), 1);
+        assert_eq!(inside[0].path, "a.py");
+        assert!(changed_files(dir.path(), "not-a-commit").is_none());
     }
 
     #[test]

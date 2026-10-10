@@ -8,9 +8,14 @@ use regex::Regex;
 
 /// What a reference points at.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum Reference {
+pub enum Reference {
     /// A file of the project, at a line when one was given.
-    File { path: String, line: Option<usize> },
+    File {
+        /// The path, relative to the project.
+        path: String,
+        /// The line, from 1, when one was given.
+        line: Option<usize>,
+    },
     /// A commit.
     Commit(String),
 }
@@ -24,7 +29,7 @@ static CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// The places in `text` that may be references, as byte ranges with what
 /// they would point at; whether they exist is for the caller to check.
-pub(crate) fn candidates(text: &str) -> Vec<(usize, usize, Reference)> {
+pub fn candidates(text: &str) -> Vec<(usize, usize, Reference)> {
     let mut out = Vec::new();
     for found in CANDIDATE.captures_iter(text) {
         let whole = found.get(0).expect("a match");

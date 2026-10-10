@@ -1,21 +1,22 @@
 [package]
-name    = "ironquill-tui"
+name    = "ironquill-gui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The ironquill terminal interface: draws the interface's state with Ratatui."
+description = "The ironquill window: draws the interface's state on the GPU with Bevy and egui."
 
 [dependencies]
 ironquill-core.workspace  = true
 ironquill-tools.workspace = true
 ironquill-agent.workspace = true
 ironquill-ui.workspace    = true
+ironquill-codemap.workspace = true
 thiserror.workspace       = true
-ratatui.workspace         = true
-crossterm.workspace       = true
-futures.workspace         = true
-tokio = { workspace = true, features = ["sync", "time"] }
+bevy.workspace            = true
+bevy_egui.workspace       = true
+egui_plot.workspace       = true
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

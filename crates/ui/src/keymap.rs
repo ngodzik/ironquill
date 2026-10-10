@@ -7,7 +7,7 @@
 //! Movement is on the arrow keys everywhere. Vim's spirit is kept in the modes,
 //! the `,` leader and the `Ctrl-W` window prefix, not in `hjkl`.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The editing mode, as in Vim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +18,9 @@ pub enum Mode {
     Insert,
     /// Typing a `:` command.
     Command,
+    /// Typing a search of the codebase's maps, which keeps what it names
+    /// as it is typed.
+    Search,
 }
 
 /// The pane that receives movement keys.
@@ -122,6 +125,12 @@ pub enum Action {
     ToggleUsage,
     /// The usage pane's next window: an hour, six, a day.
     NextUsageWindow,
+    /// Let what is behind the window show through, or make it opaque again.
+    ToggleSeeThrough,
+    /// Show the codebase's plan, its API, its universe, then the panes again.
+    NextMap,
+    /// Search the codebase's maps, while one is shown.
+    Search,
 }
 
 /// Every shortcut, as Ctrl-S lists them. Kept next to the bindings above so
@@ -148,6 +157,18 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-K", "show or hide the Docker containers"),
             ("Ctrl-O", "show or hide the usage pane (/usage)"),
             ("Ctrl-P", "the usage pane's window: 1h, 6h, 24h"),
+            (
+                "Ctrl-M",
+                "the window see-through, as a terminal can be, or opaque (--gui only)",
+            ),
+            (
+                "Ctrl-N",
+                "the codebase's plan, its API, its universe of files, then back (--gui only)",
+            ),
+            (
+                "Ctrl-F",
+                "search the plan, the API and the universe: Enter keeps the search, Esc clears it (--gui only)",
+            ),
             ("Ctrl-S", "this list"),
             ("Ctrl-C", "stop the request; twice to quit"),
             ("Tab", "next pane"),
@@ -210,8 +231,21 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("/ n N", "search, next, previous"),
             (
                 "zo zc za zR zM",
-                "open, close, toggle a block; open all, close all (in /context)",
+                "open, close, toggle a block; open all, close all (in /context); in /review \
+                 and /work, zo opens unchanged lines, zR shows the whole file, zM only its changes",
             ),
+            (
+                "gd Ctrl-click",
+                "go to where the name under the cursor is defined, as its language server says \
+                 (pyright, typescript-language-server, rust-analyzer), else git grep; several: \
+                 choose with ↑ ↓ Enter",
+            ),
+            ("gr", "list where the name under the cursor is used"),
+            (
+                "Ctrl-O Alt-← Alt-→",
+                "back to where gd left from, and forward again",
+            ),
+            ("Alt-↑ Alt-↓", "to the previous / next change"),
             (
                 "Enter Space",
                 "open or close the block under the cursor (in /context)",
@@ -259,6 +293,12 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         // O for overview of what was used; P for its period.
         KeyCode::Char('o') if ctrl => return Some(Action::ToggleUsage),
         KeyCode::Char('p') if ctrl => return Some(Action::NextUsageWindow),
+        // Only the window tells Ctrl-M from Enter: a terminal sends both
+        // the same, which is fine, as only the window can be see-through.
+        KeyCode::Char('m') if ctrl => return Some(Action::ToggleSeeThrough),
+        KeyCode::Char('n') if ctrl => return Some(Action::NextMap),
+        // F for find, as in most applications.
+        KeyCode::Char('f') if ctrl => return Some(Action::Search),
         // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
         KeyCode::Char('e') if ctrl => return Some(Action::PickModel),
         _ => {}
@@ -280,7 +320,7 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
 
     match mode {
         Mode::Normal => normal(focus, key, ctrl),
-        Mode::Insert | Mode::Command => match key.code {
+        Mode::Insert | Mode::Command | Mode::Search => match key.code {
             KeyCode::Esc => Some(Action::Enter(Mode::Normal)),
             KeyCode::Enter => Some(Action::Submit),
             KeyCode::Backspace => Some(Action::Backspace),
@@ -391,7 +431,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_cancels_and_ctrl_b_toggles_the_tree_in_every_mode() {
-        for mode in [Mode::Normal, Mode::Insert, Mode::Command] {
+        for mode in [Mode::Normal, Mode::Insert, Mode::Command, Mode::Search] {
             assert_eq!(
                 action(mode, Focus::Chat, None, ctrl('c')),
                 Some(Action::Cancel)

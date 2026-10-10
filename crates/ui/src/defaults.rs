@@ -19,7 +19,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::graphics::Images;
+/// Whether replies show images, as `images` in `~/.ironquill/config.toml`
+/// says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Images {
+    /// In a terminal known to draw them.
+    #[default]
+    Auto,
+    /// With Kitty's protocol, whatever the terminal seems to be: for a
+    /// terminal that speaks it but is not recognised.
+    Kitty,
+    /// Never.
+    Off,
+}
 
 /// What a new session starts with, unless the command line says otherwise.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -66,6 +79,18 @@ pub struct Defaults {
     /// waits, as `/tick` left it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tick: bool,
+    /// Whether the window lets what is behind it show through, as a
+    /// terminal can, as Ctrl-M left it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub see_through: bool,
+    /// How opaque the window is while see-through, from 0.2 to 1. Set in
+    /// the file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+    /// How wide the window's conversation is beside a file or the
+    /// codebase, in points, as last dragged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_width: Option<f32>,
     /// Whether replies show images: `auto` in a terminal known to draw
     /// them, `kitty` with Kitty's protocol whatever the terminal, `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +192,9 @@ mod tests {
             allowed_hosts: vec!["api.example.com".into()],
             pair_mode: Some(true),
             tick: true,
+            see_through: true,
+            opacity: Some(0.7),
+            chat_width: Some(420.0),
             images: Some(Images::Off),
             mermaid: Some(vec!["mmdr".into(), "-i".into(), "{input}".into()]),
         };

@@ -7,28 +7,30 @@
 //! redo, `:w`, `:q`, `:42`, `:s` with ranges, and `/` search. Not covered:
 //! counts, block visual mode, macros.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use regex::RegexBuilder;
 
 use ironquill_tools::{LineChanges, committed_lines, line_changes};
 
 use crate::clipboard;
 use crate::command;
-use crate::highlight::{Highlighter, StyledLine};
+use crate::highlight::{Highlighted, Highlighter, StyledLine};
 
 /// Spaces typed by the Tab key in insert mode, and added by `>`. Spaces
 /// rather than a tab character, as most Python and Rust code wants.
 const TAB: &str = "    ";
 
-/// Above this many lines, colours are recomputed when insert mode ends
-/// rather than after every key, so that typing stays instant.
-const LIVE_HIGHLIGHT_LINES: usize = 3_000;
+/// While typing, how many lines past an edit are coloured again at most
+/// when the edit changes how they read (an opened string or comment): the
+/// next keys, and leaving insert mode, carry on, so that no key waits on
+/// the whole file.
+const TYPING_RECOLOUR: usize = 40;
 
 /// First and last row of a line range, both included.
 type Rows = (usize, usize);
@@ -39,13 +41,34 @@ const BLOCK: &str = "=== ";
 /// The register every yank and delete also lands in, as in Vim.
 const UNNAMED: char = '"';
 
+/// Unchanged lines kept in sight around each change when a file shows only
+/// its changes, as `git diff` does.
+const CONTEXT: usize = 3;
+
+/// The fewest unchanged lines worth folding: fewer read faster than the
+/// line that would stand for them.
+const SHORTEST_FOLD: usize = 4;
+
+/// A row of the file as drawn: one of its lines, or a line of the base
+/// that is gone from that place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenRow {
+    /// The line at this index.
+    Line(usize),
+    /// A line of the base, removed.
+    Removed(String),
+}
+
 /// The editor's own mode, as in Vim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EditorMode {
+pub enum EditorMode {
+    /// Moving around, as in Vim.
     Normal,
+    /// Typing text.
     Insert,
     /// `v` selects characters, `V` whole lines.
     Visual {
+        /// Whether whole lines are selected, as with `V`.
         line: bool,
     },
     /// Typing a `:` command in the frame under the file.
@@ -71,6 +94,10 @@ pub(crate) enum Outcome {
     Saved,
     /// `:q`: close the file.
     Close,
+    /// `gd`: go to where this name is defined.
+    Definition(String),
+    /// `gr`: list where this name is used.
+    Uses(String),
 }
 
 /// Where the system clipboard is reached. A trait so that tests do not
@@ -122,7 +149,7 @@ impl Register {
 
 /// The selected region, ends included, start before end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Selection {
+pub struct Selection {
     pub(crate) start: (usize, usize),
     pub(crate) end: (usize, usize),
     pub(crate) line: bool,
@@ -131,7 +158,7 @@ pub(crate) struct Selection {
 impl Selection {
     /// The selected characters of `row`, as a half-open range of columns,
     /// or `None` when the row is outside the selection.
-    pub(crate) fn columns(&self, row: usize, len: usize) -> Option<(usize, usize)> {
+    pub fn columns(&self, row: usize, len: usize) -> Option<(usize, usize)> {
         if row < self.start.0 || row > self.end.0 {
             return None;
         }
@@ -157,7 +184,7 @@ struct Snapshot {
 
 /// What the editor holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
+pub enum Kind {
     /// A file of the project, written to disk by `:w`.
     File,
     /// The conversation's context, handed back to the interface by `:w`.
@@ -165,7 +192,7 @@ pub(crate) enum Kind {
 }
 
 /// One open file, or the conversation's context.
-pub(crate) struct Editor {
+pub struct Editor {
     kind: Kind,
     /// Relative to the project root.
     path: PathBuf,
@@ -174,11 +201,15 @@ pub(crate) struct Editor {
     trailing_newline: bool,
     /// Set for binary or unreadable files, which are shown but not edited.
     read_only: bool,
-    styled: Option<Vec<StyledLine>>,
+    /// Coloured as the lines are shown: drawing them colours what comes
+    /// into sight.
+    styled: RefCell<Option<Highlighted>>,
     /// The file as of the last commit, `None` outside git.
     base: Option<Vec<String>>,
     /// The revision changes are shown against: the last commit unless set.
     base_rev: Option<String>,
+    /// Where the file was in that revision, when it moved since.
+    base_path: Option<PathBuf>,
     /// How the lines on screen differ from `base`.
     changes: LineChanges,
     /// For each row the view drew, the line it shows, or `None` for a line
@@ -207,6 +238,12 @@ pub(crate) struct Editor {
     pending: Option<char>,
     /// In the context document, the block headers whose body is hidden.
     closed: BTreeSet<usize>,
+    /// Runs of lines the base has too, folded so that only the changes
+    /// show: each from its first line, which stays in sight, to the end it
+    /// stops before.
+    unchanged: std::collections::BTreeMap<usize, usize>,
+    /// Why the file may be read but not changed, when it may not: a review.
+    locked: Option<String>,
     /// Tab completion of a `:` command, while it cycles.
     completion: Option<command::Completion>,
     /// `"` was typed: the next key names a register.
@@ -266,9 +303,10 @@ impl Editor {
             lines: loaded.lines,
             trailing_newline: loaded.trailing_newline,
             read_only: loaded.read_only,
-            styled: None,
+            styled: RefCell::new(None),
             base: None,
             base_rev: None,
+            base_path: None,
             changes: LineChanges::default(),
             rows: RefCell::new(Vec::new()),
             highlighter,
@@ -285,6 +323,8 @@ impl Editor {
             prompt: String::new(),
             pending: None,
             closed: BTreeSet::new(),
+            unchanged: std::collections::BTreeMap::new(),
+            locked: None,
             completion: None,
             naming_register: false,
             register: None,
@@ -305,9 +345,13 @@ impl Editor {
         self.base = if self.read_only {
             None
         } else {
+            // Git names files from the project's root, whichever way the
+            // file was opened.
+            let path = self.path.strip_prefix(&self.root).unwrap_or(&self.path);
+            let path = self.base_path.as_deref().unwrap_or(path);
             match &self.base_rev {
-                Some(rev) => ironquill_tools::lines_at(&self.root, &self.path, rev),
-                None => committed_lines(&self.root, &self.path),
+                Some(rev) => ironquill_tools::lines_at(&self.root, path, rev),
+                None => committed_lines(&self.root, path),
             }
         };
     }
@@ -318,6 +362,22 @@ impl Editor {
         self.base_rev = Some(rev);
         self.load_base();
         self.restyle();
+    }
+
+    /// Shows what changed since `rev`, where the file was at `from`: it
+    /// moved since.
+    pub(crate) fn compare_with_moved(&mut self, rev: String, from: PathBuf) {
+        self.base_path = Some(from);
+        self.compare_with(rev);
+    }
+
+    /// Shows a file the branch deleted: nothing now, all of what it held at
+    /// `rev` as removed, and nothing to edit.
+    pub(crate) fn show_deleted(&mut self, rev: String) {
+        self.lines = vec![String::new()];
+        self.read_only = false;
+        self.compare_with(rev);
+        self.lock("Deleted by the branch: this is what it held");
     }
 
     /// Moves to line `line`, counted from 1.
@@ -365,7 +425,7 @@ impl Editor {
         }
         editor.read_only = false;
         editor.base = None;
-        editor.styled = None;
+        *editor.styled.get_mut() = None;
         editor.message = None;
         editor.fold_all();
         editor
@@ -383,7 +443,7 @@ impl Editor {
         editor.copies_out = true;
         editor.base = None;
         editor.message = None;
-        editor.styled = editor
+        *editor.styled.get_mut() = editor
             .highlighter
             .highlight(Path::new("chat.md"), &editor.lines);
         editor.row = editor.lines.len() - 1;
@@ -406,32 +466,183 @@ impl Editor {
     }
 
     /// How many lines a closed fold at `row` hides, if `row` is one.
-    pub(crate) fn folded(&self, row: usize) -> Option<usize> {
+    pub fn folded(&self, row: usize) -> Option<usize> {
+        if let Some(end) = self.unchanged.get(&row) {
+            return Some(end - row - 1);
+        }
         (self.closed.contains(&row) && self.is_header(row)).then(|| self.block_end(row) - row - 1)
     }
 
+    /// Whether a fold at `row` stands for unchanged lines, rather than a
+    /// block of the context document.
+    pub fn folds_unchanged(&self, row: usize) -> bool {
+        self.unchanged.contains_key(&row)
+    }
+
+    /// Whether the file shows only its changes, the rest folded.
+    pub fn shows_changes_only(&self) -> bool {
+        !self.unchanged.is_empty()
+    }
+
     /// Which rows a closed fold hides, one flag per line.
-    pub(crate) fn hidden(&self) -> Vec<bool> {
+    pub fn hidden(&self) -> Vec<bool> {
         let mut mask = vec![false; self.lines.len()];
-        for &header in &self.closed {
-            if self.is_header(header) {
-                for flag in mask
-                    .iter_mut()
-                    .take(self.block_end(header))
-                    .skip(header + 1)
-                {
-                    *flag = true;
-                }
+        let headers = self
+            .closed
+            .iter()
+            .filter(|h| self.is_header(**h))
+            .map(|&h| (h, self.block_end(h)));
+        for (start, end) in headers.chain(self.unchanged.iter().map(|(s, e)| (*s, *e))) {
+            for flag in mask.iter_mut().take(end).skip(start + 1) {
+                *flag = true;
             }
         }
         mask
     }
 
-    /// The header of the block `row` is in, if any.
+    /// The header of the block `row` is in, if any: the first line of the
+    /// unchanged run folded over it, or of its context block.
     fn header_of(&self, row: usize) -> Option<usize> {
+        if let Some((&start, _)) = self
+            .unchanged
+            .range(..=row)
+            .next_back()
+            .filter(|(_, e)| row < **e)
+        {
+            return Some(start);
+        }
         (0..=row.min(self.lines.len().saturating_sub(1)))
             .rev()
             .find(|r| self.is_header(*r))
+    }
+
+    /// Folds every run of lines the base has too, but the few around each
+    /// change: the file reads as its changes. Nothing is folded without a
+    /// base, or when nothing changed.
+    pub(crate) fn fold_unchanged(&mut self) {
+        self.unchanged.clear();
+        if self.base.is_none() || self.changes.is_empty() {
+            return;
+        }
+        let rows = self.lines.len();
+        let mut near = vec![false; rows];
+        for (row, mark) in self.changes.marks.iter().enumerate() {
+            if *mark != ironquill_tools::LineMark::Same {
+                near[row] = true;
+            }
+        }
+        // Lines removed before a row show just above it, or after the last
+        // line when they ended the file.
+        for &row in self.changes.removed.keys() {
+            near[row.min(rows - 1)] = true;
+        }
+        let changed: Vec<usize> = (0..rows).filter(|r| near[*r]).collect();
+        let mut kept = vec![false; rows];
+        for row in changed {
+            for k in kept
+                .iter_mut()
+                .take((row + CONTEXT + 1).min(rows))
+                .skip(row.saturating_sub(CONTEXT))
+            {
+                *k = true;
+            }
+        }
+        let mut row = 0;
+        while row < rows {
+            if kept[row] {
+                row += 1;
+                continue;
+            }
+            let start = row;
+            while row < rows && !kept[row] {
+                row += 1;
+            }
+            if row - start >= SHORTEST_FOLD {
+                self.unchanged.insert(start, row);
+            }
+        }
+        if let Some(start) = self.header_of(self.row) {
+            self.row = start;
+        }
+        self.keep_visible();
+    }
+
+    /// The name under `col` of `row`, letters, digits and `_` or `$`, if
+    /// one is there.
+    pub fn word_at(&self, row: usize, col: usize) -> Option<String> {
+        let chars: Vec<char> = self.lines.get(row)?.chars().collect();
+        let part = |c: &char| c.is_alphanumeric() || *c == '_' || *c == '$';
+        let col = col.min(chars.len().checked_sub(1)?);
+        if !part(&chars[col]) {
+            return None;
+        }
+        let start = (0..=col).rev().take_while(|i| part(&chars[*i])).last()?;
+        let end = (col..chars.len()).take_while(|i| part(&chars[*i])).last()?;
+        let word: String = chars[start..=end].iter().collect();
+        (!word.chars().next()?.is_ascii_digit()).then_some(word)
+    }
+
+    /// Unfolds the unchanged run folded at `row`, if one is, and moves there.
+    pub(crate) fn open_unchanged(&mut self, row: usize) {
+        if self.unchanged.remove(&row).is_some() {
+            self.row = row;
+            self.clamp_col();
+        }
+    }
+
+    /// Unfolds every unchanged run: the whole file shows.
+    pub(crate) fn unfold_unchanged(&mut self) {
+        self.unchanged.clear();
+    }
+
+    /// Lets the file be read but not changed, saying `why` when a change is
+    /// tried.
+    pub(crate) fn lock(&mut self, why: &str) {
+        self.locked = Some(why.to_owned());
+    }
+
+    /// The rows to draw from the line in view on, `height` at most, and
+    /// recorded for clicks: each line not folded away, the lines of the
+    /// base removed before it above it. Starts later when the lines removed
+    /// would push the cursor out of sight.
+    pub fn screen_rows(&self, height: usize) -> Vec<ScreenRow> {
+        let hidden = self.hidden();
+        let rows_from = |start: usize| {
+            let mut rows: Vec<ScreenRow> = Vec::new();
+            for i in start..=self.lines.len() {
+                if hidden.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                if self.base.is_some()
+                    && let Some(gone) = self.changes.removed.get(&i)
+                {
+                    rows.extend(gone.iter().cloned().map(ScreenRow::Removed));
+                }
+                if i < self.lines.len() {
+                    rows.push(ScreenRow::Line(i));
+                }
+                if rows.len() >= height {
+                    break;
+                }
+            }
+            rows.truncate(height);
+            rows
+        };
+        let mut start = self.scroll;
+        let mut rows = rows_from(start);
+        while start < self.row && !rows.contains(&ScreenRow::Line(self.row)) {
+            start += 1;
+            rows = rows_from(start);
+        }
+        self.set_rows(
+            rows.iter()
+                .map(|r| match r {
+                    ScreenRow::Line(i) => Some(*i),
+                    ScreenRow::Removed(_) => None,
+                })
+                .collect(),
+        );
+        rows
     }
 
     /// Closes every block that has a body: the whole document reads as one
@@ -452,6 +663,23 @@ impl Editor {
     }
 
     fn fold_command(&mut self, key: char) {
+        // Over a file that shows its changes: `zo` and `za` open the run
+        // under the cursor, `zR` shows the whole file, `zM` and `zc` show
+        // only the changes again.
+        if self.kind != Kind::Context {
+            match key {
+                'o' | 'a' => {
+                    if let Some(start) = self.header_of(self.row) {
+                        self.unchanged.remove(&start);
+                    }
+                }
+                'R' => self.unfold_unchanged(),
+                'c' | 'M' => self.fold_unchanged(),
+                _ => {}
+            }
+            self.clamp_col();
+            return;
+        }
         let header = self.header_of(self.row);
         match (key, header) {
             ('o', Some(h)) => {
@@ -484,6 +712,13 @@ impl Editor {
 
     fn insert_line(&mut self, at: usize, line: String) {
         self.lines.insert(at, line);
+        // A line typed inside an unchanged run opens it; those after move.
+        self.unchanged = self
+            .unchanged
+            .iter()
+            .filter(|(s, e)| !(**s < at && at < **e))
+            .map(|(&s, &e)| if s >= at { (s + 1, e + 1) } else { (s, e) })
+            .collect();
         self.closed = self
             .closed
             .iter()
@@ -493,6 +728,19 @@ impl Editor {
 
     fn remove_lines(&mut self, range: std::ops::Range<usize>) -> Vec<String> {
         let (at, count) = (range.start, range.len());
+        let end = range.end;
+        self.unchanged = self
+            .unchanged
+            .iter()
+            .filter(|(s, e)| **e <= at || **s >= end)
+            .map(|(&s, &e)| {
+                if s >= end {
+                    (s - count, e - count)
+                } else {
+                    (s, e)
+                }
+            })
+            .collect();
         let removed = self.lines.drain(range).collect();
         self.closed = self
             .closed
@@ -512,10 +760,16 @@ impl Editor {
     /// The last row a line operation on `row` covers: the end of its block
     /// when it is a closed fold, so that `dd` and `yy` take the block whole.
     fn through_fold(&self, row: usize) -> usize {
+        // Only a block of the context document goes whole: an unchanged run
+        // folded away is still lines of the file, one at a time.
+        if self.folds_unchanged(row) {
+            return row;
+        }
         self.folded(row).map_or(row, |hidden| row + hidden)
     }
 
-    pub(crate) fn kind(&self) -> Kind {
+    /// What the editor holds: a file, or the conversation's context.
+    pub fn kind(&self) -> Kind {
         self.kind
     }
 
@@ -547,63 +801,82 @@ impl Editor {
 
     // Read access for the view.
 
-    pub(crate) fn path(&self) -> &Path {
+    /// The file's path.
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn lines(&self) -> &[String] {
+    /// The lines, as edited.
+    pub fn lines(&self) -> &[String] {
         &self.lines
     }
 
-    pub(crate) fn styled(&self) -> Option<&[StyledLine]> {
-        self.styled.as_deref()
+    /// The lines coloured by their language, when it is known: those in
+    /// view, and those seen before, coloured; the others plain until shown.
+    pub fn styled(&self) -> Option<Ref<'_, [StyledLine]>> {
+        {
+            let mut styled = self.styled.borrow_mut();
+            let end = self.scroll + self.view_height() + 1;
+            if let Some(highlighted) = styled.as_mut()
+                && !highlighted.colour_to(&self.highlighter, end)
+            {
+                *styled = None;
+            }
+        }
+        Ref::filter_map(self.styled.borrow(), |s| s.as_ref().map(Highlighted::lines)).ok()
     }
 
     /// How the lines differ from the last commit, while that is known and in
     /// step with the lines; `None` outside git or while it is being redone.
-    pub(crate) fn changes(&self) -> Option<&LineChanges> {
+    pub fn changes(&self) -> Option<&LineChanges> {
         (self.base.is_some() && self.changes.marks.len() == self.lines.len())
             .then_some(&self.changes)
     }
 
     /// Records which line each drawn row shows.
-    pub(crate) fn set_rows(&self, rows: Vec<Option<usize>>) {
+    pub fn set_rows(&self, rows: Vec<Option<usize>>) {
         *self.rows.borrow_mut() = rows;
     }
 
-    pub(crate) fn cursor(&self) -> (usize, usize) {
+    /// The cursor, as a row and a column in characters.
+    pub fn cursor(&self) -> (usize, usize) {
         (self.row, self.col)
     }
 
-    pub(crate) fn scroll(&self) -> usize {
+    /// The first line in view.
+    pub fn scroll(&self) -> usize {
         self.scroll
     }
 
     /// Records the size of the text area, line numbers excluded.
-    pub(crate) fn set_viewport(&self, height: usize, width: usize) {
+    pub fn set_viewport(&self, height: usize, width: usize) {
         self.height.set(height);
         self.width.set(width);
     }
 
-    pub(crate) fn mode(&self) -> EditorMode {
+    /// The editing mode.
+    pub fn mode(&self) -> EditorMode {
         self.mode
     }
 
-    pub(crate) fn prompt(&self) -> &str {
+    /// What is typed after `:` or `/`, while it is.
+    pub fn prompt(&self) -> &str {
         &self.prompt
     }
 
-    pub(crate) fn message(&self) -> Option<(&str, bool)> {
+    /// A message for the person, and whether it is an error.
+    pub fn message(&self) -> Option<(&str, bool)> {
         self.message.as_ref().map(|(m, e)| (m.as_str(), *e))
     }
 
-    pub(crate) fn is_modified(&self) -> bool {
+    /// Whether there are changes not written yet.
+    pub fn is_modified(&self) -> bool {
         self.modified
     }
 
     /// Keys typed so far of a command not yet complete, as Vim's `showcmd`
     /// shows them: `"+`, `d`, `"+y`.
-    pub(crate) fn partial_command(&self) -> String {
+    pub fn partial_command(&self) -> String {
         let mut shown = String::new();
         if let Some(name) = self.register {
             shown.push('"');
@@ -617,7 +890,8 @@ impl Editor {
         shown
     }
 
-    pub(crate) fn selection(&self) -> Option<Selection> {
+    /// The selection, in visual mode.
+    pub fn selection(&self) -> Option<Selection> {
         let EditorMode::Visual { line } = self.mode else {
             return None;
         };
@@ -639,14 +913,14 @@ impl Editor {
     }
 
     /// Width of the line number column, gutter spaces included.
-    pub(crate) fn gutter(&self) -> usize {
+    pub fn gutter(&self) -> usize {
         // The number, a space, the change mark, a space.
         self.lines.len().max(1).to_string().len() + 3
     }
 
     /// The first column shown, so that the cursor stays on screen in long
     /// lines. Every line is shifted by the same amount, as in Vim with `nowrap`.
-    pub(crate) fn left_offset(&self) -> usize {
+    pub fn left_offset(&self) -> usize {
         (self.col + 1).saturating_sub(self.width.get().max(1))
     }
 
@@ -787,6 +1061,15 @@ impl Editor {
             return Outcome::Stay;
         }
         if let Some(first) = self.pending.take() {
+            if first == 'g' && matches!(key.code, KeyCode::Char('d' | 'r')) {
+                self.register = None;
+                let word = self.word_at(self.row, self.col);
+                return match (key.code, word) {
+                    (KeyCode::Char('d'), Some(word)) => Outcome::Definition(word),
+                    (_, Some(word)) => Outcome::Uses(word),
+                    (_, None) => Outcome::Stay,
+                };
+            }
             match (first, key.code) {
                 ('d', KeyCode::Char('d')) => self.delete_line(),
                 ('y', KeyCode::Char('y')) => self.yank_line(),
@@ -1273,17 +1556,18 @@ impl Editor {
             self.say_error("This file cannot be edited");
             return false;
         }
+        if let Some(why) = self.locked.clone() {
+            self.say_error(&why);
+            return false;
+        }
         self.snapshot();
         true
     }
 
     fn changed(&mut self) {
         self.modified = true;
-        if self.mode != EditorMode::Insert || self.lines.len() <= LIVE_HIGHLIGHT_LINES {
-            self.restyle();
-        } else {
-            self.styled = None;
-        }
+        let budget = (self.mode == EditorMode::Insert).then_some(TYPING_RECOLOUR);
+        self.recolour(budget);
     }
 
     fn start_insert(&mut self, col: usize) {
@@ -1577,6 +1861,10 @@ impl Editor {
             self.say_error("This file cannot be written");
             return false;
         }
+        if let Some(why) = self.locked.clone() {
+            self.say_error(&why);
+            return false;
+        }
         let mut text = self.lines.join("\n");
         if self.trailing_newline {
             text.push('\n');
@@ -1659,9 +1947,17 @@ impl Editor {
     }
 
     fn go_to(&mut self, row: usize) {
-        // A row inside a closed fold is reached through its header, as in Vim.
+        // A row inside a closed fold is reached through its header, as in
+        // Vim; inside unchanged lines folded away, they open, as the line
+        // was asked for.
         let row = if self.hidden().get(row).copied().unwrap_or(false) {
-            self.header_of(row).unwrap_or(row)
+            match self.header_of(row) {
+                Some(start) if self.unchanged.contains_key(&start) => {
+                    self.unchanged.remove(&start);
+                    row
+                }
+                header => header.unwrap_or(row),
+            }
         } else {
             row
         };
@@ -1671,11 +1967,30 @@ impl Editor {
     }
 
     fn keep_visible(&mut self) {
-        let height = self.view_height();
+        let height = self.view_height().max(1);
         if self.row < self.scroll {
             self.scroll = self.row;
-        } else if self.row >= self.scroll + height {
-            self.scroll = self.row + 1 - height;
+            return;
+        }
+        // Counted in rows on screen: what folds hide takes none.
+        let hidden = self.hidden();
+        let shown = |from: usize| (from..=self.row).filter(|r| !hidden[*r]).count();
+        if shown(self.scroll) > height {
+            let mut start = self.row;
+            let mut seen = 0;
+            loop {
+                if !hidden[start] {
+                    seen += 1;
+                    if seen == height {
+                        break;
+                    }
+                }
+                if start == 0 {
+                    break;
+                }
+                start -= 1;
+            }
+            self.scroll = start;
         }
     }
 
@@ -1783,14 +2098,26 @@ impl Editor {
     }
 
     fn restyle(&mut self) {
+        self.recolour(None);
+    }
+
+    /// Marks the lines against the last commit and colours them again: only
+    /// from the first changed, and `budget` lines past it at most.
+    fn recolour(&mut self, budget: Option<usize>) {
         if let Some(base) = &self.base {
             self.changes = line_changes(base, &self.lines);
         }
-        self.styled = if self.read_only {
-            None
-        } else {
-            self.highlighter.highlight(&self.path, &self.lines)
-        };
+        let styled = self.styled.get_mut();
+        if self.read_only {
+            *styled = None;
+            return;
+        }
+        let kept = styled
+            .as_mut()
+            .is_some_and(|s| s.update(&self.highlighter, &self.lines, budget));
+        if !kept {
+            *styled = self.highlighter.highlight(&self.path, &self.lines);
+        }
     }
 }
 
@@ -1987,6 +2314,59 @@ mod tests {
         assert_eq!(ed.lines()[0], "> hi");
         keys(&mut ed, "Gyy");
         assert_eq!(clipboard.0.borrow().as_str(), "print(1)\n");
+    }
+
+    #[test]
+    fn folded_to_its_changes_a_file_shows_them_and_a_few_lines_around() {
+        let text: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        let (_dir, mut ed) = editor(&text);
+        // The base had line 16 different, and one more line after line 25.
+        let mut base: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+        base[15] = "old 16".into();
+        base.insert(25, "gone".into());
+        ed.base = Some(base);
+        ed.restyle();
+        ed.fold_unchanged();
+        assert!(ed.shows_changes_only());
+        // Rows 0 to 11 fold under row 0; 12 to 18 show around the change
+        // at row 15, its old line above it; 19 to 21 are too few to fold;
+        // the removed line shows before row 25, with 3 lines each side.
+        assert_eq!(ed.folded(0), Some(11));
+        assert!(ed.folds_unchanged(0));
+        assert_eq!(ed.folded(12), None);
+        assert_eq!(ed.folded(29), None);
+        ed.set_viewport(40, 80);
+        let rows = ed.screen_rows(40);
+        let shown: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                ScreenRow::Line(i) => (i + 1).to_string(),
+                ScreenRow::Removed(t) => format!("-{t}"),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "1", "13", "14", "15", "-old 16", "16", "17", "18", "19", "20", "21", "22", "23",
+                "24", "25", "-gone", "26", "27", "28", "29", "30"
+            ]
+        );
+        // j steps over the fold; zR shows the whole file, zM folds again.
+        ed.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(ed.cursor().0, 12);
+        for key in ['z', 'R'] {
+            ed.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        assert!(!ed.shows_changes_only());
+        for key in ['z', 'M'] {
+            ed.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        assert_eq!(ed.folded(0), Some(11));
+        // Locked, nothing changes.
+        ed.lock("Read only while reviewing");
+        ed.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(ed.lines()[12], "line 13");
+        assert_eq!(ed.message().map(|m| m.0), Some("Read only while reviewing"));
     }
 
     #[test]

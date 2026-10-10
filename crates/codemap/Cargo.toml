@@ -1,0 +1,16 @@
+[package]
+name    = "ironquill-codemap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The shape of a codebase: its files, folders and imports as a graph, and where to place them in space."
+
+[dependencies]
+ignore.workspace = true
+regex.workspace  = true
+serde_json.workspace = true
+yaml-rust2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

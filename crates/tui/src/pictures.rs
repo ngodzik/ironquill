@@ -30,6 +30,13 @@ pub(crate) trait Pictures {
     fn lines(&self, picture: Picture<'_>, width: usize) -> Option<Vec<Line<'static>>>;
 }
 
+/// The gallery draws while the screen is drawn, which only lends it.
+impl Pictures for std::cell::RefCell<Gallery> {
+    fn lines(&self, picture: Picture<'_>, width: usize) -> Option<Vec<Line<'static>>> {
+        self.borrow_mut().lines(picture, width)
+    }
+}
+
 /// Shows no picture: text stays text.
 #[cfg(test)]
 pub(crate) struct NoPictures;
@@ -394,7 +401,7 @@ mod tests {
     }
 
     fn kitty() -> Option<Terminal> {
-        graphics::detect(graphics::Images::Kitty, |_| None)
+        graphics::detect(ironquill_ui::defaults::Images::Kitty, |_| None)
     }
 
     #[test]

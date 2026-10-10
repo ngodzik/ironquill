@@ -10,14 +10,14 @@ use ratatui::widgets::{
     Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, LegendPosition, Padding, Paragraph,
 };
 
-use crate::app::{App, CompactRow, Entry, LineEditor, Panes, SubAgent};
-use crate::editor::{Editor, EditorMode, Kind};
-use crate::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use crate::markdown;
 use crate::pictures::{Picture, Pictures};
-use crate::references::{self, Reference};
-use crate::sessions;
 use crate::wrap::wrap;
+use ironquill_ui::editor::{Editor, EditorMode, Kind, ScreenRow};
+use ironquill_ui::keymap::{Focus, Mode, Pending, SHORTCUTS};
+use ironquill_ui::references::{self, Reference};
+use ironquill_ui::sessions;
+use ironquill_ui::{App, CompactRow, Entry, LineEditor, Panes, SubAgent};
 
 const ACCENT: Color = Color::Rgb(215, 119, 87);
 // Changes since the last commit, in the open file. Backgrounds stay dark and
@@ -39,7 +39,7 @@ const EXCERPT_LINES: usize = 6;
 const PLACEHOLDER: &str = "Ask a question or describe a change";
 
 /// Draws the whole interface: panes, activity line, input box, status line.
-pub(crate) fn render(frame: &mut Frame, app: &App) {
+pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
     let [main, activity, input, status] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -48,7 +48,7 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    render_panes(frame, app, main);
+    render_panes(frame, app, pictures, main);
     render_activity(frame, app, activity);
     render_input(frame, app, input);
     render_status(frame, app, status);
@@ -57,6 +57,9 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     }
     if app.model_picker().is_some() {
         render_model_picker(frame, app);
+    }
+    if app.definition_choice().is_some() {
+        render_definitions(frame, app);
     }
     if app.keys_open().is_some() {
         render_keys(frame, app);
@@ -465,6 +468,62 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
 }
 
 /// The `/resume` list, over everything else.
+/// The places a name is defined (gd), to choose one.
+fn render_definitions(frame: &mut Frame, app: &App) {
+    let Some(choice) = app.definition_choice() else {
+        return;
+    };
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 110).min(screen.width);
+    let height =
+        (choice.items.len() as u16 * 2 + 2).clamp(4, screen.height.saturating_sub(4).max(4));
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height.saturating_sub(height)) / 3,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let title = format!(
+        " Where {} is {} ({}) ",
+        choice.name,
+        if choice.uses { "used" } else { "defined" },
+        choice.items.len()
+    );
+    let hint = format!(" ↑ ↓ choose · Enter: go · Esc: close · by {} ", choice.by);
+    let block = pane_block(title, true).title_bottom(Line::styled(hint, fg(DIM)).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Two rows each: where, then the line itself.
+    let shown = usize::from(inner.height) / 2;
+    let first = choice.selected.saturating_sub(shown.saturating_sub(1));
+    let room = usize::from(inner.width);
+    let lines: Vec<Line> = choice
+        .items
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .flat_map(|(i, item)| {
+            let style = if i == choice.selected {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            let place: String = format!("{}:{}", item.path, item.line)
+                .chars()
+                .take(room)
+                .collect();
+            let text: String = format!("  {}", item.text).chars().take(room).collect();
+            [
+                Line::styled(format!("{place:<room$}"), style.fg(DIM)),
+                Line::styled(format!("{text:<room$}"), style),
+            ]
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_picker(frame: &mut Frame, app: &App) {
     let Some(picker) = app.picker() else {
         return;
@@ -527,13 +586,13 @@ const SIDE_CHAT_MIN: u16 = 36;
 
 /// Tree on the left if open; the open file or the conversation in the middle;
 /// the conversation on the right while a file is open, if there is room.
-fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
+fn render_panes(frame: &mut Frame, app: &App, pictures: &dyn Pictures, area: Rect) {
     if app.is_zoomed() {
         // Only the conversation; the other panes keep their state, unseen.
-        let sub = render_chat(frame, app, area, false);
+        let sub = render_chat(frame, app, pictures, area, false);
         app.set_panes(Panes {
-            chat: area,
-            sub,
+            chat: cells(area),
+            sub: sub.map(cells),
             ..Panes::default()
         });
         return;
@@ -582,10 +641,10 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
 
     let alone = app.tree().is_none() && app.file().is_none();
     let mut panes = Panes {
-        tree: (tree_width > 0).then_some(tree),
+        tree: (tree_width > 0).then_some(cells(tree)),
         file: None,
-        chat: center,
-        docker,
+        chat: cells(center),
+        docker: docker.map(cells),
         sub: None,
     };
     if let Some(docker) = docker {
@@ -598,17 +657,27 @@ fn render_panes(frame: &mut Frame, app: &App, area: Rect) {
         // The command frame sits under the file, as Vim's command line does.
         let [file, command] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(center);
-        panes.file = Some(file);
+        panes.file = Some(cells(file));
         render_file(frame, app, file);
         render_command_frame(frame, app, command);
-        panes.chat = side;
+        panes.chat = cells(side);
         if side_width > 0 {
-            panes.sub = render_chat(frame, app, side, true);
+            panes.sub = render_chat(frame, app, pictures, side, true).map(cells);
         }
     } else {
-        panes.sub = render_chat(frame, app, center, !alone);
+        panes.sub = render_chat(frame, app, pictures, center, !alone).map(cells);
     }
     app.set_panes(panes);
+}
+
+/// A colour of the state, as the terminal draws it.
+fn rgb(c: ironquill_ui::style::Rgb) -> Color {
+    Color::Rgb(c.0, c.1, c.2)
+}
+
+/// Where a pane was drawn, as the state reads it to match a click.
+fn cells(area: Rect) -> ironquill_ui::input::Rect {
+    ironquill_ui::input::Rect::new(area.x, area.y, area.width, area.height)
 }
 
 /// The border of a pane, bright when it has the focus.
@@ -696,7 +765,13 @@ fn render_docker(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The conversation, and under it the sub-agent pane when it is open,
 /// whose area is returned for the mouse.
-fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) -> Option<Rect> {
+fn render_chat(
+    frame: &mut Frame,
+    app: &App,
+    pictures: &dyn Pictures,
+    area: Rect,
+    framed: bool,
+) -> Option<Rect> {
     // While a model of the team works, or until the next request, its work
     // takes most of the room: the conversation keeps a third.
     if let Some(sub) = app.sub_agent()
@@ -705,17 +780,23 @@ fn render_chat(frame: &mut Frame, app: &App, area: Rect, framed: bool) -> Option
         let top = (area.height / 3).max(6);
         let [chat, pane] =
             Layout::vertical([Constraint::Length(top), Constraint::Min(6)]).areas(area);
-        render_conversation(frame, app, chat, true);
-        render_sub_agent(frame, app, &sub, pane);
+        render_conversation(frame, app, pictures, chat, true);
+        render_sub_agent(frame, app, pictures, &sub, pane);
         return Some(pane);
     }
-    render_conversation(frame, app, area, framed);
+    render_conversation(frame, app, pictures, area, framed);
     None
 }
 
 /// The model a task was handed to, at work: who it is, the task, then
 /// everything it does, the latest at the bottom.
-fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect) {
+fn render_sub_agent(
+    frame: &mut Frame,
+    app: &App,
+    pictures: &dyn Pictures,
+    sub: &SubAgent<'_>,
+    area: Rect,
+) {
     let state = if sub.working {
         format!(" working {} ", SPINNER[app.spinner() % SPINNER.len()])
     } else {
@@ -758,7 +839,7 @@ fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect
     );
     lines.push(Line::default());
     for entry in &sub.work {
-        lines.extend(entry_lines(entry, app, width));
+        lines.extend(entry_lines(entry, app, pictures, width));
         lines.push(Line::default());
     }
     if sub.work.is_empty() {
@@ -782,14 +863,20 @@ fn render_sub_agent(frame: &mut Frame, app: &App, sub: &SubAgent<'_>, area: Rect
     frame.render_widget(Paragraph::new(shown), inner);
 }
 
-fn render_conversation(frame: &mut Frame, app: &App, area: Rect, framed: bool) {
+fn render_conversation(
+    frame: &mut Frame,
+    app: &App,
+    pictures: &dyn Pictures,
+    area: Rect,
+    framed: bool,
+) {
     if framed {
         let block = pane_block(" Chat ".into(), app.focus() == Focus::Chat);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        render_transcript(frame, app, inner);
+        render_transcript(frame, app, pictures, inner);
     } else {
-        render_transcript(frame, app, area);
+        render_transcript(frame, app, pictures, area);
     }
 }
 
@@ -828,7 +915,12 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
                 "▸ "
             };
             let changed = app.is_changed(&row.path, row.is_dir);
-            let git = tree.git_status(&row.path, row.is_dir);
+            // The row standing for a folder's unchanged files has no letter.
+            let git = if row.unchanged.is_some() {
+                None
+            } else {
+                tree.git_status(&row.path, row.is_dir)
+            };
             let mut text = format!("{}{icon}{}", "  ".repeat(row.depth), row.name);
             if row.is_dir {
                 text.push('/');
@@ -846,6 +938,7 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
                 Some('D') => fg(REMOVED_SIGN),
                 Some(_) => fg(CHANGED_SIGN),
                 None if changed => fg(Color::Yellow),
+                None if row.unchanged.is_some() => fg(DIM).add_modifier(Modifier::ITALIC),
                 None if row.is_dir => fg(Color::Blue),
                 None => Style::new(),
             };
@@ -864,8 +957,8 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
 
 /// A line as styled runs: coloured by its language when known, plain otherwise.
 fn line_runs(file: &Editor, row: usize, text: &str) -> Vec<(Style, String)> {
-    match file.styled().and_then(|s| s.get(row)) {
-        Some(runs) => runs.iter().map(|(c, t)| (fg(*c), t.clone())).collect(),
+    match file.styled().as_deref().and_then(|s| s.get(row)) {
+        Some(runs) => runs.iter().map(|(c, t)| (fg(rgb(*c)), t.clone())).collect(),
         None => vec![(Style::new(), text.to_owned())],
     }
 }
@@ -966,49 +1059,15 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
     let (cursor_row, cursor_col) = file.cursor();
     let selection = file.selection();
 
-    // Rows to draw: each line, preceded by the lines of the last commit
-    // that are gone from that place.
-    let height = usize::from(inner.height);
+    // Rows to draw: each line not folded away, preceded by the lines of
+    // the base that are gone from that place.
     let changes = file.changes();
-    let hidden = file.hidden();
-    let rows_from = |start: usize| {
-        let mut rows: Vec<Option<usize>> = Vec::new();
-        let mut removed: Vec<(usize, &String)> = Vec::new();
-        for i in start..=file.lines().len() {
-            // Lines inside a closed fold are not drawn.
-            if hidden.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            if let Some(gone) = changes.and_then(|c| c.removed.get(&i)) {
-                for text in gone {
-                    removed.push((rows.len(), text));
-                    rows.push(None);
-                }
-            }
-            if i < file.lines().len() {
-                rows.push(Some(i));
-            }
-            if rows.len() >= height {
-                break;
-            }
-        }
-        rows.truncate(height);
-        (rows, removed)
-    };
-    // Removed lines take rows too, so the start may need to move down for
-    // the cursor to stay on screen.
-    let mut start = file.scroll();
-    let (mut rows, mut removed) = rows_from(start);
-    while start < cursor_row && !rows.contains(&Some(cursor_row)) {
-        start += 1;
-        (rows, removed) = rows_from(start);
-    }
+    let rows = file.screen_rows(usize::from(inner.height));
 
     let lines: Vec<Line> = rows
         .iter()
-        .enumerate()
-        .map(|(at, row)| match row {
-            Some(i) => {
+        .map(|row| match row {
+            ScreenRow::Line(i) => {
                 let i = *i;
                 let text = &file.lines()[i];
                 let number_style = if i == cursor_row && focused {
@@ -1048,6 +1107,17 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
                         ));
                     }
                 }
+                if file.folds_unchanged(i)
+                    && let Some(count) = file.folded(i)
+                {
+                    runs.push((
+                        fg(DIM),
+                        format!(
+                            "  ⋯ {} unchanged · zo opens, zR the whole file",
+                            plural(count, "line", "lines")
+                        ),
+                    ));
+                }
                 if let Some(bg) = background {
                     runs = runs
                         .into_iter()
@@ -1062,11 +1132,8 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
                 spans.extend(clip(&runs, left, room));
                 Line::from(spans)
             }
-            None => {
-                let text = removed
-                    .iter()
-                    .find(|(row, _)| *row == at)
-                    .map_or("", |(_, t)| t.as_str());
+            ScreenRow::Removed(text) => {
+                let text = text.as_str();
                 let style = Style::new().fg(REMOVED_FG).bg(REMOVED_BG);
                 let mut spans = vec![
                     Span::raw(" ".repeat(gutter - 2)),
@@ -1078,13 +1145,12 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
             }
         })
         .collect();
-    file.set_rows(rows.clone());
     frame.render_widget(Paragraph::new(lines), inner);
 
     let typing_below = matches!(file.mode(), EditorMode::Command | EditorMode::Search);
     if focused
         && !typing_below
-        && let Some(y) = rows.iter().position(|r| *r == Some(cursor_row))
+        && let Some(y) = rows.iter().position(|r| *r == ScreenRow::Line(cursor_row))
     {
         let x = gutter + cursor_col.saturating_sub(left);
         if x < usize::from(inner.width) {
@@ -1192,7 +1258,12 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
+fn entry_lines(
+    entry: &Entry,
+    app: &App,
+    pictures: &dyn Pictures,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     match entry {
         Entry::Welcome => welcome(&mut out, app, width),
@@ -1275,7 +1346,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 width,
             );
         }
-        Entry::Image(path) => match app.lines(Picture::File(path), width.saturating_sub(2)) {
+        Entry::Image(path) => match pictures.lines(Picture::File(path), width.saturating_sub(2)) {
             Some(drawn) => {
                 out.push(Line::styled(format!("  {path}"), fg(DIM)));
                 out.extend(drawn.into_iter().map(|line| {
@@ -1304,7 +1375,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
             );
         }
         Entry::Said(text) => {
-            let body = markdown::render(text, width.saturating_sub(2), Style::new(), app);
+            let body = markdown::render(text, width.saturating_sub(2), Style::new(), pictures);
             for (i, line) in body.into_iter().enumerate() {
                 let lead = if i == 0 {
                     Span::styled("● ", fg(Color::White))
@@ -1357,7 +1428,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                     Span::styled(model.to_string(), fg(Color::Magenta)),
                 ]));
             }
-            for line in entry_lines(entry, app, width.saturating_sub(4)) {
+            for line in entry_lines(entry, app, pictures, width.saturating_sub(4)) {
                 let mut spans = vec![bar()];
                 spans.extend(line.spans);
                 out.push(Line::from(spans));
@@ -1378,7 +1449,7 @@ fn entry_lines(entry: &Entry, app: &App, width: usize) -> Vec<Line<'static>> {
                 (Some(_), true) => ACCENT,
                 (Some(_), false) => Color::Magenta,
             };
-            let title = crate::app::step_title(*number, *of, name, model.as_ref(), *effort);
+            let title = ironquill_ui::step_title(*number, *of, name, model.as_ref(), *effort);
             let rule = width.saturating_sub(title.chars().count() + 6);
             out.push(Line::styled(
                 format!("━━ {title} {}", "━".repeat(rule.min(40))),
@@ -1637,7 +1708,7 @@ const FOLD_SHOW: usize = 6;
 /// the terminal's, enough to see it, not enough to hurt reading.
 const SELECTED_BG: Color = Color::Rgb(34, 36, 44);
 
-fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
+fn render_transcript(frame: &mut Frame, app: &App, pictures: &dyn Pictures, area: Rect) {
     let width = usize::from(area.width).saturating_sub(1).max(1);
     let selected = app.selected_reply();
     let mut lines: Vec<Line> = Vec::new();
@@ -1684,12 +1755,12 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 block
             }
             Entry::Command { .. } => {
-                let mut block = entry_lines(entry, app, width);
+                let mut block = entry_lines(entry, app, pictures, width);
                 fold_marks.push(first + block.len());
                 block.push(Line::styled("  ▾ fold", fg(DIM)));
                 block
             }
-            _ => entry_lines(entry, app, width),
+            _ => entry_lines(entry, app, pictures, width),
         };
         if let Entry::Delegating { to, spent, .. } = entry {
             let steps = app.transcript()[i + 1..]
@@ -1730,7 +1801,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         }
         // The copy marks of a reply's code blocks, as far as shown.
         if let Entry::Said(text) = entry {
-            let codes = markdown::code_blocks(text);
+            let codes = ironquill_ui::blocks::code_blocks(text);
             let marked = block.iter().enumerate().filter(|(_, line)| {
                 line.spans
                     .iter()
@@ -1786,7 +1857,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
 
     let back = app.scroll_back().min(max_scroll);
     let top = max_scroll - back;
-    app.set_entry_lines(ranges, top, area);
+    app.set_entry_lines(ranges, top, cells(area));
     app.set_marks(fold_marks, copy_marks, link_marks);
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
@@ -1846,6 +1917,7 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     let (editor, prompt) = match app.mode() {
         Mode::Command => (app.command_line(), ":"),
+        Mode::Search => (app.search_line(), "search: "),
         Mode::Insert | Mode::Normal => (app.input(), "> "),
     };
     let focused = app.mode() != Mode::Normal;
@@ -1941,6 +2013,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "-- NORMAL --",
         Mode::Insert => "-- INSERT --",
         Mode::Command => "-- COMMAND --",
+        Mode::Search => "-- SEARCH --",
     };
     // Only what a key already typed is waiting for; no shortcut reminders.
     let waiting = match app.pending() {
@@ -1953,8 +2026,13 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Some(notice) => Span::styled(format!("  {notice}"), fg(Color::Yellow)),
         None => Span::styled(format!("  {}", app.session_label()), fg(DIM)),
     };
+    // Looking at a branch's changes: which way, and how many files.
+    let lens = app.change_set().map_or_else(String::new, |c| {
+        format!("  {} {} files", c.lens.name(), c.files.len())
+    });
     let left = Line::from(vec![
         Span::styled(format!("  {mode}"), fg(DIM)),
+        Span::styled(lens, fg(Color::Cyan)),
         Span::styled(waiting, fg(Color::Gray)),
         label,
     ]);
@@ -2010,7 +2088,10 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
     let from = now.saturating_sub(window);
     let span = window as f64;
     let block = pane_block(
-        format!(" Usage · last {} ", crate::usage::window_name(window)),
+        format!(
+            " Usage · last {} ",
+            ironquill_ui::usage::window_name(window)
+        ),
         false,
     );
     let inner = block.inner(area);
@@ -2039,7 +2120,7 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
             let mut points = log.cost_steps(&m.model, from);
             let last = points.last().map_or(0.0, |p| p.1);
             points.push((span, last));
-            (m.color, points)
+            (rgb(m.color), points)
         })
         .collect();
     let top = models
@@ -2060,7 +2141,10 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     let time_axis = || {
         Axis::default().bounds([0.0, span]).labels([
-            Span::styled(format!("-{}", crate::usage::window_name(window)), fg(DIM)),
+            Span::styled(
+                format!("-{}", ironquill_ui::usage::window_name(window)),
+                fg(DIM),
+            ),
             Span::styled("now", fg(DIM)),
         ])
     };
@@ -2122,7 +2206,7 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
             format!(" · {} rebuilt", m.rebuilds)
         };
         lines.push(Line::from(vec![
-            Span::styled("● ", fg(m.color)),
+            Span::styled("● ", fg(rgb(m.color))),
             Span::raw(m.model.clone()),
         ]));
         lines.push(Line::styled(
@@ -2136,4 +2220,277 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
     frame.render_widget(Paragraph::new(lines), table);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use ironquill_agent::{Approval, Compaction, Event, Question, Subject};
+    use ironquill_core::{CacheUse, ContextUse, ModelId, TokenCount, Usage, Usd};
+    use ironquill_tools::Check;
+    use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
+    use ironquill_ui::{AgentMessage, Effect, Settings};
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::pictures::NoPictures;
+
+    fn press(app: &mut App, code: KeyCode) -> Option<Effect> {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn ready() -> App {
+        App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                checks: vec![Check::parse("cargo check").unwrap()],
+                rounds: 2,
+                max_turns: 30,
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        )
+    }
+
+    fn project() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "one\ntwo\n").unwrap();
+        let app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                ..Settings::default()
+            },
+            dir.path().to_owned(),
+        );
+        (dir, app)
+    }
+
+    /// A reply from the model, as the agent reports it.
+    fn said(app: &mut App, text: &str) {
+        app.on_agent(AgentMessage::Event(Event::Said {
+            model: ModelId::new("cheap").unwrap(),
+            text: text.into(),
+        }));
+    }
+
+    fn screen_of(app: &App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, app, &NoPictures))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    fn screen(app: &App) -> String {
+        screen_of(app, 120, 40)
+    }
+
+    #[test]
+    fn the_usage_pane_shows_what_each_model_used() {
+        let mut app = ready();
+        for (model, cost, written) in [("glm", 0.01, 500), ("opus", 0.2, 9_000), ("glm", 0.01, 400)]
+        {
+            app.on_agent(AgentMessage::Event(Event::Turn {
+                model: ModelId::new(model).unwrap(),
+                usage: Usage {
+                    input: TokenCount(10_000),
+                    output: TokenCount(100),
+                },
+                cost: Some(Usd(cost)),
+                subscription: false,
+                context: Some(ContextUse {
+                    used: TokenCount(10_000),
+                    window: TokenCount(200_000),
+                }),
+                cache: Some(CacheUse {
+                    read: TokenCount(10_000 - written),
+                    written: Some(TokenCount(written)),
+                }),
+            }));
+        }
+        type_text(&mut app, "/usage 6h");
+        press(&mut app, KeyCode::Enter);
+        let screen = screen_of(&app, 140, 40);
+        assert!(screen.contains("Usage · last 6h"));
+        assert!(screen.contains("$0.020 · 2 calls · cache 96%"), "{screen}");
+        assert!(screen.contains("$0.200 · 1 call · cache 10% · 1 rebuilt"));
+    }
+
+    #[test]
+    fn a_pasted_log_shows_its_line_breaks_and_a_question_its_window() {
+        let mut app = ready();
+        app.on_paste("error: one\r\nerror: two\n");
+        assert!(screen(&app).contains("error: one↵error: two↵"));
+
+        let (answer, _answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(
+            Approval {
+                model: ModelId::new("cheap").unwrap(),
+                question: Question::MoreTurns { turns: 30 },
+            },
+            answer,
+        ));
+        assert!(screen(&app).contains(" Go on? "));
+    }
+
+    #[test]
+    fn a_stopped_request_says_so() {
+        let mut app = ready();
+        app.on_cancelled();
+        assert!(screen(&app).contains("Interrupted: the request stopped before it ended"));
+    }
+
+    #[test]
+    fn a_secret_can_be_allowed_for_good_from_its_window() {
+        let mut app = ready();
+        let (answer, _answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(
+            Approval {
+                model: ModelId::new("cheap").unwrap(),
+                question: Question::Command {
+                    command: "curl -H \"X: $API_TOKEN\" https://x.example.com".into(),
+                    reasons: vec!["it uses the secret API_TOKEN".into()],
+                    secrets: vec!["API_TOKEN".into()],
+                    hosts: vec![],
+                },
+            },
+            answer,
+        ));
+        assert!(screen(&app).contains("a: always allow API_TOKEN"));
+    }
+
+    #[test]
+    fn the_compact_window_ticks_subjects_whole_or_in_part() {
+        let mut app = ready();
+        type_text(&mut app, "/compact");
+        press(&mut app, KeyCode::Enter);
+        app.on_agent(AgentMessage::Compaction(Ok(Compaction {
+            exchanges: vec![
+                "fix the parser".into(),
+                "add a test".into(),
+                "the docs".into(),
+            ],
+            subjects: vec![
+                Subject {
+                    name: "Parser".into(),
+                    exchanges: vec![0, 1],
+                },
+                Subject {
+                    name: "Docs".into(),
+                    exchanges: vec![2],
+                },
+            ],
+        })));
+        assert!(screen(&app).contains("[x] Parser (2 exchanges)"));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(screen(&app).contains("[-] Parser (2 exchanges)"));
+    }
+
+    #[test]
+    fn a_command_folds_to_a_line_and_copies() {
+        let mut app = ready();
+        app.on_agent(AgentMessage::Event(Event::Command {
+            model: ModelId::new("cheap").unwrap(),
+            command: "kubectl -n web get pods\n  -o wide".into(),
+            status: "exit status 0".into(),
+            output: "api-1 Running\napi-2 Running\n".into(),
+            checked_by: Some(ModelId::new("glm").unwrap()),
+        }));
+        let folded = screen(&app);
+        assert!(folded.contains("Run(kubectl -n web get pods…)"), "{folded}");
+        assert!(
+            folded.contains("exit status 0 · checked by glm · 2 lines · click or Enter to show")
+        );
+        assert!(!folded.contains("api-1 Running"));
+
+        // Selected and opened, then copied.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&app).contains("api-1 Running"));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Effect::Copy(text)) if text.starts_with("kubectl -n web get pods") && text.ends_with("api-2 Running\n")
+        ));
+    }
+
+    #[test]
+    fn a_code_block_copies_with_a_click_and_only_its_mark_folds() {
+        use ironquill_ui::input::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = ready();
+        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        said(
+            &mut app,
+            &format!("Try:\n```sh\ncargo test -q\n```\n{long}"),
+        );
+        said(&mut app, &long);
+        let screen_text = screen(&app);
+        let rows: Vec<&str> = screen_text.lines().collect();
+        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap() as u16;
+        let click = |app: &mut App, row: u16| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        // The first reply is folded, the latest open.
+        assert!(screen_text.contains("▸ "));
+        assert!(screen_text.contains("▾ fold"));
+        assert!(matches!(
+            click(&mut app, row_of("⧉ copy")),
+            Some(Effect::Copy(code)) if code == "cargo test -q"
+        ));
+        // A click on the text does not fold; one on the mark does.
+        click(&mut app, row_of("Try:"));
+        assert!(!app.is_expanded(1));
+        screen(&app);
+        click(&mut app, row_of("▸ "));
+        assert!(app.is_expanded(1));
+    }
+
+    #[test]
+    fn a_cited_file_opens_at_its_line_with_a_click() {
+        use ironquill_ui::input::{MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = project();
+        said(
+            &mut app,
+            "The second line is in src/lib.rs:2, not in nowhere.rs:1.",
+        );
+        let shown = screen(&app);
+        assert!(shown.contains("src/lib.rs:2↗"));
+        assert!(!shown.contains("nowhere.rs:1↗"));
+        let (row, column) = shown
+            .lines()
+            .enumerate()
+            .find_map(|(r, l)| l.find("src/lib.rs:2").map(|c| (r, l[..c].chars().count())))
+            .unwrap();
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column as u16 + 2,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        let file = app.file().expect("the file is open");
+        assert_eq!(file.lines(), ["one", "two"]);
+        assert_eq!(file.cursor().0, 1);
+    }
 }

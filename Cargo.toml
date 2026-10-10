@@ -3,8 +3,11 @@ members = [
     "crates/core",
     "crates/llm",
     "crates/tools",
+    "crates/codemap",
     "crates/agent",
+    "crates/ui",
     "crates/tui",
+    "crates/gui",
     ".",
 ]
 resolver = "3"
@@ -14,7 +17,7 @@ version     = "0.1.0"
 edition     = "2024"
 # The oldest toolchain the code is known to build on. CI holds it to this, so
 # the promise is checked rather than asserted.
-rust-version = "1.89"
+rust-version = "1.95"
 authors     = ["Nicolas Godzik"]
 license     = "MIT"
 
@@ -22,13 +25,17 @@ license     = "MIT"
 ironquill-core = { path = "crates/core", version = "0.1.0" }
 ironquill-llm  = { path = "crates/llm", version = "0.1.0" }
 ironquill-tools = { path = "crates/tools", version = "0.1.0" }
+ironquill-codemap = { path = "crates/codemap", version = "0.1.0" }
 ironquill-agent = { path = "crates/agent", version = "0.1.0" }
+ironquill-ui    = { path = "crates/ui", version = "0.1.0" }
 ironquill-tui   = { path = "crates/tui", version = "0.1.0" }
+ironquill-gui   = { path = "crates/gui", version = "0.1.0" }
 
 thiserror  = "2.0.21"
 anyhow     = "1.0.104"
 serde      = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+yaml-rust2 = "0.13.0"
 tokio      = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 clap       = { version = "4.6.7", features = ["derive", "env"] }
 # The default TLS backend verifies against the operating system trust store, so
@@ -48,7 +55,7 @@ similar    = "3.2.0"
 toml       = "1.1.6"
 # The directory walker of ripgrep: it skips what .gitignore skips.
 ignore     = "0.4.33"
-# Parsers for the code map. 0.26 keeps the oldest supported Rust at 1.89.
+# Parsers for the code map.
 tree-sitter            = "0.26.13"
 tree-sitter-rust       = "0.24.2"
 tree-sitter-python     = "0.25.0"
@@ -56,6 +63,18 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-javascript = "0.25.0"
 # Pure Rust regex engine instead of the default C Oniguruma: nothing to build
 # in C, the same on every platform.
+# The window: Bevy draws it on the GPU, egui the panels, egui_plot the
+# charts. bevy_egui 0.42 is the release for Bevy 0.19 and egui 0.36, which
+# egui_plot 0.37 is built on. Only what a desktop window needs is enabled:
+# no audio, no gamepads, no glTF.
+bevy       = { version = "0.19.1", default-features = false, features = [
+    "std", "async_executor", "multi_threaded", "bevy_log", "bevy_winit", "bevy_window",
+    "x11", "wayland", "bevy_render", "bevy_core_pipeline", "bevy_asset", "bevy_color", "hdr",
+    "bevy_post_process", "bevy_camera", "bevy_mesh", "bevy_image", "bevy_shader", "bevy_material",
+    "bevy_pbr", "bevy_light", "bevy_gizmos", "bevy_gizmos_render",
+] }
+bevy_egui  = { version = "0.42.0", default-features = false, features = ["render", "default_fonts"] }
+egui_plot  = "0.37.0"
 syntect    = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
 [package]
@@ -75,7 +94,9 @@ ironquill-core.workspace     = true
 ironquill-llm.workspace      = true
 ironquill-tools.workspace    = true
 ironquill-agent.workspace    = true
+ironquill-ui.workspace       = true
 ironquill-tui.workspace      = true
+ironquill-gui.workspace      = true
 anyhow.workspace             = true
 clap.workspace               = true
 serde.workspace              = true
@@ -91,3 +112,14 @@ codegen-units = 1
 # wraps silently would print a number that looks like a bill; a panic is the
 # cheaper failure.
 overflow-checks = true
+
+# Dependencies are built optimised in a debug build too: syntect, egui and
+# Bevy run tens of times slower without, enough to make the window lag on
+# every key, while ironquill's own crates stay quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 3
+
+# The map of a large project is read on every Ctrl-N: optimised in debug
+# builds too, it takes about a second for 15,000 files rather than many.
+[profile.dev.package.ironquill-codemap]
+opt-level = 3

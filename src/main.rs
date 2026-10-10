@@ -18,7 +18,7 @@ use ironquill_llm::{
     Ranking, find_ranking,
 };
 use ironquill_tools::{Check, ToolSummary, Toolbox, Workspace};
-use ironquill_tui::Defaults;
+use ironquill_ui::Defaults;
 use tracing_subscriber::EnvFilter;
 
 /// How many tracked file names go to the model up front. Enough to orient it
@@ -83,7 +83,13 @@ struct Cli {
     #[arg(short = 'r', long, num_args = 0..=1, value_name = "ID")]
     resume: Option<Option<String>>,
 
-    /// Without a subcommand, ironquill opens its terminal interface.
+    /// Open the window instead of the terminal interface: the same
+    /// conversation, keys and commands, drawn on the GPU.
+    #[arg(long)]
+    gui: bool,
+
+    /// Without a subcommand, ironquill opens its terminal interface, or its
+    /// window with --gui.
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -142,21 +148,26 @@ async fn main() -> Result<()> {
     // sessions; one from the environment does not, so that a variable set
     // long ago does not undo what was picked since.
     let typed = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
-    let api_key = cli.api_key.context("no API key: set IRONQUILL_API_KEY")?;
-    let provider = OpenAiCompatible::new(cli.base_url, api_key);
+    // The interface runs without a key: Claude Code and Codex bring their
+    // own credentials, and a call to the provider says the key is missing.
+    let keyed = cli.api_key.is_some();
+    let provider = match cli.api_key {
+        Some(key) => OpenAiCompatible::new(cli.base_url, key),
+        None => OpenAiCompatible::without_key(cli.base_url),
+    };
 
     let Some(command) = cli.command else {
         // No log subscriber here: anything written to the terminal while the
         // interface owns it would tear the screen.
         let start = if cli.continue_last {
-            ironquill_tui::Start::Continue
+            ironquill_ui::Start::Continue
         } else if let Some(resume) = cli.resume {
             match resume {
-                Some(id) => ironquill_tui::Start::Id(id),
-                None => ironquill_tui::Start::Pick,
+                Some(id) => ironquill_ui::Start::Id(id),
+                None => ironquill_ui::Start::Pick,
             }
         } else {
-            ironquill_tui::Start::New
+            ironquill_ui::Start::New
         };
         let choices = Choices {
             model: Pick::new(cli.model, typed("model")),
@@ -166,8 +177,18 @@ async fn main() -> Result<()> {
             budget: Pick::new(cli.budget, typed("budget")),
             effort: Pick::new(cli.effort, typed("effort")),
         };
-        return interface(provider, choices, start).await;
+        let screen = if cli.gui {
+            Screen::Window
+        } else {
+            Screen::Terminal
+        };
+        return interface(provider, keyed, choices, start, screen).await;
     };
+
+    // The commands below only call the provider.
+    if !keyed {
+        anyhow::bail!("no API key: set IRONQUILL_API_KEY");
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -256,10 +277,19 @@ impl<T> Pick<T> {
     }
 }
 
+/// Where the interface is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Terminal,
+    Window,
+}
+
 async fn interface(
     provider: OpenAiCompatible,
+    keyed: bool,
     choices: Choices,
-    start: ironquill_tui::Start,
+    start: ironquill_ui::Start,
+    screen: Screen,
 ) -> Result<()> {
     let workspace = Workspace::new(".")?;
     let defaults = match Defaults::path() {
@@ -270,6 +300,13 @@ async fn interface(
     // A model typed at the command line replaces the one kept: say so, a
     // command recalled from the history would hide it otherwise.
     let mut notes = Vec::new();
+    if !keyed {
+        notes.push(
+            "No IRONQUILL_API_KEY: the provider's models cannot answer. Claude Code and Codex \
+             can, with their own sign-in: Ctrl-E to pick claude-code/... or codex/..."
+                .to_owned(),
+        );
+    }
     if let (Some(typed), Some(kept)) = (&choices.model.typed, &defaults.model)
         && typed != kept
     {
@@ -359,7 +396,7 @@ async fn interface(
         })
         .collect();
 
-    let settings = ironquill_tui::Settings {
+    let settings = ironquill_ui::Settings {
         tiers,
         checks,
         rounds: 2,
@@ -378,13 +415,16 @@ async fn interface(
         usage_window: defaults
             .usage_window
             .as_deref()
-            .and_then(ironquill_tui::parse_window),
+            .and_then(ironquill_ui::parse_window),
         allowed_secrets: defaults.allowed_secrets.clone(),
         strict_commands: !defaults.lenient_commands,
         allowed_hosts: defaults.allowed_hosts.clone(),
         // With Claude Code installed, a pair is Opus planning, Sonnet coding.
         pair_mode: defaults.pair_mode.unwrap_or(claude.is_some()),
         tick: defaults.tick,
+        see_through: defaults.see_through,
+        opacity: defaults.opacity,
+        chat_width: defaults.chat_width,
         images: defaults.images.unwrap_or_default(),
         mermaid: defaults.mermaid.clone(),
         detect_checks,
@@ -398,14 +438,33 @@ async fn interface(
         claude: claude.unwrap_or_else(|| ClaudeCode::new("claude")),
         codex: codex.unwrap_or_else(|| Codex::new("codex")),
     };
-    ironquill_tui::run(
-        Arc::new(provider),
-        Arc::new(agents),
-        workspace,
-        settings,
-        start,
-    )
-    .await?;
+    match screen {
+        Screen::Terminal => {
+            ironquill_tui::run(
+                Arc::new(provider),
+                Arc::new(agents),
+                workspace,
+                settings,
+                start,
+            )
+            .await?;
+        }
+        Screen::Window => {
+            // The window needs the main thread, which this task runs on:
+            // the runtime's other threads carry its work meanwhile.
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                ironquill_gui::run(
+                    runtime,
+                    Arc::new(provider),
+                    Arc::new(agents),
+                    workspace,
+                    settings,
+                    start,
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 

@@ -15,7 +15,7 @@ Change no file: the person applies the changes they choose with /apply.";
 
 /// The request answering pull request `number`'s review comments, read
 /// with `gh` (`gh api --method GET` only), bots left out.
-pub(crate) fn request(root: &Path, number: &str) -> Result<String, String> {
+pub fn request(root: &Path, number: &str) -> Result<String, String> {
     let repo = gh(
         root,
         &[
@@ -102,7 +102,7 @@ fn gh(root: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Applies `patches` with `git apply`, all or none: each is checked first,
 /// with the counts of its hunks worked out again, as models get them wrong.
-pub(crate) fn apply(root: &Path, patches: &[String]) -> Result<(), String> {
+pub fn apply(root: &Path, patches: &[String]) -> Result<(), String> {
     let run = |patch: &str, check: bool| -> Result<(), String> {
         let mut args = vec!["apply", "--recount", "--whitespace=nowarn"];
         if check {
