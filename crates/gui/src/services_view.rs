@@ -17,7 +17,7 @@ use ironquill_ui::{App, MapView};
 
 use crate::api_view::{self, ApiView};
 use crate::plan::Plan;
-use crate::theme::{self, ACCENT, DIM, EDGE, LINK, MAGENTA, PANEL, RAISED, TEXT, YELLOW};
+use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, LINK, MAGENTA, PANEL, RAISED, TEXT, YELLOW};
 
 /// A card's size, and the room between cards of a column.
 const CARD: egui::Vec2 = egui::Vec2::new(220.0, 64.0);
@@ -47,6 +47,7 @@ fn look(via: Via) -> (Color32, &'static str) {
         Via::OpenApi => (LINK, "OpenAPI"),
         Via::Mcp => (MAGENTA, "MCP"),
         Via::Http => (YELLOW, "HTTP"),
+        Via::Cloud => (CYAN, "cloud"),
     }
 }
 
@@ -72,6 +73,10 @@ fn label(services: &Services, link: usize) -> String {
             }
         }
         Via::Http => "HTTP".to_owned(),
+        Via::Cloud => services.services[l.to]
+            .cloud
+            .map_or("cloud", |k| k.label())
+            .to_owned(),
     }
 }
 
@@ -649,6 +654,7 @@ mod tests {
             external: false,
             operations: Vec::new(),
             tools: Vec::new(),
+            cloud: None,
         }
     }
 

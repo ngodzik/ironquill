@@ -33,6 +33,8 @@ pub enum Via {
     Mcp,
     /// By plain HTTP, to a URL that names it.
     Http,
+    /// To a cloud resource an environment configures for it.
+    Cloud,
 }
 
 /// What an MCP server offers.
@@ -73,6 +75,8 @@ pub struct Service {
     pub operations: Vec<usize>,
     /// The MCP tools and prompts it offers.
     pub tools: Vec<Tool>,
+    /// What it is when a cloud resource: a database, a bucket, a role.
+    pub cloud: Option<crate::deployment::ElementKind>,
 }
 
 /// Where a link was read.
@@ -175,6 +179,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
                 external: false,
                 operations: Vec::new(),
                 tools: Vec::new(),
+                cloud: None,
             })
             .collect(),
         ..Services::default()
@@ -202,6 +207,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
                 external: false,
                 operations: Vec::new(),
                 tools: Vec::new(),
+                cloud: None,
             });
         }
     }
@@ -350,7 +356,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
                     let evidence = Evidence {
                         path: path.to_owned(),
                         line: number + 1,
-                        text: line.trim().to_owned(),
+                        text: crate::secret::scrub_line(line.trim()),
                     };
                     add(
                         &mut links,
@@ -401,6 +407,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
                         external: true,
                         operations: Vec::new(),
                         tools: Vec::new(),
+                        cloud: None,
                     });
                     services.services.len() - 1
                 }
@@ -445,22 +452,33 @@ fn via_of(path: &str) -> Via {
     }
 }
 
-/// The hosts without a dot and the paths of the `http(s)://` URLs in
-/// `text`: what can name a service.
+/// The service names and the paths of the `http(s)://` URLs in `text`
+/// whose host can name a service.
 fn urls(text: &str) -> Vec<(String, String)> {
     static URL: LazyLock<Option<Regex>> =
         LazyLock::new(|| Regex::new(r#"https?://([A-Za-z0-9_.-]+)(?::\d+)?(/[^\s"'<>`)]*)?"#).ok());
     URL.as_ref().map_or_else(Vec::new, |re| {
         re.captures_iter(text)
-            .filter(|c| !c[1].contains('.'))
-            .map(|c| {
-                (
-                    c[1].to_owned(),
+            .filter_map(|c| {
+                Some((
+                    service_host(&c[1])?.to_owned(),
                     c.get(2).map_or("/", |p| p.as_str()).to_owned(),
-                )
+                ))
             })
             .collect()
     })
+}
+
+/// The service a URL's host names: a host without a dot, or a
+/// Kubernetes service's DNS name, `<svc>.<ns>.svc[.cluster.local]`.
+fn service_host(host: &str) -> Option<&str> {
+    if !host.contains('.') {
+        return Some(host);
+    }
+    let rest = host
+        .strip_suffix(".svc.cluster.local")
+        .or_else(|| host.strip_suffix(".svc"))?;
+    rest.split('.').next().filter(|s| !s.is_empty())
 }
 
 /// Where `needle` is first written in `text` of the file `path`.
@@ -469,7 +487,7 @@ fn where_written(path: &str, text: &str, needle: &str) -> Option<Evidence> {
         line.contains(needle).then(|| Evidence {
             path: path.to_owned(),
             line: i + 1,
-            text: line.trim().to_owned(),
+            text: crate::secret::scrub_line(line.trim()),
         })
     })
 }
@@ -835,6 +853,7 @@ mod tests {
                     external: false,
                     operations: Vec::new(),
                     tools: Vec::new(),
+                    cloud: None,
                 },
                 Service {
                     name: "backend".into(),
@@ -842,6 +861,7 @@ mod tests {
                     external: false,
                     operations: Vec::new(),
                     tools: Vec::new(),
+                    cloud: None,
                 },
             ],
             ..Services::default()
@@ -852,6 +872,13 @@ mod tests {
         assert_eq!(
             urls("see https://name.app/x and http://api:80/y"),
             [("api".to_owned(), "/y".to_owned())]
+        );
+        assert_eq!(
+            urls("http://tools.agents.svc.cluster.local:9000/mcp http://api.web.svc/v1"),
+            [
+                ("tools".to_owned(), "/mcp".to_owned()),
+                ("api".to_owned(), "/v1".to_owned())
+            ]
         );
     }
 }
