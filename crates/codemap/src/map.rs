@@ -9,7 +9,7 @@ use crate::imports;
 
 /// Beyond this a file is not read: its lines are not counted and its
 /// imports not looked for. A generated file that big says nothing useful;
-/// an API's spec can come close (Airflow's is half a megabyte).
+/// an API's spec can come close (a large one's is half a megabyte).
 const MAX_READ: u64 = 2 * 1024 * 1024;
 
 /// What a source file is written in, as far as the drawing cares.
@@ -135,6 +135,8 @@ pub struct CodeMap {
     /// The operations of the project's OpenAPI specs, with who serves and
     /// who calls each.
     pub operations: Vec<crate::api::Operation>,
+    /// The services it runs, what each serves, and who reaches whom.
+    pub services: crate::services::Services,
 }
 
 impl CodeMap {
@@ -278,6 +280,7 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
         edges: Vec::new(),
         left_out,
         operations: Vec::new(),
+        services: crate::services::Services::default(),
     };
     let mut index: HashMap<String, usize> = HashMap::from([(String::new(), 0)]);
     let mut sources: Vec<(usize, String)> = Vec::new();
@@ -358,6 +361,7 @@ pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
             });
         }
     }
+    map.services = crate::services::read(root, &map, &sources);
     map
 }
 

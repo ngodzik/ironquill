@@ -20,6 +20,7 @@ mod error;
 mod keys;
 mod plan;
 mod review_view;
+mod services_view;
 mod theme;
 mod transcript;
 mod universe;
@@ -61,6 +62,14 @@ use crate::plan::Plan;
 use crate::theme::{ACCENT, DIM, EDGE, PANEL, RAISED, SELECTED, TEXT, YELLOW};
 use crate::universe::{Assets3d, Universe};
 use crate::usage::UsageView;
+
+/// How the window's pixels blend with what is behind it. Metal offers only
+/// `Opaque` and `PostMultiplied`: asked for another, the surface cannot be
+/// made and the window stops at its first frame.
+#[cfg(target_os = "macos")]
+const COMPOSITE_ALPHA: CompositeAlphaMode = CompositeAlphaMode::PostMultiplied;
+#[cfg(not(target_os = "macos"))]
+const COMPOSITE_ALPHA: CompositeAlphaMode = CompositeAlphaMode::PreMultiplied;
 
 /// How long the window may sleep while a request runs: the spinner turns
 /// and the agent's messages show within it.
@@ -114,6 +123,7 @@ where
         api: api_view::ApiView::default(),
         review: review_view::ReviewView::default(),
         database: database_view::DatabaseView::default(),
+        services: services_view::ServicesView::default(),
         app,
         host,
         runtime,
@@ -142,7 +152,7 @@ where
                         // Made see-through from the start: a window cannot
                         // become so later. Opaque, its panels hide it all.
                         transparent: true,
-                        composite_alpha_mode: CompositeAlphaMode::PreMultiplied,
+                        composite_alpha_mode: COMPOSITE_ALPHA,
                         ..default()
                     }),
                     ..default()
@@ -206,6 +216,8 @@ struct Shell<M, D> {
     review: review_view::ReviewView,
     /// The tables the project's models define.
     database: database_view::DatabaseView,
+    /// The services the project runs, and who reaches whom.
+    services: services_view::ServicesView,
     /// The conversation's scroll as the state last had it, in lines: a key
     /// that scrolls changes it, and the view follows by the difference.
     scroll_seen: usize,
@@ -519,7 +531,13 @@ where
     shell.plan.showing(
         matches!(
             view,
-            Some(MapView::Plan | MapView::Api | MapView::Review | MapView::Database)
+            Some(
+                MapView::Plan
+                    | MapView::Services
+                    | MapView::Api
+                    | MapView::Review
+                    | MapView::Database
+            )
         ),
         now,
         shell.app.transcript(),
@@ -543,9 +561,11 @@ where
         egui::CentralPanel::default()
             .frame(match view {
                 MapView::Universe => Frame::NONE,
-                MapView::Plan | MapView::Api | MapView::Review | MapView::Database => {
-                    Frame::NONE.fill(background)
-                }
+                MapView::Plan
+                | MapView::Services
+                | MapView::Api
+                | MapView::Review
+                | MapView::Database => Frame::NONE.fill(background),
             })
             .show(&mut root, |ui| match view {
                 MapView::Universe => {
@@ -559,6 +579,13 @@ where
                     &shell.review,
                     &mut shell.app,
                     &mut shell.effects,
+                ),
+                MapView::Services => services_view::show(
+                    ui,
+                    &mut shell.services,
+                    &shell.plan,
+                    &mut shell.api,
+                    &mut shell.app,
                 ),
                 MapView::Database => {
                     database_view::show(ui, &mut shell.database, &shell.review, &mut shell.app);

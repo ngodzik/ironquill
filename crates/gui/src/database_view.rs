@@ -931,8 +931,8 @@ class Log(Base):
         assert_eq!(short_type("?"), "");
         assert_eq!(cut("exceeds_max_non_backfill", 10), "exceeds_m…");
         assert_eq!(cut("dag_id", 10), "dag_id");
-        assert!(models_may_be_in("airflow/models/dag.py"));
-        assert!(!models_may_be_in("airflow/migrations/versions/0001_x.py"));
+        assert!(models_may_be_in("app/models/dag.py"));
+        assert!(!models_may_be_in("app/migrations/versions/0001_x.py"));
         assert!(!models_may_be_in("tests/models/test_dag.py"));
     }
 }

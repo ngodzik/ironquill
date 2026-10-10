@@ -698,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlalchemy_columns_keys_and_constraints_as_airflow_writes_them() {
+    fn sqlalchemy_columns_keys_and_constraints() {
         let text = r#"
 class DagModel(Base):
     __tablename__ = "dag"
@@ -794,7 +794,7 @@ class TaskInstance(Base):
         let ti = &schema.tables[2];
         assert!(ti.columns[..2].iter().all(|c| c.primary));
         assert_eq!(ti.columns[1].references.as_ref().unwrap().table, "dag_run");
-        // Named, as Airflow writes some.
+        // Named, as some models write them.
         assert_eq!(ti.columns[2].references.as_ref().unwrap().table, "trigger");
 
         let links = schema.foreign_keys();

@@ -37,11 +37,11 @@ pub struct Definition {
 /// # Examples
 ///
 /// ```no_run
-/// let lines = vec!["from airflow.models.asset import AssetModel".to_owned()];
+/// let lines = vec!["from app.models.asset import AssetModel".to_owned()];
 /// let found = ironquill_tools::definitions(
 ///     std::path::Path::new("."),
 ///     "AssetModel",
-///     std::path::Path::new("airflow/api/routes.py"),
+///     std::path::Path::new("app/api/routes.py"),
 ///     &lines,
 /// );
 /// if let Some(first) = found.first() {
@@ -155,7 +155,7 @@ pub fn uses(root: &Path, name: &str) -> Vec<Definition> {
 }
 
 /// The files `lines`, the text of `from`, imports `name` from, as ends of
-/// paths: `airflow/models/asset.py` for `from airflow.models.asset import
+/// paths: `app/models/asset.py` for `from app.models.asset import
 /// AssetModel`, `src/api.ts` for `import { get } from "./api"` in `src/`.
 fn imported_from(from: &Path, name: &str, lines: &[String]) -> Vec<String> {
     let mut found = Vec::new();
@@ -311,26 +311,23 @@ mod tests {
     #[test]
     fn the_definition_imported_comes_before_one_of_the_same_name() {
         let dir = repo(&[
-            (
-                "airflow/models/asset.py",
-                "class AssetModel(Base):\n    pass\n",
-            ),
-            ("airflow/other/asset.py", "class AssetModel:\n    pass\n"),
+            ("app/models/asset.py", "class AssetModel(Base):\n    pass\n"),
+            ("app/other/asset.py", "class AssetModel:\n    pass\n"),
             ("tests/test_asset.py", "class AssetModel:\n    pass\n"),
             (
-                "airflow/api/routes.py",
-                "from airflow.models.asset import AssetModel\n\nx = AssetModel()\n",
+                "app/api/routes.py",
+                "from app.models.asset import AssetModel\n\nx = AssetModel()\n",
             ),
         ]);
-        let from = Path::new("airflow/api/routes.py");
+        let from = Path::new("app/api/routes.py");
         let text = lines(&std::fs::read_to_string(dir.path().join(from)).unwrap());
         let found = definitions(dir.path(), "AssetModel", from, &text);
         let paths: Vec<&str> = found.iter().map(|d| d.path.as_str()).collect();
         assert_eq!(
             paths,
             [
-                "airflow/models/asset.py",
-                "airflow/other/asset.py",
+                "app/models/asset.py",
+                "app/other/asset.py",
                 "tests/test_asset.py"
             ]
         );

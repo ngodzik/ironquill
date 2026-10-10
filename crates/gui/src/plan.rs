@@ -1140,7 +1140,7 @@ fn trail(ui: &mut Ui, at: Pos2, level: &str, project: &str) -> Option<String> {
 
 /// The two views of the codebase, top right, to pick with the mouse.
 pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
-    let area = Rect::from_min_size(rect.right_top() + vec2(-404.0, 20.0), vec2(380.0, 30.0));
+    let area = Rect::from_min_size(rect.right_top() + vec2(-504.0, 20.0), vec2(480.0, 30.0));
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(area)
@@ -1151,6 +1151,7 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
                 ("Universe", MapView::Universe),
                 ("Database", MapView::Database),
                 ("API", MapView::Api),
+                ("Services", MapView::Services),
                 ("Plan", MapView::Plan),
             ];
             if app.change_set().is_some() {
