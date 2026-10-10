@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 mod app;
+mod awake;
 pub mod blocks;
 pub mod changes;
 pub mod clipboard;
@@ -30,7 +31,8 @@ pub mod usage;
 
 pub use app::{
     AgentMessage, App, CompactRow, DEFAULT_OPACITY, DefinitionChoice, DockerPane, Effect, Entry,
-    Found, LineEditor, Lookup, MapView, Panes, Settings, SubAgent, parse_window, step_title,
+    Found, LineEditor, Lookup, MapView, Panes, Settings, SubAgent, TickStatus, parse_window,
+    step_title,
 };
 pub use defaults::{Defaults, Images};
 pub use host::{Host, Incoming, Start, Waiting};

@@ -21,5 +21,5 @@ pub use config::{
     AgentConfig, AgentConfigBuilder, Answer, Approval, Approver, COMPACT_AT, Member, Pair, Question,
 };
 pub use error::AgentError;
-pub use event::Event;
+pub use event::{Event, Purpose};
 pub use run::{Compaction, Outcome, Session, Subject, Verdict, run};

@@ -231,6 +231,7 @@ impl Codex {
                 cache: Some(CacheUse {
                     read: TokenCount(tokens.cache_read),
                     written: None,
+                    rewrite_extra: None,
                 }),
             });
         }

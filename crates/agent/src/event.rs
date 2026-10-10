@@ -1,6 +1,46 @@
 use ironquill_core::{CacheUse, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::ToolSummary;
 
+/// What a call to a model was for: what its cost is put down to, and what
+/// a tick kept warm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub enum Purpose {
+    /// The conversation itself.
+    #[default]
+    Chat,
+    /// A pair's planner, planning or reviewing.
+    PlanReview,
+    /// A pair's coder.
+    Code,
+    /// Anything else: a summary, a question to the cheapest model.
+    Other,
+    /// A tick keeping the conversation's own agent session warm.
+    ChatTick,
+    /// A tick keeping a pair's planner session warm.
+    PairTick,
+}
+
+impl Purpose {
+    /// Its name, as the usage log keeps it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::PlanReview => "plan/review",
+            Self::Code => "code",
+            Self::Other => "other",
+            Self::ChatTick => "tick-chat",
+            Self::PairTick => "tick-pair",
+        }
+    }
+
+    /// Whether the call only kept a cache warm.
+    #[must_use]
+    pub fn is_tick(self) -> bool {
+        matches!(self, Self::ChatTick | Self::PairTick)
+    }
+}
+
 /// Something that happened during a session, for whoever is watching.
 ///
 /// The loop reports and never prints; the command line, and later the TUI,
@@ -22,6 +62,8 @@ pub enum Event {
         context: Option<ContextUse>,
         /// What it read from the prompt cache and wrote to it, when known.
         cache: Option<CacheUse>,
+        /// What the call was for.
+        purpose: Purpose,
     },
     /// Text as it is being written, by an agent that reports it in pieces.
     Saying {

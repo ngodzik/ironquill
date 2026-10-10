@@ -107,6 +107,9 @@ pub struct Host<M, D> {
     save_pending: bool,
     /// The project's language servers, each started when first needed.
     servers: Arc<Servers>,
+    /// The machine kept from idle sleep while ticks run; released when
+    /// they stop, and when the host goes, however the loop ends.
+    awake: crate::awake::Awake,
 }
 
 impl<M, D> Host<M, D>
@@ -142,6 +145,7 @@ where
             warm_tick: tokio::time::interval(Duration::from_secs(30)),
             save_pending: false,
             servers: Arc::new(Servers::new(workspace_root)),
+            awake: crate::awake::Awake::default(),
         }
     }
 
@@ -202,6 +206,11 @@ where
     /// loop: a save that waited for the request to end, and the choices to
     /// keep for the next session.
     pub async fn carry_out(&mut self, app: &mut App, effect: Option<Effect>) {
+        // Checked every turn: held exactly while ticks can run.
+        if let Some(said) = self.awake.hold(app.wants_awake()) {
+            app.report_info(&said);
+        }
+        app.set_kept_awake(self.awake.is_held());
         if self.save_pending && !app.is_running() {
             self.save_pending = false;
             save(self.store.as_ref(), app, &self.conversation).await;
@@ -299,20 +308,30 @@ where
                 save(store, app, conversation).await;
             }
             Effect::KeepWarm => {
-                // In the background, while the conversation waits; a request
-                // sent meanwhile waits for it.
+                // In the background, the conversation held only to list the
+                // ticks due and to mark them read, never during the calls:
+                // a request sent meanwhile is not kept waiting.
                 let conversation = Arc::clone(conversation);
                 let delegate = Arc::clone(delegate);
                 let root = workspace.root().to_owned();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    let mut guard = conversation.lock().await;
-                    guard
-                        .session
-                        .keep_warm(&*delegate, &root, |e| {
-                            let _ = tx.send(AgentMessage::Event(e));
-                        })
-                        .await;
+                    let ticks = conversation.lock().await.session.due_ticks(&root);
+                    let mut last = None;
+                    for tick in ticks {
+                        let events = tx.clone();
+                        let read = tick
+                            .run(&*delegate, |e| {
+                                let _ = events.send(AgentMessage::Event(e));
+                            })
+                            .await;
+                        if read {
+                            let at = crate::sessions::now();
+                            conversation.lock().await.session.ticked(tick.pair, at);
+                            last = Some(at);
+                        }
+                    }
+                    let _ = tx.send(AgentMessage::Ticked(last));
                 });
             }
             Effect::PlanCompaction(config) => {
@@ -365,6 +384,13 @@ where
                         .await
                         .map_err(|e| error_chain(&e));
                     let _ = tx.send(AgentMessage::Compacted(result));
+                });
+            }
+            Effect::DropExchanges(keep) => {
+                let (conversation, tx) = (Arc::clone(conversation), tx.clone());
+                tokio::spawn(async move {
+                    let (before, after) = conversation.lock().await.session.drop_exchanges(&keep);
+                    let _ = tx.send(AgentMessage::Dropped(before, after));
                 });
             }
             Effect::Find(lookup) => {
@@ -563,11 +589,13 @@ async fn resume(
     };
     match store.find(id).and_then(|id| store.load(&id)) {
         Ok(saved) => {
+            let last_read = saved.session.last_read();
             *conversation.lock().await = Conversation {
                 session: saved.session.clone(),
                 toolbox: Toolbox::new(workspace.clone()),
             };
             app.load_saved(saved);
+            app.ticks_restored(last_read);
         }
         Err(e) => app.report_error(e),
     }

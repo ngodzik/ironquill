@@ -109,12 +109,17 @@ pub struct TokenCount(pub u64);
 /// What a call read from the provider's prompt cache, and wrote to it. A
 /// provider that says nothing of its cache gives none of this: unknown, not
 /// a cache that never hits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct CacheUse {
     /// Input tokens read from the cache.
     pub read: TokenCount,
     /// Input tokens written to it, when the provider says.
     pub written: Option<TokenCount>,
+    /// What the call would have cost more had what it read been written to
+    /// the cache again, as after an expiry, at the model's list prices,
+    /// when they are known: what a warm cache saved it.
+    #[serde(default)]
+    pub rewrite_extra: Option<Usd>,
 }
 
 impl Add for TokenCount {

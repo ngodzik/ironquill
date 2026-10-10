@@ -410,6 +410,7 @@ impl WireUsage {
         (read.is_some() || written.is_some()).then(|| CacheUse {
             read: TokenCount(read.unwrap_or(0)),
             written,
+            rewrite_extra: None,
         })
     }
 }

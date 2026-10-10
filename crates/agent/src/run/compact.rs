@@ -1,6 +1,7 @@
 //! Compacting a conversation by subject: ironquill cuts it into exchanges,
 //! the cheapest model groups them by subject from their titles, the person
-//! picks what to keep, and the same model sums it up.
+//! picks what to keep, and the same model sums it up; or what is not kept
+//! is dropped, with no summary and no model at all.
 
 use ironquill_core::{
     Agent, ChatModel, Delegate, DelegateRequest, Effort, Message, ModelId, TokenCount,
@@ -13,15 +14,22 @@ use super::{
 };
 use crate::config::AgentConfig;
 use crate::error::AgentError;
-use crate::event::Event;
+use crate::event::{Event, Purpose};
 
 /// Subjects of a conversation, for the person to pick what to keep.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Compaction {
     /// Each exchange's title: the start of its request.
     pub exchanges: Vec<String>,
-    /// The subjects, each a name and its exchanges, every exchange in one.
+    /// The subjects, each a name and its exchanges in a row, every exchange
+    /// in one, in the order of the conversation.
     pub subjects: Vec<Subject>,
+    /// About what each exchange adds to the context.
+    pub sizes: Vec<TokenCount>,
+    /// When each exchange was asked, in seconds since 1970, when known.
+    pub asked: Vec<Option<u64>>,
+    /// About what the whole conversation holds.
+    pub context: TokenCount,
 }
 
 /// Exchanges about one thing.
@@ -76,8 +84,19 @@ impl Session {
         config: &AgentConfig,
         observe: impl FnMut(Event) + Send,
     ) -> Result<Compaction, AgentError> {
-        let exchanges: Vec<String> = self
-            .exchange_ranges()
+        let ranges = self.exchange_ranges();
+        let sizes = ranges
+            .iter()
+            .map(|(start, end)| {
+                TokenCount(crate::context::approx_tokens(&self.messages[*start..*end]))
+            })
+            .collect();
+        let asked = ranges
+            .iter()
+            .map(|(start, _)| self.asked.get(start).copied())
+            .collect();
+        let context = TokenCount(crate::context::approx_tokens(&self.messages));
+        let exchanges: Vec<String> = ranges
             .iter()
             .map(|(start, _)| match &self.messages[*start] {
                 Message::User(text) => {
@@ -108,6 +127,9 @@ impl Session {
             return Ok(Compaction {
                 subjects: each(),
                 exchanges,
+                sizes,
+                asked,
+                context,
             });
         }
         let list: String = exchanges
@@ -125,10 +147,14 @@ impl Session {
         .await;
         let subjects = reply
             .and_then(|reply| subjects_of(&reply, exchanges.len()))
+            .map(in_a_row)
             .unwrap_or_else(each);
         Ok(Compaction {
             exchanges,
             subjects,
+            sizes,
+            asked,
+            context,
         })
     }
 
@@ -190,11 +216,27 @@ impl Session {
         } else {
             self.summary = None;
         }
+        // The summary is as old as the latest exchange it tells.
+        let mut asked = std::collections::BTreeMap::new();
+        if let Some(when) = ranges
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep.contains(i) && Some(*i) != last)
+            .filter_map(|(_, (start, _))| self.asked.get(start))
+            .max()
+            && compacted.len() > 1
+        {
+            asked.insert(1, *when);
+        }
         if let Some(last) = last {
             let (start, end) = ranges[last];
+            if let Some(when) = self.asked.get(&start) {
+                asked.insert(compacted.len(), *when);
+            }
             compacted.extend_from_slice(&self.messages[start..end]);
         }
         self.messages = compacted;
+        self.asked = asked;
         // Their sessions held what was just dropped.
         self.agents.clear();
         self.planners.clear();
@@ -202,6 +244,71 @@ impl Session {
         let after = crate::context::approx_tokens(&self.messages);
         Ok((TokenCount(before), TokenCount(after)))
     }
+}
+
+impl Session {
+    /// Drops the exchanges not in `keep`, with no summary and no model: what
+    /// is kept stays as it was. The agents' sessions end, as they held what
+    /// was dropped. Returns about how many tokens it held before, and after.
+    pub fn drop_exchanges(&mut self, keep: &[usize]) -> (TokenCount, TokenCount) {
+        self.settle();
+        let before = crate::context::approx_tokens(&self.messages);
+        let ranges = self.exchange_ranges();
+        let first = ranges.first().map_or(self.messages.len(), |r| r.0);
+        let mut kept: Vec<Message> = self.messages[..first].to_vec();
+        let mut asked = std::collections::BTreeMap::new();
+        // A summary still tells what it covered when all of that is kept.
+        let mut summary_holds = true;
+        for (i, (start, end)) in ranges.iter().enumerate() {
+            if keep.contains(&i) {
+                if let Some(when) = self.asked.get(start) {
+                    asked.insert(kept.len(), *when);
+                }
+                kept.extend_from_slice(&self.messages[*start..*end]);
+            } else if self.summary.as_ref().is_some_and(|s| *start < s.covers) {
+                summary_holds = false;
+            }
+        }
+        if !summary_holds {
+            self.summary = None;
+        }
+        self.messages = kept;
+        self.asked = asked;
+        self.agents.clear();
+        self.planners.clear();
+        self.coders.clear();
+        let after = crate::context::approx_tokens(&self.messages);
+        (TokenCount(before), TokenCount(after))
+    }
+}
+
+/// Subjects in the order of the conversation, each a run of exchanges in a
+/// row: a subject the model scattered is cut into its runs, so that what
+/// is kept or dropped reads as stretches of the conversation.
+fn in_a_row(subjects: Vec<Subject>) -> Vec<Subject> {
+    let mut runs: Vec<Subject> = Vec::new();
+    for subject in subjects {
+        let mut exchanges = subject.exchanges;
+        exchanges.sort_unstable();
+        let mut run: Vec<usize> = Vec::new();
+        for e in exchanges {
+            if run.last().is_some_and(|last| last + 1 != e) {
+                runs.push(Subject {
+                    name: subject.name.clone(),
+                    exchanges: std::mem::take(&mut run),
+                });
+            }
+            run.push(e);
+        }
+        if !run.is_empty() {
+            runs.push(Subject {
+                name: subject.name,
+                exchanges: run,
+            });
+        }
+    }
+    runs.sort_by_key(|s| s.exchanges.first().copied());
+    runs
 }
 
 /// Asks the cheapest priced model one small question; with none, Claude
@@ -280,6 +387,7 @@ impl<'a, M, D, O> Ctx<'a, M, D, O> {
             toolbox,
             ledger: Ledger::new(),
             observe,
+            purpose: Purpose::Other,
             thread: None,
             catch_up: String::new(),
             effort: config.effort,
@@ -398,6 +506,45 @@ mod tests {
         assert!(
             matches!(&asked[1].messages[1], Message::User(t) if t.contains("add a test") && !t.contains("and the docs?"))
         );
+    }
+
+    #[test]
+    fn scattered_subjects_are_cut_into_runs_in_the_conversations_order() {
+        let subjects = in_a_row(subjects_of("Parser: 1, 3, 4\nDocs: 2, 5", 5).unwrap());
+        let runs: Vec<(&str, &[usize])> = subjects
+            .iter()
+            .map(|s| (s.name.as_str(), s.exchanges.as_slice()))
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("Parser", &[0][..]),
+                ("Docs", &[1][..]),
+                ("Parser", &[2, 3][..]),
+                ("Docs", &[4][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_keeps_the_rest_as_it_was_with_no_model() {
+        let mut session = Session::new();
+        for asked in ["fix the parser", "add a test", "and the docs?"] {
+            session.asked.insert(session.messages.len(), 100);
+            session.messages.push(Message::user(asked));
+            session.messages.push(Message::Assistant {
+                content: Some("Done.".into()),
+                tool_calls: vec![],
+            });
+        }
+        session.asked.insert(5, 300);
+        let (before, after) = session.drop_exchanges(&[0, 2]);
+        assert!(after < before);
+        assert_eq!(session.messages.len(), 5);
+        assert!(matches!(&session.messages[3], Message::User(t) if t == "and the docs?"));
+        // The times moved with their exchanges.
+        assert_eq!(session.asked.get(&3), Some(&300));
+        assert_eq!(session.asked.len(), 2);
     }
 
     #[test]

@@ -353,6 +353,10 @@ impl StreamParser {
                         .prices
                         .as_ref()
                         .and_then(|prices| prices.cost(&self.model, tokens));
+                    let rewrite_extra = self
+                        .prices
+                        .as_ref()
+                        .and_then(|prices| prices.rewrite_extra(&self.model, tokens.cache_read));
                     on_event(DelegateEvent::Usage {
                         usage,
                         cost,
@@ -360,6 +364,7 @@ impl StreamParser {
                         cache: Some(CacheUse {
                             read: TokenCount(tokens.cache_read),
                             written: Some(TokenCount(tokens.cache_write)),
+                            rewrite_extra,
                         }),
                     });
                 }
@@ -583,6 +588,7 @@ mod tests {
             Some(CacheUse {
                 read: TokenCount(100_000),
                 written: Some(TokenCount(2_000)),
+                rewrite_extra: Some(Usd(100_000.0 * (5e-6 - 2e-7))),
             })
         );
         assert!(parser.finish().unwrap().billed);

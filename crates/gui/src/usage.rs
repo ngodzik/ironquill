@@ -14,7 +14,7 @@ use egui_plot::{
 };
 use ironquill_core::TokenCount;
 use ironquill_ui::sessions;
-use ironquill_ui::usage::{ModelUse, UsageLog, window_name};
+use ironquill_ui::usage::{ModelUse, ROLES, TickBalance, UsageLog, window_name};
 
 use crate::theme::{ACCENT, CYAN, DIM, EDGE, RAISED, TEXT, rgb};
 
@@ -27,8 +27,23 @@ const WINDOWS: [u64; 3] = [3600, 6 * 3600, 24 * 3600];
 /// Where cache rebuilds stand out: the warm orange of the terminal's marks.
 const REBUILD: Color32 = Color32::from_rgb(230, 126, 34);
 
-/// The context line, neutral beside the models' colours.
-const CONTEXT: Color32 = Color32::from_rgb(150, 160, 180);
+/// Each role's context line, in the order of `ROLES`: the chat's neutral
+/// beside the models' colours, the others apart from it and each other.
+const ROLE_COLOURS: [Color32; 4] = [
+    Color32::from_rgb(150, 160, 180),
+    Color32::from_rgb(170, 120, 230),
+    Color32::from_rgb(80, 200, 120),
+    Color32::from_rgb(230, 190, 70),
+];
+
+/// A line drawn on a plot: its name, its colour and its points.
+type Drawn<P> = (String, Color32, Vec<P>);
+
+/// A model's cost line, with its ticks on it.
+type WithTicks = (Drawn<[f64; 2]>, Vec<[f64; 2]>);
+
+/// What ticks saved, when it is more than they cost.
+const GAIN: Color32 = Color32::from_rgb(80, 200, 120);
 
 /// What the pane remembers between frames: when it opened, to draw itself
 /// in.
@@ -74,6 +89,11 @@ pub(crate) fn show(ui: &mut Ui, view: &mut UsageView, log: &UsageLog, window: u6
     }
 
     tiles(ui, log, &models, from, window, progress);
+    let balance = log.tick_balance(from);
+    if balance.ticks > 0 {
+        ui.add_space(8.0);
+        ticks(ui, balance);
+    }
     ui.add_space(14.0);
     section(ui, "Cost", "added up, per model");
     cost_plot(ui, log, &models, from, window, progress);
@@ -81,9 +101,9 @@ pub(crate) fn show(ui: &mut Ui, view: &mut UsageView, log: &UsageLog, window: u6
     section(
         ui,
         "Context",
-        "how full the conversation is, and the caches rebuilt",
+        "how full each role's context is, the chat's cache, and the caches rebuilt",
     );
-    context_plot(ui, log, from, window, progress);
+    context_plot(ui, log, from, now, window, progress);
     ui.add_space(14.0);
     section(
         ui,
@@ -188,6 +208,47 @@ fn tiles(ui: &mut Ui, log: &UsageLog, models: &[ModelUse], from: u64, window: u6
     });
 }
 
+/// What ticks cost over the window, what they saved by keeping caches warm,
+/// and the difference: whether they paid for themselves.
+fn ticks(ui: &mut Ui, balance: TickBalance) {
+    let net = balance.saved - balance.spent;
+    Frame::new()
+        .fill(RAISED)
+        .stroke(Stroke::new(1.0, EDGE))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Ticks").strong().color(CYAN));
+                ui.label(
+                    RichText::new(format!(
+                        "{} · spent ${:.3} · saved ${:.3}",
+                        balance.ticks, balance.spent, balance.saved
+                    ))
+                    .color(TEXT),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (sign, colour) = if net >= 0.0 {
+                        ("+", GAIN)
+                    } else {
+                        ("-", REBUILD)
+                    };
+                    ui.label(
+                        RichText::new(format!("net {sign}${:.3}", net.abs()))
+                            .strong()
+                            .color(colour),
+                    );
+                })
+                .response
+                .on_hover_text(
+                    "What the requests after a pause would have paid more to write their \
+                     cache again, less what the ticks that kept it warm cost",
+                );
+            });
+        });
+}
+
 /// Seconds after `from` as minutes before now, the plots' x.
 fn minutes_before_now(seconds_after_from: f64, window: u64) -> f64 {
     (seconds_after_from - window as f64) / 60.0
@@ -287,16 +348,19 @@ fn cost_plot(
     window: u64,
     progress: f32,
 ) {
-    let lines: Vec<(String, Color32, Vec<[f64; 2]>)> = models
+    let lines: Vec<WithTicks> = models
         .iter()
         .map(|m| {
             let mut steps = log.cost_steps(&m.model, from);
             let last = steps.last().map_or(0.0, |p| p.1);
             steps.push((window as f64, last));
             (
-                m.model.clone(),
-                rgb(m.color),
-                revealed(&steps, window, progress),
+                (
+                    m.model.clone(),
+                    rgb(m.color),
+                    revealed(&steps, window, progress),
+                ),
+                revealed(&log.tick_points(&m.model, from), window, progress),
             )
         })
         .collect();
@@ -318,6 +382,15 @@ fn cost_plot(
                 plot_name,
                 position,
                 ..
+            } if plot_name.ends_with(" tick") => Some(format!(
+                "{plot_name} {}\n${:.4} by then",
+                ago(position.x),
+                position.y
+            )),
+            HoverPosition::NearDataPoint {
+                plot_name,
+                position,
+                ..
             } if !plot_name.is_empty() => Some(format!(
                 "{plot_name}\n${:.4} by {}",
                 position.y,
@@ -326,7 +399,7 @@ fn cost_plot(
             _ => None,
         })
         .show(ui, |plot| {
-            for (name, colour, points) in lines {
+            for ((name, colour, points), ticks) in lines {
                 // Two wide faint lines under the sharp one: the glow.
                 for (width, alpha) in [(12.0, 0.07), (6.0, 0.18)] {
                     plot.line(
@@ -338,12 +411,22 @@ fn cost_plot(
                 }
                 let head = points.last().copied();
                 plot.line(
-                    Line::new(name, PlotPoints::from(points))
+                    Line::new(name.clone(), PlotPoints::from(points))
                         .color(colour)
                         .width(2.0)
                         .fill(0.0)
                         .fill_alpha(0.14),
                 );
+                // The ticks, as small rings on the line they add to.
+                if !ticks.is_empty() {
+                    plot.points(
+                        Points::new(format!("{name} tick"), PlotPoints::from(ticks))
+                            .color(colour)
+                            .shape(MarkerShape::Circle)
+                            .filled(false)
+                            .radius(3.0),
+                    );
+                }
                 // Where the line stands now, lit.
                 if let Some(head) = head {
                     head_mark(plot, head, colour);
@@ -370,20 +453,46 @@ fn head_mark(plot: &mut egui_plot::PlotUi<'_>, at: [f64; 2], colour: Color32) {
     );
 }
 
-/// The conversation's context over time, and the calls that wrote most of
-/// their input to the cache: it had expired.
-fn context_plot(ui: &mut Ui, log: &UsageLog, from: u64, window: u64, progress: f32) {
-    let line = log.context_line(from);
-    let top = line
+/// Each role's context over time, labelled with where it stands now, the
+/// chat's cached prefix (down to nothing once it expired), and the calls
+/// that wrote most of their input to the cache: it had expired.
+fn context_plot(ui: &mut Ui, log: &UsageLog, from: u64, now: u64, window: u64, progress: f32) {
+    let roles: Vec<Drawn<(f64, f64)>> = ROLES
         .iter()
-        .chain(&log.rebuilds(from))
+        .zip(ROLE_COLOURS)
+        .map(|(role, colour)| (role.to_string(), colour, log.context_of(role, from, now)))
+        .filter(|(_, _, line)| !line.is_empty())
+        .collect();
+    let cache = log.chat_cache(from, now);
+    let rebuilt = log.rebuilds(from);
+    let top = roles
+        .iter()
+        .flat_map(|(_, _, line)| line)
+        .chain(&cache)
+        .chain(&rebuilt)
         .map(|p| p.1)
         .fold(1_000.0_f64, f64::max)
         * 1.15;
-    let context = revealed(&line, window, progress);
-    let rebuilds: Vec<[f64; 2]> = revealed(&log.rebuilds(from), window, progress);
+    // Where a line stands now, for its name in the legend.
+    let named = |name: &str, line: &[(f64, f64)]| match line.last() {
+        Some(&(_, y)) => format!("{name} · {}", tokens(y)),
+        None => name.to_owned(),
+    };
+    let cache_name = named("chat cache", &cache);
+    let cache = revealed(&cache, window, progress);
+    let rebuilds = revealed(&rebuilt, window, progress);
+    let roles: Vec<Drawn<[f64; 2]>> = roles
+        .into_iter()
+        .map(|(role, colour, line)| {
+            (
+                named(&role, &line),
+                colour,
+                revealed(&line, window, progress),
+            )
+        })
+        .collect();
     base_plot("usage-context", window, top)
-        .height(130.0)
+        .height(150.0)
         .y_axis_formatter(|mark: GridMark, _| tokens(mark.value.max(0.0)))
         .label_formatter(|hover: &HoverPosition<'_>| match hover {
             HoverPosition::NearDataPoint {
@@ -395,12 +504,15 @@ fn context_plot(ui: &mut Ui, log: &UsageLog, from: u64, window: u64, progress: f
                 ago(position.x),
                 TokenCount(position.y as u64)
             )),
+            // The name without where the line stands now: the point may be
+            // earlier.
             HoverPosition::NearDataPoint {
-                plot_name: "context",
+                plot_name,
                 position,
                 ..
-            } => Some(format!(
-                "context {}\n{}",
+            } if !plot_name.is_empty() => Some(format!(
+                "{} {}\n{}",
+                plot_name.split(" · ").next().unwrap_or(plot_name),
                 ago(position.x),
                 TokenCount(position.y as u64)
             )),
@@ -412,22 +524,32 @@ fn context_plot(ui: &mut Ui, log: &UsageLog, from: u64, window: u64, progress: f
                 .background_alpha(0.85),
         )
         .show(ui, |plot| {
-            let head = context.last().copied();
-            plot.line(
-                Line::new("", PlotPoints::from(context.clone()))
-                    .color(CONTEXT.gamma_multiply(0.15))
-                    .width(6.0)
-                    .allow_hover(false),
-            );
-            plot.line(
-                Line::new("context", PlotPoints::from(context))
-                    .color(CONTEXT)
-                    .width(1.5)
-                    .fill(0.0)
-                    .fill_alpha(0.08),
-            );
-            if let Some(head) = head {
-                head_mark(plot, head, CONTEXT);
+            // The cache first, a filled band under the lines it serves.
+            if !cache.is_empty() {
+                plot.line(
+                    Line::new(cache_name, PlotPoints::from(cache))
+                        .color(CYAN.gamma_multiply(0.7))
+                        .width(1.0)
+                        .fill(0.0)
+                        .fill_alpha(0.12),
+                );
+            }
+            for (name, colour, line) in roles {
+                let head = line.last().copied();
+                plot.line(
+                    Line::new("", PlotPoints::from(line.clone()))
+                        .color(colour.gamma_multiply(0.15))
+                        .width(6.0)
+                        .allow_hover(false),
+                );
+                plot.line(
+                    Line::new(name, PlotPoints::from(line))
+                        .color(colour)
+                        .width(1.5),
+                );
+                if let Some(head) = head {
+                    head_mark(plot, head, colour);
+                }
             }
             plot.points(
                 Points::new("", PlotPoints::from(rebuilds.clone()))
@@ -490,9 +612,14 @@ fn breakdown(ui: &mut Ui, models: &[ModelUse], progress: f32) {
         } else {
             format!(" · {} rebuilt", model.rebuilds)
         };
+        let ticks = if model.ticks == 0 {
+            String::new()
+        } else {
+            format!(" · {} ticks ${:.3}", model.ticks, model.tick_cost)
+        };
         ui.label(
             RichText::new(format!(
-                "{} call{} · {cache}{rebuilt}",
+                "{} call{} · {cache}{rebuilt}{ticks}",
                 model.calls,
                 if model.calls == 1 { "" } else { "s" }
             ))

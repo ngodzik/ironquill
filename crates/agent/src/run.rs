@@ -9,7 +9,7 @@ use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox, Trial};
 use crate::config::{AgentConfig, Answer, Approval, Member, Pair, Question};
 use crate::delegate;
 use crate::error::AgentError;
-use crate::event::Event;
+use crate::event::{Event, Purpose};
 
 mod compact;
 
@@ -258,6 +258,8 @@ struct Ctx<'a, M, D, O> {
     toolbox: &'a mut Toolbox,
     ledger: Ledger,
     observe: O,
+    /// What the calls made now are for.
+    purpose: Purpose,
     /// The delegate session to continue, and after a delegated attempt the
     /// session it ended in.
     thread: Option<String>,
@@ -331,6 +333,10 @@ pub struct Session {
     /// When the conversation was last sent, in seconds since 1970.
     #[serde(default)]
     last_used: u64,
+    /// When each request was asked, in seconds since 1970, by the place of
+    /// its message: for /compact to show how old each exchange is.
+    #[serde(default)]
+    asked: BTreeMap<usize, u64>,
 }
 
 /// A summary of the conversation and how far it goes.
@@ -383,6 +389,7 @@ impl Session {
             summary: None,
             windows: BTreeMap::new(),
             last_used: 0,
+            asked: BTreeMap::new(),
         }
     }
 
@@ -413,8 +420,10 @@ impl Session {
             self.context_added = true;
         }
         toolbox.reset_changes();
+        self.asked.insert(self.messages.len(), now_secs());
         self.messages.push(Message::user(text));
 
+        let root = toolbox.workspace().root().to_owned();
         let mut ctx = Ctx {
             model,
             delegate,
@@ -422,6 +431,7 @@ impl Session {
             toolbox,
             ledger: Ledger::new(),
             observe,
+            purpose: Purpose::Chat,
             thread: None,
             catch_up: String::new(),
             effort: config.effort,
@@ -433,9 +443,27 @@ impl Session {
             last_call: None,
             last_context: None,
         };
+        // A request keeps its own session warm; the other one is ticked
+        // meanwhile, and the ticks count with the request.
+        let other = self.other_ticker(delegate, config.pair.is_some(), &root);
         let started = match self.restart_if_cold(&mut ctx).await {
             Err(e) => Err(e),
-            Ok(()) => self.work(&mut ctx, text, context).await,
+            Ok(()) => match &other {
+                Some((ticker, pair)) => {
+                    let (result, spent) = ticker.during(self.work(&mut ctx, text, context)).await;
+                    if let Some(at) = spent.iter().filter_map(|s| s.4).max() {
+                        self.ticked(*pair, at);
+                    }
+                    let purpose = if *pair {
+                        Purpose::PairTick
+                    } else {
+                        Purpose::ChatTick
+                    };
+                    count_ticks(&mut ctx, &ModelId::agent(Agent::ClaudeCode), spent, purpose);
+                    result
+                }
+                None => self.work(&mut ctx, text, context).await,
+            },
         };
         // Stopped before it began: as if it had not been sent.
         if matches!(started, Err(AgentError::NotSent)) {
@@ -584,6 +612,11 @@ impl Session {
             };
         }
         self.messages = restarted;
+        self.asked = std::mem::take(&mut self.asked)
+            .into_iter()
+            .filter(|(at, _)| *at >= cut)
+            .map(|(at, when)| (at - cut + kept, when))
+            .collect();
         // It covers what it covered, where that now is.
         self.summary = Some(Summary {
             text: summary.text,
@@ -798,6 +831,7 @@ impl Session {
             model: Some(planner.clone()),
             effort: Some(pair.planner_effort),
         });
+        ctx.purpose = Purpose::PlanReview;
         let mut planning = self.start_planning(ctx, pair, request_at).await;
         let mut plan = match planning
             .ask(
@@ -898,6 +932,7 @@ impl Session {
                     });
                     work.push(Message::user(instruction.clone()));
                     ctx.effort = Some(pair.coder_effort);
+                    ctx.purpose = Purpose::Code;
                     let ticker = planning.ticker(ctx);
                     let (step, ticks) = match &ticker {
                         Some(ticker) => {
@@ -910,7 +945,7 @@ impl Session {
                             Vec::new(),
                         ),
                     };
-                    count_ticks(ctx, &planner, ticks);
+                    count_ticks(ctx, &planner, ticks, Purpose::PairTick);
                     let step = match step {
                         Ok(step) => step,
                         Err(e) => break 'work Err(e),
@@ -950,6 +985,7 @@ impl Session {
                 });
                 let prompt =
                     review_prompt(ctx, text, checked, failure.as_ref(), &work, &asked, idle).await;
+                ctx.purpose = Purpose::PlanReview;
                 let reply = match planning.ask(ctx, &prompt, Step::Review).await {
                     Ok(reply) => reply,
                     Err(e) => break 'work Err(e),
@@ -1111,6 +1147,7 @@ impl Session {
         account: &PairAccount,
         result: Result<Verdict, AgentError>,
     ) -> Result<Verdict, AgentError> {
+        ctx.purpose = Purpose::Chat;
         let mut account = account.clone();
         if matches!(result, Err(AgentError::OverBudget)) {
             account.ended = "the budget ran out".into();
@@ -1194,6 +1231,7 @@ impl Session {
             subscription: false,
             context: None,
             cache: response.cache,
+            purpose: Purpose::Other,
         });
         if let Some(text) = &response.content {
             (ctx.observe)(Event::Said {
@@ -1264,82 +1302,78 @@ impl Session {
         self.agents.insert(agent, thread);
     }
 
-    /// Whether a session is warm enough to keep warm: Claude Code's chat or
-    /// last pair, used in the last minutes, with the settings of its last
-    /// call known.
-    pub fn has_warm_sessions(&self) -> bool {
-        !self.warm_sessions().is_empty()
+    /// The Claude Code session of the chat, or of the last pair's planner
+    /// with `pair`, when it is warm and the settings of its last call are
+    /// known: what a tick would read, and when it was last read.
+    fn tickable(&self, pair: bool) -> Option<(&Thread, &Call)> {
+        let map = if pair { &self.planners } else { &self.agents };
+        // Only Claude Code makes copies of a session.
+        let thread = map.get(&Agent::ClaudeCode)?;
+        let warm = now_secs().saturating_sub(thread.used) <= THREAD_WARM_SECS;
+        warm.then_some((thread, thread.call.as_ref()?))
     }
 
-    fn warm_sessions(&self) -> Vec<(Agent, bool, Thread)> {
-        let warm =
-            |t: &&Thread| now_secs().saturating_sub(t.used) <= THREAD_WARM_SECS && t.call.is_some();
-        let mut out = Vec::new();
-        for (pair, map) in [(false, &self.agents), (true, &self.planners)] {
-            // Only Claude Code makes copies of a session.
-            if let Some(thread) = map.get(&Agent::ClaudeCode).filter(warm) {
-                out.push((Agent::ClaudeCode, pair, thread.clone()));
-            }
+    /// The ticks due now: each warm session read four minutes ago or more,
+    /// within the five its cache lives.
+    #[must_use]
+    pub fn due_ticks(&self, root: &std::path::Path) -> Vec<Tick> {
+        [false, true]
+            .into_iter()
+            .filter_map(|pair| {
+                let (thread, call) = self.tickable(pair)?;
+                let since = now_secs().saturating_sub(thread.used);
+                (since >= TICK_EVERY.as_secs())
+                    .then(|| Tick::new(pair, &thread.session, call, root))
+            })
+            .collect()
+    }
+
+    /// When a warm session was last read, chat's or pair's, in seconds
+    /// since 1970: what ticks go on from after a restart.
+    #[must_use]
+    pub fn last_read(&self) -> Option<u64> {
+        [&self.agents, &self.planners]
+            .into_iter()
+            .filter_map(|map| map.get(&Agent::ClaudeCode))
+            .map(|t| t.used)
+            .filter(|used| *used > 0)
+            .max()
+    }
+
+    /// Notes that a tick read the chat's session, or the pair's, at `at`:
+    /// it counts as used then, which keeps it warm for the next tick.
+    pub fn ticked(&mut self, pair: bool, at: u64) {
+        let map = if pair {
+            &mut self.planners
+        } else {
+            &mut self.agents
+        };
+        if let Some(thread) = map.get_mut(&Agent::ClaudeCode) {
+            thread.used = thread.used.max(at);
         }
-        out
     }
 
-    /// Keeps the warm sessions warm while the conversation waits: each is
-    /// read by a one word copy of it, with the very same settings as its
-    /// last call, and counts as used again. What that costs is told as
-    /// turns.
-    pub async fn keep_warm<D: Delegate>(
-        &mut self,
-        delegate: &D,
+    /// What keeps the other warm session warm during a request: the pair's
+    /// planner during a chat request, the chat's during a pair; its first
+    /// read four minutes after its last use.
+    fn other_ticker<'d, D: Delegate>(
+        &self,
+        delegate: &'d D,
+        in_pair: bool,
         root: &std::path::Path,
-        mut observe: impl FnMut(Event) + Send,
-    ) {
-        for (agent, pair, thread) in self.warm_sessions() {
-            let Some(call) = thread.call.clone() else {
-                continue;
-            };
-            let request = DelegateRequest {
-                agent,
-                effort: call.effort,
-                model: call.model.clone(),
-                prompt: TICK_PROMPT.into(),
-                instructions: call.instructions.clone(),
-                resume: Some(thread.session.clone()),
-                fork: true,
-                ephemeral: true,
-                directory: root.to_owned(),
-                read_only: call.read_only,
-            };
-            let model = ModelId::agent(agent);
-            let mut on_event = |event: DelegateEvent| {
-                if let DelegateEvent::Usage {
-                    usage,
-                    cost,
-                    billed,
-                    cache,
-                } = event
-                {
-                    observe(Event::Turn {
-                        model: model.clone(),
-                        usage,
-                        cost: cost.filter(|_| billed),
-                        subscription: !billed,
-                        context: None,
-                        cache,
-                    });
-                }
-            };
-            if delegate.run(&request, &mut on_event).await.is_ok() {
-                let map = if pair {
-                    &mut self.planners
-                } else {
-                    &mut self.agents
-                };
-                if let Some(t) = map.get_mut(&agent) {
-                    t.used = now_secs();
-                }
-            }
-        }
+    ) -> Option<(Ticker<'d, D>, bool)> {
+        let pair = !in_pair;
+        let (thread, call) = self.tickable(pair)?;
+        let since = now_secs().saturating_sub(thread.used);
+        let tick = Tick::new(pair, &thread.session, call, root);
+        Some((
+            Ticker {
+                delegate,
+                request: tick.request,
+                first: TICK_EVERY.saturating_sub(std::time::Duration::from_secs(since)),
+            },
+            pair,
+        ))
     }
 
     /// The session of `agent` its next request would continue, if any.
@@ -1397,6 +1431,7 @@ impl Session {
     /// applying changes, so that the next model knows.
     pub fn note_from_person(&mut self, text: &str) {
         self.settle();
+        self.asked.insert(self.messages.len(), now_secs());
         self.messages.push(Message::user(format!("({text})")));
         self.messages.push(Message::Assistant {
             content: Some("Noted.".into()),
@@ -1457,6 +1492,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         toolbox,
         ledger: Ledger::new(),
         observe,
+        purpose: Purpose::Chat,
         thread: None,
         catch_up: String::new(),
         effort: config.effort,
@@ -1707,6 +1743,7 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
     let mut live_cost = Usd(0.0);
     // The agent's commands, for the audit log once it is done.
     let mut log: Vec<(String, String, Option<String>)> = Vec::new();
+    let purpose = ctx.purpose;
     let reply = {
         let Ctx {
             delegate,
@@ -1749,6 +1786,7 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
                         subscription: !billed,
                         context,
                         cache,
+                        purpose,
                     }
                 }
                 DelegateEvent::TextStart => Event::Saying {
@@ -1870,6 +1908,7 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
             subscription: !reply.billed,
             context: reply.context,
             cache: None,
+            purpose,
         });
     }
     Ok(reply)
@@ -2083,28 +2122,107 @@ impl Planning {
                 directory: ctx.toolbox.workspace().root().to_owned(),
                 read_only: call.read_only,
             },
+            // The planner was just read: its first tick is a full wait away.
+            first: TICK_EVERY,
         })
     }
 }
 
-/// What one call that keeps a cache warm used.
-type Tick = (Usage, Option<Usd>, bool, Option<CacheUse>);
+/// What one call that keeps a cache warm used, and when it ended, when it
+/// read the session.
+type Spent = (Usage, Option<Usd>, bool, Option<CacheUse>, Option<u64>);
+
+/// A tick due: a one word read of a copy of a warm session, with the very
+/// settings of its last call, so that it reads the same cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tick {
+    /// Whether it reads the pair's planner session, rather than the chat's.
+    pub pair: bool,
+    request: DelegateRequest,
+}
+
+impl Tick {
+    fn new(pair: bool, session: &str, call: &Call, root: &std::path::Path) -> Self {
+        Self {
+            pair,
+            request: DelegateRequest {
+                agent: Agent::ClaudeCode,
+                effort: call.effort,
+                model: call.model.clone(),
+                prompt: TICK_PROMPT.into(),
+                instructions: call.instructions.clone(),
+                resume: Some(session.to_owned()),
+                fork: true,
+                ephemeral: true,
+                directory: root.to_owned(),
+                read_only: call.read_only,
+            },
+        }
+    }
+
+    /// What it was for.
+    #[must_use]
+    pub fn purpose(&self) -> Purpose {
+        if self.pair {
+            Purpose::PairTick
+        } else {
+            Purpose::ChatTick
+        }
+    }
+
+    /// Reads the session, telling what the call used; returns whether it
+    /// read it. Run without the conversation: it needs nothing of it.
+    pub async fn run<D: Delegate>(
+        &self,
+        delegate: &D,
+        mut observe: impl FnMut(Event) + Send,
+    ) -> bool {
+        let model = ModelId::agent(Agent::ClaudeCode);
+        let purpose = self.purpose();
+        let mut on_event = |event: DelegateEvent| {
+            if let DelegateEvent::Usage {
+                usage,
+                cost,
+                billed,
+                cache,
+            } = event
+            {
+                observe(Event::Turn {
+                    model: model.clone(),
+                    usage,
+                    cost: cost.filter(|_| billed),
+                    subscription: !billed,
+                    context: None,
+                    cache,
+                    purpose,
+                });
+            }
+        };
+        delegate.run(&self.request, &mut on_event).await.is_ok()
+    }
+}
 
 /// Reads a session every few minutes with a one word copy of it, with the
 /// very same settings, so that its cache stays warm.
 struct Ticker<'d, D> {
     delegate: &'d D,
     request: DelegateRequest,
+    /// How long before the first read: a session already close to
+    /// expiring is read first.
+    first: std::time::Duration,
 }
 
 impl<D: Delegate> Ticker<'_, D> {
     /// Runs `work`, ticking meanwhile; returns its result and what the
     /// ticks used.
-    async fn during<T>(&self, work: impl std::future::Future<Output = T>) -> (T, Vec<Tick>) {
+    async fn during<T>(&self, work: impl std::future::Future<Output = T>) -> (T, Vec<Spent>) {
         let spent = std::sync::Mutex::new(Vec::new());
         let ticks = async {
+            let mut wait = self.first;
             loop {
-                tokio::time::sleep(TICK_EVERY).await;
+                tokio::time::sleep(wait).await;
+                wait = TICK_EVERY;
+                let mut used = Vec::new();
                 let mut on_event = |event: DelegateEvent| {
                     if let DelegateEvent::Usage {
                         usage,
@@ -2113,20 +2231,25 @@ impl<D: Delegate> Ticker<'_, D> {
                         cache,
                     } = event
                     {
-                        spent
-                            .lock()
-                            .expect("not poisoned")
-                            .push((usage, cost, billed, cache));
+                        used.push((usage, cost, billed, cache));
                     }
                 };
-                let _ = self.delegate.run(&self.request, &mut on_event).await;
+                let read = self
+                    .delegate
+                    .run(&self.request, &mut on_event)
+                    .await
+                    .is_ok();
+                let at = read.then(now_secs);
+                if let Ok(mut spent) = spent.lock() {
+                    spent.extend(used.into_iter().map(|(u, c, b, k)| (u, c, b, k, at)));
+                }
             }
         };
         let result = tokio::select! {
             result = work => result,
             () = ticks => unreachable!("ticks never end"),
         };
-        (result, spent.into_inner().expect("not poisoned"))
+        (result, spent.into_inner().unwrap_or_default())
     }
 }
 
@@ -2134,9 +2257,10 @@ impl<D: Delegate> Ticker<'_, D> {
 fn count_ticks<M, D, O: FnMut(Event)>(
     ctx: &mut Ctx<'_, M, D, O>,
     model: &ModelId,
-    ticks: Vec<Tick>,
+    ticks: Vec<Spent>,
+    purpose: Purpose,
 ) {
-    for (usage, cost, billed, cache) in ticks {
+    for (usage, cost, billed, cache, _) in ticks {
         ctx.ledger.usage += usage;
         let cost = cost.filter(|_| billed);
         match cost {
@@ -2150,6 +2274,7 @@ fn count_ticks<M, D, O: FnMut(Event)>(
             subscription: !billed,
             context: None,
             cache,
+            purpose,
         });
     }
 }
@@ -2844,6 +2969,7 @@ async fn answer_only<M: ChatModel, D, O: FnMut(Event) + Send>(
         subscription: false,
         context: None,
         cache: response.cache,
+        purpose: ctx.purpose,
     });
     let text = response.content.unwrap_or_default();
     (ctx.observe)(Event::Said {
@@ -3009,6 +3135,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             subscription: false,
             context,
             cache: response.cache,
+            purpose: ctx.purpose,
         });
         if let Some(text) = &response.content {
             (ctx.observe)(Event::Said {
@@ -3170,6 +3297,7 @@ async fn conclude<M: ChatModel, D, O: FnMut(Event) + Send>(
         subscription: false,
         context: None,
         cache: response.cache,
+        purpose: Purpose::Other,
     });
     let text = response.content.unwrap_or_default();
     if !text.trim().is_empty() {
@@ -3550,6 +3678,7 @@ async fn ask_cheapest<M: ChatModel, D, O: FnMut(Event) + Send>(
         subscription: false,
         context: None,
         cache: response.cache,
+        purpose: Purpose::Other,
     });
     let text = response.content.unwrap_or_default().trim().to_owned();
     (!text.is_empty()).then_some((text, model))
@@ -5504,14 +5633,27 @@ mod tests {
     #[tokio::test]
     async fn warm_sessions_are_read_by_a_copy_with_the_same_settings() {
         let planner = PlanningAgent::new(vec!["Hello.", "ok"]);
-        let (mut session, dir, _toolbox) = chat_left(&planner, 60).await;
+        // Read four minutes and ten seconds ago: due, and still warm.
+        let (mut session, dir, _toolbox) = chat_left(&planner, 250).await;
         let before = session.agents[&Agent::ClaudeCode].used;
+        let ticks = session.due_ticks(dir.path());
+        assert_eq!(ticks.len(), 1);
+        assert!(!ticks[0].pair);
+        assert_eq!(ticks[0].purpose(), Purpose::ChatTick);
         let mut turns = 0;
-        session
-            .keep_warm(&planner, dir.path(), |e| {
-                turns += usize::from(matches!(e, Event::Turn { .. }));
+        let read = ticks[0]
+            .run(&planner, |e| {
+                turns += usize::from(matches!(
+                    e,
+                    Event::Turn {
+                        purpose: Purpose::ChatTick,
+                        ..
+                    }
+                ));
             })
             .await;
+        assert!(read);
+        session.ticked(false, now_secs());
         let requests = planner.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         let (chat, tick) = (&requests[0], &requests[1]);
@@ -5523,6 +5665,31 @@ mod tests {
             (&chat.model, chat.effort, &chat.instructions, chat.read_only)
         );
         assert!(session.agents[&Agent::ClaudeCode].used > before);
+        // Read now: the next tick is four minutes away.
+        assert!(session.due_ticks(dir.path()).is_empty());
+        assert!(session.last_read().is_some_and(|at| at + 5 >= now_secs()));
+    }
+
+    #[tokio::test]
+    async fn a_session_read_lately_or_long_ago_is_not_ticked() {
+        let planner = PlanningAgent::new(vec!["Hello."]);
+        let (session, dir, _toolbox) = chat_left(&planner, 60).await;
+        assert!(
+            session.due_ticks(dir.path()).is_empty(),
+            "read a minute ago"
+        );
+        let planner = PlanningAgent::new(vec!["Hello."]);
+        let (session, dir, _toolbox) = chat_left(&planner, 6 * 60).await;
+        // Its cache is gone: reading it would write it again, not keep it.
+        assert!(
+            session.due_ticks(dir.path()).is_empty(),
+            "read six minutes ago"
+        );
+        assert!(
+            session
+                .last_read()
+                .is_some_and(|at| now_secs() - at >= 6 * 60)
+        );
     }
 
     fn answering_cold(answer: Answer) -> AgentConfig {
