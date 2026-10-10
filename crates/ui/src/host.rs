@@ -2,6 +2,7 @@
 //! saving, compacting, asking docker. The terminal and a window drive the
 //! same [`Host`], so that neither carries out an effect its own way.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Interval;
 
-use crate::app::{AgentMessage, App, Effect};
+use crate::app::{AgentMessage, App, ChatId, Effect};
 use crate::defaults::Defaults;
 use crate::sessions::Store;
 use crate::{clipboard, review};
@@ -42,6 +43,47 @@ struct Conversation {
     toolbox: Toolbox,
 }
 
+/// What the host holds for one open conversation.
+struct Slot {
+    conversation: Arc<Mutex<Conversation>>,
+    /// The task working on its current request, while one does.
+    task: Option<JoinHandle<()>>,
+    /// Where its agent and its timers report: tagged with the
+    /// conversation on the way, so that a hidden one hears its own.
+    tx: mpsc::UnboundedSender<AgentMessage>,
+    /// A save asked for while a request runs waits for its end: the
+    /// conversation is the request's meanwhile.
+    save_pending: bool,
+}
+
+impl Slot {
+    /// An empty conversation whose messages reach `out` tagged with `id`.
+    fn new(
+        id: ChatId,
+        workspace: &Workspace,
+        out: &mpsc::UnboundedSender<(ChatId, AgentMessage)>,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = out.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if out.send((id, message)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            conversation: Arc::new(Mutex::new(Conversation {
+                session: Session::new(),
+                toolbox: Toolbox::new(workspace.clone()),
+            })),
+            task: None,
+            tx,
+            save_pending: false,
+        }
+    }
+}
+
 /// What the state is doing, read before waiting so that the wait does not
 /// hold the state: the timers it needs depend on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +109,8 @@ impl Waiting {
 /// [`Host::receive`] to apply.
 #[derive(Debug)]
 pub enum Incoming {
-    /// The agent said something, or asks something.
-    Agent(AgentMessage),
+    /// The agent of a conversation said something, or asks something.
+    Agent(ChatId, AgentMessage),
     /// Docker listed its containers, or could not.
     Docker(Result<Vec<Container>, String>),
     /// The spinner's next frame is due.
@@ -85,12 +127,11 @@ pub struct Host<M, D> {
     model: Arc<M>,
     delegate: Arc<D>,
     workspace: Workspace,
-    conversation: Arc<Mutex<Conversation>>,
+    /// Each open conversation's agent side, by the state's id for it.
+    slots: BTreeMap<ChatId, Slot>,
     store: Option<Store>,
-    /// The task working on the current request, while one does.
-    task: Option<JoinHandle<()>>,
-    tx: mpsc::UnboundedSender<AgentMessage>,
-    rx: mpsc::UnboundedReceiver<AgentMessage>,
+    tx: mpsc::UnboundedSender<(ChatId, AgentMessage)>,
+    rx: mpsc::UnboundedReceiver<(ChatId, AgentMessage)>,
     docker_tx: mpsc::UnboundedSender<Result<Vec<Container>, String>>,
     docker_rx: mpsc::UnboundedReceiver<Result<Vec<Container>, String>>,
     /// Docker is asked one question at a time.
@@ -102,9 +143,6 @@ pub struct Host<M, D> {
     /// Whether keeping the sessions warm is due is looked at every half
     /// minute; it happens every four.
     warm_tick: Interval,
-    /// A save asked for while a request runs waits for its end: the
-    /// conversation is the request's meanwhile.
-    save_pending: bool,
     /// The project's language servers, each started when first needed.
     servers: Arc<Servers>,
     /// The machine kept from idle sleep while ticks run; released when
@@ -126,15 +164,11 @@ where
         let store = Store::for_project(workspace.root());
         let workspace_root = &workspace.root().to_owned();
         Self {
-            conversation: Arc::new(Mutex::new(Conversation {
-                session: Session::new(),
-                toolbox: Toolbox::new(workspace.clone()),
-            })),
+            slots: BTreeMap::new(),
             model,
             delegate,
             workspace,
             store,
-            task: None,
             tx,
             rx,
             docker_tx,
@@ -143,25 +177,106 @@ where
             spin: tokio::time::interval(Duration::from_millis(120)),
             docker_tick: tokio::time::interval(Duration::from_secs(2)),
             warm_tick: tokio::time::interval(Duration::from_secs(30)),
-            save_pending: false,
             servers: Arc::new(Servers::new(workspace_root)),
             awake: crate::awake::Awake::default(),
         }
     }
 
-    /// Starts as asked: resumes a saved conversation or lists them.
+    /// Starts as asked, after reopening the conversations open when the
+    /// window last closed, hidden: a new one, the latest, one picked or
+    /// one by id is shown, and `Continue` shows the one shown last.
     pub async fn start(&mut self, app: &mut App, start: Start) {
-        let store = self.store.as_ref();
+        let shown = app.chat_id();
+        self.slot(shown);
+        let state = self
+            .store
+            .as_ref()
+            .map(Store::project_state)
+            .unwrap_or_default();
+        app.project_state_loaded(&state);
+        let target = match &start {
+            Start::Continue => state
+                .shown
+                .clone()
+                .or_else(|| self.store.as_ref()?.list().into_iter().next().map(|s| s.id)),
+            Start::Id(id) => self.store.as_ref().and_then(|s| s.find(id).ok()),
+            Start::New | Start::Pick => None,
+        };
+        for id in state.open.iter().filter(|id| Some(*id) != target.as_ref()) {
+            let chat = app.open_chat();
+            self.resume_into(app, chat, id).await;
+        }
+        app.show_chat(shown);
+        let hidden = app.chat_ids().len() - 1;
         match start {
-            Start::New => {}
-            Start::Continue => match store.and_then(|s| s.list().into_iter().next()) {
-                Some(latest) => {
-                    resume(store, app, &self.conversation, &self.workspace, &latest.id).await;
+            Start::New | Start::Pick | Start::Continue | Start::Id(_) if target.is_some() => {
+                if let Some(id) = target {
+                    self.resume_into(app, shown, &id).await;
                 }
-                None => app.report_error("No saved conversation for this project yet".into()),
-            },
-            Start::Pick => app.show_picker(store.map(Store::list).unwrap_or_default()),
-            Start::Id(id) => resume(store, app, &self.conversation, &self.workspace, &id).await,
+            }
+            Start::Continue => {
+                app.report_error("No saved conversation for this project yet".into())
+            }
+            Start::Id(id) => app.report_error(format!(
+                "No saved conversation of this project has the id {id}"
+            )),
+            Start::Pick => {
+                app.show_picker(self.store.as_ref().map(Store::list).unwrap_or_default())
+            }
+            Start::New => {}
+        }
+        if hidden > 0 {
+            app.report_info(&format!(
+                "{hidden} other conversation{} open, going on: /chats lists them",
+                if hidden == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    /// Ticks the warm sessions of the hidden conversation `chat`.
+    fn keep_warm(&mut self, chat: ChatId) {
+        let delegate = Arc::clone(&self.delegate);
+        let root = self.workspace.root().to_owned();
+        let slot = self.slot(chat);
+        spawn_ticks(
+            Arc::clone(&slot.conversation),
+            delegate,
+            root,
+            slot.tx.clone(),
+        );
+    }
+
+    /// The host's side of conversation `id`, made empty when first needed.
+    fn slot(&mut self, id: ChatId) -> &mut Slot {
+        let (workspace, tx) = (&self.workspace, &self.tx);
+        self.slots
+            .entry(id)
+            .or_insert_with(|| Slot::new(id, workspace, tx))
+    }
+
+    /// Loads the saved conversation `saved` into the open conversation
+    /// `chat`, shown or not.
+    async fn resume_into(&mut self, app: &mut App, chat: ChatId, saved: &str) {
+        let conversation = Arc::clone(&self.slot(chat).conversation);
+        let store = self.store.clone();
+        let workspace = self.workspace.clone();
+        if chat == app.chat_id() {
+            resume(store.as_ref(), app, &conversation, &workspace, saved).await;
+            return;
+        }
+        let found = store
+            .as_ref()
+            .map(|s| s.find(saved).and_then(|id| s.load(&id)));
+        if let Some(Ok(loaded)) = found {
+            let last_read = loaded.session.last_read();
+            *conversation.lock().await = Conversation {
+                session: loaded.session.clone(),
+                toolbox: Toolbox::new(workspace),
+            };
+            app.with_chat(chat, |app| {
+                app.load_saved(loaded);
+                app.ticks_restored(last_read);
+            });
         }
     }
 
@@ -170,7 +285,7 @@ where
     /// nothing is lost.
     pub async fn next(&mut self, waiting: Waiting) -> Incoming {
         tokio::select! {
-            Some(message) = self.rx.recv() => Incoming::Agent(message),
+            Some((chat, message)) = self.rx.recv() => Incoming::Agent(chat, message),
             Some(result) = self.docker_rx.recv() => Incoming::Docker(result),
             _ = self.docker_tick.tick(), if waiting.docker && !self.docker_asking => Incoming::DockerDue,
             _ = self.spin.tick(), if waiting.running => Incoming::Spin,
@@ -182,9 +297,24 @@ where
     /// turn.
     pub async fn receive(&mut self, app: &mut App, incoming: Incoming) -> Option<Effect> {
         match incoming {
-            Incoming::Agent(message) => {
-                if app.on_agent(message) {
-                    save(self.store.as_ref(), app, &self.conversation).await;
+            Incoming::Agent(chat, message) => {
+                let conversation = self.slots.get(&chat).map(|s| Arc::clone(&s.conversation))?;
+                let store = self.store.clone();
+                if app.with_chat(chat, |app| app.on_agent(message)) == Some(true) {
+                    if chat == app.chat_id() {
+                        save(store.as_ref(), app, &conversation).await;
+                    } else {
+                        // Saved as the shown one is, swapped in for it: the
+                        // file holds its own transcript.
+                        let session = conversation.lock().await.session.clone();
+                        let failed = app
+                            .with_chat(chat, |app| app.to_saved(session))
+                            .flatten()
+                            .and_then(|saved| store.as_ref()?.save(&saved).err());
+                        if let Some(e) = failed {
+                            app.report_error(format!("Could not save a hidden conversation: {e}"));
+                        }
+                    }
                 }
                 None
             }
@@ -198,7 +328,17 @@ where
                 app.on_tick();
                 None
             }
-            Incoming::WarmDue => app.keep_warm_due().then_some(Effect::KeepWarm),
+            Incoming::WarmDue => {
+                // The hidden conversations tick by the same rules, each its
+                // own sessions.
+                let shown = app.chat_id();
+                for chat in app.chat_ids().into_iter().filter(|c| *c != shown) {
+                    if app.with_chat(chat, App::keep_warm_due) == Some(true) {
+                        self.keep_warm(chat);
+                    }
+                }
+                app.keep_warm_due().then_some(Effect::KeepWarm)
+            }
         }
     }
 
@@ -207,19 +347,55 @@ where
     /// keep for the next session.
     pub async fn carry_out(&mut self, app: &mut App, effect: Option<Effect>) {
         // Checked every turn: held exactly while ticks can run.
-        if let Some(said) = self.awake.hold(app.wants_awake()) {
+        if let Some(said) = self.awake.hold(app.any_wants_awake()) {
             app.report_info(&said);
         }
         app.set_kept_awake(self.awake.is_held());
-        if self.save_pending && !app.is_running() {
-            self.save_pending = false;
-            save(self.store.as_ref(), app, &self.conversation).await;
+        for chat in app.take_closed() {
+            if let Some(mut slot) = self.slots.remove(&chat)
+                && let Some(handle) = slot.task.take()
+            {
+                handle.abort();
+            }
+        }
+        let shown = app.chat_id();
+        self.slot(shown);
+        let pending: Vec<ChatId> = self
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.save_pending)
+            .map(|(id, _)| *id)
+            .collect();
+        for chat in pending {
+            if app.with_chat(chat, |app| app.is_running()) == Some(false)
+                && let Some(slot) = self.slots.get_mut(&chat)
+            {
+                slot.save_pending = false;
+                let conversation = Arc::clone(&slot.conversation);
+                let store = self.store.clone();
+                let session = conversation.lock().await.session.clone();
+                let failed = app
+                    .with_chat(chat, |app| app.to_saved(session))
+                    .flatten()
+                    .and_then(|saved| store.as_ref()?.save(&saved).err());
+                if let Some(e) = failed {
+                    app.report_error(format!("Could not save the conversation: {e}"));
+                }
+            }
+        }
+        if let Some(state) = app.project_state_to_keep()
+            && let Some(store) = &self.store
+            && let Err(e) = store.save_project_state(&state)
+        {
+            app.report_error(format!(
+                "Could not keep the open conversations and tasks: {e}"
+            ));
         }
         // What needs the conversation waits while a request has it, rather
         // than freeze the interface until its end.
         let effect = match effect {
             Some(Effect::Save) if app.is_running() => {
-                self.save_pending = true;
+                self.slot(shown).save_pending = true;
                 None
             }
             Some(Effect::OpenContext | Effect::ApplyContext(_) | Effect::ForgetDelegate(_))
@@ -243,20 +419,32 @@ where
         let Some(effect) = effect else {
             return;
         };
+        if let Effect::OpenSaved(saved) = &effect {
+            let chat = app.open_chat();
+            self.resume_into(app, chat, saved).await;
+            return;
+        }
         let Self {
             model,
             delegate,
             workspace,
-            conversation,
+            slots,
             store,
-            task,
-            tx,
+            tx: main_tx,
             docker_tx,
             docker_asking,
             servers,
             ..
         } = self;
         let store = store.as_ref();
+        let Slot {
+            conversation,
+            task,
+            tx,
+            ..
+        } = slots
+            .entry(shown)
+            .or_insert_with(|| Slot::new(shown, workspace, main_tx));
         match effect {
             Effect::Send { text, config } => {
                 // Read again each time: an edit counts from the next request.
@@ -307,33 +495,12 @@ where
                 app.on_cancelled();
                 save(store, app, conversation).await;
             }
-            Effect::KeepWarm => {
-                // In the background, the conversation held only to list the
-                // ticks due and to mark them read, never during the calls:
-                // a request sent meanwhile is not kept waiting.
-                let conversation = Arc::clone(conversation);
-                let delegate = Arc::clone(delegate);
-                let root = workspace.root().to_owned();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let ticks = conversation.lock().await.session.due_ticks(&root);
-                    let mut last = None;
-                    for tick in ticks {
-                        let events = tx.clone();
-                        let read = tick
-                            .run(&*delegate, |e| {
-                                let _ = events.send(AgentMessage::Event(e));
-                            })
-                            .await;
-                        if read {
-                            let at = crate::sessions::now();
-                            conversation.lock().await.session.ticked(tick.pair, at);
-                            last = Some(at);
-                        }
-                    }
-                    let _ = tx.send(AgentMessage::Ticked(last));
-                });
-            }
+            Effect::KeepWarm => spawn_ticks(
+                Arc::clone(conversation),
+                Arc::clone(delegate),
+                workspace.root().to_owned(),
+                tx.clone(),
+            ),
             Effect::PlanCompaction(config) => {
                 let (conversation, model, delegate, tx) = (
                     Arc::clone(conversation),
@@ -386,6 +553,8 @@ where
                     let _ = tx.send(AgentMessage::Compacted(result));
                 });
             }
+            // Opened above: it needs the host whole.
+            Effect::OpenSaved(_) => {}
             Effect::DropExchanges(keep) => {
                 let (conversation, tx) = (Arc::clone(conversation), tx.clone());
                 tokio::spawn(async move {
@@ -551,8 +720,10 @@ where
 impl<M, D> Drop for Host<M, D> {
     /// A request still running stops with the interface.
     fn drop(&mut self) {
-        if let Some(handle) = self.task.take() {
-            handle.abort();
+        for slot in self.slots.values_mut() {
+            if let Some(handle) = slot.task.take() {
+                handle.abort();
+            }
         }
     }
 }
@@ -599,6 +770,35 @@ async fn resume(
         }
         Err(e) => app.report_error(e),
     }
+}
+
+/// Ticks a conversation's warm sessions in the background, the
+/// conversation held only to list the ticks due and to mark them read,
+/// never during the calls: a request sent meanwhile is not kept waiting.
+fn spawn_ticks<D: Delegate + 'static>(
+    conversation: Arc<Mutex<Conversation>>,
+    delegate: Arc<D>,
+    root: std::path::PathBuf,
+    tx: mpsc::UnboundedSender<AgentMessage>,
+) {
+    tokio::spawn(async move {
+        let ticks = conversation.lock().await.session.due_ticks(&root);
+        let mut last = None;
+        for tick in ticks {
+            let events = tx.clone();
+            let read = tick
+                .run(&*delegate, |e| {
+                    let _ = events.send(AgentMessage::Event(e));
+                })
+                .await;
+            if read {
+                let at = crate::sessions::now();
+                conversation.lock().await.session.ticked(tick.pair, at);
+                last = Some(at);
+            }
+        }
+        let _ = tx.send(AgentMessage::Ticked(last));
+    });
 }
 
 fn spawn_agent<M, D>(
