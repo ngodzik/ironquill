@@ -16,6 +16,7 @@ mod imports;
 mod layout;
 mod map;
 mod review;
+mod schema;
 
 pub use api::{Body, Operation, Parameter, Response};
 pub use architecture::{Architecture, Component, ComponentKind, Link, architecture};
@@ -26,3 +27,4 @@ pub use review::{
     Area, Delta, Migration, Review, Revised, RouteChange, SchemaChange, migration, model_changes,
     review, route_changes,
 };
+pub use schema::{Column, ForeignKey, Index, Reference, Schema, Table, schema};

@@ -15,6 +15,7 @@
 
 mod activity;
 mod api_view;
+mod database_view;
 mod error;
 mod keys;
 mod plan;
@@ -112,6 +113,7 @@ where
         plan,
         api: api_view::ApiView::default(),
         review: review_view::ReviewView::default(),
+        database: database_view::DatabaseView::default(),
         app,
         host,
         runtime,
@@ -202,6 +204,8 @@ struct Shell<M, D> {
     api: api_view::ApiView,
     /// What the branch looked at changed, read.
     review: review_view::ReviewView,
+    /// The tables the project's models define.
+    database: database_view::DatabaseView,
     /// The conversation's scroll as the state last had it, in lines: a key
     /// that scrolls changes it, and the view follows by the difference.
     scroll_seen: usize,
@@ -513,11 +517,17 @@ where
     let project = shell.app.root().to_owned();
     shell.review.update(&project, shell.app.change_set());
     shell.plan.showing(
-        matches!(view, Some(MapView::Plan | MapView::Api | MapView::Review)),
+        matches!(
+            view,
+            Some(MapView::Plan | MapView::Api | MapView::Review | MapView::Database)
+        ),
         now,
         shell.app.transcript(),
     );
     shell.plan.take_read(now);
+    if view == Some(MapView::Database) {
+        shell.database.update(&shell.plan);
+    }
     shell.plan.light_up(shell.app.transcript(), now);
     if let Some(view) = view {
         // The conversation beside the codebase, translucent so that what
@@ -533,7 +543,9 @@ where
         egui::CentralPanel::default()
             .frame(match view {
                 MapView::Universe => Frame::NONE,
-                MapView::Plan | MapView::Api | MapView::Review => Frame::NONE.fill(background),
+                MapView::Plan | MapView::Api | MapView::Review | MapView::Database => {
+                    Frame::NONE.fill(background)
+                }
             })
             .show(&mut root, |ui| match view {
                 MapView::Universe => {
@@ -548,6 +560,9 @@ where
                     &mut shell.app,
                     &mut shell.effects,
                 ),
+                MapView::Database => {
+                    database_view::show(ui, &mut shell.database, &shell.review, &mut shell.app);
+                }
                 MapView::Review => review_view::show(
                     ui,
                     &mut shell.review,

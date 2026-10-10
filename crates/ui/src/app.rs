@@ -62,6 +62,9 @@ pub enum MapView {
     Api,
     /// Its files as stars in space, lit as the agent works.
     Universe,
+    /// Its database: the tables its models define, their columns, and the
+    /// foreign keys between them.
+    Database,
     /// What a branch changed, read as a reviewer reads it: its routes, its
     /// database, its files by area. Only while a review or a piece of work
     /// is looked at.
@@ -1553,7 +1556,8 @@ impl App {
                     None if reviewing => Some(MapView::Review),
                     None | Some(MapView::Review) => Some(MapView::Plan),
                     Some(MapView::Plan) => Some(MapView::Api),
-                    Some(MapView::Api) => Some(MapView::Universe),
+                    Some(MapView::Api) => Some(MapView::Database),
+                    Some(MapView::Database) => Some(MapView::Universe),
                     Some(MapView::Universe) => None,
                 };
                 self.show_map(next);
@@ -3844,6 +3848,11 @@ impl App {
                 "The universe: drag to turn, scroll to come closer, click a star to centre it; \
                  Ctrl-N again to go back"
             }
+            Some(MapView::Database) => {
+                "The database: the tables the models define, foundations at the bottom, each \
+                 foreign key from its column to the one it points at. Click a table for its \
+                 columns; Ctrl-N again for the universe"
+            }
             Some(MapView::Review) => {
                 "The review: the routes, the database and the files the branch changed. Click \
                  one to open it; Ctrl-N again for the plan"
@@ -4483,7 +4492,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_n_shows_the_plan_the_api_the_universe_then_the_panes() {
+    fn ctrl_n_shows_the_plan_the_api_the_database_the_universe_then_the_panes() {
         let mut app = ready();
         let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
         assert_eq!(app.map_view(), None);
@@ -4491,6 +4500,8 @@ mod tests {
         assert_eq!(app.map_view(), Some(MapView::Plan));
         app.on_key(ctrl_n);
         assert_eq!(app.map_view(), Some(MapView::Api));
+        app.on_key(ctrl_n);
+        assert_eq!(app.map_view(), Some(MapView::Database));
         app.on_key(ctrl_n);
         assert_eq!(app.map_view(), Some(MapView::Universe));
         app.on_key(ctrl_n);
