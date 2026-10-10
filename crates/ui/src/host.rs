@@ -420,6 +420,13 @@ where
             return;
         };
         if let Effect::OpenSaved(saved) = &effect {
+            // A task can name a conversation that was never saved, one
+            // closed before its first request: say so where the person is
+            // rather than open an empty one.
+            if let Some(Err(e)) = self.store.as_ref().map(|s| s.find(saved)) {
+                app.report_error(e);
+                return;
+            }
             let chat = app.open_chat();
             self.resume_into(app, chat, saved).await;
             return;
