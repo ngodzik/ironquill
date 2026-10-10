@@ -152,6 +152,9 @@ pub(crate) struct Universe {
     /// How much of the window's width the panels cover on the right: the
     /// view moves so that the universe is centred in what is left.
     pub(crate) covered: f32,
+    /// Whether the window shows an architecture rather than the code: the
+    /// stars rest, and the camera is the architecture's.
+    pub(crate) architecture: bool,
 }
 
 impl Universe {
@@ -191,6 +194,7 @@ impl Universe {
             chosen: None,
             on_screen: Vec::new(),
             covered: 0.0,
+            architecture: false,
         }
     }
 
@@ -903,7 +907,7 @@ pub(crate) fn animate(
     mut camera: Query<CameraParts, CameraOnly>,
     mut gizmos: Gizmos,
 ) {
-    if !universe.shown {
+    if !universe.shown || universe.architecture {
         return;
     }
     let dt = time.delta_secs().min(0.1);

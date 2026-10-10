@@ -15,8 +15,11 @@
 
 mod activity;
 mod api_view;
+mod arch3d;
+mod arch_view;
 mod database_view;
 mod error;
+mod infra;
 mod keys;
 mod plan;
 mod review_view;
@@ -124,6 +127,7 @@ where
         review: review_view::ReviewView::default(),
         database: database_view::DatabaseView::default(),
         services: services_view::ServicesView::default(),
+        infra: infra::Infra::new(app.root().to_owned()),
         app,
         host,
         runtime,
@@ -171,6 +175,7 @@ where
         })
         .insert_non_send(shell)
         .insert_resource(universe)
+        .insert_resource(arch3d::Arch3d::default())
         .add_systems(Startup, (panels_camera, universe::setup))
         .add_systems(
             PreUpdate,
@@ -184,8 +189,10 @@ where
                 read_keys::<M, D>,
                 drive::<M, D>,
                 universe::show_or_hide,
+                arch3d::spawn,
                 universe_activity::<M, D>,
                 universe::animate,
+                arch3d::look,
             )
                 .chain(),
         )
@@ -218,6 +225,8 @@ struct Shell<M, D> {
     database: database_view::DatabaseView,
     /// The services the project runs, and who reaches whom.
     services: services_view::ServicesView,
+    /// Where the project runs, read on threads of their own.
+    infra: infra::Infra,
     /// The conversation's scroll as the state last had it, in lines: a key
     /// that scrolls changes it, and the view follows by the difference.
     scroll_seen: usize,
@@ -397,6 +406,7 @@ fn drive<M, D>(
     mut winit: ResMut<WinitSettings>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
     mut universe: ResMut<Universe>,
+    arch: Res<arch3d::Arch3d>,
     mut panels: Query<&mut Camera, With<Camera2d>>,
 ) where
     M: ChatModel + 'static,
@@ -435,14 +445,17 @@ fn drive<M, D>(
     // Written only when it changes: a write wakes the loop, and a write
     // every frame would keep it from ever sleeping. The universe moves all
     // the time, and only it draws without rest.
-    let focused = if shown {
+    // An architecture draws only while its camera moves: it never turns
+    // by itself.
+    let continuous = shown && (!arch.active || arch.needs_frames());
+    let focused = if continuous {
         UpdateMode::Continuous
     } else {
         UpdateMode::reactive(wait)
     };
     if winit.focused_mode != focused {
         winit.focused_mode = focused;
-        winit.unfocused_mode = if shown {
+        winit.unfocused_mode = if continuous {
             UpdateMode::Continuous
         } else {
             UpdateMode::reactive_low_power(wait)
@@ -459,6 +472,7 @@ fn draw<M, D>(
     mut contexts: EguiContexts,
     mut shell: NonSendMut<Shell<M, D>>,
     mut universe: ResMut<Universe>,
+    mut arch: ResMut<arch3d::Arch3d>,
     mut styled: Local<bool>,
 ) -> Result
 where
@@ -558,6 +572,7 @@ where
         );
         let window = ctx.content_rect().width().max(1.0);
         universe.covered = (window - chat.response.rect.left()).max(0.0) / window;
+        arch.covered = universe.covered;
         egui::CentralPanel::default()
             .frame(match view {
                 MapView::Universe => Frame::NONE,
@@ -568,6 +583,17 @@ where
                 | MapView::Database => Frame::NONE.fill(background),
             })
             .show(&mut root, |ui| match view {
+                MapView::Universe if arch.active => {
+                    let rect = ui.max_rect();
+                    let (open, leave) = arch3d::view(ui, &mut arch, rect);
+                    if let Some(place) = open {
+                        services_view::open_at(&shell.infra, &place, &mut shell.app);
+                    }
+                    if leave {
+                        arch.active = false;
+                        shell.app.show_map(Some(MapView::Services));
+                    }
+                }
                 MapView::Universe => {
                     universe_view(ui, &mut universe, &mut shell.app);
                 }
@@ -584,6 +610,7 @@ where
                     ui,
                     &mut shell.services,
                     &shell.plan,
+                    &mut shell.infra,
                     &mut shell.api,
                     &mut shell.app,
                 ),
@@ -620,6 +647,19 @@ where
             .show(&mut root, |ui| conversation(ui, shell));
     }
 
+    // The 3D architecture asked for: the universe window takes it.
+    if std::mem::take(&mut shell.services.open_3d)
+        && let Some(env) = shell.infra.view()
+    {
+        arch.open(env.deployment.clone());
+        shell.app.show_map(Some(MapView::Universe));
+    }
+    if shell.app.map_view() != Some(MapView::Universe) && arch.active {
+        arch.active = false;
+    }
+    if universe.architecture != arch.active {
+        universe.architecture = arch.active;
+    }
     windows::show(&ctx, &shell.app, &mut shell.keys);
     if !shell.effects.is_empty() || !shell.keys.is_empty() {
         ctx.request_repaint();
@@ -1089,7 +1129,7 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
 }
 
 /// `text` with a dark shadow under it, to read over the stars.
-fn shadowed(
+pub(crate) fn shadowed(
     painter: &egui::Painter,
     at: egui::Pos2,
     anchor: egui::Align2,
