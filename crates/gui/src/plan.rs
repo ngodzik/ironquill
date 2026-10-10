@@ -20,7 +20,7 @@ use bevy_egui::egui::{
 use ironquill_codemap::{Architecture, CodeMap, ComponentKind};
 use ironquill_ui::{App, Entry, MapView};
 
-use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, MAGENTA, PANEL, RAISED, RED, TEXT};
+use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, MAGENTA, PANEL, RAISED, RED, TEXT, YELLOW};
 
 /// The most files mapped: the code first, so that a monorepo's shows
 /// whole; read away from the window, which shows the last plan meanwhile.
@@ -521,6 +521,58 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
     }
     let shown_chosen = plan.chosen.filter(|_| settled);
     let focus = plan.hovered.or(plan.chosen);
+    // What the search keeps: a part by its name, its path or any of its
+    // files'; the others fade, with their links.
+    let query = app.map_search().to_owned();
+    // How many files of each part the branch looked at changed: tests,
+    // documents and migrations under it count too.
+    let under = |path: &str, part: &str| {
+        path == part
+            || path
+                .strip_prefix(part)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    let changed: Vec<usize> = design
+        .components
+        .iter()
+        .map(|c| {
+            app.change_set().map_or(0, |changes| {
+                changes
+                    .files
+                    .iter()
+                    .filter(|f| {
+                        // The project's own part holds what no other does.
+                        if c.path.is_empty() {
+                            !design
+                                .components
+                                .iter()
+                                .any(|o| !o.path.is_empty() && under(&f.path, &o.path))
+                        } else {
+                            under(&f.path, &c.path)
+                        }
+                    })
+                    .count()
+            })
+        })
+        .collect();
+    // Looking at a branch, what it did not touch fades as the search does.
+    let reviewing = app.change_set().is_some();
+    let kept: Vec<bool> = design
+        .components
+        .iter()
+        .zip(&changed)
+        .map(|(c, &touched)| {
+            let searched = query.is_empty()
+                || plan.map.as_ref().is_some_and(|map| {
+                    let files = c.files.iter().map(|&f| map.nodes[f].path.as_str());
+                    ironquill_ui::search_matches(
+                        &query,
+                        [c.name.as_str(), c.path.as_str()].into_iter().chain(files),
+                    )
+                });
+            searched && (!reviewing || touched > 0)
+        })
+        .collect();
 
     // The cards rise into place layer by layer as the plan opens.
     let since = now - plan.opened_at;
@@ -639,7 +691,12 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
                 0.95,
             ),
         };
-        let alpha = alpha * rise;
+        let searched = if kept[link.from] && kept[link.to] {
+            1.0
+        } else {
+            0.12
+        };
+        let alpha = alpha * rise * searched;
         let width = (1.0 + 2.6 * ((link.imports + link.calls) as f32).ln_1p() / most.ln_1p())
             * scale.sqrt();
         // A wide faint stroke under a thin bright one: the link glows.
@@ -692,7 +749,7 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
                     .iter()
                     .any(|l| (l.from == f && l.to == c) || (l.to == f && l.from == c))
         });
-        let alpha = rise * if related { 1.0 } else { 0.32 };
+        let alpha = rise * if related { 1.0 } else { 0.32 } * if kept[c] { 1.0 } else { 0.22 };
         let picked = focus == Some(c);
         let radius = CornerRadius::same((10.0 * scale.min(1.4)) as u8);
 
@@ -774,6 +831,24 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
             faded(colour, 0.85 * alpha),
         );
 
+        // What the branch changed in it, in a pill on its corner.
+        if changed[c] > 0 {
+            let text = format!("{} changed", changed[c]);
+            let font = FontId::proportional(10.5 * scale.clamp(0.8, 1.3));
+            let galley = painter.layout_no_wrap(text, font, YELLOW);
+            let pill = Rect::from_min_size(
+                card.right_top() + vec2(-galley.size().x - 18.0, -9.0),
+                galley.size() + vec2(12.0, 4.0),
+            );
+            painter.rect(
+                pill,
+                CornerRadius::same(8),
+                mix(theme::BACKGROUND, YELLOW, 0.18),
+                Stroke::new(1.0, faded(YELLOW, 0.7)),
+                StrokeKind::Inside,
+            );
+            painter.galley(pill.min + vec2(6.0, 2.0), galley, YELLOW);
+        }
         if let Some(touch) = &plan.touches[c] {
             let shows = if touch.edited { EDIT_SHOWS } else { READ_SHOWS };
             let age = now - touch.at;
@@ -1071,11 +1146,16 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
             .max_rect(area)
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
         |ui| {
-            for (name, view) in [
+            // Right to left: the review, while there is one, comes first.
+            let mut views = vec![
                 ("Universe", MapView::Universe),
                 ("API", MapView::Api),
                 ("Plan", MapView::Plan),
-            ] {
+            ];
+            if app.change_set().is_some() {
+                views.push(("Review", MapView::Review));
+            }
+            for (name, view) in views {
                 let on = app.map_view() == Some(view);
                 let text = RichText::new(name)
                     .size(14.0)
@@ -1086,6 +1166,94 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
             }
         },
     );
+    search_box(
+        ui,
+        Rect::from_min_size(area.min + vec2(0.0, 38.0), area.size()),
+        app,
+    );
+}
+
+/// The search of the three views, under their switch: what is searched
+/// for, the caret while it is typed, a cross to clear it. A click starts
+/// typing it, as Ctrl-F does.
+fn search_box(ui: &mut Ui, area: Rect, app: &mut App) {
+    let typing = app.mode() == ironquill_ui::keymap::Mode::Search;
+    let query = app.search_line().text().to_owned();
+    let response = ui
+        .interact(area, Id::new("map-search"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::Text);
+    let painter = ui.painter_at(area.expand(2.0));
+    let lit = typing || !query.trim().is_empty();
+    painter.rect(
+        area,
+        CornerRadius::same(8),
+        theme::see(RAISED, 0.92),
+        Stroke::new(
+            1.0,
+            if typing {
+                ACCENT.gamma_multiply(0.8)
+            } else if response.hovered() {
+                DIM
+            } else {
+                EDGE
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    // A magnifying glass, drawn: no font is sure to hold one.
+    let glass = area.left_center() + vec2(15.0, -1.5);
+    let colour = if lit { TEXT } else { DIM };
+    painter.circle_stroke(glass, 5.0, Stroke::new(1.5, colour));
+    painter.line_segment(
+        [glass + vec2(3.6, 3.6), glass + vec2(7.5, 7.5)],
+        Stroke::new(1.8, colour),
+    );
+    let text_at = area.left_center() + vec2(30.0, 0.0);
+    let font = FontId::proportional(13.5);
+    if query.is_empty() && !typing {
+        painter.text(text_at, Align2::LEFT_CENTER, "Search", font.clone(), DIM);
+        painter.text(
+            area.right_center() - vec2(10.0, 0.0),
+            Align2::RIGHT_CENTER,
+            "Ctrl-F",
+            FontId::proportional(11.5),
+            DIM,
+        );
+    } else {
+        let shown = painter.text(text_at, Align2::LEFT_CENTER, &query, font, TEXT);
+        if typing {
+            // The caret, at the end: the search is typed, not edited in
+            // the middle, often enough for that to do.
+            let x = shown.right() + 1.5;
+            painter.line_segment(
+                [pos2(x, area.top() + 7.0), pos2(x, area.bottom() - 7.0)],
+                Stroke::new(1.5, ACCENT),
+            );
+        }
+    }
+    let mut cleared = false;
+    if !query.is_empty() {
+        let cross = Rect::from_center_size(area.right_center() - vec2(16.0, 0.0), vec2(22.0, 22.0));
+        let clear = ui
+            .interact(cross, Id::new("map-search-clear"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Clear the search (Esc while typing it)");
+        let colour = if clear.hovered() { TEXT } else { DIM };
+        let c = cross.center();
+        for (a, b) in [
+            (vec2(-4.0, -4.0), vec2(4.0, 4.0)),
+            (vec2(-4.0, 4.0), vec2(4.0, -4.0)),
+        ] {
+            painter.line_segment([c + a, c + b], Stroke::new(1.6, colour));
+        }
+        if clear.clicked() {
+            app.clear_search();
+            cleared = true;
+        }
+    }
+    if response.clicked() && !cleared {
+        app.start_search();
+    }
 }
 
 /// The chosen component: what it holds, what it uses and what uses it,

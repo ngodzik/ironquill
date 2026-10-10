@@ -7,7 +7,7 @@ use bevy_egui::egui::{
 };
 use ironquill_agent::Question;
 use ironquill_core::{Effort, TokenCount};
-use ironquill_ui::input::{KeyCode, KeyEvent};
+use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use ironquill_ui::keymap::SHORTCUTS;
 use ironquill_ui::{App, CompactRow, sessions};
 
@@ -27,6 +27,9 @@ pub(crate) fn show(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
     }
     if app.compact_picker().is_some() {
         compact(ctx, app);
+    }
+    if app.definition_choice().is_some() {
+        definitions(ctx, app, keys);
     }
     if app.approval().is_some() || app.keep_warm_question().is_some() {
         approval(ctx, app, keys);
@@ -191,6 +194,59 @@ fn resume(ctx: &Context, app: &App) {
             }
         });
         hint(ui, "↑ ↓ to move · Enter to choose · Esc to close");
+    });
+}
+
+/// The places a name is defined (gd, Ctrl-click), to choose one: a click
+/// goes there, as the arrows then Enter do.
+fn definitions(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
+    let Some(choice) = app.definition_choice() else {
+        return;
+    };
+    let title = format!(
+        "Where {} is {} · {} {}",
+        choice.name,
+        if choice.uses { "used" } else { "defined" },
+        choice.items.len(),
+        if choice.uses { "uses" } else { "places" }
+    );
+    window(ctx, &title, ACCENT, |ui| {
+        ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            for (i, item) in choice.items.iter().enumerate() {
+                let shown = row(ui, i == choice.selected, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(format!("{}:{}", item.path, item.line))
+                                .small()
+                                .color(DIM),
+                        );
+                        ui.label(RichText::new(&item.text).monospace().color(TEXT));
+                    });
+                });
+                if i == choice.selected {
+                    shown.scroll_to_me(None);
+                }
+                if shown.interact(egui::Sense::click()).clicked() {
+                    // The state moves by keys: down or up to it, then Enter.
+                    let (code, steps) = if i >= choice.selected {
+                        (KeyCode::Down, i - choice.selected)
+                    } else {
+                        (KeyCode::Up, choice.selected - i)
+                    };
+                    for _ in 0..steps {
+                        keys.push(KeyEvent::new(code, KeyModifiers::NONE));
+                    }
+                    keys.push(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+            }
+        });
+        hint(
+            ui,
+            &format!(
+                "↑ ↓ to move · Enter or a click to go · Esc to close · found by {}",
+                choice.by
+            ),
+        );
     });
 }
 

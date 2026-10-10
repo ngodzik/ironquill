@@ -1,8 +1,14 @@
-//! The codebase as a universe (Ctrl-N, twice): each file a star coloured by its
-//! language and sized by its length, each folder a dimmer one, the links
-//! between them what holds what and what imports what. The stars spread out
-//! from the centre as the layout finds their places, and light up as the
-//! agent reads them, or flare with sparks as it edits them.
+//! The codebase as a universe (Ctrl-N, twice): each file a star sized by its
+//! length, each folder a dimmer one, the links between them what holds what
+//! and what imports what. The stars spread out from the centre as the
+//! layout finds their places, and light up as the agent reads them, or
+//! flare with sparks as it edits them.
+//!
+//! The stars gather into galaxies by what the person chose: by module at
+//! first, or by language, layer or role, and by a second criterion into
+//! clusters within each galaxy, which then gives the colours. A galaxy can
+//! be entered: the others fade where they are, and its own stars spread
+//! out, gathered again within it.
 //!
 //! The scene is drawn by a camera of its own, in HDR with bloom, under the
 //! panels. It is only drawn while shown: hidden, the camera sleeps and the
@@ -14,7 +20,9 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
-use ironquill_codemap::{CodeMap, EdgeKind, Language, Layout, NodeKind};
+use ironquill_codemap::{
+    CodeMap, Criterion, EdgeKind, Grouping, Key, Language, Layout, MAX_CRITERIA, NodeKind, Role,
+};
 use ironquill_ui::Entry;
 
 /// The most files mapped: beyond, the layout would take too long to settle
@@ -27,6 +35,11 @@ const STEPS_PER_FRAME: usize = 2;
 
 /// How bright a star is at rest, in HDR units: above 1, it blooms.
 const REST: f32 = 3.6;
+/// How bright a star outside the galaxy entered is: below 1, it does not
+/// bloom, and the galaxy stands out.
+const FADED: f32 = 0.16;
+/// How much smaller a star outside the galaxy entered is.
+const FADED_SIZE: f32 = 0.55;
 
 /// How much brighter a star a file the agent just read or edited is, and
 /// how fast that fades, per second.
@@ -43,8 +56,31 @@ const SPARK_LIFE: f32 = 1.4;
 /// through it and its glow fill the window.
 const NEAREST: f32 = 3.5;
 
-/// The far stars of the background.
+/// The far stars of the background, and how far: beyond the widest
+/// universe the camera can back away from.
 const SKY_STARS: usize = 1_400;
+const SKY_NEAR: f32 = 900.0;
+const SKY_DEPTH: f32 = 500.0;
+
+/// The farthest the camera frames the whole from.
+const FARTHEST: f32 = 320.0;
+
+/// The colours of groups that have none of their own, as directions in
+/// HDR: modules, or what a criterion leaves out.
+const PALETTE: [[f32; 3]; 10] = [
+    [1.0, 0.42, 0.18],
+    [0.25, 0.6, 1.0],
+    [0.3, 1.0, 0.45],
+    [1.0, 0.3, 0.7],
+    [1.0, 0.85, 0.25],
+    [0.2, 0.95, 0.9],
+    [0.65, 0.4, 1.0],
+    [1.0, 0.25, 0.25],
+    [0.7, 1.0, 0.2],
+    [0.55, 0.8, 1.0],
+];
+const LEFT_OUT: LinearRgba = LinearRgba::rgb(0.5, 0.55, 0.65);
+const FOLDER: LinearRgba = LinearRgba::rgb(0.55, 0.35, 1.0);
 
 /// The layer the links are drawn on: seen by the universe's camera only, so
 /// that the panels' camera does not draw them flattened.
@@ -77,6 +113,34 @@ pub(crate) struct Universe {
     /// Whether the wheel set the distance since the view last framed
     /// something: it is then left alone.
     pub(crate) zoomed: bool,
+    /// What the stars are grouped by, in order, as the person chose.
+    criteria: Vec<Criterion>,
+    /// The galaxies entered, outermost first, each with its name.
+    entered: Vec<(Key, String)>,
+    /// The stars gathered as the criteria and the focus say.
+    grouping: Grouping,
+    /// The colour of each galaxy, and of each cluster within it.
+    galaxy_colours: Vec<LinearRgba>,
+    cluster_colours: Vec<Vec<LinearRgba>>,
+    /// What the colours mean: a name, a colour and how many files.
+    legend: Legend,
+    /// The stars must take their colours again.
+    recolour: bool,
+    /// The map must be read again: a branch changed files it left out;
+    /// and the changes it was last read again for.
+    rebuild: bool,
+    rebuilt_for: Vec<String>,
+    /// What the stars are searched for, and whether the search finds each:
+    /// a file by its path, a folder when it holds a file found. Empty when
+    /// nothing is searched for.
+    query: String,
+    found: Vec<bool>,
+    /// The files of the branch looked at, and whether each node is one of
+    /// them or holds one. Empty when no branch is.
+    changed_paths: Vec<String>,
+    changed: Vec<bool>,
+    /// Where each galaxy's name goes on screen, in logical pixels.
+    pub(crate) galaxies_on_screen: Vec<Option<Vec2>>,
     /// What the panels report of the mouse, for the next frame.
     pub(crate) drag: Vec2,
     pub(crate) zoom: f32,
@@ -109,11 +173,249 @@ impl Universe {
             zoomed: false,
             drag: Vec2::ZERO,
             zoom: 0.0,
+            criteria: vec![Criterion::Module],
+            entered: Vec::new(),
+            grouping: Grouping::default(),
+            galaxy_colours: Vec::new(),
+            cluster_colours: Vec::new(),
+            legend: Vec::new(),
+            recolour: false,
+            rebuild: false,
+            rebuilt_for: Vec::new(),
+            query: String::new(),
+            found: Vec::new(),
+            changed_paths: Vec::new(),
+            changed: Vec::new(),
+            galaxies_on_screen: Vec::new(),
             hovered: None,
             chosen: None,
             on_screen: Vec::new(),
             covered: 0.0,
         }
+    }
+
+    /// What the stars are grouped by, in order.
+    pub(crate) fn criteria(&self) -> &[Criterion] {
+        &self.criteria
+    }
+
+    /// Groups by `criterion` too, after those chosen, or no longer when it
+    /// was: past the most criteria, it takes the last one's place.
+    pub(crate) fn toggle(&mut self, criterion: Criterion) {
+        if let Some(at) = self.criteria.iter().position(|c| *c == criterion) {
+            self.criteria.remove(at);
+        } else {
+            self.criteria.truncate(MAX_CRITERIA - 1);
+            self.criteria.push(criterion);
+        }
+        self.regroup();
+    }
+
+    /// The galaxies entered, outermost first, by name.
+    pub(crate) fn path(&self) -> impl Iterator<Item = &str> {
+        self.entered.iter().map(|(_, name)| name.as_str())
+    }
+
+    /// Enters the grouping's galaxy `group`, unless it is what a criterion
+    /// leaves out, which has nothing to narrow to.
+    pub(crate) fn enter(&mut self, group: usize) {
+        if let Some(galaxy) = self.grouping.groups.get(group)
+            && let Some(key) = galaxy.key.clone()
+        {
+            self.entered.push((key, galaxy.label.clone()));
+            self.regroup();
+        }
+    }
+
+    /// Narrows to the legend's entry `at`, in every galaxy: to the Rust
+    /// files of each module, say.
+    pub(crate) fn enter_legend(&mut self, at: usize) {
+        if let Some(meaning) = self.legend.get(at)
+            && let Some(key) = meaning.key.clone()
+        {
+            self.entered.push((key, meaning.name.clone()));
+            self.regroup();
+        }
+    }
+
+    /// Leaves the galaxies entered past the first `depth`.
+    pub(crate) fn leave(&mut self, depth: usize) {
+        if depth < self.entered.len() {
+            self.entered.truncate(depth);
+            self.regroup();
+        }
+    }
+
+    /// The stars as they are gathered.
+    pub(crate) fn grouping(&self) -> &Grouping {
+        &self.grouping
+    }
+
+    /// Searches the stars for `query`, unless they already are.
+    pub(crate) fn search(&mut self, query: &str) {
+        if query == self.query {
+            return;
+        }
+        query.clone_into(&mut self.query);
+        self.found = match &self.map {
+            Some(map) if !query.is_empty() => found(map, query),
+            _ => Vec::new(),
+        };
+        self.recolour = true;
+        self.chosen = None;
+    }
+
+    /// Lights only the stars of `paths`, the files a branch changed, and
+    /// the folders that hold them; all of them again with none.
+    pub(crate) fn show_changes(&mut self, paths: &[String]) {
+        if paths == self.changed_paths.as_slice() {
+            return;
+        }
+        self.changed_paths = paths.to_vec();
+        // A changed file the map left out: read it again, that file in.
+        // Once per set of changes: a file the map cannot take (one git
+        // ignores) would have it read again and again.
+        if let Some(map) = &self.map
+            && self.rebuilt_for.as_slice() != paths
+            && paths
+                .iter()
+                .any(|p| map.find(p).is_none() && self.root.join(p).is_file())
+        {
+            self.rebuilt_for = paths.to_vec();
+            self.rebuild = true;
+            return;
+        }
+        self.changed = match &self.map {
+            Some(map) if !paths.is_empty() => {
+                let files: std::collections::HashSet<&str> =
+                    paths.iter().map(String::as_str).collect();
+                let mut ways: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for path in &files {
+                    ways.insert("");
+                    ways.extend(path.match_indices('/').map(|(at, _)| &path[..at]));
+                }
+                map.nodes
+                    .iter()
+                    .map(|n| match n.kind {
+                        NodeKind::File { .. } => files.contains(n.path.as_str()),
+                        NodeKind::Folder => ways.contains(n.path.as_str()),
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        self.recolour = true;
+        self.chosen = None;
+    }
+
+    /// Whether only a branch's changes are lit.
+    pub(crate) fn shows_changes(&self) -> bool {
+        !self.changed.is_empty()
+    }
+
+    /// Whether the stars are searched for something.
+    pub(crate) fn searching(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    /// Whether a node's star is lit: inside the galaxy entered, and found
+    /// by the search, if any.
+    pub(crate) fn lit(&self, node: usize) -> bool {
+        self.grouping.inside(node)
+            && self.found.get(node).copied().unwrap_or(true)
+            && self.changed.get(node).copied().unwrap_or(true)
+    }
+
+    /// The colour of galaxy `group`, for its name.
+    pub(crate) fn galaxy_colour(&self, group: usize) -> [u8; 3] {
+        srgb(self.galaxy_colours.get(group).copied().unwrap_or(LEFT_OUT))
+    }
+
+    /// The colour of a node's star, for its name.
+    pub(crate) fn tint(&self, node: usize) -> [u8; 3] {
+        srgb(self.colour(node))
+    }
+
+    /// What the colours mean: a name, a colour, how many files, and
+    /// whether it can be narrowed to.
+    pub(crate) fn legend(&self) -> impl Iterator<Item = (&str, [u8; 3], usize, bool)> {
+        self.legend
+            .iter()
+            .map(|m| (m.name.as_str(), srgb(m.colour), m.files, m.key.is_some()))
+    }
+
+    /// The colour of a node, as a direction in HDR: brightness comes
+    /// after. Folders keep theirs, to read as the frame of what they hold.
+    fn colour(&self, node: usize) -> LinearRgba {
+        let Some(map) = &self.map else {
+            return LEFT_OUT;
+        };
+        match (map.nodes[node].kind, self.grouping.of(node)) {
+            (NodeKind::Folder, _) => FOLDER,
+            (NodeKind::File { language, .. }, None) if self.grouping.criteria.is_empty() => {
+                language_colour(language)
+            }
+            (_, None) => LEFT_OUT,
+            (_, Some((galaxy, None))) => self.galaxy_colours[galaxy],
+            (_, Some((galaxy, Some(cluster)))) => self.cluster_colours[galaxy][cluster],
+        }
+    }
+
+    /// How bright a node's star is at rest: faded when outside the galaxy
+    /// entered.
+    fn rest(&self, node: usize) -> f32 {
+        if self.lit(node) { REST } else { FADED }
+    }
+
+    /// How large a node's star is at rest: smaller when outside the galaxy
+    /// entered.
+    fn scale(&self, node: usize) -> f32 {
+        let Some(map) = &self.map else {
+            return 0.0;
+        };
+        let size = size(&map.nodes[node]);
+        if self.lit(node) {
+            size
+        } else {
+            size * FADED_SIZE
+        }
+    }
+
+    /// Gathers the stars again, as the criteria and the focus now say, and
+    /// sends them to their new places.
+    fn regroup(&mut self) {
+        let Some(map) = &self.map else {
+            return;
+        };
+        let keys: Vec<Key> = self.entered.iter().map(|(key, _)| key.clone()).collect();
+        self.grouping = ironquill_codemap::group(map, &keys, &self.criteria);
+        // The project's own package has no name of its own: it takes its
+        // folder's.
+        let project = self
+            .root
+            .file_name()
+            .map_or_else(|| ".".to_owned(), |n| n.to_string_lossy().into_owned());
+        for group in self
+            .grouping
+            .groups
+            .iter_mut()
+            .chain(self.grouping.subgroups.iter_mut().flatten())
+            .filter(|g| g.label.is_empty())
+        {
+            group.label.clone_from(&project);
+        }
+        if let Some(layout) = &mut self.layout {
+            layout.regroup(&self.grouping);
+        }
+        let (galaxies, clusters, legend) = colours(map, &self.grouping);
+        self.galaxy_colours = galaxies;
+        self.cluster_colours = clusters;
+        self.legend = legend;
+        self.galaxies_on_screen = vec![None; self.grouping.groups.len()];
+        self.recolour = true;
+        self.chosen = None;
+        self.hovered = None;
+        self.zoomed = false;
     }
 
     /// The map, once built.
@@ -177,6 +479,11 @@ pub(crate) fn setup(
             ..Bloom::NATURAL
         },
         RenderLayers::from_layers(&[0, LINKS_LAYER]),
+        // Far enough to see the sky from the farthest the camera goes.
+        Projection::Perspective(PerspectiveProjection {
+            far: (SKY_NEAR + SKY_DEPTH + FARTHEST * 1.5) * 1.2,
+            ..default()
+        }),
         Transform::from_xyz(0.0, 0.0, 90.0).looking_at(Vec3::ZERO, Vec3::Y),
         UniverseCamera,
     ));
@@ -212,9 +519,10 @@ pub(crate) fn setup(
         let theta = random() * std::f32::consts::TAU;
         let y = random() * 2.0 - 1.0;
         let r = (1.0 - y * y).sqrt();
-        let far = 160.0 + random() * 120.0;
+        let far = SKY_NEAR + random() * SKY_DEPTH;
         let at = Vec3::new(theta.cos() * r, y, theta.sin() * r) * far;
-        let size = 0.08 + random() * random() * 0.35;
+        // As large, seen from where they are, as they always were.
+        let size = (0.08 + random() * random() * 0.35) * far / 220.0;
         commands.spawn((
             Mesh3d(sphere.clone()),
             MeshMaterial3d(if i % 9 == 0 {
@@ -241,25 +549,178 @@ fn hdr(colour: LinearRgba, brightness: f32, alpha: f32) -> LinearRgba {
     )
 }
 
-/// The colour of a node, as a direction in HDR: brightness comes after.
-fn colour(kind: NodeKind) -> LinearRgba {
-    match kind {
-        NodeKind::Folder => LinearRgba::rgb(0.55, 0.35, 1.0),
-        NodeKind::File { language, .. } => match language {
-            Language::Rust => LinearRgba::rgb(1.0, 0.42, 0.18),
-            Language::Python => LinearRgba::rgb(0.25, 0.65, 1.0),
-            Language::TypeScript => LinearRgba::rgb(0.2, 0.5, 1.0),
-            Language::JavaScript => LinearRgba::rgb(1.0, 0.85, 0.25),
-            Language::Markdown => LinearRgba::rgb(0.85, 0.9, 1.0),
-            Language::Config => LinearRgba::rgb(0.2, 0.95, 0.75),
-            Language::Other => LinearRgba::rgb(0.5, 0.55, 0.65),
-        },
+/// Which nodes of `map` a search for `query` finds: the files whose path
+/// it matches, and the folders on the way to them.
+fn found(map: &CodeMap, query: &str) -> Vec<bool> {
+    let mut found: Vec<bool> = map
+        .nodes
+        .iter()
+        .map(|n| {
+            matches!(n.kind, NodeKind::File { .. })
+                && ironquill_ui::search_matches(query, [n.path.as_str()])
+        })
+        .collect();
+    let mut ways: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (node, _) in found.iter().enumerate().filter(|(_, f)| **f) {
+        let path = map.nodes[node].path.as_str();
+        ways.insert("");
+        ways.extend(path.match_indices('/').map(|(at, _)| &path[..at]));
+    }
+    for (node, f) in found.iter_mut().enumerate() {
+        if matches!(map.nodes[node].kind, NodeKind::Folder) {
+            *f = ways.contains(map.nodes[node].path.as_str());
+        }
+    }
+    found
+}
+
+/// The colour of a language, as a direction in HDR.
+fn language_colour(language: Language) -> LinearRgba {
+    match language {
+        Language::Rust => LinearRgba::rgb(1.0, 0.42, 0.18),
+        Language::Python => LinearRgba::rgb(0.25, 0.65, 1.0),
+        Language::TypeScript => LinearRgba::rgb(0.2, 0.5, 1.0),
+        Language::JavaScript => LinearRgba::rgb(1.0, 0.85, 0.25),
+        Language::Markdown => LinearRgba::rgb(0.85, 0.9, 1.0),
+        Language::Config => LinearRgba::rgb(0.2, 0.95, 0.75),
+        Language::Other => LEFT_OUT,
     }
 }
 
-/// The colour of a node, for the panels' legend and labels.
-pub(crate) fn srgb(kind: NodeKind) -> [u8; 3] {
-    let c = Color::from(colour(kind)).to_srgba();
+/// The colour of a role, as a direction in HDR.
+fn role_colour(role: Role) -> LinearRgba {
+    match role {
+        Role::Code => LinearRgba::rgb(1.0, 0.5, 0.2),
+        Role::Tests => LinearRgba::rgb(0.3, 1.0, 0.45),
+        Role::Documents => LinearRgba::rgb(0.85, 0.9, 1.0),
+        Role::Settings => LinearRgba::rgb(0.2, 0.95, 0.75),
+        Role::Other => LEFT_OUT,
+    }
+}
+
+/// What a colour means.
+struct Meaning {
+    /// The group it stands for; `None` for what a criterion leaves out.
+    key: Option<Key>,
+    name: String,
+    colour: LinearRgba,
+    /// How many files are in it.
+    files: usize,
+}
+
+/// What the colours mean, the most files first.
+type Legend = Vec<Meaning>;
+
+/// The colour of each galaxy and of each cluster, and the legend of the
+/// one that colours the stars: the clusters when there are, as the same
+/// group in two galaxies (Rust here and there) shares its colour.
+fn colours(map: &CodeMap, grouping: &Grouping) -> (Vec<LinearRgba>, Vec<Vec<LinearRgba>>, Legend) {
+    // Every distinct group, galaxies first, in their order: a module's
+    // colour is its place among them, the same wherever it shows.
+    let mut seen: Vec<Option<Key>> = Vec::new();
+    let all = grouping
+        .groups
+        .iter()
+        .chain(grouping.subgroups.iter().flatten());
+    for group in all.clone() {
+        if !seen.contains(&group.key) {
+            seen.push(group.key.clone());
+        }
+    }
+    let modules: Vec<&Key> = seen
+        .iter()
+        .flatten()
+        .filter(|k| matches!(k, Key::Module(_)))
+        .collect();
+    let layers = all
+        .filter_map(|g| match g.key {
+            Some(Key::Layer { layer, .. }) => Some(layer),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let colour = |key: &Option<Key>| match key {
+        None => LEFT_OUT,
+        Some(Key::Language(language)) => language_colour(*language),
+        Some(Key::Role(role)) => role_colour(*role),
+        Some(Key::Layer { layer, .. }) => {
+            // Foundations cool, the top warm, as in the plan.
+            let t = if layers > 0 {
+                *layer as f32 / layers as f32
+            } else {
+                0.0
+            };
+            LinearRgba::rgb(0.2, 0.8, 1.0).mix(&LinearRgba::rgb(1.0, 0.42, 0.2), t)
+        }
+        Some(module) => {
+            let place = modules.iter().position(|m| *m == module).unwrap_or(0);
+            let [r, g, b] = PALETTE[place % PALETTE.len()];
+            LinearRgba::rgb(r, g, b)
+        }
+    };
+    let galaxies: Vec<LinearRgba> = grouping.groups.iter().map(|g| colour(&g.key)).collect();
+    let clusters: Vec<Vec<LinearRgba>> = grouping
+        .subgroups
+        .iter()
+        .map(|groups| groups.iter().map(|g| colour(&g.key)).collect())
+        .collect();
+    let mut legend: Vec<(Option<Key>, String, usize)> = Vec::new();
+    let colouring = if grouping.subgroups.is_empty() {
+        grouping.groups.iter().collect::<Vec<_>>()
+    } else {
+        grouping.subgroups.iter().flatten().collect()
+    };
+    for group in colouring {
+        match legend.iter_mut().find(|(key, ..)| *key == group.key) {
+            Some(entry) => entry.2 += group.files,
+            None => legend.push((group.key.clone(), group.label.clone(), group.files)),
+        }
+    }
+    legend.sort_by(|a, b| {
+        a.0.is_none()
+            .cmp(&b.0.is_none())
+            .then(b.2.cmp(&a.2))
+            .then(a.1.cmp(&b.1))
+    });
+    let mut legend: Legend = legend
+        .into_iter()
+        .map(|(key, name, files)| Meaning {
+            colour: colour(&key),
+            key,
+            name,
+            files,
+        })
+        .collect();
+    // Ungrouped, the stars keep their languages' colours.
+    if grouping.criteria.is_empty() {
+        let mut languages: Vec<(Language, usize)> = Vec::new();
+        for (at, node) in map.nodes.iter().enumerate() {
+            if let NodeKind::File { language, .. } = node.kind
+                && grouping.inside(at)
+            {
+                match languages.iter_mut().find(|(l, _)| *l == language) {
+                    Some(entry) => entry.1 += 1,
+                    None => languages.push((language, 1)),
+                }
+            }
+        }
+        languages.sort_by_key(|(_, files)| std::cmp::Reverse(*files));
+        legend = languages
+            .into_iter()
+            .map(|(language, files)| Meaning {
+                key: Some(Key::Language(language)),
+                name: language.name().to_owned(),
+                colour: language_colour(language),
+                files,
+            })
+            .collect();
+    }
+    (galaxies, clusters, legend)
+}
+
+/// A colour, as the panels draw it.
+fn srgb(colour: LinearRgba) -> [u8; 3] {
+    let c = Color::from(colour).to_srgba();
     [
         (c.red * 255.0) as u8,
         (c.green * 255.0) as u8,
@@ -307,19 +768,30 @@ pub(crate) fn show_or_hide(
     let Some(assets) = assets else {
         return;
     };
+    // Read again: the stars of the old map go, the new ones spread out.
+    if universe.rebuild && shown {
+        universe.rebuild = false;
+        for star in std::mem::take(&mut universe.stars) {
+            commands.entity(star).despawn();
+        }
+        universe.map = None;
+        universe.layout = None;
+    }
     if !shown || universe.map.is_some() {
         return;
     }
-    let map = ironquill_codemap::map(&universe.root, MAX_FILES);
+    // The files a branch changed come first: they show, whatever fits.
+    let map = ironquill_codemap::map_with(&universe.root, MAX_FILES, &universe.changed_paths);
     let layout = Layout::new(&map);
     let stars = map
         .nodes
         .iter()
         .zip(layout.positions())
         .map(|(node, at)| {
+            // Coloured once gathered, below.
             let material = materials.add(StandardMaterial {
                 base_color: Color::BLACK,
-                emissive: hdr(colour(node.kind), REST, 1.0),
+                emissive: hdr(FOLDER, REST, 1.0),
                 ..default()
             });
             commands
@@ -340,6 +812,10 @@ pub(crate) fn show_or_hide(
     universe.map = Some(map);
     universe.layout = Some(layout);
     universe.fresh = true;
+    // What was searched for and changed is found again in the new map.
+    universe.query.clear();
+    universe.changed_paths.clear();
+    universe.regroup();
 }
 
 /// Lights the files the agent read or edited since last frame, and throws
@@ -431,11 +907,28 @@ pub(crate) fn animate(
         return;
     }
     let dt = time.delta_secs().min(0.1);
+    if universe.map.is_none() {
+        return;
+    }
+    let tints: Vec<(LinearRgba, f32, f32)> = (0..universe.stars.len())
+        .map(|node| {
+            (
+                universe.colour(node),
+                universe.rest(node),
+                universe.scale(node),
+            )
+        })
+        .collect();
+    let lit: Vec<bool> = (0..universe.stars.len())
+        .map(|node| universe.lit(node))
+        .collect();
+    let recolour = std::mem::take(&mut universe.recolour);
     let Universe {
         map,
         layout,
         stars: entities,
         flash,
+        grouping,
         ..
     } = &mut *universe;
     let (Some(map), Some(layout)) = (map.as_ref(), layout.as_mut()) else {
@@ -451,21 +944,28 @@ pub(crate) fn animate(
         .iter()
         .map(|p| Vec3::from_array(*p))
         .collect();
+    let (middle, extent) = layout.extent();
 
     for (node, entity) in entities.iter().enumerate() {
         let Ok((mut transform, material)) = stars.get_mut(*entity) else {
             continue;
         };
         transform.translation = positions[node];
+        let (colour, rest, scale) = tints[node];
         let (glow, tint) = &mut flash[node];
+        if recolour {
+            transform.scale = Vec3::splat(scale);
+            if let Some(mut material) = materials.get_mut(&material.0) {
+                material.emissive = hdr(colour, rest, 1.0) + hdr(*tint, *glow, 0.0);
+            }
+        }
         if *glow > 0.0 {
             *glow = (*glow - *glow * FADE * dt - 0.05).max(0.0);
             if let Some(mut material) = materials.get_mut(&material.0) {
-                let base = hdr(colour(map.nodes[node].kind), REST, 1.0);
-                material.emissive = base + hdr(*tint, *glow, 0.0);
+                material.emissive = hdr(colour, rest, 1.0) + hdr(*tint, *glow, 0.0);
             }
             let swell = 1.0 + (*glow / EDIT_FLASH) * 1.6;
-            transform.scale = Vec3::splat(size(&map.nodes[node]) * swell);
+            transform.scale = Vec3::splat(scale * swell);
         }
     }
 
@@ -481,8 +981,12 @@ pub(crate) fn animate(
     }
 
     // The links: what holds what faint and violet, imports in the colour of
-    // the file that imports, brighter when either end glows.
+    // the file that imports, brighter when either end glows. Only within
+    // the galaxy entered: the rest is background.
     for edge in &map.edges {
+        if !lit[edge.from] || !lit[edge.to] {
+            continue;
+        }
         let (a, b) = (positions[edge.from], positions[edge.to]);
         let lit = flash[edge.from].0.max(flash[edge.to].0) / EDIT_FLASH;
         let colour = match edge.kind {
@@ -491,17 +995,22 @@ pub(crate) fn animate(
                 0.9 + lit * 4.0,
                 0.25 + lit * 0.6,
             ),
-            EdgeKind::Imports => hdr(
-                colour(map.nodes[edge.from].kind),
-                1.1 + lit * 6.0,
-                0.32 + lit * 0.6,
-            ),
+            EdgeKind::Imports => hdr(tints[edge.from].0, 1.1 + lit * 6.0, 0.32 + lit * 0.6),
             // Through the API, from the front end to the back: magenta.
             EdgeKind::Calls => hdr(
                 LinearRgba::rgb(0.85, 0.35, 0.95),
                 1.4 + lit * 6.0,
                 0.45 + lit * 0.5,
             ),
+        };
+        // Between galaxies, fainter, unless lit: the galaxies stand out,
+        // and what ties them still shows.
+        let galaxy = |node: usize| grouping.of(node).map(|(g, _)| g);
+        let between = galaxy(edge.from) != galaxy(edge.to);
+        let colour = if between && lit < 0.05 {
+            hdr(colour, 0.45, colour.alpha * 0.45)
+        } else {
+            colour
         };
         gizmos.line(a, b, Color::from(colour));
     }
@@ -515,11 +1024,10 @@ pub(crate) fn animate(
     }
     universe.yaw -= drag.x * 0.006;
     universe.pitch = (universe.pitch + drag.y * 0.006).clamp(-1.4, 1.4);
-    let extent = positions.iter().map(|p| p.length()).fold(1.0_f32, f32::max);
-    let whole = (extent * 2.1).clamp(6.0, 120.0);
+    let whole = (extent * 2.4).clamp(6.0, FARTHEST);
     let goal = match universe.chosen {
         Some(node) => (positions.get(node).copied().unwrap_or(Vec3::ZERO), 7.0),
-        None => (Vec3::ZERO, whole),
+        None => (Vec3::from_array(middle), whole),
     };
     // Until the wheel moves it, the camera frames the whole universe, or
     // the star chosen; after, it stays where the wheel left it. The wheel
@@ -557,6 +1065,36 @@ pub(crate) fn animate(
     universe.on_screen = positions
         .iter()
         .map(|p| camera.world_to_viewport(global, *p).ok())
+        .collect();
+    // And where each galaxy's name goes: just above its highest star, as
+    // the camera sees it.
+    let up = looking.up();
+    let galaxies = universe.grouping.groups.len();
+    let mut sums = vec![(Vec3::ZERO, 0_usize); galaxies];
+    for (node, at) in positions.iter().enumerate() {
+        if let Some((galaxy, _)) = universe.grouping.of(node) {
+            sums[galaxy].0 += *at;
+            sums[galaxy].1 += 1;
+        }
+    }
+    let middles: Vec<Vec3> = sums
+        .iter()
+        .map(|(sum, n)| *sum / (*n).max(1) as f32)
+        .collect();
+    let mut tops = vec![0.0_f32; galaxies];
+    for (node, at) in positions.iter().enumerate() {
+        if let Some((galaxy, _)) = universe.grouping.of(node) {
+            tops[galaxy] = tops[galaxy].max((*at - middles[galaxy]).dot(*up));
+        }
+    }
+    universe.galaxies_on_screen = middles
+        .iter()
+        .zip(&tops)
+        .map(|(middle, top)| {
+            camera
+                .world_to_viewport(global, *middle + *up * (top + 1.0))
+                .ok()
+        })
         .collect();
 }
 

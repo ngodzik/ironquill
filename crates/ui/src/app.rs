@@ -62,6 +62,10 @@ pub enum MapView {
     Api,
     /// Its files as stars in space, lit as the agent works.
     Universe,
+    /// What a branch changed, read as a reviewer reads it: its routes, its
+    /// database, its files by area. Only while a review or a piece of work
+    /// is looked at.
+    Review,
 }
 
 /// The Docker pane: what `docker ps` said last.
@@ -258,6 +262,42 @@ pub enum Effect {
     SaveDefaults(Defaults),
     /// Open the person's instructions for every model, creating the file.
     OpenInstructions,
+    /// Find where a name is defined, or used: asked of the language
+    /// server, else read by patterns.
+    Find(Lookup),
+    /// Start the language servers for these files, from the project's
+    /// root, so that they read the project before they are asked.
+    WarmServers(Vec<PathBuf>),
+}
+
+/// A name to find, where it was asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lookup {
+    /// The name.
+    pub name: String,
+    /// The file it is in, from the project's root.
+    pub path: PathBuf,
+    /// Its line, from 0, and its column, in characters.
+    pub line: usize,
+    /// Its column.
+    pub column: usize,
+    /// The file's text, as it is in the editor.
+    pub text: String,
+    /// Where it is used, rather than where it is defined.
+    pub uses: bool,
+}
+
+/// What a lookup found, and who found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    /// The name looked up.
+    pub name: String,
+    /// Whether its uses were looked for, rather than its definition.
+    pub uses: bool,
+    /// The places, the likeliest first.
+    pub places: Vec<ironquill_tools::Definition>,
+    /// What found them: a language server, or `git grep`.
+    pub by: String,
 }
 
 /// What the agent task sends back to the interface.
@@ -271,6 +311,8 @@ pub enum AgentMessage {
     NotSent(String),
     /// A pull request's review comments, as a request to send.
     Addressed(Result<String, String>),
+    /// Where a name is defined or used.
+    Found(Found),
     /// The subjects of the conversation, for the person to pick from.
     Compaction(Result<Compaction, String>),
     /// The conversation was compacted: about how many tokens before, after.
@@ -630,6 +672,10 @@ pub struct App {
     /// Asking whether to keep the sessions warm, after a long wait.
     ask_keep_warm: bool,
     command: LineEditor,
+    /// The search of the codebase's maps, kept after Enter; and the mode
+    /// it was started from, to go back to.
+    search: LineEditor,
+    search_from: Mode,
     transcript: Vec<Entry>,
     /// Lines scrolled up from the bottom; 0 follows new output.
     scroll_back: Cell<usize>,
@@ -637,6 +683,8 @@ pub struct App {
     /// only part that knows how many lines the transcript wraps to.
     max_scroll: Cell<usize>,
     tree: Option<FileTree>,
+    /// The branch's changes, while a review or a piece of work is looked at.
+    changes: Option<crate::changes::ChangeSet>,
     file: Option<Editor>,
     /// Files the agent changed during this conversation, relative to the root.
     changed: BTreeSet<String>,
@@ -678,6 +726,12 @@ pub struct App {
     created: u64,
     requests: usize,
     picker: Option<Picker>,
+    /// Several definitions of a name found, to choose one.
+    definitions: Option<DefinitionChoice>,
+    /// Where `gd` left from, the last last: what Ctrl-O goes back to; and
+    /// where going back left from, what Alt-→ goes forward to.
+    back: Vec<Place>,
+    ahead: Vec<Place>,
     /// Replies unfolded by the person, by transcript index. Long replies are
     /// folded otherwise.
     expanded: BTreeSet<usize>,
@@ -727,6 +781,31 @@ pub struct Picker {
     pub selected: usize,
 }
 
+/// The definitions of a name found in several places, or its uses, to
+/// choose one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionChoice {
+    /// The name.
+    pub name: String,
+    /// Whether these are its uses, rather than its definitions.
+    pub uses: bool,
+    /// What found them.
+    pub by: String,
+    /// Where it is defined, the most likely first.
+    pub items: Vec<ironquill_tools::Definition>,
+    /// The one chosen, by its place.
+    pub selected: usize,
+}
+
+/// A line of a file, to come back to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Place {
+    /// The file, from the project's root.
+    path: PathBuf,
+    /// The line, from 1.
+    line: usize,
+}
+
 impl App {
     /// The state of a new conversation in the project at `root`.
     pub fn new(mut settings: Settings, root: PathBuf) -> Self {
@@ -772,10 +851,13 @@ impl App {
             last_warm: None,
             ask_keep_warm: false,
             command: LineEditor::default(),
+            search: LineEditor::default(),
+            search_from: Mode::Insert,
             transcript,
             scroll_back: Cell::new(0),
             max_scroll: Cell::new(0),
             tree: None,
+            changes: None,
             file: None,
             changed: BTreeSet::new(),
             panes: Cell::new(Panes::default()),
@@ -801,6 +883,9 @@ impl App {
             created: sessions::now(),
             requests: 0,
             picker: None,
+            definitions: None,
+            back: Vec::new(),
+            ahead: Vec::new(),
             expanded: BTreeSet::new(),
             selected_reply: None,
             reveal: Cell::new(false),
@@ -835,6 +920,42 @@ impl App {
     /// The message box.
     pub fn input(&self) -> &LineEditor {
         &self.input
+    }
+
+    /// The search of the codebase's maps, as typed so far.
+    pub fn search_line(&self) -> &LineEditor {
+        &self.search
+    }
+
+    /// What the codebase's maps are searched for: empty when they are not,
+    /// and they show everything.
+    pub fn map_search(&self) -> &str {
+        self.search.text().trim()
+    }
+
+    /// Starts typing a search of the codebase's maps, after what was kept:
+    /// what Ctrl-F does, and what a click on a map's search box does.
+    pub fn start_search(&mut self) {
+        if self.map.is_none() {
+            self.notice = Some(
+                "Ctrl-F searches the plan, the API and the universe: Ctrl-N shows them \
+                 (in the window)"
+                    .to_owned(),
+            );
+            return;
+        }
+        if self.mode != Mode::Search {
+            self.search_from = self.mode;
+            self.mode = Mode::Search;
+        }
+    }
+
+    /// Clears the search of the codebase's maps, and stops typing it.
+    pub fn clear_search(&mut self) {
+        self.search.take();
+        if self.mode == Mode::Search {
+            self.mode = self.search_from;
+        }
     }
 
     /// The `:` command line.
@@ -881,6 +1002,277 @@ impl App {
     /// The file tree, when open.
     pub fn tree(&self) -> Option<&FileTree> {
         self.tree.as_ref()
+    }
+
+    /// The branch's changes, while a review or a piece of work is looked at.
+    pub fn change_set(&self) -> Option<&crate::changes::ChangeSet> {
+        self.changes.as_ref()
+    }
+
+    /// Shows the open file whole, or only its changes again: what `zR` and
+    /// `zM` do, for a button.
+    pub fn toggle_whole_file(&mut self) {
+        if let Some(file) = &mut self.file {
+            if file.shows_changes_only() {
+                file.unfold_unchanged();
+            } else {
+                file.fold_unchanged();
+            }
+        }
+    }
+
+    /// The definitions of a name to choose from, when several were found.
+    pub fn definition_choice(&self) -> Option<&DefinitionChoice> {
+        self.definitions.as_ref()
+    }
+
+    /// Goes to the definition at `index` of those to choose from, for a
+    /// click on it.
+    pub fn choose_definition(&mut self, index: usize) {
+        if let Some(choice) = self.definitions.take()
+            && let Some(found) = choice.items.get(index)
+        {
+            self.go_to_found(found.clone());
+        }
+    }
+
+    /// Goes to where the name under `column` of the drawn `row` of the open
+    /// file is defined: a Ctrl-click. The lookup is queued for the loop.
+    pub fn definition_at(&mut self, row: usize, column: usize) {
+        self.click_file(row, column);
+        let word = self.file.as_ref().and_then(|f| {
+            let (row, col) = f.cursor();
+            f.word_at(row, col)
+        });
+        if let Some(word) = word {
+            self.queued = self.look_up(&word, false);
+        }
+    }
+
+    /// Where the cursor of the open file is, as a place to come back to.
+    fn here(&self) -> Option<Place> {
+        let file = self.file.as_ref()?;
+        let path = file.path();
+        let path = path.strip_prefix(&self.root).unwrap_or(path).to_owned();
+        Some(Place {
+            path,
+            line: file.cursor().0 + 1,
+        })
+    }
+
+    /// Goes to `place`, opening its file unless it is open.
+    fn go_to_place(&mut self, place: &Place) {
+        if self.here().is_none_or(|here| here.path != place.path) {
+            self.open_path(place.path.clone());
+        }
+        let opened = self.here().is_some_and(|here| here.path == place.path);
+        if opened && let Some(file) = &mut self.file {
+            file.go_to_line(place.line);
+        }
+        self.focus_on(Focus::File);
+    }
+
+    /// Asks where `name`, under the cursor of the open file, is defined or,
+    /// with `uses`, used: of the loop, which asks the language server.
+    fn look_up(&mut self, name: &str, uses: bool) -> Option<Effect> {
+        let file = self.file.as_ref()?;
+        let path = file.path();
+        let path = path.strip_prefix(&self.root).unwrap_or(path).to_owned();
+        let (line, column) = file.cursor();
+        let lookup = Lookup {
+            name: name.to_owned(),
+            path,
+            line,
+            column,
+            text: file.lines().join("\n"),
+            uses,
+        };
+        self.notice = Some(format!(
+            "Looking for where {name} is {}…",
+            if uses { "used" } else { "defined" }
+        ));
+        Some(Effect::Find(lookup))
+    }
+
+    /// Goes to what a lookup found: at once when one place is the
+    /// likeliest definition, else to choose among them.
+    fn on_found(&mut self, found: Found) {
+        self.notice = None;
+        let what = if found.uses { "use" } else { "definition" };
+        match found.places.len() {
+            0 => self.info(format!("No {what} of {} found ({})", found.name, found.by)),
+            1 if !found.uses => self.go_to_found(found.places[0].clone()),
+            _ => {
+                self.definitions = Some(DefinitionChoice {
+                    name: found.name,
+                    uses: found.uses,
+                    by: found.by,
+                    items: found.places,
+                    selected: 0,
+                });
+            }
+        }
+    }
+
+    /// Goes to a definition found, remembering where it left from.
+    fn go_to_found(&mut self, found: ironquill_tools::Definition) {
+        if let Some(here) = self.here() {
+            self.back.push(here);
+            self.ahead.clear();
+        }
+        let place = Place {
+            path: PathBuf::from(found.path),
+            line: found.line,
+        };
+        self.go_to_place(&place);
+    }
+
+    /// Goes back to where the last `gd` left from.
+    fn go_back(&mut self) {
+        let Some(place) = self.back.pop() else {
+            self.info("Nowhere to go back to: gd goes to a definition, Ctrl-O comes back");
+            return;
+        };
+        if let Some(here) = self.here() {
+            self.ahead.push(here);
+        }
+        self.go_to_place(&place);
+    }
+
+    /// Goes forward again to where going back left from.
+    fn go_forward(&mut self) {
+        let Some(place) = self.ahead.pop() else {
+            return;
+        };
+        if let Some(here) = self.here() {
+            self.back.push(here);
+        }
+        self.go_to_place(&place);
+    }
+
+    /// Keys while definitions are offered: the arrows choose, Enter goes,
+    /// Esc gives up. Returns whether the key was theirs.
+    fn definition_key(&mut self, key: KeyEvent) -> bool {
+        let Some(choice) = &mut self.definitions else {
+            return false;
+        };
+        let last = choice.items.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => choice.selected = choice.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => choice.selected = (choice.selected + 1).min(last),
+            KeyCode::Enter => {
+                let index = choice.selected;
+                self.choose_definition(index);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.definitions = None,
+            _ => {}
+        }
+        true
+    }
+
+    /// Opens the run of unchanged lines folded at `line` of the open file,
+    /// for a click on it.
+    pub fn open_fold(&mut self, line: usize) {
+        self.focus_on(Focus::File);
+        if let Some(file) = &mut self.file {
+            file.open_unchanged(line);
+        }
+    }
+
+    /// The file tree, showing only the branch's changes while they are
+    /// looked at.
+    fn new_tree(&self) -> FileTree {
+        let mut tree = FileTree::new(self.root.clone());
+        if let Some(changes) = &self.changes {
+            tree.show_changes(changes.letters());
+        }
+        tree
+    }
+
+    /// Starts looking at the branch's changes through `lens`, against
+    /// `base` or where the branch left main; or stops with `off`.
+    fn look_at_changes(
+        &mut self,
+        lens: crate::changes::Lens,
+        argument: Option<String>,
+    ) -> Option<Effect> {
+        if argument.as_deref() == Some("off") {
+            if self.changes.take().is_some() {
+                if let Some(tree) = &mut self.tree {
+                    tree.show_everything();
+                }
+                if let Some(file) = &mut self.file {
+                    file.unfold_unchanged();
+                }
+                self.info("Back to the whole project");
+            }
+            return None;
+        }
+        match crate::changes::ChangeSet::read(&self.root, lens, argument.as_deref()) {
+            Err(e) => {
+                self.error(e);
+                None
+            }
+            Ok(changes) => {
+                let (added, removed) = changes.lines();
+                let count = changes.files.len();
+                self.info(format!(
+                    "{}: {count} file{} changed since {}, +{added} −{removed}. The tree shows \
+                     only them; a file opens folded to its changes (zR: whole, zM: back){}. \
+                     /{} off ends it",
+                    match lens {
+                        crate::changes::Lens::Review => "Reviewing",
+                        crate::changes::Lens::Work => "Working",
+                    },
+                    if count == 1 { "" } else { "s" },
+                    changes.base_line,
+                    match lens {
+                        crate::changes::Lens::Review => "; nothing can be edited",
+                        crate::changes::Lens::Work => "",
+                    },
+                    lens.command(),
+                ));
+                // The language servers start reading the project now, to
+                // answer at once when asked.
+                let files: Vec<PathBuf> = changes
+                    .files
+                    .iter()
+                    .map(|f| PathBuf::from(&f.path))
+                    .filter(|p| ironquill_tools::Servers::program_for(p).is_some())
+                    .collect();
+                self.changes = Some(changes);
+                self.unzoom();
+                self.tree = Some(self.new_tree());
+                self.focus_on(Focus::Tree);
+                (!files.is_empty()).then_some(Effect::WarmServers(files))
+            }
+        }
+    }
+
+    /// Shows the file just opened as the changes looked at want it:
+    /// compared with their base, folded to its changes, and read only in a
+    /// review.
+    fn as_changes_want(&mut self) {
+        let (Some(changes), Some(file)) = (&self.changes, &mut self.file) else {
+            return;
+        };
+        let path = file.path();
+        let path = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        match changes.find(&path).map(|f| &f.change) {
+            Some(ironquill_tools::Change::Deleted) => file.show_deleted(changes.base.clone()),
+            Some(ironquill_tools::Change::Renamed { from }) => {
+                file.compare_with_moved(changes.base.clone(), PathBuf::from(from));
+            }
+            _ => file.compare_with(changes.base.clone()),
+        }
+        file.fold_unchanged();
+        if changes.lens == crate::changes::Lens::Review {
+            file.lock("Read only while reviewing: /review off to edit");
+        }
     }
 
     /// The open file, when one is.
@@ -979,11 +1371,37 @@ impl App {
                 return None;
             }
         }
+        if self.definition_key(key) {
+            return None;
+        }
+        // In a file at rest, Ctrl-O and Alt-← go back to where `gd` left
+        // from, as in Vim; Alt-→ goes forward again.
+        if self.focus == Focus::File
+            && self.pending.is_none()
+            && self.mode != Mode::Search
+            && self.file.as_ref().is_some_and(Editor::is_idle)
+        {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            // Ctrl-O shows the usage pane otherwise, as everywhere.
+            let back = !self.back.is_empty() && ctrl && key.code == KeyCode::Char('o');
+            if back || (alt && key.code == KeyCode::Left) {
+                self.go_back();
+                return None;
+            }
+            if alt && key.code == KeyCode::Right {
+                self.go_forward();
+                return None;
+            }
+        }
         if self.focus == Focus::File
             && self.pending.is_none()
             && let Some(editor) = &mut self.file
         {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            // Over a map, Ctrl-F searches it; over the file alone, it is
+            // Vim's page down.
+            let search = ctrl && key.code == KeyCode::Char('f') && self.map.is_some();
             // The shortcuts that work anywhere work here too, rather than
             // reach Vim as the letter they hold (Ctrl-O would open a line);
             // Tab, Ctrl-W and the leader leave the file only when Vim is not
@@ -1011,9 +1429,11 @@ impl App {
                 && (key.code == KeyCode::Tab
                     || key.code == KeyCode::Char(',')
                     || (ctrl && key.code == KeyCode::Char('w')));
-            if !global && !pane {
+            if !global && !pane && !search && self.mode != Mode::Search {
                 match editor.handle_key(key) {
                     EditorOutcome::Command(line) => return self.run_command(&line),
+                    EditorOutcome::Definition(name) => return self.look_up(&name, false),
+                    EditorOutcome::Uses(name) => return self.look_up(&name, true),
                     EditorOutcome::Context { text, close } => {
                         if close {
                             self.file = None;
@@ -1058,6 +1478,9 @@ impl App {
 
     fn on_action(&mut self, action: Action) -> Option<Effect> {
         match action {
+            // Esc while searching: the search is cleared, and typing goes
+            // back to where it was.
+            Action::Enter(Mode::Normal) if self.mode == Mode::Search => self.clear_search(),
             Action::Enter(mode) => {
                 if mode == Mode::Command {
                     self.command.take();
@@ -1095,6 +1518,11 @@ impl App {
                         self.mode = Mode::Normal;
                         self.run_command(&line)
                     }
+                    // Enter keeps the search, and goes back to where it was.
+                    Mode::Search => {
+                        self.mode = self.search_from;
+                        None
+                    }
                     Mode::Normal => None,
                 };
             }
@@ -1117,9 +1545,13 @@ impl App {
                 }
             }
             Action::ToggleUsage => self.usage_open = !self.usage_open,
+            Action::Search => self.start_search(),
             Action::NextMap => {
+                // Looking at a branch, its review comes first.
+                let reviewing = self.changes.is_some();
                 let next = match self.map {
-                    None => Some(MapView::Plan),
+                    None if reviewing => Some(MapView::Review),
+                    None | Some(MapView::Review) => Some(MapView::Plan),
                     Some(MapView::Plan) => Some(MapView::Api),
                     Some(MapView::Api) => Some(MapView::Universe),
                     Some(MapView::Universe) => None,
@@ -1204,7 +1636,7 @@ impl App {
                         });
                     }
                 } else {
-                    self.tree = Some(FileTree::new(self.root.clone()));
+                    self.tree = Some(self.new_tree());
                     self.focus_on(Focus::Tree);
                 }
             }
@@ -1242,7 +1674,7 @@ impl App {
                 self.unzoom();
                 match &mut self.tree {
                     Some(tree) => tree.refresh(),
-                    None => self.tree = Some(FileTree::new(self.root.clone())),
+                    None => self.tree = Some(self.new_tree()),
                 }
                 self.focus_on(Focus::Tree);
             }
@@ -1322,6 +1754,7 @@ impl App {
             editing => match self.mode {
                 Mode::Insert => self.input.apply(&editing),
                 Mode::Command => self.command.apply(&editing),
+                Mode::Search => self.search.apply(&editing),
                 Mode::Normal => {}
             },
         }
@@ -1571,6 +2004,7 @@ impl App {
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
         self.unzoom();
         self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.as_changes_want();
         self.focus_on(Focus::File);
     }
 
@@ -1601,6 +2035,7 @@ impl App {
         }
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
         self.file = Some(Editor::open(&self.root, path, highlighter));
+        self.as_changes_want();
         self.focus_on(Focus::File);
     }
 
@@ -2147,6 +2582,12 @@ impl App {
                 return Some(Effect::ForgetDelegate(agent));
             }
             Command::Keys => self.keys_open = Some(0),
+            Command::Review(argument) => {
+                return self.look_at_changes(crate::changes::Lens::Review, argument);
+            }
+            Command::Work(argument) => {
+                return self.look_at_changes(crate::changes::Lens::Work, argument);
+            }
             Command::Budget(None) => match self.settings.budget {
                 Some(budget) => self.info(format!("Budget: {budget} per request")),
                 None => self.info("No budget: requests may cost any amount"),
@@ -2252,6 +2693,10 @@ impl App {
                      from the summary. /context shows it"
                 ));
                 true
+            }
+            AgentMessage::Found(found) => {
+                self.on_found(found);
+                false
             }
             AgentMessage::Addressed(Ok(request)) => {
                 self.running_since = None;
@@ -3399,6 +3844,10 @@ impl App {
                 "The universe: drag to turn, scroll to come closer, click a star to centre it; \
                  Ctrl-N again to go back"
             }
+            Some(MapView::Review) => {
+                "The review: the routes, the database and the files the branch changed. Click \
+                 one to open it; Ctrl-N again for the plan"
+            }
             None => return,
         };
         self.notice = Some(notice.to_owned());
@@ -3758,7 +4207,7 @@ impl App {
         if self.approval.is_some()
             || self.picker.is_some()
             || self.model_picker.is_some()
-            || self.focus == Focus::File
+            || (self.focus == Focus::File && self.mode != Mode::Search)
         {
             return;
         }
@@ -3773,6 +4222,11 @@ impl App {
             Mode::Command => {
                 for c in text.chars() {
                     self.command.insert(if c == '\n' { ' ' } else { c });
+                }
+            }
+            Mode::Search => {
+                for c in text.chars() {
+                    self.search.insert(if c == '\n' { ' ' } else { c });
                 }
             }
             Mode::Normal => {}
@@ -3975,6 +4429,56 @@ mod tests {
         assert_eq!(app.map_view(), Some(MapView::Plan));
         app.on_key(ctrl('o'));
         assert!(app.usage_open);
+        assert!(app.file.as_ref().is_some_and(|f| !f.is_modified()));
+    }
+
+    #[test]
+    fn ctrl_f_searches_the_maps_enter_keeps_the_search_and_esc_clears_it() {
+        let mut app = ready();
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // No map shown: nothing to search, and the way to one is said.
+        app.on_key(ctrl('f'));
+        assert_eq!(app.mode(), Mode::Insert);
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("Ctrl-N")));
+
+        app.on_key(ctrl('n'));
+        app.on_key(ctrl('f'));
+        assert_eq!(app.mode(), Mode::Search);
+        for c in "gui ".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        // Kept as it is typed, without its trailing space; the message box
+        // is left alone.
+        assert_eq!(app.map_search(), "gui");
+        assert_eq!(app.input().text(), "");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode(), Mode::Insert);
+        assert_eq!(app.map_search(), "gui");
+        // Across the views.
+        app.on_key(ctrl('n'));
+        assert_eq!(app.map_search(), "gui");
+
+        // Typed on from where it was: its trailing space, then a letter.
+        app.on_key(ctrl('f'));
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.map_search(), "gu");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode(), Mode::Insert);
+        assert_eq!(app.map_search(), "");
+    }
+
+    #[test]
+    fn over_a_map_ctrl_f_searches_it_rather_than_scroll_the_open_file() {
+        let (_dir, mut app) = project();
+        app.open_path(app.root.join("src/lib.rs"));
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('n'));
+        app.on_key(ctrl('f'));
+        assert_eq!(app.mode(), Mode::Search);
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.map_search(), "x");
         assert!(app.file.as_ref().is_some_and(|f| !f.is_modified()));
     }
 
@@ -4326,6 +4830,187 @@ mod tests {
             dir.path().to_owned(),
         );
         (dir, app)
+    }
+
+    /// A project in git where `b.py` uses `f`, defined in `a.py` and, as a
+    /// decoy, in `c.py`.
+    fn defined() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n\ndef f():\n    pass\n").unwrap();
+        std::fs::write(dir.path().join("c.py"), "def f():\n    pass\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), "from a import f\n\nf()\n").unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                ..Settings::default()
+            },
+            dir.path().to_owned(),
+        );
+        (dir, app)
+    }
+
+    #[test]
+    fn a_review_shows_only_the_branch_and_its_files_against_their_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        let write = |path: &str, text: &str| std::fs::write(dir.path().join(path), text).unwrap();
+        git(&["init", "-q"]);
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        write("a.py", &body);
+        write("old.py", "kept\n");
+        write("gone.py", "one\ntwo\n");
+        write("same.py", "x\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        git(&["mv", "old.py", "new.py"]);
+        git(&["rm", "-q", "gone.py"]);
+        git(&["commit", "-q", "-m", "work"]);
+        write("a.py", &body.replace("line 10\n", "line ten\n"));
+
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("cheap").unwrap()],
+                ..Settings::default()
+            },
+            dir.path().to_owned(),
+        );
+        app.run_command(&format!("review {base}"));
+        let changes = app.change_set().unwrap();
+        let files: Vec<&str> = changes.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(files, ["a.py", "gone.py", "new.py"]);
+        let rows: Vec<&str> = app
+            .tree()
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(rows, ["a.py", "gone.py", "new.py", "+1 unchanged"]);
+
+        // The changed file, folded to its change, read only.
+        app.open_path(PathBuf::from("a.py"));
+        let file = app.file().unwrap();
+        assert!(file.shows_changes_only());
+        assert_eq!(file.folded(0), Some(5));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.file().unwrap().is_modified());
+        // The deleted one, all removed; the moved one, the same as before.
+        app.open_path(PathBuf::from("gone.py"));
+        let gone = app.file().unwrap().changes().unwrap();
+        assert_eq!(gone.removed.values().map(Vec::len).sum::<usize>(), 2);
+        app.open_path(PathBuf::from("new.py"));
+        assert!(app.file().unwrap().changes().unwrap().is_empty());
+
+        app.run_command("review off");
+        assert!(app.change_set().is_none());
+        assert!(
+            app.tree()
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|r| r.name == "same.py")
+        );
+    }
+
+    #[test]
+    fn gd_goes_to_the_definition_imported_ctrl_o_comes_back_alt_right_goes_again() {
+        let (_dir, mut app) = defined();
+        app.open_path_at(PathBuf::from("b.py"), 3);
+        let here = |app: &App| {
+            let file = app.file().unwrap();
+            (
+                file.path().to_string_lossy().into_owned(),
+                file.cursor().0 + 1,
+            )
+        };
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::File);
+        press(&mut app, KeyCode::Char('g'));
+        // gd asks the loop, which asks the language server, else git grep:
+        // here, git grep, as the loop's fallback would.
+        let effect = app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let Some(Effect::Find(lookup)) = effect else {
+            panic!("gd asks the loop to find, not {effect:?}");
+        };
+        assert_eq!(
+            (lookup.name.as_str(), lookup.line, lookup.uses),
+            ("f", 2, false)
+        );
+        assert_eq!(lookup.path, PathBuf::from("b.py"));
+        let lines: Vec<String> = lookup.text.lines().map(str::to_owned).collect();
+        let places = ironquill_tools::definitions(&app.root, "f", &lookup.path, &lines);
+        app.on_agent(AgentMessage::Found(Found {
+            name: "f".into(),
+            uses: false,
+            places,
+            by: "git grep".into(),
+        }));
+        // Two definitions, the one b.py imports first: offered to choose.
+        let choice = app.definition_choice().unwrap();
+        assert_eq!(choice.name, "f");
+        assert_eq!(
+            choice
+                .items
+                .iter()
+                .map(|d| d.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a.py", "c.py"]
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(app.definition_choice().is_none());
+        assert_eq!(here(&app), ("a.py".to_owned(), 3));
+
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('o'));
+        assert_eq!(here(&app), ("b.py".to_owned(), 3));
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(here(&app), ("a.py".to_owned(), 3));
+        // Nothing further: a word, and the place stays.
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(here(&app), ("a.py".to_owned(), 3));
+
+        // gr: the uses, offered to choose even when there is one.
+        press(&mut app, KeyCode::Char('g'));
+        let effect = app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        let Some(Effect::Find(lookup)) = effect else {
+            panic!("gr asks the loop to find, not {effect:?}");
+        };
+        assert!(lookup.uses);
+        let places = ironquill_tools::uses(&app.root, "f");
+        assert_eq!(places.len(), 4);
+        app.on_agent(AgentMessage::Found(Found {
+            name: "f".into(),
+            uses: true,
+            places: places[..1].to_vec(),
+            by: "pyright-langserver".into(),
+        }));
+        let choice = app.definition_choice().unwrap();
+        assert!(choice.uses);
+        assert_eq!(choice.by, "pyright-langserver");
     }
 
     #[test]

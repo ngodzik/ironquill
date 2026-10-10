@@ -18,6 +18,7 @@ mod api_view;
 mod error;
 mod keys;
 mod plan;
+mod review_view;
 mod theme;
 mod transcript;
 mod universe;
@@ -46,7 +47,7 @@ use bevy_egui::{
 use ironquill_codemap::NodeKind;
 use ironquill_core::{ChatModel, Delegate};
 use ironquill_tools::Workspace;
-use ironquill_ui::editor::EditorMode;
+use ironquill_ui::editor::{EditorMode, ScreenRow};
 use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use ironquill_ui::keymap::{Focus, Mode, Pending};
 use ironquill_ui::{App, Effect, Host, MapView, Settings, Start, Waiting, clipboard};
@@ -110,6 +111,7 @@ where
     let shell = Shell {
         plan,
         api: api_view::ApiView::default(),
+        review: review_view::ReviewView::default(),
         app,
         host,
         runtime,
@@ -198,6 +200,8 @@ struct Shell<M, D> {
     plan: Plan,
     /// The codebase's API, from the plan's map.
     api: api_view::ApiView,
+    /// What the branch looked at changed, read.
+    review: review_view::ReviewView,
     /// The conversation's scroll as the state last had it, in lines: a key
     /// that scrolls changes it, and the view follows by the difference.
     scroll_seen: usize,
@@ -506,8 +510,10 @@ where
 
     let now = ctx.input(|i| i.time);
     let view = shell.app.map_view();
+    let project = shell.app.root().to_owned();
+    shell.review.update(&project, shell.app.change_set());
     shell.plan.showing(
-        matches!(view, Some(MapView::Plan | MapView::Api)),
+        matches!(view, Some(MapView::Plan | MapView::Api | MapView::Review)),
         now,
         shell.app.transcript(),
     );
@@ -527,7 +533,7 @@ where
         egui::CentralPanel::default()
             .frame(match view {
                 MapView::Universe => Frame::NONE,
-                MapView::Plan | MapView::Api => Frame::NONE.fill(background),
+                MapView::Plan | MapView::Api | MapView::Review => Frame::NONE.fill(background),
             })
             .show(&mut root, |ui| match view {
                 MapView::Universe => {
@@ -538,8 +544,16 @@ where
                     ui,
                     &mut shell.api,
                     &shell.plan,
+                    &shell.review,
                     &mut shell.app,
                     &mut shell.effects,
+                ),
+                MapView::Review => review_view::show(
+                    ui,
+                    &mut shell.review,
+                    &mut shell.api,
+                    &shell.plan,
+                    &mut shell.app,
                 ),
             });
     } else if shell.app.tree().is_some() {
@@ -602,11 +616,20 @@ where
     chat
 }
 
+/// The most files a narrowed universe names all of.
+const FEW_NAMED: usize = 40;
+
 /// The universe's own controls: dragging turns it, the wheel comes closer,
-/// a click centres a star, a double click opens its file. Names show for
-/// the star under the pointer, the one chosen, and those the agent just
-/// touched.
+/// a click centres a star, a double click opens its file, a click on a
+/// galaxy's name enters it. Names show for each galaxy, for the star under
+/// the pointer, the one chosen, and those the agent just touched.
 fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
+    universe.search(app.map_search());
+    let changed: Vec<String> = app
+        .change_set()
+        .map(|c| c.files.iter().map(|f| f.path.clone()).collect())
+        .unwrap_or_default();
+    universe.show_changes(&changed);
     let rect = ui.max_rect();
     let response = ui.allocate_rect(
         rect.with_max_x(rect.max.x - plan::EDGE_GRIP),
@@ -620,11 +643,14 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
         universe.zoom += ui.input(|i| i.smooth_scroll_delta.y);
     }
     let pointer = response.hover_pos();
+    // Only the stars of the galaxy entered can be picked: the others are
+    // background.
     universe.hovered = pointer.and_then(|at| {
         universe
             .on_screen
             .iter()
             .enumerate()
+            .filter(|(node, _)| universe.lit(*node))
             .filter_map(|(node, p)| p.map(|p| (node, egui::pos2(p.x, p.y).distance(at))))
             .filter(|(_, d)| *d < 18.0)
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -655,19 +681,34 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
         );
         return;
     };
-    // The names worth reading: under the pointer, chosen, or just touched.
+    // The names worth reading: under the pointer, chosen, or just touched;
+    // and every file's, faint, once few enough are looked at to read them
+    // all and no galaxy names them.
+    let lit_files = (0..map.nodes.len())
+        .filter(|n| universe.lit(*n))
+        .filter(|n| matches!(map.nodes[*n].kind, NodeKind::File { .. }))
+        .count();
+    let few =
+        (universe.grouping().groups.is_empty() || universe.searching() || universe.shows_changes())
+            && lit_files <= FEW_NAMED;
     for (node, at) in universe.on_screen.iter().enumerate() {
         let Some(at) = at else {
             continue;
         };
         let glow = universe.glow(node);
         let picked = universe.hovered == Some(node) || universe.chosen == Some(node);
-        if !picked && glow < 1.0 {
+        let named =
+            few && universe.lit(node) && matches!(map.nodes[node].kind, NodeKind::File { .. });
+        if !picked && glow < 1.0 && !named {
             continue;
         }
         let entry = &map.nodes[node];
-        let [r, g, b] = universe::srgb(entry.kind);
-        let fade = if picked { 1.0 } else { (glow / 8.0).min(1.0) };
+        let [r, g, b] = universe.tint(node);
+        let fade = if picked {
+            1.0
+        } else {
+            (glow / 8.0).clamp(0.25, 1.0)
+        };
         let colour = Color32::from_rgb(r, g, b).gamma_multiply(0.4 + 0.6 * fade);
         let text = if picked {
             match entry.kind {
@@ -686,69 +727,285 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
         };
         let at = egui::pos2(at.x + 12.0, at.y - 10.0);
         let font = egui::FontId::proportional(if picked { 15.0 } else { 13.0 });
-        painter.text(
-            at + egui::vec2(1.0, 1.0),
-            egui::Align2::LEFT_BOTTOM,
-            &text,
-            font.clone(),
-            Color32::from_black_alpha(200),
-        );
-        painter.text(at, egui::Align2::LEFT_BOTTOM, &text, font, colour);
+        shadowed(&painter, at, egui::Align2::LEFT_BOTTOM, &text, font, colour);
     }
 
-    // What the universe is, in the corner, with the colours' meaning.
-    let files = map
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.kind, NodeKind::File { .. }))
+    // Each galaxy's name above it, to click to enter it.
+    let mut enter = None;
+    let groups = universe.grouping().groups.clone();
+    for (galaxy, group) in groups.iter().enumerate() {
+        let Some(at) = universe.galaxies_on_screen.get(galaxy).copied().flatten() else {
+            continue;
+        };
+        let at = egui::pos2(at.x, at.y);
+        if !rect.contains(at) {
+            continue;
+        }
+        // Searched, how many of its files are found: a galaxy with none
+        // fades, its name too.
+        let found = (universe.searching() || universe.shows_changes()).then(|| {
+            (0..map.nodes.len())
+                .filter(|&n| {
+                    universe.lit(n) && universe.grouping().of(n).map(|g| g.0) == Some(galaxy)
+                })
+                .filter(|&n| matches!(map.nodes[n].kind, NodeKind::File { .. }))
+                .count()
+        });
+        // A galaxy with nothing found or changed is background: unnamed.
+        if found == Some(0) {
+            continue;
+        }
+        let [r, g, b] = universe.galaxy_colour(galaxy);
+        let colour = Color32::from_rgb(r, g, b);
+        let name = egui::FontId::proportional(16.0);
+        let galley = painter.layout_no_wrap(group.label.clone(), name.clone(), colour);
+        let area = egui::Rect::from_center_size(
+            at + egui::vec2(0.0, -galley.size().y / 2.0),
+            galley.size() + egui::vec2(12.0, 6.0),
+        );
+        let openable = group.key.is_some();
+        let label = ui.interact(
+            area,
+            Id::new(("galaxy", galaxy)),
+            if openable {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
+        let lit = openable && label.hovered();
+        if lit {
+            painter.rect_filled(area, 6.0, Color32::from_black_alpha(160));
+            painter.rect_stroke(
+                area,
+                6.0,
+                Stroke::new(1.0, colour.gamma_multiply(0.7)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        shadowed(
+            &painter,
+            at,
+            egui::Align2::CENTER_BOTTOM,
+            &group.label,
+            name,
+            if lit {
+                colour
+            } else {
+                colour.gamma_multiply(0.85)
+            },
+        );
+        let files = if let Some(found) = found {
+            let word = if universe.searching() {
+                "found"
+            } else {
+                "changed"
+            };
+            format!("{found} of {} {word}", group.files)
+        } else if group.files == 1 {
+            "1 file".to_owned()
+        } else {
+            format!("{} files", group.files)
+        };
+        shadowed(
+            &painter,
+            at + egui::vec2(0.0, 2.0),
+            egui::Align2::CENTER_TOP,
+            &files,
+            egui::FontId::proportional(11.0),
+            DIM,
+        );
+        let label = label.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if label.clicked() {
+            enter = Some(galaxy);
+        }
+    }
+
+    // What the universe is, in the corner: the way in, what it holds, what
+    // it is grouped by, and what the colours mean.
+    let inside = |node: &usize| universe.grouping().inside(*node);
+    let files = (0..map.nodes.len())
+        .filter(inside)
+        .filter(|n| matches!(map.nodes[*n].kind, NodeKind::File { .. }))
         .count();
     let imports = map
         .edges
         .iter()
         .filter(|e| e.kind == ironquill_codemap::EdgeKind::Imports)
+        .filter(|e| inside(&e.from) && inside(&e.to))
         .count();
+    let left_out = map.left_out;
     let corner = rect.left_top() + egui::vec2(24.0, 22.0);
-    painter.text(
-        corner,
-        egui::Align2::LEFT_TOP,
-        "Universe",
-        egui::FontId::proportional(26.0),
-        TEXT,
+    let path: Vec<String> = universe.path().map(str::to_owned).collect();
+    let mut leave = None;
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(corner, egui::vec2(560.0, 34.0)))
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            // Inside a galaxy, the way back out is a button, not only the
+            // path: one level up.
+            if !path.is_empty() {
+                let back = egui::Button::new(RichText::new("‹ Back").size(14.0).color(TEXT))
+                    .fill(theme::see(RAISED, 0.9))
+                    .stroke(Stroke::new(1.0, EDGE))
+                    .corner_radius(6.0);
+                if ui
+                    .add(back)
+                    .on_hover_text("Back out one level")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    leave = Some(path.len() - 1);
+                }
+                ui.add_space(6.0);
+            }
+            let crumb = |ui: &mut Ui, name: &str, size: f32, last: bool| {
+                if last {
+                    ui.label(RichText::new(name).size(size).color(TEXT));
+                    return false;
+                }
+                // Lit and underlined under the pointer, to read as a link.
+                let id = ui.next_auto_id();
+                let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
+                let mut text =
+                    RichText::new(name)
+                        .size(size)
+                        .color(if hovered { TEXT } else { DIM });
+                if hovered {
+                    text = text.underline();
+                }
+                ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+                    .on_hover_text(format!("Back to {name}"))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+            };
+            if crumb(ui, "Universe", 26.0, path.is_empty()) {
+                leave = Some(0);
+            }
+            for (depth, name) in path.iter().enumerate() {
+                ui.label(RichText::new("›").size(20.0).color(DIM));
+                if crumb(ui, name, 20.0, depth + 1 == path.len()) {
+                    leave = Some(depth + 1);
+                }
+            }
+        },
     );
     let mut summary = format!("{} · {files} files · {imports} imports", app.project());
-    if map.left_out > 0 {
-        summary.push_str(&format!(" · {} more not shown", map.left_out));
+    if universe.searching() {
+        summary.push_str(&format!(" · {lit_files} found"));
+    } else if universe.shows_changes() {
+        summary.push_str(&format!(" · {lit_files} changed by the branch"));
+    }
+    if left_out > 0 && path.is_empty() {
+        summary.push_str(&format!(" · {left_out} more not shown"));
     }
     painter.text(
-        corner + egui::vec2(0.0, 34.0),
+        corner + egui::vec2(0.0, 38.0),
         egui::Align2::LEFT_TOP,
         summary,
         egui::FontId::proportional(13.0),
         DIM,
     );
-    let legend = [
-        ("Rust", ironquill_codemap::Language::Rust),
-        ("Python", ironquill_codemap::Language::Python),
-        ("TypeScript", ironquill_codemap::Language::TypeScript),
-        ("JavaScript", ironquill_codemap::Language::JavaScript),
-        ("Markdown", ironquill_codemap::Language::Markdown),
-        ("Settings", ironquill_codemap::Language::Config),
-    ];
-    let mut at = corner + egui::vec2(0.0, 58.0);
-    for (name, language) in legend {
-        let [r, g, b] = universe::srgb(NodeKind::File { language, lines: 0 });
-        painter.circle_filled(at + egui::vec2(5.0, 7.0), 4.0, Color32::from_rgb(r, g, b));
+
+    // The criteria, to pick in order: the first makes the galaxies, the
+    // second the clusters within them.
+    let mut toggle = None;
+    let chosen = universe.criteria().to_vec();
+    let applied = universe.grouping().criteria.clone();
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(
+                corner + egui::vec2(0.0, 60.0),
+                egui::vec2(560.0, 26.0),
+            ))
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(RichText::new("Group by").size(12.0).color(DIM));
+            for criterion in ironquill_codemap::Criterion::ALL {
+                let place = chosen.iter().position(|c| *c == criterion);
+                let text = match place {
+                    Some(at) => format!("{} {}", at + 1, criterion.name()),
+                    None => criterion.name().to_owned(),
+                };
+                // Chosen but saying nothing here (one language inside a
+                // language): shown, but dim.
+                let colour = match place {
+                    Some(_) if applied.contains(&criterion) => TEXT,
+                    Some(_) => DIM,
+                    None => DIM,
+                };
+                let button = egui::Button::selectable(
+                    place.is_some(),
+                    RichText::new(text).size(13.0).color(colour),
+                );
+                let hint = match place {
+                    Some(0) => "Makes the galaxies: click to stop grouping by it",
+                    Some(_) => "Makes the clusters within each galaxy, and the colours: click to stop grouping by it",
+                    None if chosen.is_empty() => "Group the stars into galaxies by it",
+                    None => "Group each galaxy's stars into clusters by it",
+                };
+                if ui.add(button).on_hover_text(hint).clicked() {
+                    toggle = Some(criterion);
+                }
+            }
+        },
+    );
+
+    // The legend: what the colours mean, each a click away from narrowing
+    // to it, unlike the galaxies' names, which turn with the sky.
+    let mut at = corner + egui::vec2(0.0, 96.0);
+    let legend: Vec<(String, [u8; 3], usize, bool)> = universe
+        .legend()
+        .map(|(name, colour, files, openable)| (name.to_owned(), colour, files, openable))
+        .collect();
+    const SHOWN: usize = 12;
+    let mut narrow = None;
+    for (place, (name, [r, g, b], files, openable)) in legend.iter().enumerate().take(SHOWN) {
+        let colour = Color32::from_rgb(*r, *g, *b);
+        let galley = painter.layout_no_wrap(
+            format!("{name}  {files}"),
+            egui::FontId::proportional(12.0),
+            DIM,
+        );
+        let area = egui::Rect::from_min_size(at, galley.size() + egui::vec2(16.0, 2.0));
+        let lit = *openable
+            && ui
+                .interact(area, Id::new(("legend", place)), egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("Only {name}"))
+                .clicked();
+        if lit {
+            narrow = Some(place);
+        }
+        let hovered = *openable && ui.rect_contains_pointer(area);
+        painter.circle_filled(at + egui::vec2(5.0, 7.0), 4.0, colour);
         painter.text(
             at + egui::vec2(16.0, 0.0),
             egui::Align2::LEFT_TOP,
-            name,
+            format!("{name}  {files}"),
+            egui::FontId::proportional(12.0),
+            if hovered { TEXT } else { DIM },
+        );
+        at.y += 18.0;
+    }
+    if legend.len() > SHOWN {
+        painter.text(
+            at + egui::vec2(16.0, 0.0),
+            egui::Align2::LEFT_TOP,
+            format!("and {} more", legend.len() - SHOWN),
             egui::FontId::proportional(12.0),
             DIM,
         );
         at.y += 18.0;
     }
-    let [r, g, b] = universe::srgb(NodeKind::Folder);
-    painter.circle_filled(at + egui::vec2(5.0, 7.0), 4.0, Color32::from_rgb(r, g, b));
+    painter.circle_filled(
+        at + egui::vec2(5.0, 7.0),
+        4.0,
+        Color32::from_rgb(140, 90, 255),
+    );
     painter.text(
         at + egui::vec2(16.0, 0.0),
         egui::Align2::LEFT_TOP,
@@ -756,14 +1013,56 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
         egui::FontId::proportional(12.0),
         DIM,
     );
+    let mut hint = vec!["drag to turn", "scroll to come closer"];
+    if !groups.is_empty() {
+        hint.push("click a galaxy's name to enter it");
+    }
+    if !path.is_empty() {
+        hint.push("‹ Back to come back out");
+    }
+    hint.extend([
+        "click a star to centre it",
+        "double-click to open it",
+        "Ctrl-N to leave",
+    ]);
+    let hint = hint.join(" · ");
     painter.text(
         rect.left_bottom() + egui::vec2(24.0, -18.0),
         egui::Align2::LEFT_BOTTOM,
-        "drag to turn · scroll to come closer · click a star to centre it · double-click to open it · Ctrl-N to leave",
+        hint,
         egui::FontId::proportional(12.0),
         DIM,
     );
     plan::switch(ui, rect, app);
+
+    if let Some(criterion) = toggle {
+        universe.toggle(criterion);
+    } else if let Some(depth) = leave {
+        universe.leave(depth);
+    } else if let Some(galaxy) = enter {
+        universe.enter(galaxy);
+    } else if let Some(place) = narrow {
+        universe.enter_legend(place);
+    }
+}
+
+/// `text` with a dark shadow under it, to read over the stars.
+fn shadowed(
+    painter: &egui::Painter,
+    at: egui::Pos2,
+    anchor: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+    colour: Color32,
+) {
+    painter.text(
+        at + egui::vec2(1.0, 1.0),
+        anchor,
+        text,
+        font.clone(),
+        Color32::from_black_alpha(200),
+    );
+    painter.text(at, anchor, text, font, colour);
 }
 
 /// The conversation, following new output unless a key scrolled it back.
@@ -830,6 +1129,7 @@ fn activity(ui: &mut Ui, app: &App) {
 fn input(ui: &mut Ui, app: &App) {
     let (editor, prompt) = match app.mode() {
         Mode::Command => (app.command_line(), ":"),
+        Mode::Search => (app.search_line(), "Search ›"),
         Mode::Insert | Mode::Normal => (app.input(), "›"),
     };
     let focused = app.mode() != Mode::Normal;
@@ -916,6 +1216,7 @@ fn status(ui: &mut Ui, app: &App) {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
             Mode::Command => "COMMAND",
+            Mode::Search => "SEARCH",
         };
         Frame::new()
             .fill(if app.mode() == Mode::Normal {
@@ -928,6 +1229,35 @@ fn status(ui: &mut Ui, app: &App) {
             .show(ui, |ui| {
                 ui.label(RichText::new(mode).small().strong().color(TEXT));
             });
+        // Looking at a branch's changes: which way, how many, against what.
+        if let Some(changes) = app.change_set() {
+            Frame::new()
+                .fill(theme::CYAN.gamma_multiply(0.3))
+                .corner_radius(4)
+                .inner_margin(Margin::symmetric(6, 1))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(changes.lens.name())
+                            .small()
+                            .strong()
+                            .color(TEXT),
+                    );
+                });
+            let (added, removed) = changes.lines();
+            ui.label(
+                RichText::new(format!(
+                    "{} files · +{added} −{removed} · since {}",
+                    changes.files.len(),
+                    changes.base_line
+                ))
+                .small()
+                .color(DIM),
+            )
+            .on_hover_text(format!(
+                "/{} off ends it",
+                changes.lens.name().to_lowercase()
+            ));
+        }
         match app.pending() {
             Some(Pending::Leader) => {
                 ui.label(RichText::new(",").small().color(TEXT));
@@ -937,10 +1267,6 @@ fn status(ui: &mut Ui, app: &App) {
             }
             None => {}
         }
-        match app.notice() {
-            Some(notice) => ui.label(RichText::new(notice).small().color(YELLOW)),
-            None => ui.label(RichText::new(app.session_label()).small().color(DIM)),
-        };
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let (usage, cost, complete) = app.totals();
             let budget = app
@@ -965,6 +1291,16 @@ fn status(ui: &mut Ui, app: &App) {
             if let Some(model) = app.current_model() {
                 ui.label(RichText::new(model.to_string()).small().color(ACCENT));
             }
+            // The notice, or the conversation's name, in what is left
+            // between: cut short rather than over the rest, whole on hover.
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let (text, colour) = match app.notice() {
+                    Some(notice) => (notice.to_owned(), YELLOW),
+                    None => (app.session_label(), DIM),
+                };
+                ui.add(egui::Label::new(RichText::new(&text).small().color(colour)).truncate())
+                    .on_hover_text(text);
+            });
         });
     });
 }
@@ -1004,7 +1340,37 @@ fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     }
     tree.set_offset(offset);
     let mut clicked = None;
+    let branch = tree.shows_changes_only();
     for (i, entry) in tree.rows().iter().enumerate().skip(offset).take(visible) {
+        // The row standing for a folder's unchanged files: quiet, a click
+        // away from showing them.
+        if entry.unchanged.is_some() {
+            let text = RichText::new(format!("{}  {}", "   ".repeat(entry.depth), entry.name))
+                .italics()
+                .small()
+                .color(DIM);
+            let shown = Frame::new()
+                .fill(if i == selected && focused {
+                    SELECTED
+                } else {
+                    Color32::TRANSPARENT
+                })
+                .corner_radius(4)
+                .inner_margin(Margin::symmetric(4, 1))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(egui::Label::new(text).selectable(false));
+                });
+            let response = shown.response.interact(egui::Sense::click());
+            if response.hovered() {
+                ui.painter()
+                    .rect_filled(response.rect, 4, Color32::from_white_alpha(6));
+            }
+            if response.clicked() {
+                clicked = Some(i);
+            }
+            continue;
+        }
         let icon = if entry.is_dir {
             if tree.is_expanded(&entry.path) {
                 "▾ "
@@ -1015,14 +1381,31 @@ fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             "  "
         };
         let changed = app.is_changed(&entry.path, entry.is_dir);
+        // Looking at a branch, each change has git's letter and colour.
+        let letter = branch
+            .then(|| tree.git_status(&entry.path, entry.is_dir))
+            .flatten();
+        let letter_colour = |letter: char| match letter {
+            'A' => theme::GREEN,
+            'D' => theme::RED,
+            'R' => theme::CYAN,
+            _ => YELLOW,
+        };
         let text = RichText::new(format!("{}{icon}{}", "   ".repeat(entry.depth), entry.name))
             .color(if changed {
                 ACCENT
+            } else if let Some(letter) = letter.filter(|_| !entry.is_dir) {
+                letter_colour(letter)
             } else if entry.is_dir {
                 TEXT
             } else {
                 DIM
             });
+        let text = if letter == Some('D') {
+            text.strikethrough()
+        } else {
+            text
+        };
         let shown = Frame::new()
             .fill(if i == selected && focused {
                 SELECTED
@@ -1033,7 +1416,19 @@ fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             .inner_margin(Margin::symmetric(4, 1))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.add(egui::Label::new(text).selectable(false));
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(text).selectable(false));
+                    if let Some(letter) = letter.filter(|_| !entry.is_dir) {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(letter.to_string())
+                                    .monospace()
+                                    .small()
+                                    .color(letter_colour(letter)),
+                            );
+                        });
+                    }
+                });
             });
         let response = shown.response.interact(egui::Sense::click());
         if response.hovered() {
@@ -1080,6 +1475,9 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     };
     let focused = app.focus() == Focus::File;
     let mut close = false;
+    let mut whole = false;
+    let mut open_fold = None;
+    let mut definition = None;
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(editor.path().display().to_string())
@@ -1096,6 +1494,59 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
                 .clicked()
             {
                 close = true;
+            }
+            // Folded to its changes, the whole file is a click away, and
+            // back.
+            let changed = editor.changes().is_some_and(|c| !c.is_empty());
+            if editor.shows_changes_only() {
+                if ui
+                    .small_button("whole file")
+                    .on_hover_text("show the lines left unchanged too (zR)")
+                    .clicked()
+                {
+                    whole = true;
+                }
+            } else if changed
+                && app.change_set().is_some()
+                && ui
+                    .small_button("only the changes")
+                    .on_hover_text("fold the lines left unchanged (zM)")
+                    .clicked()
+            {
+                whole = true;
+            }
+            if changed && let Some(changes) = editor.changes() {
+                let added = changes
+                    .marks
+                    .iter()
+                    .filter(|m| **m != ironquill_tools::LineMark::Same)
+                    .count();
+                let removed: usize = changes.removed.values().map(Vec::len).sum();
+                ui.label(
+                    RichText::new(format!("−{removed}"))
+                        .small()
+                        .color(theme::RED),
+                );
+                ui.label(
+                    RichText::new(format!("+{added}"))
+                        .small()
+                        .color(theme::GREEN),
+                );
+            }
+            // Back to where gd left from, and forward again.
+            if ui
+                .small_button("›")
+                .on_hover_text("forward again (Alt-→)")
+                .clicked()
+            {
+                keys.push(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+            }
+            if ui
+                .small_button("‹")
+                .on_hover_text("back to where gd or a Ctrl-click left from (Ctrl-O, Alt-←)")
+                .clicked()
+            {
+                keys.push(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
             }
             if app.tree().is_none()
                 && ui
@@ -1117,21 +1568,46 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     let (cursor_row, cursor_column) = editor.cursor();
     let styled = editor.styled();
     let text_area = ui.available_rect_before_wrap();
-    let first = editor.scroll();
     let mut clicked = None;
     // Long lines shift left together to keep the cursor in sight, as in
     // Vim with `nowrap`.
     let left = editor.left_offset();
     let font = egui::TextStyle::Monospace.resolve(ui.style());
     let insert = editor.mode() == EditorMode::Insert;
-    for (i, line) in editor
-        .lines()
-        .iter()
-        .enumerate()
-        .skip(editor.scroll())
-        .take(rows)
-    {
+    let changes = editor.changes();
+    for (on_screen, screen) in editor.screen_rows(rows).into_iter().enumerate() {
+        let i = match screen {
+            ScreenRow::Line(i) => i,
+            // A line of the base, gone from here: red, under no number.
+            ScreenRow::Removed(text) => {
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    &format!("{:>5}  ", "−"),
+                    0.0,
+                    egui::TextFormat::simple(font.clone(), theme::RED),
+                );
+                let text: String = text.chars().skip(left).collect();
+                job.append(
+                    &text,
+                    0.0,
+                    egui::TextFormat::simple(font.clone(), theme::RED.gamma_multiply(0.8)),
+                );
+                job.wrap.max_rows = 1;
+                job.wrap.max_width = f32::INFINITY;
+                Frame::new()
+                    .fill(theme::RED.gamma_multiply(0.1))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.add(egui::Label::new(job).selectable(false).extend());
+                    });
+                continue;
+            }
+        };
+        let line = &editor.lines()[i];
         let current = i == cursor_row;
+        let mark = changes
+            .and_then(|c| c.marks.get(i).copied())
+            .unwrap_or(ironquill_tools::LineMark::Same);
         // One piece of text per line, its runs coloured: a widget per run
         // made every key cost a frame of hundreds of them.
         let mut job = egui::text::LayoutJob::default();
@@ -1160,19 +1636,49 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             }
             None => runs(line, TEXT),
         }
+        // A run of unchanged lines folded away: how many, a click to open.
+        let fold = editor.folded(i).filter(|_| editor.folds_unchanged(i));
+        if let Some(count) = fold {
+            job.append(
+                &format!(
+                    "   ⋯ {count} unchanged line{} · click to open",
+                    if count == 1 { "" } else { "s" }
+                ),
+                0.0,
+                format(DIM),
+            );
+        }
         job.wrap.max_rows = 1;
         job.wrap.max_width = f32::INFINITY;
-        let shown = Frame::new()
-            .fill(if current {
-                SELECTED
-            } else {
-                Color32::TRANSPARENT
-            })
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add(egui::Label::new(job).selectable(false).extend());
-            });
+        let background = match mark {
+            _ if current => SELECTED,
+            ironquill_tools::LineMark::Added => theme::GREEN.gamma_multiply(0.1),
+            ironquill_tools::LineMark::Changed => theme::LINK.gamma_multiply(0.1),
+            ironquill_tools::LineMark::Same if fold.is_some() => RAISED,
+            ironquill_tools::LineMark::Same => Color32::TRANSPARENT,
+        };
+        let shown = Frame::new().fill(background).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(job).selectable(false).extend());
+        });
         let rect = shown.response.rect;
+        // The change's mark, between the number and the text, as in the
+        // terminal.
+        let sign = match mark {
+            ironquill_tools::LineMark::Added => Some(theme::GREEN),
+            ironquill_tools::LineMark::Changed => Some(theme::LINK),
+            ironquill_tools::LineMark::Same => None,
+        };
+        if let Some(colour) = sign {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 5.6 * glyph, rect.top()),
+                    egui::vec2(3.0, rect.height()),
+                ),
+                1,
+                colour,
+            );
+        }
         if current && focused {
             // The cursor: a bar while typing, a block otherwise, as in Vim.
             let x = rect.left() + (7 + cursor_column.saturating_sub(left)) as f32 * glyph;
@@ -1205,7 +1711,14 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             // adds the shift.
             let gutter = 7.0 * glyph;
             let column = ((at.x - rect.left() - gutter) / glyph.max(1.0)).max(0.0);
-            clicked = Some((i - first, column as usize));
+            if fold.is_some() {
+                open_fold = Some(i);
+            } else if ui.input(|i| i.modifiers.command) {
+                // Ctrl-click: to where the name clicked is defined.
+                definition = Some((on_screen, column as usize));
+            } else {
+                clicked = Some((on_screen, column as usize));
+            }
         }
     }
     // The colours are borrowed from the editor, which the clicks change.
@@ -1239,5 +1752,14 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     }
     if close {
         app.close_file(Focus::Chat);
+    }
+    if whole {
+        app.toggle_whole_file();
+    }
+    if let Some(line) = open_fold {
+        app.open_fold(line);
+    }
+    if let Some((row, column)) = definition {
+        app.definition_at(row, column);
     }
 }

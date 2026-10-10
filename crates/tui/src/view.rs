@@ -13,7 +13,7 @@ use ratatui::widgets::{
 use crate::markdown;
 use crate::pictures::{Picture, Pictures};
 use crate::wrap::wrap;
-use ironquill_ui::editor::{Editor, EditorMode, Kind};
+use ironquill_ui::editor::{Editor, EditorMode, Kind, ScreenRow};
 use ironquill_ui::keymap::{Focus, Mode, Pending, SHORTCUTS};
 use ironquill_ui::references::{self, Reference};
 use ironquill_ui::sessions;
@@ -57,6 +57,9 @@ pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
     }
     if app.model_picker().is_some() {
         render_model_picker(frame, app);
+    }
+    if app.definition_choice().is_some() {
+        render_definitions(frame, app);
     }
     if app.keys_open().is_some() {
         render_keys(frame, app);
@@ -465,6 +468,62 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
 }
 
 /// The `/resume` list, over everything else.
+/// The places a name is defined (gd), to choose one.
+fn render_definitions(frame: &mut Frame, app: &App) {
+    let Some(choice) = app.definition_choice() else {
+        return;
+    };
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 110).min(screen.width);
+    let height =
+        (choice.items.len() as u16 * 2 + 2).clamp(4, screen.height.saturating_sub(4).max(4));
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height.saturating_sub(height)) / 3,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let title = format!(
+        " Where {} is {} ({}) ",
+        choice.name,
+        if choice.uses { "used" } else { "defined" },
+        choice.items.len()
+    );
+    let hint = format!(" ↑ ↓ choose · Enter: go · Esc: close · by {} ", choice.by);
+    let block = pane_block(title, true).title_bottom(Line::styled(hint, fg(DIM)).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Two rows each: where, then the line itself.
+    let shown = usize::from(inner.height) / 2;
+    let first = choice.selected.saturating_sub(shown.saturating_sub(1));
+    let room = usize::from(inner.width);
+    let lines: Vec<Line> = choice
+        .items
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .flat_map(|(i, item)| {
+            let style = if i == choice.selected {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            let place: String = format!("{}:{}", item.path, item.line)
+                .chars()
+                .take(room)
+                .collect();
+            let text: String = format!("  {}", item.text).chars().take(room).collect();
+            [
+                Line::styled(format!("{place:<room$}"), style.fg(DIM)),
+                Line::styled(format!("{text:<room$}"), style),
+            ]
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_picker(frame: &mut Frame, app: &App) {
     let Some(picker) = app.picker() else {
         return;
@@ -856,7 +915,12 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
                 "▸ "
             };
             let changed = app.is_changed(&row.path, row.is_dir);
-            let git = tree.git_status(&row.path, row.is_dir);
+            // The row standing for a folder's unchanged files has no letter.
+            let git = if row.unchanged.is_some() {
+                None
+            } else {
+                tree.git_status(&row.path, row.is_dir)
+            };
             let mut text = format!("{}{icon}{}", "  ".repeat(row.depth), row.name);
             if row.is_dir {
                 text.push('/');
@@ -874,6 +938,7 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
                 Some('D') => fg(REMOVED_SIGN),
                 Some(_) => fg(CHANGED_SIGN),
                 None if changed => fg(Color::Yellow),
+                None if row.unchanged.is_some() => fg(DIM).add_modifier(Modifier::ITALIC),
                 None if row.is_dir => fg(Color::Blue),
                 None => Style::new(),
             };
@@ -994,49 +1059,15 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
     let (cursor_row, cursor_col) = file.cursor();
     let selection = file.selection();
 
-    // Rows to draw: each line, preceded by the lines of the last commit
-    // that are gone from that place.
-    let height = usize::from(inner.height);
+    // Rows to draw: each line not folded away, preceded by the lines of
+    // the base that are gone from that place.
     let changes = file.changes();
-    let hidden = file.hidden();
-    let rows_from = |start: usize| {
-        let mut rows: Vec<Option<usize>> = Vec::new();
-        let mut removed: Vec<(usize, &String)> = Vec::new();
-        for i in start..=file.lines().len() {
-            // Lines inside a closed fold are not drawn.
-            if hidden.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            if let Some(gone) = changes.and_then(|c| c.removed.get(&i)) {
-                for text in gone {
-                    removed.push((rows.len(), text));
-                    rows.push(None);
-                }
-            }
-            if i < file.lines().len() {
-                rows.push(Some(i));
-            }
-            if rows.len() >= height {
-                break;
-            }
-        }
-        rows.truncate(height);
-        (rows, removed)
-    };
-    // Removed lines take rows too, so the start may need to move down for
-    // the cursor to stay on screen.
-    let mut start = file.scroll();
-    let (mut rows, mut removed) = rows_from(start);
-    while start < cursor_row && !rows.contains(&Some(cursor_row)) {
-        start += 1;
-        (rows, removed) = rows_from(start);
-    }
+    let rows = file.screen_rows(usize::from(inner.height));
 
     let lines: Vec<Line> = rows
         .iter()
-        .enumerate()
-        .map(|(at, row)| match row {
-            Some(i) => {
+        .map(|row| match row {
+            ScreenRow::Line(i) => {
                 let i = *i;
                 let text = &file.lines()[i];
                 let number_style = if i == cursor_row && focused {
@@ -1076,6 +1107,17 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
                         ));
                     }
                 }
+                if file.folds_unchanged(i)
+                    && let Some(count) = file.folded(i)
+                {
+                    runs.push((
+                        fg(DIM),
+                        format!(
+                            "  ⋯ {} unchanged · zo opens, zR the whole file",
+                            plural(count, "line", "lines")
+                        ),
+                    ));
+                }
                 if let Some(bg) = background {
                     runs = runs
                         .into_iter()
@@ -1090,11 +1132,8 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
                 spans.extend(clip(&runs, left, room));
                 Line::from(spans)
             }
-            None => {
-                let text = removed
-                    .iter()
-                    .find(|(row, _)| *row == at)
-                    .map_or("", |(_, t)| t.as_str());
+            ScreenRow::Removed(text) => {
+                let text = text.as_str();
                 let style = Style::new().fg(REMOVED_FG).bg(REMOVED_BG);
                 let mut spans = vec![
                     Span::raw(" ".repeat(gutter - 2)),
@@ -1106,13 +1145,12 @@ fn render_file(frame: &mut Frame, app: &App, area: Rect) {
             }
         })
         .collect();
-    file.set_rows(rows.clone());
     frame.render_widget(Paragraph::new(lines), inner);
 
     let typing_below = matches!(file.mode(), EditorMode::Command | EditorMode::Search);
     if focused
         && !typing_below
-        && let Some(y) = rows.iter().position(|r| *r == Some(cursor_row))
+        && let Some(y) = rows.iter().position(|r| *r == ScreenRow::Line(cursor_row))
     {
         let x = gutter + cursor_col.saturating_sub(left);
         if x < usize::from(inner.width) {
@@ -1879,6 +1917,7 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     let (editor, prompt) = match app.mode() {
         Mode::Command => (app.command_line(), ":"),
+        Mode::Search => (app.search_line(), "search: "),
         Mode::Insert | Mode::Normal => (app.input(), "> "),
     };
     let focused = app.mode() != Mode::Normal;
@@ -1974,6 +2013,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "-- NORMAL --",
         Mode::Insert => "-- INSERT --",
         Mode::Command => "-- COMMAND --",
+        Mode::Search => "-- SEARCH --",
     };
     // Only what a key already typed is waiting for; no shortcut reminders.
     let waiting = match app.pending() {
@@ -1986,8 +2026,13 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Some(notice) => Span::styled(format!("  {notice}"), fg(Color::Yellow)),
         None => Span::styled(format!("  {}", app.session_label()), fg(DIM)),
     };
+    // Looking at a branch's changes: which way, and how many files.
+    let lens = app.change_set().map_or_else(String::new, |c| {
+        format!("  {} {} files", c.lens.name(), c.files.len())
+    });
     let left = Line::from(vec![
         Span::styled(format!("  {mode}"), fg(DIM)),
+        Span::styled(lens, fg(Color::Cyan)),
         Span::styled(waiting, fg(Color::Gray)),
         label,
     ]);

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ironquill_agent::{AgentConfig, Answer, Approver, Session};
 use ironquill_core::{ChatModel, Delegate};
-use ironquill_tools::{Container, Toolbox, Workspace};
+use ironquill_tools::{Container, Servers, Toolbox, Workspace};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Interval;
@@ -105,6 +105,8 @@ pub struct Host<M, D> {
     /// A save asked for while a request runs waits for its end: the
     /// conversation is the request's meanwhile.
     save_pending: bool,
+    /// The project's language servers, each started when first needed.
+    servers: Arc<Servers>,
 }
 
 impl<M, D> Host<M, D>
@@ -119,6 +121,7 @@ where
         let (tx, rx) = mpsc::unbounded_channel();
         let (docker_tx, docker_rx) = mpsc::unbounded_channel();
         let store = Store::for_project(workspace.root());
+        let workspace_root = &workspace.root().to_owned();
         Self {
             conversation: Arc::new(Mutex::new(Conversation {
                 session: Session::new(),
@@ -138,6 +141,7 @@ where
             docker_tick: tokio::time::interval(Duration::from_secs(2)),
             warm_tick: tokio::time::interval(Duration::from_secs(30)),
             save_pending: false,
+            servers: Arc::new(Servers::new(workspace_root)),
         }
     }
 
@@ -240,6 +244,7 @@ where
             tx,
             docker_tx,
             docker_asking,
+            servers,
             ..
         } = self;
         let store = store.as_ref();
@@ -360,6 +365,29 @@ where
                         .await
                         .map_err(|e| error_chain(&e));
                     let _ = tx.send(AgentMessage::Compacted(result));
+                });
+            }
+            Effect::Find(lookup) => {
+                let root = workspace.root().to_owned();
+                let servers = Arc::clone(servers);
+                let tx = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(AgentMessage::Found(find(&servers, &root, &lookup)));
+                });
+            }
+            Effect::WarmServers(paths) => {
+                let servers = Arc::clone(servers);
+                tokio::task::spawn_blocking(move || {
+                    // One file per language is enough: the server reads the
+                    // rest of the project itself.
+                    let mut warmed = std::collections::HashSet::new();
+                    for path in paths {
+                        if let Some(program) = Servers::program_for(&path)
+                            && warmed.insert(program)
+                        {
+                            let _ = servers.warm(&path);
+                        }
+                    }
                 });
             }
             Effect::Address(number) => {
@@ -596,4 +624,67 @@ fn error_chain(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     text
+}
+
+/// Where `lookup`'s name is defined or used: as the language server for
+/// its file says, or, when none answers or it only points at an import of
+/// the file itself (an alias it could not follow), as `git grep` reads it.
+fn find(
+    servers: &Servers,
+    root: &std::path::Path,
+    lookup: &crate::app::Lookup,
+) -> crate::app::Found {
+    let asked = if lookup.uses {
+        servers.references(&lookup.path, &lookup.text, lookup.line, lookup.column)
+    } else {
+        servers.definition(&lookup.path, &lookup.text, lookup.line, lookup.column)
+    };
+    let program = Servers::program_for(&lookup.path).unwrap_or("the language server");
+    let mut files: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut line_of = |path: &str, line: usize| -> String {
+        let lines = files.entry(path.to_owned()).or_insert_with(|| {
+            std::fs::read_to_string(root.join(path))
+                .map(|t| t.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        });
+        lines
+            .get(line.saturating_sub(1))
+            .map(|l| l.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let here = lookup.path.to_string_lossy().into_owned();
+    if let Ok(places) = asked {
+        let places: Vec<ironquill_tools::Definition> = places
+            .into_iter()
+            .map(|p| ironquill_tools::Definition {
+                text: line_of(&p.path, p.line),
+                path: p.path,
+                line: p.line,
+            })
+            .collect();
+        let only_imports = places.iter().all(|p| {
+            p.path == here && (p.text.starts_with("import ") || p.text.starts_with("from "))
+        });
+        if !places.is_empty() && (lookup.uses || !only_imports) {
+            return crate::app::Found {
+                name: lookup.name.clone(),
+                uses: lookup.uses,
+                places,
+                by: program.to_owned(),
+            };
+        }
+    }
+    let lines: Vec<String> = lookup.text.lines().map(str::to_owned).collect();
+    let places = if lookup.uses {
+        ironquill_tools::uses(root, &lookup.name)
+    } else {
+        ironquill_tools::definitions(root, &lookup.name, &lookup.path, &lines)
+    };
+    crate::app::Found {
+        name: lookup.name.clone(),
+        uses: lookup.uses,
+        places,
+        by: "git grep".to_owned(),
+    }
 }
