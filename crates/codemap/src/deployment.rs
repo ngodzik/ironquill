@@ -442,12 +442,15 @@ pub fn deployment(
                 let resolved = terraform.resolve(block, &near);
                 e.properties.push((
                     "configured by".into(),
-                    format!(
-                        "{} {}",
-                        block.what.rsplit("//").next().unwrap_or(&block.what),
-                        block.name
-                    ),
+                    match block.kind {
+                        BlockKind::Module => format!("module {}", block.name),
+                        _ => format!("{} {}", block.what, block.name),
+                    },
                 ));
+                if block.kind == BlockKind::Module {
+                    e.properties
+                        .push(("module source".into(), block.what.clone()));
+                }
                 e.properties.push((
                     "match".into(),
                     match quality {
@@ -531,7 +534,7 @@ pub fn deployment(
             .iter()
             .enumerate()
             .filter(|(_, e)| {
-                e.kind == ElementKind::Workload
+                matches!(e.kind, ElementKind::Workload | ElementKind::Job)
                     && (e.name == name
                         || e.service.as_deref() == Some(name)
                         || e.name.ends_with(&format!("-{name}")))

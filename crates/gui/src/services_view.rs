@@ -12,12 +12,15 @@ use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
-use ironquill_codemap::{CodeMap, Services, ToolKind, Via};
+use ironquill_codemap::{CodeMap, Place, Services, ToolKind, Via};
 use ironquill_ui::{App, MapView};
 
 use crate::api_view::{self, ApiView};
+use crate::infra::Infra;
 use crate::plan::Plan;
-use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, LINK, MAGENTA, PANEL, RAISED, TEXT, YELLOW};
+use crate::theme::{
+    self, ACCENT, CODE, CYAN, DIM, EDGE, LINK, MAGENTA, PANEL, RAISED, TEXT, YELLOW,
+};
 
 /// A card's size, and the room between cards of a column.
 const CARD: egui::Vec2 = egui::Vec2::new(220.0, 64.0);
@@ -26,11 +29,26 @@ const GAP: f32 = 18.0;
 /// The details' width, on the right.
 const DETAILS_WIDTH: f32 = 380.0;
 
+/// The width of a setting's value in the configuration.
+const VALUE_WIDTH: f32 = 280.0;
+
 /// What is chosen: a service, or a link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Chosen {
     Service(usize),
     Link(usize),
+}
+
+/// What the services view shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Who reaches whom.
+    #[default]
+    Links,
+    /// The environment's architecture, flat.
+    Architecture,
+    /// A service's settings, layer by layer.
+    Configuration,
 }
 
 /// What the services view remembers between frames.
@@ -39,6 +57,19 @@ pub(crate) struct ServicesView {
     /// The service put in the middle, when not the map's centre.
     centre: Option<usize>,
     chosen: Option<Chosen>,
+    pub(crate) mode: Mode,
+    /// What the configuration is filtered by.
+    filter: String,
+    /// The release whose configuration shows, by its label.
+    release: Option<String>,
+    /// The settings whose earlier layers show, by key.
+    expanded: std::collections::HashSet<String>,
+    /// The element of the architecture chosen.
+    pub(crate) element: Option<usize>,
+    /// Whether the notes show.
+    notes: bool,
+    /// The 3D architecture was asked for: the universe window takes it.
+    pub(crate) open_3d: bool,
 }
 
 /// A way's colour and name.
@@ -83,8 +114,14 @@ fn label(services: &Services, link: usize) -> String {
 /// What a card says under a service's name.
 fn subtitle(services: &Services, service: usize) -> String {
     let s = &services.services[service];
+    if let Some(kind) = s.cloud {
+        return format!("{} in the cloud", kind.label().to_lowercase());
+    }
     if s.external {
         return "outside the project".to_owned();
+    }
+    if s.folder.is_none() && s.operations.is_empty() && s.tools.is_empty() {
+        return "deployed".to_owned();
     }
     let tools = s.tools.iter().filter(|t| t.kind == ToolKind::Tool).count();
     let mut parts = Vec::new();
@@ -149,9 +186,16 @@ pub(crate) fn show(
     ui: &mut Ui,
     view: &mut ServicesView,
     plan: &Plan,
+    infra: &mut Infra,
     api: &mut ApiView,
     app: &mut App,
 ) {
+    infra.want();
+    infra.poll(plan.map().map(|m| &m.services), app);
+    if infra.busy() {
+        // Read on threads: look again until they are done.
+        ui.ctx().request_repaint();
+    }
     let rect = ui.max_rect();
     let background = ui.allocate_rect(
         rect.with_max_x(rect.max.x - crate::plan::EDGE_GRIP),
@@ -178,7 +222,26 @@ pub(crate) fn show(
         crate::plan::switch(ui, rect, app);
         return;
     };
-    let services = &map.services;
+    let combined = infra
+        .view()
+        .map(|v| ironquill_codemap::with_cloud(&map.services, &v.deployment));
+    let services = combined.as_ref().unwrap_or(&map.services);
+    let room_top = bar(ui, rect, view, infra);
+    if view.mode == Mode::Architecture {
+        match infra.view() {
+            Some(env) => {
+                crate::arch_view::show(ui, rect, room_top, view, &env.deployment, infra, app)
+            }
+            None => waiting(&painter, rect, infra),
+        }
+        crate::plan::switch(ui, rect, app);
+        return;
+    }
+    if view.mode == Mode::Configuration {
+        configuration(ui, rect, room_top, view, infra, services, app);
+        crate::plan::switch(ui, rect, app);
+        return;
+    }
     if services.services.is_empty() {
         painter.text(
             rect.center(),
@@ -193,6 +256,7 @@ pub(crate) fn show(
     let centre = view
         .centre
         .filter(|c| *c < services.services.len())
+        .or_else(|| settings_centre(infra, services))
         .or(services.centre)
         .unwrap_or(0);
     painter.text(
@@ -209,13 +273,17 @@ pub(crate) fn show(
         DIM,
     );
 
-    let aside = if view.chosen.is_some() {
+    // The details take their room on the right while three columns still
+    // fit beside them; narrower, they go over the right column instead.
+    let aside = if view.chosen.is_some()
+        && rect.width() - DETAILS_WIDTH - 104.0 >= 3.0 * CARD.x + 2.0 * 60.0
+    {
         DETAILS_WIDTH + 24.0
     } else {
         0.0
     };
     let room = Rect::from_min_max(
-        rect.min + vec2(40.0, 120.0),
+        pos2(rect.min.x + 40.0, room_top + 20.0),
         rect.max - vec2(40.0 + aside, 90.0),
     );
     let cards = arrange(services, centre, room);
@@ -387,7 +455,7 @@ pub(crate) fn show(
     painter.text(
         rect.left_bottom() + vec2(24.0, -18.0),
         Align2::LEFT_BOTTOM,
-        "click a service or a link for what it holds · double-click a service to put it in the middle · blue OpenAPI · violet MCP · yellow HTTP",
+        "click a service or a link for what it holds · double-click a service to put it in the middle · blue OpenAPI · violet MCP · yellow HTTP · cyan cloud",
         FontId::proportional(12.0),
         DIM,
     );
@@ -403,7 +471,7 @@ pub(crate) fn show(
         view.chosen = None;
     }
     if let Some(chosen) = view.chosen {
-        details(ui, rect, view, map, chosen, api, app);
+        details(ui, rect, view, map, services, infra, chosen, api, app);
     }
     crate::plan::switch(ui, rect, app);
 }
@@ -439,16 +507,19 @@ fn place(ui: &mut Ui, path: &str, line: usize, text: &str) -> bool {
 
 /// What is chosen, whole, on the right: a service or a link.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn details(
     ui: &mut Ui,
     rect: Rect,
     view: &mut ServicesView,
     map: &CodeMap,
+    services: &Services,
+    infra: &Infra,
     chosen: Chosen,
     api: &mut ApiView,
     app: &mut App,
 ) {
-    let services = &map.services;
+    let mut open_place: Option<Place> = None;
     let top = rect.right_top() + vec2(-DETAILS_WIDTH - 24.0, 104.0);
     let height = (rect.bottom() - 70.0 - top.y).max(120.0);
     let mut open: Option<(String, usize)> = None;
@@ -575,6 +646,17 @@ fn details(
                                 });
                             });
                             ui.label(RichText::new(way).size(12.0).color(colour));
+                            if link.via == Via::Cloud
+                                && let Some(element) = infra.view().and_then(|v| {
+                                    v.deployment.elements.iter().find(|e| {
+                                        Some(e.kind) == services.services[link.to].cloud
+                                            && e.name == services.services[link.to].name
+                                    })
+                                })
+                                && let Some(p) = crate::arch_view::element_details(ui, element)
+                            {
+                                open_place = Some(p);
+                            }
                             if !link.operations.is_empty() {
                                 ui.add_space(8.0);
                                 ui.label(RichText::new("ROUTES CALLED").size(11.0).color(DIM));
@@ -635,10 +717,484 @@ fn details(
         app.show_map(None);
         app.open_path_at(path, line);
     }
+    if let Some(place) = open_place {
+        open_at(infra, &place, app);
+    }
     if let Some(o) = route {
         let operation = &map.operations[o];
         api.choose(&map.operations, &operation.method, &operation.path);
         app.show_map(Some(MapView::Api));
+    }
+}
+
+/// Opens the file a place names, at its line.
+pub(crate) fn open_at(infra: &Infra, place: &Place, app: &mut App) {
+    if let Some(path) = infra.file(place) {
+        app.show_map(None);
+        app.open_path_at(path, place.line.max(1));
+    }
+}
+
+/// The service the settings put in the middle.
+fn settings_centre(infra: &Infra, services: &Services) -> Option<usize> {
+    let name = infra.read()?.settings.centre.as_deref()?;
+    services.services.iter().position(|s| s.name == name)
+}
+
+/// While the environment renders, or when there is none.
+fn waiting(painter: &egui::Painter, rect: Rect, infra: &Infra) {
+    let text = match (infra.read(), infra.rendering()) {
+        (_, Some(name)) => format!("Rendering {name} with kustomize and helm…"),
+        (None, None) if infra.busy() => "Reading the deployment…".to_owned(),
+        (Some(read), None) if read.deploy.environments.is_empty() => {
+            "No environment found: no Kustomize tree in the project or in the repositories its settings link".to_owned()
+        }
+        _ => "Choose an environment".to_owned(),
+    };
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::proportional(16.0),
+        DIM,
+    );
+}
+
+/// The bar under the title: the environment, what is shown of it, the
+/// repositories' update, what could not be read, and a banner for the
+/// linked repositories not on their main branch. Returns where the room
+/// below starts.
+fn bar(ui: &mut Ui, rect: Rect, view: &mut ServicesView, infra: &mut Infra) -> f32 {
+    let top = rect.top() + 72.0;
+    let area = Rect::from_min_size(
+        pos2(rect.left() + 24.0, top),
+        vec2(rect.width() - 560.0, 30.0),
+    );
+    let mut chosen_env: Option<usize> = None;
+    let mut update = false;
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(area)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            if let Some(read) = infra.read() {
+                let environments = &read.deploy.environments;
+                let current = infra
+                    .environment
+                    .and_then(|e| environments.get(e))
+                    .map_or("no environment", |e| e.name.as_str());
+                egui::ComboBox::from_id_salt("environment")
+                    .selected_text(RichText::new(current).size(13.5).color(TEXT))
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        let mut other = false;
+                        for (i, env) in environments.iter().enumerate() {
+                            if !env.chosen && !other {
+                                other = true;
+                                if i > 0 {
+                                    ui.separator();
+                                }
+                                ui.label(RichText::new("Other").size(11.0).color(DIM));
+                            }
+                            if ui
+                                .selectable_label(infra.environment == Some(i), &env.name)
+                                .clicked()
+                            {
+                                chosen_env = Some(i);
+                            }
+                        }
+                    });
+            } else if infra.error.is_none() {
+                ui.label(RichText::new("Reading the deployment…").size(13.0).color(DIM));
+            }
+            ui.add_space(12.0);
+            for (name, mode) in [
+                ("Links", Mode::Links),
+                ("Architecture", Mode::Architecture),
+                ("Configuration", Mode::Configuration),
+            ] {
+                let on = view.mode == mode;
+                let text = RichText::new(name).size(13.5).color(if on { TEXT } else { DIM });
+                if ui.add(egui::Button::selectable(on, text)).clicked() {
+                    view.mode = mode;
+                }
+            }
+            let ready = infra.view().is_some();
+            if ui
+                .add_enabled(ready, egui::Button::new(RichText::new("3D").size(13.5)))
+                .on_hover_text("the environment's architecture in 3D, in the universe window")
+                .on_disabled_hover_text("once the environment is rendered")
+                .clicked()
+            {
+                view.open_3d = true;
+            }
+            ui.add_space(12.0);
+            let linked = infra
+                .read()
+                .is_some_and(|r| r.repos.repos.iter().any(|repo| !repo.own));
+            let label = if infra.updating() { "Updating…" } else { "Update repos" };
+            if ui
+                .add_enabled(linked && !infra.updating(), egui::Button::new(RichText::new(label).size(13.0)))
+                .on_hover_text("fetch each linked repository, and fast-forward those on their main branch with no local change; the project's own is never touched")
+                .on_disabled_hover_text("the settings link no repository")
+                .clicked()
+            {
+                update = true;
+            }
+            let notes = infra.read().map_or(0, |r| r.notes.len())
+                + infra.view().map_or(0, |v| v.deployment.notes.len());
+            if notes > 0
+                && ui
+                    .add(egui::Button::selectable(
+                        view.notes,
+                        RichText::new(format!("{notes} note{}", if notes == 1 { "" } else { "s" }))
+                            .size(13.0)
+                            .color(YELLOW),
+                    ))
+                    .clicked()
+            {
+                view.notes = !view.notes;
+            }
+            if let Some(name) = infra.rendering() {
+                ui.label(RichText::new(format!("rendering {name}…")).size(12.5).color(DIM));
+            }
+        },
+    );
+    if let Some(i) = chosen_env {
+        infra.choose(i);
+        view.chosen = None;
+        view.element = None;
+        view.release = None;
+    }
+    if update {
+        infra.update_repos();
+    }
+    let painter = ui.painter_at(rect);
+    let mut y = top + 40.0;
+    if let Some(error) = &infra.error {
+        painter.text(
+            pos2(rect.left() + 24.0, y),
+            Align2::LEFT_TOP,
+            format!("The settings could not be read: {error}"),
+            FontId::proportional(13.0),
+            theme::RED,
+        );
+        y += 22.0;
+    } else if let Some(read) = infra.read()
+        && read.settings.linked.is_empty()
+        && read.deploy.environments.is_empty()
+    {
+        let file = infra
+            .settings_file()
+            .map_or_else(String::new, |f| f.display().to_string());
+        painter.text(
+            pos2(rect.left() + 24.0, y),
+            Align2::LEFT_TOP,
+            format!("To read where it runs, link its deployment repositories in {file}: linked = [\"~/code/deploy\"]"),
+            FontId::proportional(12.5),
+            DIM,
+        );
+        y += 22.0;
+    }
+    if let Some(read) = infra.read() {
+        for (repo, branch) in &read.off_main {
+            let banner = Rect::from_min_size(
+                pos2(rect.left() + 24.0, y),
+                vec2(rect.width() - 560.0, 24.0),
+            );
+            painter.rect_filled(banner, CornerRadius::same(6), YELLOW.gamma_multiply(0.15));
+            painter.text(
+                banner.left_center() + vec2(10.0, 0.0),
+                Align2::LEFT_CENTER,
+                format!(
+                    "{repo} is on {branch}, not its main branch: what shows is read from {branch}"
+                ),
+                FontId::proportional(12.5),
+                YELLOW,
+            );
+            y += 30.0;
+        }
+    }
+    if view.notes {
+        let mut notes: Vec<String> = infra.read().map(|r| r.notes.clone()).unwrap_or_default();
+        if let Some(v) = infra.view() {
+            notes.extend(v.deployment.notes.iter().cloned());
+        }
+        egui::Window::new("What could not be read")
+            .id(Id::new("deployment-notes"))
+            .collapsible(false)
+            .default_pos(pos2(rect.left() + 40.0, y + 10.0))
+            .default_width(560.0)
+            .open(&mut view.notes)
+            .show(ui.ctx(), |ui| {
+                ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for note in &notes {
+                        ui.label(RichText::new(note).size(12.5).color(TEXT));
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+    }
+    y
+}
+
+/// A release's settings, layer by layer: each with its value and where it
+/// was set, those replaced under it; a filter; a double click opens the
+/// file at the line.
+fn configuration(
+    ui: &mut Ui,
+    rect: Rect,
+    top: f32,
+    view: &mut ServicesView,
+    infra: &Infra,
+    services: &Services,
+    app: &mut App,
+) {
+    let painter = ui.painter_at(rect);
+    let Some(env) = infra
+        .read()
+        .and_then(|r| r.deploy.environments.get(infra.environment?))
+    else {
+        waiting(&painter, rect, infra);
+        return;
+    };
+    if env.releases.is_empty() {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            format!("{} deploys no Helm release", env.name),
+            FontId::proportional(16.0),
+            DIM,
+        );
+        return;
+    }
+    // The release of the service in the middle, at first.
+    let centre = view
+        .centre
+        .and_then(|c| services.services.get(c))
+        .map(|s| s.name.clone())
+        .or_else(|| infra.read()?.settings.centre.clone());
+    let release = view
+        .release
+        .as_deref()
+        .and_then(|l| env.releases.iter().find(|r| r.label == l))
+        .or_else(|| {
+            env.releases
+                .iter()
+                .find(|r| Some(&r.name) == centre.as_ref())
+        })
+        .unwrap_or(&env.releases[0]);
+    let area = Rect::from_min_max(
+        pos2(rect.left() + 24.0, top + 10.0),
+        rect.max - vec2(40.0, 60.0),
+    );
+    let mut open: Option<Place> = None;
+    let mut pick: Option<String> = None;
+    let mut toggle: Option<String> = None;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("release")
+                .selected_text(RichText::new(&release.label).size(15.0).color(TEXT))
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for r in &env.releases {
+                        if ui.selectable_label(r.label == release.label, &r.label).clicked() {
+                            pick = Some(r.label.clone());
+                        }
+                    }
+                });
+            ui.add_space(10.0);
+            ui.label(RichText::new("filter").size(12.5).color(DIM));
+            ui.add(
+                egui::TextEdit::singleline(&mut view.filter)
+                    .hint_text("a key or a value")
+                    .desired_width(240.0),
+            );
+            let chart = release.chart_name.as_deref().unwrap_or("an unknown chart");
+            let source = release.source.as_ref().map_or_else(String::new, |s| {
+                format!(
+                    " from {} {}{}",
+                    s.kind,
+                    s.url.as_deref().unwrap_or(&s.name),
+                    s.reference.as_deref().map_or_else(String::new, |r| format!(" at {r}"))
+                )
+            });
+            ui.label(RichText::new(format!("chart {chart}{source}")).size(12.0).color(DIM));
+        });
+        if ui
+            .add(
+                egui::Label::new(
+                    RichText::new(format!("declared at {}", release.place))
+                        .monospace()
+                        .size(11.0)
+                        .color(LINK),
+                )
+                .sense(Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            open = Some(release.place.clone());
+        }
+        for note in &release.notes {
+            ui.label(RichText::new(note).size(12.0).color(YELLOW));
+        }
+        ui.add_space(6.0);
+        let filter = view.filter.to_lowercase();
+        let shown: Vec<&ironquill_codemap::Setting> = release
+            .settings
+            .iter()
+            .filter(|s| {
+                filter.is_empty()
+                    || s.key.to_lowercase().contains(&filter)
+                    || s.value.to_lowercase().contains(&filter)
+            })
+            .collect();
+        ui.label(
+            RichText::new(format!(
+                "{} SETTINGS{} · a click shows what each replaced, a double click opens where it is set",
+                shown.len(),
+                if filter.is_empty() { String::new() } else { format!(" OF {}", release.settings.len()) }
+            ))
+            .size(11.0)
+            .color(DIM),
+        );
+        ScrollArea::both().id_salt("configuration").show(ui, |ui| {
+            egui::Grid::new("settings")
+                .num_columns(3)
+                .spacing(vec2(18.0, 4.0))
+                .striped(true)
+                .show(ui, |ui| {
+                    for setting in shown {
+                        let layers = setting.replaced.len();
+                        let key = ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "{}{}",
+                                    if layers == 0 {
+                                        "  "
+                                    } else if view.expanded.contains(&setting.key) {
+                                        "▾ "
+                                    } else {
+                                        "▸ "
+                                    },
+                                    setting.key
+                                ))
+                                .monospace()
+                                .size(12.0)
+                                .color(TEXT),
+                            )
+                            .sense(Sense::click()),
+                        );
+let value = ui
+                            .allocate_ui_with_layout(
+                                vec2(VALUE_WIDTH, 16.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_min_width(VALUE_WIDTH);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&setting.value)
+                                                .monospace()
+                                                .size(12.0)
+                                                .color(CODE),
+                                        )
+                                        .truncate()
+                                        .sense(Sense::click()),
+                                    )
+                                    .on_hover_text(&setting.value)
+                                },
+                            )
+                            .inner;
+                        let at = ui.add(
+                            egui::Label::new(
+                                RichText::new(setting.place.to_string()).monospace().size(11.0).color(LINK),
+                            )
+                            .sense(Sense::click()),
+                        );
+                        ui.end_row();
+                        if key.double_clicked() || value.double_clicked() || at.double_clicked() || at.clicked() {
+                            open = Some(setting.place.clone());
+                        } else if (key.clicked() || value.clicked()) && layers > 0 {
+                            toggle = Some(setting.key.clone());
+                        }
+                        if view.expanded.contains(&setting.key) {
+                            for earlier in &setting.replaced {
+                                ui.label(RichText::new("    replaced").size(11.0).color(DIM));
+                                ui.label(RichText::new(&earlier.value).monospace().size(11.5).color(DIM));
+                                let at = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(earlier.place.to_string()).monospace().size(11.0).color(LINK.gamma_multiply(0.7)),
+                                    )
+                                    .sense(Sense::click()),
+                                );
+                                ui.end_row();
+                                if at.clicked() || at.double_clicked() {
+                                    open = Some(earlier.place.clone());
+                                }
+                            }
+                        }
+                    }
+                });
+            // What the tools rendered of it: each object, where it was
+            // declared and what changed it after.
+            if let Some(rendered) = infra.view().map(|v| &v.rendered) {
+                let objects: Vec<&ironquill_codemap::Object> = rendered
+                    .objects
+                    .iter()
+                    .filter(|o| o.service.as_deref() == Some(release.label.as_str()))
+                    .collect();
+                if !objects.is_empty() {
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(format!("{} OBJECTS RENDERED", objects.len()))
+                            .size(11.0)
+                            .color(DIM),
+                    );
+                    for object in objects {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!("{} {}", object.kind, object.name))
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(TEXT),
+                            );
+                            for (word, place) in object
+                                .origin
+                                .iter()
+                                .map(|p| ("from", p))
+                                .chain(object.changed_by.iter().map(|p| ("changed by", p)))
+                            {
+                                ui.label(RichText::new(word).size(11.0).color(DIM));
+                                let at = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(place.to_string())
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(LINK),
+                                    )
+                                    .sense(Sense::click()),
+                                );
+                                if at.clicked() {
+                                    open = Some(place.clone());
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    });
+    if let Some(label) = pick {
+        view.release = Some(label);
+    }
+    if let Some(key) = toggle
+        && !view.expanded.remove(&key)
+    {
+        view.expanded.insert(key);
+    }
+    if let Some(place) = open {
+        open_at(infra, &place, app);
     }
 }
 
