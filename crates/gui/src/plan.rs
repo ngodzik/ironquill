@@ -1140,7 +1140,7 @@ fn trail(ui: &mut Ui, at: Pos2, level: &str, project: &str) -> Option<String> {
 
 /// The two views of the codebase, top right, to pick with the mouse.
 pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
-    let area = Rect::from_min_size(rect.right_top() + vec2(-300.0, 20.0), vec2(276.0, 30.0));
+    let area = Rect::from_min_size(rect.right_top() + vec2(-404.0, 20.0), vec2(380.0, 30.0));
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(area)
@@ -1149,6 +1149,7 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
             // Right to left: the review, while there is one, comes first.
             let mut views = vec![
                 ("Universe", MapView::Universe),
+                ("Database", MapView::Database),
                 ("API", MapView::Api),
                 ("Plan", MapView::Plan),
             ];
@@ -1166,14 +1167,18 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
             }
         },
     );
+    // As wide as it was, under the switch's right end.
     search_box(
         ui,
-        Rect::from_min_size(area.min + vec2(0.0, 38.0), area.size()),
+        Rect::from_min_size(
+            pos2(area.max.x - 276.0, area.min.y + 38.0),
+            vec2(276.0, 30.0),
+        ),
         app,
     );
 }
 
-/// The search of the three views, under their switch: what is searched
+/// The search of the views, under their switch: what is searched
 /// for, the caret while it is typed, a cross to clear it. A click starts
 /// typing it, as Ctrl-F does.
 fn search_box(ui: &mut Ui, area: Rect, app: &mut App) {

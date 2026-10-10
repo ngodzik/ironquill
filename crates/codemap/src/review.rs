@@ -393,7 +393,7 @@ fn differences(was: &Operation, now: &Operation) -> Vec<String> {
 }
 
 /// The string literals of `call`, in order, quotes left out.
-fn strings(call: &str) -> Vec<String> {
+pub(crate) fn strings(call: &str) -> Vec<String> {
     static STRING: LazyLock<Option<Regex>> =
         LazyLock::new(|| Regex::new(r#""([^"\\]*)"|'([^'\\]*)'"#).ok());
     STRING.as_ref().map_or_else(Vec::new, |re| {
@@ -406,7 +406,7 @@ fn strings(call: &str) -> Vec<String> {
 
 /// The text of the call that opens at `open` in `text`, up to its closing
 /// parenthesis, strings minded.
-fn call_at(text: &str, open: usize) -> &str {
+pub(crate) fn call_at(text: &str, open: usize) -> &str {
     let mut depth = 0;
     let mut quote: Option<char> = None;
     for (i, c) in text[open..].char_indices() {
@@ -594,111 +594,33 @@ fn docstring(text: &str) -> Option<String> {
         .map(|l| l.trim_end_matches("\"\"\"").to_owned())
 }
 
-/// A table a model defines: its name, its columns and its indexes, each
-/// with its definition as written, spaces evened out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A table a model defines, as a change to it shows: its columns and its
+/// indexes by name, each with its definition as written.
 struct Table {
-    name: String,
     columns: BTreeMap<String, String>,
     indexes: BTreeMap<String, String>,
 }
 
-/// The tables SQLAlchemy models define in `text`: classes with a
-/// `__tablename__`, and `Table(...)` objects.
-fn tables(text: &str) -> Vec<Table> {
-    static CLASS: LazyLock<Option<Regex>> =
-        LazyLock::new(|| Regex::new(r"(?m)^class \w+\b[^\n]*:\s*$").ok());
-    static TABLENAME: LazyLock<Option<Regex>> =
-        LazyLock::new(|| Regex::new(r#"__tablename__\s*=\s*["']([^"']+)["']"#).ok());
-    static COLUMN: LazyLock<Option<Regex>> = LazyLock::new(|| {
-        Regex::new(r"(?m)^\s+(\w+)\s*(?::[^=\n]+)?=\s*(?:sa\.)?(?:mapped_column|Column)\(").ok()
-    });
-    static TABLE: LazyLock<Option<Regex>> =
-        LazyLock::new(|| Regex::new(r#"(?m)^\w+\s*=\s*(?:sa\.)?Table\(\s*["']([^"']+)["']"#).ok());
-    static INDEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
-        Regex::new(r#"\b(?:sa\.)?(Index|UniqueConstraint)\(\s*["']([^"']+)["']"#).ok()
-    });
-    static TABLE_COLUMN: LazyLock<Option<Regex>> =
-        LazyLock::new(|| Regex::new(r#"\b(?:sa\.)?Column\(\s*["']([^"']+)["']"#).ok());
-    let (
-        Some(class),
-        Some(tablename),
-        Some(column),
-        Some(table_re),
-        Some(index),
-        Some(table_column),
-    ) = (
-        CLASS.as_ref(),
-        TABLENAME.as_ref(),
-        COLUMN.as_ref(),
-        TABLE.as_ref(),
-        INDEX.as_ref(),
-        TABLE_COLUMN.as_ref(),
-    )
-    else {
-        return Vec::new();
-    };
-    let even = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let indexes_of = |body: &str| -> BTreeMap<String, String> {
-        index
-            .captures_iter(body)
-            .filter_map(|c| {
-                // The call opens right after `Index`.
-                let open = c.get(1)?.end();
-                Some((c[2].to_owned(), even(call_at(body, open))))
-            })
-            .collect()
-    };
-    let mut found = Vec::new();
-    for start in class.find_iter(text).map(|m| m.start()) {
-        // The class's body: its first line, then up to the next line that
-        // is not indented and not blank.
-        let rest = &text[start..];
-        let first = rest.find('\n').map_or(rest.len(), |i| i + 1);
-        let mut end = rest.len();
-        let mut at = first;
-        for line in rest[first..].split_inclusive('\n') {
-            if !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
-                end = at;
-                break;
-            }
-            at += line.len();
-        }
-        let body = &rest[..end];
-        let Some(name) = tablename.captures(body).map(|c| c[1].to_owned()) else {
-            continue;
-        };
-        let columns = column
-            .captures_iter(body)
-            .filter_map(|c| {
-                let open = c.get(0)?.end() - 1;
-                Some((c[1].to_owned(), even(call_at(body, open))))
-            })
-            .collect();
-        found.push(Table {
-            name,
-            columns,
-            indexes: indexes_of(body),
-        });
-    }
-    for c in table_re.captures_iter(text) {
-        let Some(whole) = c.get(0) else { continue };
-        let open = text[..whole.end()].rfind('(').unwrap_or(whole.end());
-        let call = call_at(text, open);
-        found.push(Table {
-            name: c[1].to_owned(),
-            columns: table_column
-                .captures_iter(call)
-                .filter_map(|m| {
-                    let start = m.get(0)?.start();
-                    let open = start + call[start..].find('(')?;
-                    Some((m[1].to_owned(), even(call_at(call, open))))
-                })
-                .collect(),
-            indexes: indexes_of(call),
-        });
-    }
-    found
+/// The tables the models in `text` define, by name.
+fn tables(text: &str) -> BTreeMap<String, Table> {
+    crate::schema::tables_in("", text)
+        .into_iter()
+        .map(|t| {
+            let table = Table {
+                columns: t
+                    .columns
+                    .into_iter()
+                    .map(|c| (c.name, c.definition))
+                    .collect(),
+                indexes: t
+                    .indexes
+                    .into_iter()
+                    .map(|i| (i.name, i.definition))
+                    .collect(),
+            };
+            (t.name, table)
+        })
+        .collect()
 }
 
 /// What the tables of a models file gained, lost or changed between two
@@ -715,14 +637,8 @@ fn tables(text: &str) -> Vec<Table> {
 /// ```
 #[must_use]
 pub fn model_changes(before: &str, after: &str) -> Vec<SchemaChange> {
-    let old: BTreeMap<String, Table> = tables(before)
-        .into_iter()
-        .map(|t| (t.name.clone(), t))
-        .collect();
-    let new: BTreeMap<String, Table> = tables(after)
-        .into_iter()
-        .map(|t| (t.name.clone(), t))
-        .collect();
+    let old = tables(before);
+    let new = tables(after);
     let mut changes = Vec::new();
     let change = |table: &str, delta, what: String| SchemaChange {
         table: Some(table.to_owned()),
