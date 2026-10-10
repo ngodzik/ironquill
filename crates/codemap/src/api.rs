@@ -256,6 +256,12 @@ pub(crate) fn read(
     (operations, calls)
 }
 
+/// The operations a spec's text declares, in its order, with no handler
+/// nor caller: to compare two versions of a spec.
+pub(crate) fn spec_operations(text: &str) -> Vec<Operation> {
+    operations_of(0, text)
+}
+
 /// The operations a spec declares, in its order.
 fn operations_of(spec: usize, text: &str) -> Vec<Operation> {
     let Ok(documents) = YamlLoader::load_from_str(text) else {
@@ -656,7 +662,7 @@ impl Operation {
 
 /// Whether a settings file is an OpenAPI (or Swagger) spec: said near its
 /// start.
-fn is_spec(text: &str) -> bool {
+pub(crate) fn is_spec(text: &str) -> bool {
     let start: String = text.chars().take(400).collect();
     start.lines().any(|line| {
         let line = line.trim_start_matches(['{', ' ', '\t']);

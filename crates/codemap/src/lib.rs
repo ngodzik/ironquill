@@ -11,11 +11,18 @@
 
 pub(crate) mod api;
 mod architecture;
+mod grouping;
 mod imports;
 mod layout;
 mod map;
+mod review;
 
 pub use api::{Body, Operation, Parameter, Response};
 pub use architecture::{Architecture, Component, ComponentKind, Link, architecture};
+pub use grouping::{Criterion, Group, Grouping, Key, MAX_CRITERIA, Role, group};
 pub use layout::Layout;
-pub use map::{CodeMap, Edge, EdgeKind, Language, Node, NodeKind, map};
+pub use map::{CodeMap, Edge, EdgeKind, Language, Node, NodeKind, map, map_with};
+pub use review::{
+    Area, Delta, Migration, Review, Revised, RouteChange, SchemaChange, migration, model_changes,
+    review, route_changes,
+};

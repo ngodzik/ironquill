@@ -45,6 +45,20 @@ impl Language {
             _ => Self::Other,
         }
     }
+
+    /// Its name, for a legend.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::Python => "Python",
+            Self::TypeScript => "TypeScript",
+            Self::JavaScript => "JavaScript",
+            Self::Markdown => "Markdown",
+            Self::Config => "Settings",
+            Self::Other => "Other",
+        }
+    }
 }
 
 /// What a node stands for.
@@ -132,11 +146,29 @@ impl CodeMap {
     }
 }
 
+/// Whether a file is a test, by its folders' names or its own: by name or
+/// by part of it, `kubernetes-tests` as well as `tests`.
+pub(crate) fn is_test(path: &Path) -> bool {
+    const TESTS: [&str; 6] = ["tests", "test", "__tests__", "testing", "spec", "e2e"];
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    path.parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|c| c.as_os_str().to_str())
+        .any(|f| TESTS.contains(&f) || f.ends_with("-tests") || f.ends_with("_tests"))
+        || name.starts_with("test_")
+        || name.ends_with("_test.py")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+}
+
 /// How much a file tells of the project's design, the most first: source
 /// code and the files that name packages and their aliases, then tests,
 /// examples and build scripts, then documents, settings and the rest.
 pub(crate) fn worth(path: &Path) -> u8 {
-    const TESTS: [&str; 6] = ["tests", "test", "__tests__", "testing", "spec", "e2e"];
     const ASIDE: [&str; 9] = [
         "docs", "doc", "examples", "example", "locales", "locale", "i18n", "fixtures", "vendor",
     ];
@@ -161,14 +193,7 @@ pub(crate) fn worth(path: &Path) -> u8 {
         Language::of(path),
         Language::Markdown | Language::Config | Language::Other
     ) && !name.contains(".min.");
-    // By name or by part of it: `kubernetes-tests`, `docker-stack-docs`.
-    let test = folders
-        .iter()
-        .any(|f| TESTS.contains(f) || f.ends_with("-tests") || f.ends_with("_tests"))
-        || name.starts_with("test_")
-        || name.ends_with("_test.py")
-        || name.contains(".test.")
-        || name.contains(".spec.");
+    let test = is_test(path);
     // Examples by any name (`example_dags`), and the scripts that build
     // or configure rather than run (`setup.py`, `vite.config.ts`).
     let aside = folders
@@ -204,6 +229,26 @@ pub(crate) fn worth(path: &Path) -> u8 {
 /// ```
 #[must_use]
 pub fn map(root: &Path, limit: usize) -> CodeMap {
+    map_with(root, limit, &[])
+}
+
+/// Reads the project at `root` as [`map`] does, the files of `first`, from
+/// the root, taken before any other when not all fit: those a branch
+/// changed, to show whatever their worth.
+///
+/// # Examples
+///
+/// ```
+/// let dir = tempfile::tempdir().unwrap();
+/// std::fs::write(dir.path().join("a.rs"), "").unwrap();
+/// std::fs::write(dir.path().join("notes.md"), "").unwrap();
+/// let map = ironquill_codemap::map_with(dir.path(), 1, &["notes.md".to_owned()]);
+/// assert!(map.find("notes.md").is_some());
+/// assert!(map.find("a.rs").is_none());
+/// ```
+#[must_use]
+pub fn map_with(root: &Path, limit: usize, first: &[String]) -> CodeMap {
+    let first: std::collections::HashSet<&str> = first.iter().map(String::as_str).collect();
     let mut files: Vec<PathBuf> = WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
@@ -216,7 +261,10 @@ pub fn map(root: &Path, limit: usize) -> CodeMap {
     // What tells most of the design first, when not all fits: the code and
     // what names its packages, then its tests, then the rest. Sorted, so
     // that the same project always gives the same map.
-    files.sort_by_cached_key(|f| (worth(f), f.clone()));
+    files.sort_by_cached_key(|f| {
+        let wanted = first.contains(f.to_string_lossy().as_ref());
+        (!wanted, worth(f), f.clone())
+    });
     let left_out = files.len().saturating_sub(limit);
     files.truncate(limit);
     files.sort();
