@@ -79,6 +79,10 @@ pub struct Defaults {
     /// waits, as `/tick` left it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tick: bool,
+    /// Whether the machine is kept from idle sleep while ticks run; unsaid,
+    /// it is. Set in the file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_awake: Option<bool>,
     /// Whether the window lets what is behind it show through, as a
     /// terminal can, as Ctrl-M left it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -192,6 +196,7 @@ mod tests {
             allowed_hosts: vec!["api.example.com".into()],
             pair_mode: Some(true),
             tick: true,
+            keep_awake: None,
             see_through: true,
             opacity: Some(0.7),
             chat_width: Some(420.0),

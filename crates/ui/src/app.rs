@@ -141,6 +141,10 @@ pub struct Settings {
     /// Whether the warm sessions are kept warm while the conversation
     /// waits, as `/tick` turns on.
     pub tick: bool,
+    /// Whether the machine may sleep while ticks run, as
+    /// `keep_awake = false` in the settings file says; by default it is
+    /// kept awake.
+    pub allow_sleep: bool,
     /// Whether the window lets what is behind it show through.
     pub see_through: bool,
     /// How opaque the window is while see-through, as configured; `None`
@@ -237,6 +241,8 @@ pub enum Effect {
         /// Whether the last exchange stays as it was rather than summed up.
         last_as_is: bool,
     },
+    /// Drop the exchanges not kept, with no summary and no model.
+    DropExchanges(Vec<usize>),
     /// Send this message to the conversation.
     Send {
         /// The message.
@@ -319,10 +325,16 @@ pub enum AgentMessage {
     Addressed(Result<String, String>),
     /// Where a name is defined or used.
     Found(Found),
+    /// The ticks are done, the last having read a session at this time, in
+    /// seconds since 1970, if any did.
+    Ticked(Option<u64>),
     /// The subjects of the conversation, for the person to pick from.
     Compaction(Result<Compaction, String>),
     /// The conversation was compacted: about how many tokens before, after.
     Compacted(Result<(TokenCount, TokenCount), String>),
+    /// The exchanges not kept were dropped: about how many tokens before,
+    /// and after.
+    Dropped(TokenCount, TokenCount),
     /// The request ended: how, or why it failed.
     Done(Result<Outcome, String>),
 }
@@ -510,6 +522,73 @@ pub enum CompactRow {
 }
 
 impl CompactPicker {
+    /// What a subject's row says: whether it is kept, its name, how many
+    /// exchanges, what they add to the context and how old the latest is.
+    pub fn subject_text(&self, s: usize, now: u64) -> String {
+        let subject = &self.compaction.subjects[s];
+        let kept = subject.exchanges.iter().filter(|e| self.kept[**e]).count();
+        let mark = match kept {
+            0 => "[ ]",
+            k if k == subject.exchanges.len() => "[x]",
+            _ => "[-]",
+        };
+        let n = subject.exchanges.len();
+        let size: u64 = subject.exchanges.iter().map(|e| self.size(*e)).sum();
+        let asked = subject
+            .exchanges
+            .iter()
+            .filter_map(|e| self.asked(*e))
+            .max();
+        format!(
+            "{mark} {} ({n} exchange{} · {} tokens{})",
+            subject.name,
+            if n == 1 { "" } else { "s" },
+            TokenCount(size),
+            asked.map_or_else(String::new, |at| format!(
+                " · {}",
+                crate::sessions::ago(at, now)
+            )),
+        )
+    }
+
+    /// What an exchange's row says: whether it is kept, its title, what it
+    /// adds to the context and how old it is.
+    pub fn exchange_text(&self, e: usize, now: u64) -> String {
+        format!(
+            "{} {} · {} tokens{}",
+            if self.kept[e] { "[x]" } else { "[ ]" },
+            self.compaction.exchanges[e],
+            TokenCount(self.size(e)),
+            self.asked(e).map_or_else(String::new, |at| format!(
+                " · {}",
+                crate::sessions::ago(at, now)
+            )),
+        )
+    }
+
+    /// What the window says first: how much the conversation holds, how
+    /// much of it is ticked, and what the keys do with the rest.
+    pub fn header(&self) -> String {
+        let kept: u64 = (0..self.kept.len())
+            .filter(|e| self.kept[*e])
+            .map(|e| self.size(e))
+            .sum();
+        format!(
+            "The conversation holds about {} tokens, {} of them ticked. Enter sums up the ticked and \
+             drops the rest; d drops the unticked and keeps the rest as it was, with no model.",
+            self.compaction.context,
+            TokenCount(kept),
+        )
+    }
+
+    fn size(&self, e: usize) -> u64 {
+        self.compaction.sizes.get(e).map_or(0, |t| t.0)
+    }
+
+    fn asked(&self, e: usize) -> Option<u64> {
+        self.compaction.asked.get(e).copied().flatten()
+    }
+
     /// The rows shown: each subject, and the exchanges of the open one.
     pub fn rows(&self) -> Vec<CompactRow> {
         let mut rows = Vec::new();
@@ -672,11 +751,17 @@ pub struct App {
     /// An effect to run next, raised outside a key: a request built from a
     /// pull request's comments.
     queued: Option<Effect>,
-    /// When the last request ended, and the sessions were last kept warm.
+    /// When the last request was sent or ended: an hour after, ticks stop.
     idle_since: Instant,
-    last_warm: Option<Instant>,
-    /// Asking whether to keep the sessions warm, after a long wait.
-    ask_keep_warm: bool,
+    /// Ticks are paused until the next request: they ran an hour without
+    /// one, or the cache had gone cold before a restart.
+    ticks_paused: bool,
+    /// A tick reads a session now.
+    ticking: bool,
+    /// When a warm session was last read, in seconds since 1970.
+    last_read: Option<u64>,
+    /// Whether the machine is kept from idle sleep now.
+    kept_awake: bool,
     command: LineEditor,
     /// The search of the codebase's maps, kept after Enter; and the mode
     /// it was started from, to go back to.
@@ -854,8 +939,10 @@ impl App {
             compact_picker: None,
             queued: None,
             idle_since: Instant::now(),
-            last_warm: None,
-            ask_keep_warm: false,
+            ticks_paused: false,
+            ticking: false,
+            last_read: None,
+            kept_awake: false,
             command: LineEditor::default(),
             search: LineEditor::default(),
             search_from: Mode::Insert,
@@ -2268,6 +2355,9 @@ impl App {
                 self.running_since = Some(Instant::now());
                 self.working_model = tiers.first().cloned();
                 self.scroll_back.set(0);
+                // A request starts the hour of ticks again.
+                self.ticks_paused = false;
+                self.idle_since = Instant::now();
                 Some(Effect::Send { text, config })
             }
             Err(e) => {
@@ -2505,11 +2595,11 @@ impl App {
             }
             Command::Tick => {
                 self.settings.tick = !self.settings.tick;
-                self.last_warm = None;
+                self.ticks_paused = false;
                 self.idle_since = Instant::now();
                 self.info(if self.settings.tick {
                     "Keeping Claude Code's warm sessions warm while the conversation waits: a one \
-                     word read every four minutes, asking again after half an hour"
+                     word read every four minutes, until an hour without a request"
                 } else {
                     "No longer keeping the sessions warm"
                 });
@@ -2702,6 +2792,14 @@ impl App {
                 ));
                 true
             }
+            AgentMessage::Dropped(before, after) => {
+                self.info(format!(
+                    "Dropped: about {before} → {after} tokens, the rest as it was. The agents' \
+                     sessions start again from what is left"
+                ));
+                true
+            }
+            AgentMessage::Ticked(read) => self.on_ticked(read),
             AgentMessage::Found(found) => {
                 self.on_found(found);
                 false
@@ -2737,7 +2835,9 @@ impl App {
             AgentMessage::Done(Ok(outcome)) => {
                 self.learn_all_commits();
                 self.idle_since = Instant::now();
-                self.last_warm = Some(Instant::now());
+                // The request read its session: the next tick is a full
+                // wait away.
+                self.last_read = Some(crate::sessions::now());
                 let seconds = self
                     .running_since
                     .take()
@@ -2755,6 +2855,15 @@ impl App {
                     context: outcome.context,
                     runs: std::mem::take(&mut self.runs),
                 });
+                let now = crate::sessions::now();
+                let saved = self
+                    .usage_log
+                    .saved_by_ticks(now.saturating_sub(seconds), now);
+                if saved > 0.0 {
+                    self.info(format!(
+                        "A tick kept the cache warm: about ${saved:.2} saved on this request"
+                    ));
+                }
                 true
             }
             AgentMessage::Done(Err(error)) => {
@@ -3244,6 +3353,15 @@ impl App {
                 None => {}
             },
             KeyCode::Char('l' | 'L') => picker.last_as_is = !picker.last_as_is,
+            KeyCode::Char('d' | 'D') => {
+                let keep: Vec<usize> = (0..picker.kept.len()).filter(|e| picker.kept[*e]).collect();
+                if keep.len() == picker.kept.len() {
+                    self.info("Every exchange is ticked: untick those to drop");
+                    return Some(None);
+                }
+                self.compact_picker = None;
+                return Some(Some(Effect::DropExchanges(keep)));
+            }
             KeyCode::Esc => {
                 self.compact_picker = None;
                 self.info("Not compacted");
@@ -3318,53 +3436,119 @@ impl App {
 
     /// Keys while a held command waits for the person: `y` runs it, `n` or
     /// Esc refuses it. Returns whether the key was for it.
-    /// Whether the warm sessions should be read now: `/tick` is on, no
-    /// request runs, four minutes went by since the last time. After half an
-    /// hour without a request, the person is asked first.
+    /// Whether the warm sessions should be looked at for ticks now: `/tick`
+    /// is on, ticks are not paused, no request runs and no tick reads.
+    /// Which are due, the session says. After an hour without a request
+    /// they stop by themselves, until the next.
     pub fn keep_warm_due(&mut self) -> bool {
-        if !self.settings.tick || self.is_running() || self.ask_keep_warm {
+        if !self.settings.tick || self.ticks_paused || self.is_running() || self.ticking {
             return false;
         }
-        if self.idle_since.elapsed() >= KEEP_WARM_ASK {
-            self.ask_keep_warm = true;
+        if self.idle_since.elapsed() >= TICKS_LAST {
+            self.ticks_paused = true;
+            self.info(
+                "Ticks stopped after an hour without a request, and the machine may sleep: they \
+                 start again with your next request, which finds the cache cold",
+            );
             return false;
         }
-        let due = self
-            .last_warm
-            .is_none_or(|t| t.elapsed() >= KEEP_WARM_EVERY);
-        if due {
-            self.last_warm = Some(Instant::now());
-        }
-        due
+        self.ticking = true;
+        true
     }
 
-    /// The question asked after a long wait, while it is.
-    pub fn keep_warm_question(&self) -> Option<Approval> {
-        self.ask_keep_warm.then(|| Approval {
-            model: self
-                .current_model()
-                .cloned()
-                .unwrap_or_else(|| ModelId::agent(Agent::ClaudeCode)),
-            question: Question::KeepWarm {
-                minutes: KEEP_WARM_ASK.as_secs() / 60,
-            },
+    /// The ticks read the sessions, the last at `read`, if any did: the
+    /// conversation is saved, so that a restart knows when.
+    fn on_ticked(&mut self, read: Option<u64>) -> bool {
+        self.ticking = false;
+        if let Some(at) = read {
+            self.last_read = Some(at);
+        }
+        read.is_some()
+    }
+
+    /// After a restart, ticks go on from the conversation's last read of a
+    /// warm session, `last`, when its cache still lives; otherwise it is
+    /// gone, and they wait for the next request rather than pay to read a
+    /// cold one.
+    pub fn ticks_restored(&mut self, last: Option<u64>) {
+        let now = crate::sessions::now();
+        match last.filter(|at| now.saturating_sub(*at) < TICK_WARM_SECS) {
+            Some(at) => {
+                self.last_read = Some(at);
+                self.ticks_paused = false;
+            }
+            None => self.ticks_paused = last.is_some(),
+        }
+    }
+
+    /// Where ticks stand, for the status line.
+    pub fn tick_status(&self) -> TickStatus {
+        if !self.settings.tick {
+            TickStatus::Off
+        } else if self.ticking {
+            TickStatus::Reading
+        } else if self.ticks_paused {
+            TickStatus::Paused
+        } else {
+            let now = crate::sessions::now();
+            let next = self
+                .last_read
+                .map(|at| (at + TICK_EVERY_SECS).saturating_sub(now));
+            TickStatus::On { next }
+        }
+    }
+
+    /// Whether the machine should be kept from idle sleep: ticks can run,
+    /// or a request runs, whose end resumes them.
+    pub fn wants_awake(&self) -> bool {
+        !self.settings.allow_sleep
+            && self.settings.tick
+            && (!self.ticks_paused || self.is_running())
+    }
+
+    /// Where ticks stand, in a few words for a status line, and how long
+    /// the machine is kept awake; nothing while `/tick` is off.
+    pub fn tick_label(&self) -> Option<String> {
+        let ticks = match self.tick_status() {
+            TickStatus::Off => return None,
+            TickStatus::Reading => "tick…".to_owned(),
+            TickStatus::Paused => "ticks paused".to_owned(),
+            TickStatus::On { next: Some(next) } => {
+                format!("next tick {}m", next.div_ceil(60).max(1))
+            }
+            TickStatus::On { next: None } => "ticks on".to_owned(),
+        };
+        Some(if self.kept_awake {
+            format!("{ticks} · awake {}m", self.awake_minutes())
+        } else {
+            ticks
         })
     }
 
-    fn approval_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
-        if self.ask_keep_warm {
-            match key.code {
-                // Another half hour.
-                KeyCode::Char('y' | 'Y') => self.idle_since = Instant::now(),
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                    self.settings.tick = false;
-                    self.info("No longer keeping the sessions warm: /tick turns it on again");
-                }
-                _ => return Some(None),
-            }
-            self.ask_keep_warm = false;
-            return Some(None);
+    /// Notes whether the machine is kept from idle sleep, as the host
+    /// holds it.
+    pub fn set_kept_awake(&mut self, held: bool) {
+        self.kept_awake = held;
+    }
+
+    /// Whether the machine is kept from idle sleep now.
+    pub fn is_kept_awake(&self) -> bool {
+        self.kept_awake
+    }
+
+    /// How many minutes are left before ticks stop and the machine may
+    /// sleep: a full hour while a request runs.
+    pub fn awake_minutes(&self) -> u64 {
+        if self.is_running() {
+            return TICKS_LAST.as_secs() / 60;
         }
+        TICKS_LAST
+            .saturating_sub(self.idle_since.elapsed())
+            .as_secs()
+            .div_ceil(60)
+    }
+
+    fn approval_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
         let (approval, _) = self.approval.as_ref()?;
         let (secrets, hosts) = match &approval.question {
             Question::Command { secrets, hosts, .. } => (secrets.clone(), hosts.clone()),
@@ -3610,6 +3794,8 @@ impl App {
             allowed_hosts: self.settings.allowed_hosts.clone(),
             pair_mode: Some(self.settings.pair_mode),
             tick: self.settings.tick,
+            // Set in the file only: kept as written there.
+            keep_awake: self.settings.allow_sleep.then_some(false),
             see_through: self.settings.see_through,
             // Set in the file only: kept as written there.
             opacity: self.settings.opacity,
@@ -3947,6 +4133,7 @@ impl App {
                 subscription,
                 context,
                 cache,
+                purpose,
             } => {
                 // A point for the usage pane; the conversation's context
                 // only, not a member's.
@@ -3959,6 +4146,8 @@ impl App {
                     cache_read: cache.map(|c| c.read.0),
                     cache_written: cache.and_then(|c| c.written.map(|w| w.0)),
                     context: context.filter(|_| self.member.is_none()).map(|c| c.used.0),
+                    role: purpose.name().to_owned(),
+                    rewrite_extra: cache.and_then(|c| c.rewrite_extra).map(|u| u.0),
                 });
                 // The model that answers is back: the member is done.
                 if self.member.as_ref().is_some_and(|m| *m != model) {
@@ -4275,12 +4464,32 @@ pub fn parse_window(text: &str) -> Option<u64> {
     Some(secs.min(crate::usage::KEEP_SECS))
 }
 
-/// How often the warm sessions are read while the conversation waits.
-const KEEP_WARM_EVERY: Duration = Duration::from_secs(4 * 60);
+/// How often a warm session is read while the conversation waits, in
+/// seconds: within the five minutes its cache lives.
+const TICK_EVERY_SECS: u64 = 4 * 60;
 
-/// How long the conversation may wait before the person is asked whether
-/// to keep reading them.
-const KEEP_WARM_ASK: Duration = Duration::from_secs(30 * 60);
+/// How long a prompt cache lives unread, in seconds.
+const TICK_WARM_SECS: u64 = 5 * 60;
+
+/// How long ticks run without a request before they stop by themselves:
+/// past that, the person is away, and reading on costs for nothing.
+const TICKS_LAST: Duration = Duration::from_secs(60 * 60);
+
+/// Where ticks stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickStatus {
+    /// `/tick` is off.
+    Off,
+    /// On: the next read in so many seconds, when the last is known.
+    On {
+        /// Seconds before the next read.
+        next: Option<u64>,
+    },
+    /// A tick reads a session now.
+    Reading,
+    /// Paused until the next request.
+    Paused,
+}
 
 /// The first sentence of `text`, for a line: an agent's reasons run long.
 fn first_sentence(text: &str) -> &str {
@@ -4366,7 +4575,9 @@ mod tests {
                 cache: Some(CacheUse {
                     read: TokenCount(10_000 - written),
                     written: Some(TokenCount(written)),
+                    rewrite_extra: None,
                 }),
+                purpose: ironquill_agent::Purpose::Chat,
             }));
         }
         type_text(&mut app, "/usage 6h");
@@ -4598,32 +4809,60 @@ mod tests {
     }
 
     #[test]
-    fn tick_keeps_sessions_warm_and_asks_after_a_long_wait() {
+    fn ticks_run_until_an_hour_without_a_request_then_wait_for_the_next() {
         let mut app = ready();
         assert!(!app.keep_warm_due());
+        assert_eq!(app.tick_status(), TickStatus::Off);
         type_text(&mut app, "/tick");
         press(&mut app, KeyCode::Enter);
         assert!(app.keep_warm_due());
-        // Not again before four minutes.
+        // One tick reads at a time.
         assert!(!app.keep_warm_due());
-        app.last_warm = Instant::now().checked_sub(Duration::from_secs(5 * 60));
+        assert_eq!(app.tick_status(), TickStatus::Reading);
+        let now = crate::sessions::now();
+        assert!(
+            app.on_agent(AgentMessage::Ticked(Some(now))),
+            "saved after a read"
+        );
+        assert_eq!(app.tick_status(), TickStatus::On { next: Some(240) });
         assert!(app.keep_warm_due());
-        // Half an hour without a request: asked first.
+        assert!(!app.on_agent(AgentMessage::Ticked(None)));
+        assert!(app.wants_awake());
+        assert_eq!(app.awake_minutes(), 60);
+
+        // An hour without a request: they stop, said once, and the
+        // machine may sleep.
         app.idle_since = Instant::now()
-            .checked_sub(Duration::from_secs(31 * 60))
+            .checked_sub(Duration::from_secs(61 * 60))
             .unwrap();
         assert!(!app.keep_warm_due());
-        assert!(matches!(
-            app.keep_warm_question(),
-            Some(Approval {
-                question: Question::KeepWarm { .. },
-                ..
-            })
-        ));
-        press(&mut app, KeyCode::Char('n'));
-        assert!(!app.settings.tick);
-        assert!(app.keep_warm_question().is_none());
-        assert!(!app.defaults().tick);
+        assert_eq!(app.tick_status(), TickStatus::Paused);
+        assert!(!app.wants_awake());
+        assert!(app.notice.is_none() || !app.transcript.is_empty());
+
+        // The next request starts them again.
+        type_text(&mut app, "go on");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.wants_awake(), "held while the request runs");
+        assert_eq!(app.awake_minutes(), 60);
+        assert_ne!(app.tick_status(), TickStatus::Paused);
+        assert!(app.defaults().tick);
+    }
+
+    #[test]
+    fn after_a_restart_ticks_go_on_only_while_the_cache_lives() {
+        let mut app = ready();
+        app.settings.tick = true;
+        let now = crate::sessions::now();
+        app.ticks_restored(Some(now - 60));
+        assert_eq!(app.tick_status(), TickStatus::On { next: Some(180) });
+        app.ticks_restored(Some(now - 10 * 60));
+        assert_eq!(app.tick_status(), TickStatus::Paused);
+        // A new conversation has nothing to keep warm, and nothing paused.
+        app.ticks_restored(None);
+        assert_ne!(app.tick_status(), TickStatus::Paused);
+        app.settings.allow_sleep = true;
+        assert!(!app.wants_awake());
     }
 
     #[test]
@@ -4662,6 +4901,7 @@ mod tests {
                     exchanges: vec![2],
                 },
             ],
+            ..Compaction::default()
         })));
         assert_eq!(app.compact_picker().unwrap().kept, [true, true, true]);
         // Open the parser, untick its test.
@@ -4805,6 +5045,7 @@ mod tests {
                 subscription: false,
                 context: None,
                 cache: None,
+                purpose: ironquill_agent::Purpose::Chat,
             }));
         }
         let (usage, cost, complete) = app.totals();
@@ -5135,6 +5376,7 @@ mod tests {
             subscription: false,
             context: None,
             cache: None,
+            purpose: ironquill_agent::Purpose::Chat,
         }));
         let finished = app.on_agent(AgentMessage::Done(Ok(Outcome {
             verdict: Verdict::Answered,
@@ -5369,6 +5611,7 @@ mod tests {
                 allowed_hosts: vec![],
                 pair_mode: Some(false),
                 tick: false,
+                keep_awake: None,
                 see_through: false,
                 opacity: None,
                 chat_width: None,
@@ -5421,6 +5664,7 @@ mod tests {
                 subscription: false,
                 context: None,
                 cache: None,
+                purpose: ironquill_agent::Purpose::Chat,
             })
         };
         app.on_agent(AgentMessage::Event(Event::Delegating {
@@ -5439,6 +5683,7 @@ mod tests {
             subscription: false,
             context: None,
             cache: None,
+            purpose: ironquill_agent::Purpose::Chat,
         }));
         app.on_agent(AgentMessage::Event(Event::Said {
             model: id("strong"),
@@ -5631,6 +5876,7 @@ mod tests {
                 subscription: false,
                 context: None,
                 cache: None,
+                purpose: ironquill_agent::Purpose::Chat,
             })
         };
         type_text(&mut app, "do it");
@@ -5722,6 +5968,7 @@ mod tests {
             subscription: true,
             context: None,
             cache: None,
+            purpose: ironquill_agent::Purpose::Chat,
         }));
         let (usage, cost, complete) = app.totals();
         assert_eq!(usage.input, TokenCount(30_000));

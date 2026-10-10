@@ -67,15 +67,14 @@ pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
     if app.compact_picker().is_some() {
         render_compact(frame, app);
     }
-    if app.approval().is_some() || app.keep_warm_question().is_some() {
+    if app.approval().is_some() {
         render_approval(frame, app);
     }
 }
 
 /// A command held for the person, over everything else, until they answer.
 fn render_approval(frame: &mut Frame, app: &App) {
-    let asked = app.keep_warm_question();
-    let Some(approval) = app.approval().or(asked.as_ref()) else {
+    let Some(approval) = app.approval() else {
         return;
     };
     let screen = frame.area();
@@ -246,65 +245,57 @@ fn command_details(status: &str, checked_by: Option<&ModelId>, output: &str) -> 
 }
 
 /// The /compact window: the subjects, ticked to keep, one open with its
-/// exchanges.
+/// exchanges, each with what it adds to the context and how old it is. The
+/// list scrolls to keep the cursor in sight.
 fn render_compact(frame: &mut Frame, app: &App) {
     let Some(picker) = app.compact_picker() else {
         return;
     };
-    let mut lines = vec![Line::styled(
-        " Ticked is summed up and kept; unticked goes. ",
-        fg(Color::Gray),
-    )];
-    let tick = |on: bool| if on { "[x]" } else { "[ ]" };
-    for (row, kind) in picker.rows().into_iter().enumerate() {
-        let selected = row == picker.cursor;
-        let text = match kind {
-            CompactRow::Subject(s) => {
-                let subject = &picker.compaction.subjects[s];
-                let kept = subject
-                    .exchanges
-                    .iter()
-                    .filter(|e| picker.kept[**e])
-                    .count();
-                let mark = if kept == subject.exchanges.len() {
-                    "[x]"
-                } else if kept == 0 {
-                    "[ ]"
-                } else {
-                    "[-]"
-                };
-                format!(
-                    " {mark} {} ({})",
-                    subject.name,
-                    plural(subject.exchanges.len(), "exchange", "exchanges")
-                )
-            }
-            CompactRow::Exchange(e) => format!(
-                "     {} {}",
-                tick(picker.kept[e]),
-                picker.compaction.exchanges[e]
-            ),
-        };
-        let style = if selected {
-            fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-                .bg(SELECTED_BG)
-        } else {
-            Style::new()
-        };
-        lines.push(Line::styled(text, style));
-    }
+    let now = sessions::now();
+    let rows: Vec<Line> = picker
+        .rows()
+        .into_iter()
+        .enumerate()
+        .map(|(row, kind)| {
+            let text = match kind {
+                CompactRow::Subject(s) => format!(" {}", picker.subject_text(s, now)),
+                CompactRow::Exchange(e) => format!("     {}", picker.exchange_text(e, now)),
+            };
+            let style = if row == picker.cursor {
+                fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(SELECTED_BG)
+            } else {
+                Style::new()
+            };
+            Line::styled(text, style)
+        })
+        .collect();
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
+    let header: Vec<Line> = wrap(&picker.header(), usize::from(width.saturating_sub(4)))
+        .into_iter()
+        .map(|l| Line::styled(format!(" {l}"), fg(Color::Gray)))
+        .collect();
+    let header_height = header.len() as u16;
+    // The header, the rows, a blank line and the last exchange's tick,
+    // inside the border; the rows get what the screen leaves them.
+    let around = header_height + 2 + 2;
+    let height = (rows.len() as u16 + around).min(screen.height);
+    let shown = usize::from(height.saturating_sub(around)).max(1);
+    let first = picker
+        .cursor
+        .saturating_sub(shown - 1)
+        .min(rows.len().saturating_sub(shown));
+    let mut lines: Vec<Line> = rows.into_iter().skip(first).take(shown).collect();
     lines.push(Line::default());
     lines.push(Line::styled(
         format!(
             " {} The last exchange stays as it was (l)",
-            tick(picker.last_as_is)
+            if picker.last_as_is { "[x]" } else { "[ ]" }
         ),
         fg(Color::Gray),
     ));
-    let screen = frame.area();
-    let width = (screen.width * 4 / 5).clamp(30, 100).min(screen.width);
-    let height = (lines.len() as u16 + 2).min(screen.height);
     let area = Rect::new(
         screen.x + (screen.width - width) / 2,
         screen.y + screen.height.saturating_sub(height) / 3,
@@ -314,14 +305,17 @@ fn render_compact(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
     let block = pane_block(" Compact ".into(), true).title_bottom(
         Line::styled(
-            " Space: tick · →: open · ←: close · Enter: compact · Esc: cancel ",
+            " Space: tick · →: open · ←: close · Enter: compact · d: drop unticked · Esc: cancel ",
             fg(DIM),
         )
         .centered(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    let [top, rest] =
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(Paragraph::new(header), top);
+    frame.render_widget(Paragraph::new(lines), rest);
 }
 
 /// `text` cut into rows of `width` characters at most.
@@ -2047,10 +2041,15 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         .strip_prefix(&current)
         .unwrap_or_default()
         .to_owned();
+    let ticks = app
+        .tick_label()
+        .map(|t| format!("{t} · "))
+        .unwrap_or_default();
     let right = Line::from(vec![
         // Room between the conversation's name and the model, however long
         // the name.
         Span::raw("  "),
+        Span::styled(ticks, fg(Color::Cyan)),
         Span::styled(current, fg(ACCENT)),
         Span::styled(
             format!(
@@ -2319,7 +2318,9 @@ mod tests {
                 cache: Some(CacheUse {
                     read: TokenCount(10_000 - written),
                     written: Some(TokenCount(written)),
+                    rewrite_extra: None,
                 }),
+                purpose: ironquill_agent::Purpose::Chat,
             }));
         }
         type_text(&mut app, "/usage 6h");
@@ -2394,13 +2395,21 @@ mod tests {
                     exchanges: vec![2],
                 },
             ],
+            sizes: vec![TokenCount(1_000), TokenCount(2_000), TokenCount(500)],
+            asked: vec![None, Some(sessions::now() - 600), None],
+            context: TokenCount(5_000),
         })));
-        assert!(screen(&app).contains("[x] Parser (2 exchanges)"));
+        assert!(screen(&app).contains("[x] Parser (2 exchanges · 3.0k tokens · 10 min ago)"));
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char(' '));
-        assert!(screen(&app).contains("[-] Parser (2 exchanges)"));
+        assert!(screen(&app).contains("[-] Parser (2 exchanges · 3.0k tokens · 10 min ago)"));
+        assert!(screen(&app).contains("[ ] add a test · 2.0k tokens · 10 min ago"));
+        // d drops the unticked, with no model.
+        let effect = press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(effect, Some(Effect::DropExchanges(keep)) if keep == [0, 2]));
+        assert!(app.compact_picker().is_none());
     }
 
     #[test]

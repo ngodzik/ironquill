@@ -81,6 +81,15 @@ impl PriceTable {
             .copied()
     }
 
+    /// What reading `read` tokens from the cache of `model` saves over
+    /// writing them to it again, at its list prices.
+    pub fn rewrite_extra(&self, model: &str, read: u64) -> Option<Usd> {
+        let rates = self.rates(model)?;
+        Some(Usd(
+            read as f64 * (rates.cache_write - rates.cache_read).max(0.0)
+        ))
+    }
+
     /// What `tokens` cost on `model` at its list prices.
     pub fn cost(&self, model: &str, tokens: Tokens) -> Option<Usd> {
         let rates = self.rates(model)?;

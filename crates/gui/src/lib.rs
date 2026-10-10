@@ -1333,6 +1333,14 @@ fn status(ui: &mut Ui, app: &App) {
             if let Some(model) = app.current_model() {
                 ui.label(RichText::new(model.to_string()).small().color(ACCENT));
             }
+            if let Some(ticks) = app.tick_label() {
+                ui.label(RichText::new(ticks).small().color(theme::CYAN))
+                    .on_hover_text(
+                        "Ticks read Claude Code's warm sessions every four minutes, so that their \
+                         cache stays warm; they stop after an hour without a request. While they \
+                         run, the machine is kept from idle sleep. /tick turns them off",
+                    );
+            }
             // The notice, or the conversation's name, in what is left
             // between: cut short rather than over the rest, whole on hover.
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {

@@ -31,7 +31,7 @@ pub(crate) fn show(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
     if app.definition_choice().is_some() {
         definitions(ctx, app, keys);
     }
-    if app.approval().is_some() || app.keep_warm_question().is_some() {
+    if app.approval().is_some() {
         approval(ctx, app, keys);
     }
 }
@@ -65,8 +65,7 @@ fn hint(ui: &mut Ui, text: &str) {
 /// A held command or a question that only costs money: what is asked, and
 /// a button for each answer.
 fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
-    let asked = app.keep_warm_question();
-    let Some(approval) = app.approval().or(asked.as_ref()) else {
+    let Some(approval) = app.approval() else {
         return;
     };
     // What cannot be undone in red; going on costs only money, in cyan.
@@ -354,59 +353,43 @@ fn shortcuts(ctx: &Context) {
     });
 }
 
-/// The subjects of the conversation, for `/compact` to keep or drop.
+/// The subjects of the conversation, for `/compact` to keep or drop: each
+/// with what it adds to the context and how old it is, the list scrolling
+/// to the row the cursor is on.
 fn compact(ctx: &Context, app: &App) {
     let Some(picker) = app.compact_picker() else {
         return;
     };
-    let tick = |on: bool| if on { "[x]" } else { "[ ]" };
+    let now = sessions::now();
     window(ctx, "Compact", ACCENT, |ui| {
-        for (i, kind) in picker.rows().into_iter().enumerate() {
-            let text = match kind {
-                CompactRow::Subject(s) => {
-                    let subject = &picker.compaction.subjects[s];
-                    let kept = subject
-                        .exchanges
-                        .iter()
-                        .filter(|e| picker.kept[**e])
-                        .count();
-                    let mark = match kept {
-                        0 => "[ ]",
-                        k if k == subject.exchanges.len() => "[x]",
-                        _ => "[-]",
-                    };
-                    format!(
-                        "{mark} {} ({} exchange{})",
-                        subject.name,
-                        subject.exchanges.len(),
-                        if subject.exchanges.len() == 1 {
-                            ""
-                        } else {
-                            "s"
-                        }
-                    )
+        ui.label(RichText::new(picker.header()).color(DIM));
+        ui.add_space(6.0);
+        ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            for (i, kind) in picker.rows().into_iter().enumerate() {
+                let text = match kind {
+                    CompactRow::Subject(s) => picker.subject_text(s, now),
+                    CompactRow::Exchange(e) => format!("      {}", picker.exchange_text(e, now)),
+                };
+                let selected = i == picker.cursor;
+                let shown = row(ui, selected, |ui| {
+                    ui.label(RichText::new(text).monospace());
+                });
+                if selected {
+                    shown.scroll_to_me(None);
                 }
-                CompactRow::Exchange(e) => format!(
-                    "      {} {}",
-                    tick(picker.kept[e]),
-                    picker.compaction.exchanges[e]
-                ),
-            };
-            row(ui, i == picker.cursor, |ui| {
-                ui.label(RichText::new(text).monospace());
-            });
-        }
+            }
+        });
         ui.add_space(6.0);
         ui.label(
             RichText::new(format!(
                 "{} The last exchange stays as it was (l)",
-                tick(picker.last_as_is)
+                if picker.last_as_is { "[x]" } else { "[ ]" }
             ))
             .color(DIM),
         );
         hint(
             ui,
-            "Space to tick · → to open · ← to close · Enter to compact · Esc to cancel",
+            "Space to tick · → to open · ← to close · Enter to compact · d to drop the unticked · Esc to cancel",
         );
     });
 }
