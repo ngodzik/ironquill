@@ -141,7 +141,13 @@ pub fn terraform(repos: &Repos) -> Terraform {
         for (path, rel) in files(&repo.root) {
             let is_tf = rel.ends_with(".tf");
             let is_vars = rel.ends_with(".tfvars");
-            if !is_tf && !is_vars {
+            let is_unit = rel == "terragrunt.hcl" || rel.ends_with("/terragrunt.hcl");
+            // What the tools copy or download for themselves is not the
+            // project's.
+            if (!is_tf && !is_vars && !is_unit)
+                || rel.contains(".terragrunt-cache/")
+                || rel.contains(".terraform/")
+            {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else {
@@ -149,6 +155,13 @@ pub fn terraform(repos: &Repos) -> Terraform {
             };
             let body = hcl::parse(&text);
             let folder = rel.rsplit_once('/').map_or("", |(f, _)| f).to_owned();
+            if is_unit {
+                let shared = shared_locals(&body, &path);
+                if let Some(unit) = unit(&body, &shared, &repo.name, &rel, &folder) {
+                    terraform.blocks.push(unit);
+                }
+                continue;
+            }
             if is_vars {
                 terraform
                     .vars
@@ -215,11 +228,101 @@ pub fn terraform(repos: &Repos) -> Terraform {
     terraform
 }
 
+/// A Terragrunt unit as a module call: its `terraform` block's source,
+/// its `inputs` as what the call passes, its `dependency` blocks kept.
+fn unit(
+    body: &Body,
+    shared: &HashMap<String, Hcl>,
+    repo: &str,
+    rel: &str,
+    folder: &str,
+) -> Option<TfBlock> {
+    let terraform = body.blocks.iter().find(|b| b.kind == "terraform")?;
+    let source = terraform.body.text("source")?.to_owned();
+    let mut call = Body::default();
+    if let Some(inputs) = body.attributes.iter().find(|a| a.name == "inputs")
+        && let Hcl::Object(entries) = &inputs.value
+    {
+        call.attributes = entries
+            .iter()
+            .map(|(name, value)| hcl::Attribute {
+                name: name.clone(),
+                value: substitute(value, shared),
+                line: inputs.line,
+            })
+            .collect();
+    }
+    call.blocks = body
+        .blocks
+        .iter()
+        .filter(|b| b.kind == "dependency")
+        .cloned()
+        .collect();
+    Some(TfBlock {
+        kind: BlockKind::Module,
+        what: source,
+        name: folder.rsplit('/').next().unwrap_or(folder).to_owned(),
+        place: Place::new(repo, rel, terraform.line),
+        folder: folder.to_owned(),
+        body: call,
+    })
+}
+
+/// The locals a unit reads from a file of its parents, as Terragrunt's
+/// `NAME = read_terragrunt_config(find_in_parent_folders("env.hcl"))`
+/// does: each as `local.NAME.locals.KEY`, and the unit's own plain locals.
+fn shared_locals(body: &Body, path: &Path) -> HashMap<String, Hcl> {
+    static READ: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r#"read_terragrunt_config\(\s*find_in_parent_folders\(\s*"([^"]+)"\s*\)\s*\)"#)
+            .ok()
+    });
+    let mut out = HashMap::new();
+    for locals in body.blocks.iter().filter(|b| b.kind == "locals") {
+        for a in &locals.body.attributes {
+            let Hcl::Expr(text) = &a.value else {
+                out.insert(format!("local.{}", a.name), a.value.clone());
+                continue;
+            };
+            let Some(file) = READ
+                .as_ref()
+                .and_then(|re| re.captures(text))
+                .map(|c| c[1].to_owned())
+            else {
+                continue;
+            };
+            // The nearest parent folder that has it.
+            let found = path
+                .ancestors()
+                .skip(2)
+                .map(|dir| dir.join(&file))
+                .find(|f| f.is_file());
+            let Some(text) = found.and_then(|f| std::fs::read_to_string(f).ok()) else {
+                continue;
+            };
+            let read = hcl::parse(&text);
+            for b in read.blocks.iter().filter(|b| b.kind == "locals") {
+                for entry in &b.body.attributes {
+                    out.insert(
+                        format!("local.{}.locals.{}", a.name, entry.name),
+                        entry.value.clone(),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Terragrunt's way of naming the repository's root in a source.
+const REPO_ROOT: &str = "${get_repo_root()}";
+
 /// What tells two module calls apart: a local source is relative to its
-/// caller.
+/// caller, one from the repository's root to that repository.
 fn module_key(source: &str, place: &Place) -> String {
     if source.starts_with('.') {
         format!("{}:{}:{source}", place.repo, place.path)
+    } else if source.starts_with(REPO_ROOT) {
+        format!("{}:{source}", place.repo)
     } else {
         source.to_owned()
     }
@@ -258,11 +361,21 @@ fn git_source(source: &str) -> Option<(String, String, Option<String>)> {
 /// the caller when local, from a linked clone at the pinned ref when in
 /// git; a registry module is not read.
 fn read_module(repos: &Repos, source: &str, place: &Place) -> Result<Option<Module>, String> {
-    if source.starts_with('.') {
-        let Some(caller) = repos.file(place) else {
+    let local = if let Some(rest) = source.strip_prefix(REPO_ROOT) {
+        repos
+            .get(&place.repo)
+            .map(|r| crate::repos::normal(&r.root.join(rest.trim_start_matches('/'))))
+    } else if source.starts_with('.') {
+        repos.file(place).map(|caller| {
+            crate::repos::normal(&caller.parent().unwrap_or(Path::new("")).join(source))
+        })
+    } else {
+        None
+    };
+    if source.starts_with('.') || source.starts_with(REPO_ROOT) {
+        let Some(folder) = local else {
             return Ok(None);
         };
-        let folder = crate::repos::normal(&caller.parent().unwrap_or(Path::new("")).join(source));
         let Some((repo, rel)) = repos.locate(&folder) else {
             return Ok(None);
         };
@@ -425,14 +538,16 @@ pub struct Resolved {
 }
 
 /// A block inside a module, as a call sets it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inner {
     /// Its type: `aws_rds_cluster`.
     pub what: String,
     /// Its name.
     pub name: String,
-    /// Its settings, resolved.
+    /// Its settings, resolved, nested ones dotted: `metadata.name`.
     pub values: Vec<(String, String)>,
+    /// Where it is written.
+    pub place: Place,
 }
 
 impl Resolved {
@@ -441,7 +556,7 @@ impl Resolved {
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values
             .iter()
-            .find(|(k, _)| k == key)
+            .find(|(k, v)| k == key && !unresolved(v))
             .map(|(_, v)| v.as_str())
     }
 
@@ -454,14 +569,20 @@ impl Resolved {
                     inner
                         .values
                         .iter()
-                        .find(|(key, value)| {
-                            key == k && !value.contains("var.") && !value.contains("local.")
-                        })
+                        .find(|(key, value)| key == k && !unresolved(value))
                         .map(|(_, v)| v.as_str())
                 })
             })
         })
     }
+}
+
+/// Whether a value still names what could not be known: a variable, a
+/// local, another unit's outputs.
+fn unresolved(value: &str) -> bool {
+    ["var.", "local.", "dependency.", "module.", "data."]
+        .iter()
+        .any(|r| value.contains(r))
 }
 
 impl Terraform {
@@ -586,20 +707,140 @@ impl Terraform {
                 }
             }
         }
-        for (_, body) in &module.files {
+        for (file, body) in &module.files {
             for b in body.blocks.iter().filter(|b| b.kind == "resource") {
                 let what = b.labels.first().cloned().unwrap_or_default();
                 let name = b.labels.get(1).cloned().unwrap_or_default();
-                let values = b
-                    .body
-                    .attributes
-                    .iter()
-                    .map(|a| (a.name.clone(), substitute(&a.value, &inputs).show()))
-                    .collect();
-                resolved.inner.push(Inner { what, name, values });
+                let mut values = Vec::new();
+                flatten(&b.body, "", &inputs, &mut values);
+                resolved.inner.push(Inner {
+                    what,
+                    name,
+                    values,
+                    place: Place::new(&module.place.repo, file, b.line),
+                });
+            }
+        }
+        // A setting that names another block's, as `kubernetes_namespace.
+        // this.metadata[0].name` does, takes its value.
+        let known: Vec<Inner> = resolved.inner.clone();
+        for inner in &mut resolved.inner {
+            for (_, value) in &mut inner.values {
+                if let Some(found) = refer(&known, value) {
+                    *value = found;
+                }
             }
         }
         resolved
+    }
+
+    /// The units a unit depends on, by their places in [`Self::blocks`].
+    #[must_use]
+    pub fn dependencies(&self, block: usize) -> Vec<usize> {
+        let Some(unit) = self.blocks.get(block) else {
+            return Vec::new();
+        };
+        unit.body
+            .blocks
+            .iter()
+            .filter(|b| b.kind == "dependency")
+            .filter_map(|b| b.body.text("config_path"))
+            .filter_map(|path| {
+                let folder = crate::repos::normal(&Path::new(&unit.folder).join(path));
+                let folder = folder.to_string_lossy().replace('\\', "/");
+                self.blocks.iter().position(|b| {
+                    b.place.repo == unit.place.repo
+                        && b.folder == folder
+                        && b.place.path.ends_with("terragrunt.hcl")
+                })
+            })
+            .collect()
+    }
+
+    /// The dependency named `name` of a unit, by its place in
+    /// [`Self::blocks`].
+    #[must_use]
+    pub fn dependency(&self, block: usize, name: &str) -> Option<usize> {
+        let unit = self.blocks.get(block)?;
+        let path = unit
+            .body
+            .blocks
+            .iter()
+            .find(|b| b.kind == "dependency" && b.labels.first().map(String::as_str) == Some(name))?
+            .body
+            .text("config_path")?;
+        let folder = crate::repos::normal(&Path::new(&unit.folder).join(path));
+        let folder = folder.to_string_lossy().replace('\\', "/");
+        self.blocks.iter().position(|b| {
+            b.place.repo == unit.place.repo
+                && b.folder == folder
+                && b.place.path.ends_with("terragrunt.hcl")
+        })
+    }
+
+    /// The units an environment `near` runs from: those of the folder of
+    /// units nearest it, of its stage; then the same and all they depend
+    /// on. Empty without Terragrunt.
+    #[must_use]
+    pub fn units_of(&self, near: &[String]) -> (Vec<usize>, Vec<usize>) {
+        let units: Vec<usize> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.place.path.ends_with("terragrunt.hcl"))
+            .map(|(i, _)| i)
+            .collect();
+        // The folders holding units, each with how near it is.
+        let parent = |b: &TfBlock| b.folder.rsplit_once('/').map_or("", |(p, _)| p).to_owned();
+        let best = units
+            .iter()
+            .map(|&i| parent(&self.blocks[i]))
+            .filter(|p| {
+                let w = words(p);
+                !other_stage(&w, near) && w.iter().any(|w| STAGES.contains(&w.as_str()))
+            })
+            .max_by_key(|p| (nearness(&words(p), near), std::cmp::Reverse(p.clone())));
+        let Some(best) = best else {
+            return (Vec::new(), Vec::new());
+        };
+        let own: Vec<usize> = units
+            .iter()
+            .copied()
+            .filter(|&i| parent(&self.blocks[i]) == best)
+            .collect();
+        let mut found = own.clone();
+        let mut next = 0;
+        while next < found.len() {
+            for d in self.dependencies(found[next]) {
+                if !found.contains(&d) {
+                    found.push(d);
+                }
+            }
+            next += 1;
+        }
+        (own, found)
+    }
+
+    /// The module calls and units that call the module holding the file
+    /// of `place`, by their places in [`Self::blocks`].
+    #[must_use]
+    pub fn callers_of(&self, place: &Place) -> Vec<usize> {
+        let folder = place.path.rsplit_once('/').map_or("", |(f, _)| f);
+        let modules: Vec<&Module> = self
+            .modules
+            .iter()
+            .filter(|m| m.place.repo == place.repo && m.place.path == folder)
+            .collect();
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.kind == BlockKind::Module)
+            .filter(|(_, b)| {
+                let key = module_key(&b.what, &b.place);
+                modules.iter().any(|m| m.source == key)
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// The block of one of `kinds` nearest `near`, never one of another
@@ -612,7 +853,14 @@ impl Terraform {
             .filter(|(_, b)| matches(b))
             .map(|(i, b)| (i, block_words(b)))
             .filter(|(_, w)| !other_stage(w, near))
-            .max_by_key(|(i, w)| (nearness(w, near), std::cmp::Reverse(*i)))
+            // On a tie, a module call: it says how the module is used.
+            .max_by_key(|(i, w)| {
+                (
+                    nearness(w, near),
+                    self.blocks[*i].kind == BlockKind::Module,
+                    std::cmp::Reverse(*i),
+                )
+            })
             .map(|(i, _)| i)
     }
 }
@@ -623,6 +871,47 @@ fn block_words(block: &TfBlock) -> Vec<String> {
     w.extend(words(&block.place.path));
     w.extend(words(&block.name));
     w
+}
+
+/// A block's settings, its nested blocks' and objects' dotted, with the
+/// variables of `scope` put in.
+fn flatten(
+    body: &Body,
+    prefix: &str,
+    scope: &HashMap<String, Hcl>,
+    out: &mut Vec<(String, String)>,
+) {
+    for a in &body.attributes {
+        let key = format!("{prefix}{}", a.name);
+        let value = substitute(&a.value, scope);
+        if let Hcl::Object(entries) = &value {
+            for (k, v) in entries {
+                out.push((format!("{key}.{k}"), v.show()));
+            }
+        }
+        out.push((key, value.show()));
+    }
+    for b in &body.blocks {
+        flatten(&b.body, &format!("{prefix}{}.", b.kind), scope, out);
+    }
+}
+
+/// The value a reference to another block's setting has:
+/// `kubernetes_namespace.this.metadata[0].name`.
+fn refer(blocks: &[Inner], value: &str) -> Option<String> {
+    static REFERENCE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"^([a-z][a-z0-9_]*)\.([A-Za-z_][\w-]*)((?:\.[A-Za-z_][\w-]*|\[0\])+)$").ok()
+    });
+    let c = REFERENCE.as_ref()?.captures(value.trim())?;
+    let path = c[3].replace("[0]", "");
+    let key = path.trim_start_matches('.');
+    let block = blocks.iter().find(|b| b.what == c[1] && b.name == c[2])?;
+    block
+        .values
+        .iter()
+        .find(|(k, v)| k == key && !v.contains("var.") && !v.contains('.'))
+        .or_else(|| block.values.iter().find(|(k, _)| k == key))
+        .map(|(_, v)| v.clone())
 }
 
 /// The defaults of `optional(type, default)` attributes in an object type.
@@ -660,6 +949,9 @@ fn substitute(value: &Hcl, scope: &HashMap<String, Hcl>) -> Hcl {
         Regex::new(r"\b((?:var|local)\.[A-Za-z_][\w-]*)((?:\.[A-Za-z_][\w-]*)*)").ok()
     });
     let lookup = |name: &str, path: &str| -> Option<Hcl> {
+        if let Some(whole) = scope.get(&format!("{name}{path}")) {
+            return Some(whole.clone());
+        }
         let mut found = scope.get(name)?.clone();
         for key in path.split('.').filter(|k| !k.is_empty()) {
             found = found.get(key)?.clone();
@@ -789,7 +1081,30 @@ fn identify(key: &str, value: &str) -> Vec<(CloudKind, String)> {
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_owned())
     };
+    // The same, on Google Cloud and DigitalOcean.
+    static GOOGLE_ACCOUNT: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"^([a-z][a-z0-9-]{4,28}[a-z0-9])@[a-z0-9-]+\.iam\.gserviceaccount\.com$").ok()
+    });
+    static GS: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"^gs://([a-z0-9][a-z0-9._-]{1,61}[a-z0-9])").ok());
+    static CLOUD_SQL: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9-]+:[a-z]+-[a-z]+\d:([a-z][a-z0-9-]*)$").ok());
+    static DO_DATABASE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"([a-z0-9][a-z0-9-]*?)-do-user-\d+-\d+\.[a-z]\.db\.ondigitalocean\.com").ok()
+    });
+    static SPACES: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\.[a-z]+\d\.digitaloceanspaces\.com").ok()
+    });
     let mut out = Vec::new();
+    if let Some(account) = capture(&GOOGLE_ACCOUNT) {
+        out.push((CloudKind::Role, account));
+    }
+    if let Some(bucket) = capture(&GS).or_else(|| capture(&SPACES)) {
+        out.push((CloudKind::Bucket, bucket));
+    }
+    if let Some(instance) = capture(&CLOUD_SQL).or_else(|| capture(&DO_DATABASE)) {
+        out.push((CloudKind::Database, instance));
+    }
     if let Some(role) = capture(&ROLE) {
         out.push((
             CloudKind::Role,
@@ -808,7 +1123,8 @@ fn identify(key: &str, value: &str) -> Vec<(CloudKind, String)> {
         out.push((CloudKind::Users, value.to_owned()));
     }
     let lower = key.to_lowercase();
-    if let Some(bucket) = capture(&S3) {
+    if out.iter().any(|(k, _)| *k == CloudKind::Bucket) {
+    } else if let Some(bucket) = capture(&S3) {
         out.push((CloudKind::Bucket, bucket));
     } else if lower.contains("bucket")
         && !lower.contains("region")
@@ -827,11 +1143,24 @@ pub fn makes(block: &TfBlock, kind: CloudKind) -> bool {
     let what = block.what.to_lowercase();
     match block.kind {
         BlockKind::Resource => match kind {
-            CloudKind::Role => what == "aws_iam_role",
-            CloudKind::Bucket => what == "aws_s3_bucket",
-            CloudKind::Database => what == "aws_db_instance" || what == "aws_rds_cluster",
-            CloudKind::Secret => what == "aws_secretsmanager_secret",
-            CloudKind::Users => what == "aws_cognito_user_pool",
+            CloudKind::Role => what == "aws_iam_role" || what == "google_service_account",
+            CloudKind::Bucket => {
+                what == "aws_s3_bucket"
+                    || what == "google_storage_bucket"
+                    || what == "digitalocean_spaces_bucket"
+            }
+            CloudKind::Database => {
+                what == "aws_db_instance"
+                    || what == "aws_rds_cluster"
+                    || what == "google_sql_database_instance"
+                    || what == "digitalocean_database_cluster"
+            }
+            CloudKind::Secret => {
+                what == "aws_secretsmanager_secret" || what == "google_secret_manager_secret"
+            }
+            CloudKind::Users => {
+                what == "aws_cognito_user_pool" || what == "google_identity_platform_config"
+            }
         },
         BlockKind::Module => {
             let source = what.rsplit("//").next().unwrap_or(&what).to_owned() + " " + &what;
@@ -839,12 +1168,15 @@ pub fn makes(block: &TfBlock, kind: CloudKind) -> bool {
                 CloudKind::Role => {
                     source.contains("iam") || source.contains("irsa") || source.contains("role")
                 }
-                CloudKind::Bucket => source.contains("s3") || source.contains("bucket"),
+                CloudKind::Bucket => {
+                    source.contains("s3") || source.contains("bucket") || source.contains("storage")
+                }
                 CloudKind::Database => {
                     source.contains("rds")
                         || source.contains("aurora")
                         || source.contains("database")
                         || source.contains("postgres")
+                        || source.contains("sql")
                 }
                 CloudKind::Secret => source.contains("secret"),
                 CloudKind::Users => {
@@ -861,7 +1193,7 @@ pub fn makes(block: &TfBlock, kind: CloudKind) -> bool {
 /// The names a block gives what it makes: its naming settings, its own
 /// and its module's.
 fn names(resolved: &Resolved) -> Vec<String> {
-    const NAMING: [&str; 9] = [
+    const NAMING: [&str; 13] = [
         "name",
         "name_prefix",
         "bucket",
@@ -871,6 +1203,10 @@ fn names(resolved: &Resolved) -> Vec<String> {
         "role_name",
         "secret_name",
         "user_pool_name",
+        "instance_name",
+        "account_id",
+        "secret_id",
+        "cluster_name",
     ];
     let mut out: Vec<String> = resolved
         .values
@@ -1191,5 +1527,27 @@ pub(crate) mod tests {
             Some(("tf-modules".into(), "rds".into(), Some("v1.0.0".into())))
         );
         assert_eq!(git_source("terraform-aws-modules/vpc/aws"), None);
+        assert_eq!(
+            kinds(
+                "iam.gke.io/gcp-service-account",
+                "api-runner@shop-123.iam.gserviceaccount.com"
+            ),
+            [(CloudKind::Role, "api-runner".to_owned())]
+        );
+        assert_eq!(
+            kinds("EXPORTS", "gs://shop-exports/daily"),
+            [(CloudKind::Bucket, "shop-exports".to_owned())]
+        );
+        assert_eq!(
+            kinds("INSTANCE_CONNECTION_NAME", "shop-123:europe-west1:shop-db"),
+            [(CloudKind::Database, "shop-db".to_owned())]
+        );
+        assert_eq!(
+            kinds(
+                "DB_HOST",
+                "shop-db-do-user-1234567-0.b.db.ondigitalocean.com"
+            ),
+            [(CloudKind::Database, "shop-db".to_owned())]
+        );
     }
 }

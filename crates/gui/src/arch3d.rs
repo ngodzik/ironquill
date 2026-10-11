@@ -82,7 +82,10 @@ pub(crate) fn scene(deployment: &Deployment) -> Scene {
     // Namespaces, each a slab, in a row along x.
     let mut namespaces: Vec<(String, Vec<usize>)> = Vec::new();
     for (i, e) in deployment.elements.iter().enumerate() {
-        if matches!(e.kind, ElementKind::Workload | ElementKind::Job) {
+        // A Kubernetes secret stands on its namespace too.
+        if matches!(e.kind, ElementKind::Workload | ElementKind::Job)
+            || (e.kind == ElementKind::Secret && e.namespace.is_some())
+        {
             let ns = e.namespace.clone().unwrap_or_else(|| "default".to_owned());
             match namespaces.iter_mut().find(|(n, _)| *n == ns) {
                 Some((_, members)) => members.push(i),
@@ -115,7 +118,9 @@ pub(crate) fn scene(deployment: &Deployment) -> Scene {
             let px = x + 0.6 + PITCH * (col as f32 + 0.5);
             let pz = -depth / 2.0 + 0.6 + PITCH * (row as f32 + 0.5);
             let e = &deployment.elements[i];
-            let (shape, size) = if e.kind == ElementKind::Job {
+            let (shape, size) = if e.kind == ElementKind::Secret {
+                (Shape::Cuboid, Vec3::splat(0.7))
+            } else if e.kind == ElementKind::Job {
                 (Shape::Cuboid, Vec3::splat(1.1))
             } else {
                 let most = e.replicas.map_or(1, |(_, max)| max).min(16);
@@ -256,7 +261,11 @@ pub(crate) fn scene(deployment: &Deployment) -> Scene {
     .into_iter()
     .enumerate()
     {
-        let members: Vec<usize> = deployment.of(kind).map(|(i, _)| i).collect();
+        let members: Vec<usize> = deployment
+            .of(kind)
+            .filter(|(_, e)| e.namespace.is_none())
+            .map(|(i, _)| i)
+            .collect();
         for (k, &i) in members.iter().enumerate() {
             let at = Vec3::new(
                 beside + col as f32 * 4.5,

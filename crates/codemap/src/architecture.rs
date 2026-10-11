@@ -4,7 +4,7 @@
 //! first. A part can be opened, to read its own design the same way.
 //!
 //! Packages are found by their manifests (`Cargo.toml` beside a crate root,
-//! `package.json`, `pyproject.toml`, `setup.py`, `go.mod`), never by their
+//! `package.json`, `pyproject.toml`, `setup.py`, `go.mod`, `pubspec.yaml`), never by their
 //! names: a folder that only holds a few packages (`crates/`) shows them
 //! rather than itself, one that holds many (`providers/`) shows as one part
 //! to open. Only the code counts: tests, documents and examples are left out,
@@ -285,7 +285,8 @@ fn is_code(kind: NodeKind) -> bool {
             language: Language::Rust
                 | Language::Python
                 | Language::TypeScript
-                | Language::JavaScript,
+                | Language::JavaScript
+                | Language::Dart,
             ..
         }
     )
@@ -319,9 +320,15 @@ fn packages(map: &CodeMap) -> Vec<String> {
         let cargo = paths.contains(inside("Cargo.toml").as_str())
             && (paths.contains(inside("src/lib.rs").as_str())
                 || paths.contains(inside("src/main.rs").as_str()));
-        let other = ["package.json", "pyproject.toml", "setup.py", "go.mod"]
-            .iter()
-            .any(|m| paths.contains(inside(m).as_str()));
+        let other = [
+            "package.json",
+            "pyproject.toml",
+            "setup.py",
+            "go.mod",
+            "pubspec.yaml",
+        ]
+        .iter()
+        .any(|m| paths.contains(inside(m).as_str()));
         if cargo || other {
             found.push(node.path.clone());
         }

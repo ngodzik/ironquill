@@ -12,7 +12,9 @@ use crate::deploy::{Environment, Release};
 use crate::render::{Object, Rendered};
 use crate::repos::Place;
 use crate::services::Services;
-use crate::terraform::{self, BlockKind, CloudKind, Quality, Terraform, configures, makes, words};
+use crate::terraform::{
+    self, BlockKind, CloudKind, Quality, Terraform, TfBlock, configures, makes, words,
+};
 
 /// What an element of an architecture is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -212,41 +214,61 @@ pub fn deployment(
     deployment.notes.extend(environment.notes.iter().cloned());
     deployment.notes.extend(rendered.notes.iter().cloned());
 
-    // The network and the cluster, from the nearest Terraform.
-    let network = terraform
-        .nearest(
-            |b| {
-                b.what == "aws_vpc"
-                    || (b.kind == BlockKind::Module && b.what.to_lowercase().contains("vpc"))
-            },
-            &near,
-        )
-        .map(|i| {
-            let block = &terraform.blocks[i];
-            let resolved = terraform.resolve(block, &near);
-            let mut e = element(ElementKind::Network, &block.name, "The private network");
-            for key in [
-                "cidr",
-                "cidr_block",
-                "azs",
-                "private_subnets",
-                "public_subnets",
-                "database_subnets",
-            ] {
-                if let Some(v) = resolved.find(&[key]) {
-                    e.properties.push((key.to_owned(), v.to_owned()));
-                }
+    // The units this environment runs from, with Terragrunt.
+    let (own_units, all_units) = terraform.units_of(&near);
+    let pick = |test: &dyn Fn(&TfBlock) -> bool| -> Option<usize> {
+        all_units
+            .iter()
+            .copied()
+            .find(|&u| test(&terraform.blocks[u]))
+            .or_else(|| terraform.nearest(|b| test(b), &near))
+    };
+
+    // The network and the cluster: those its units depend on, else the
+    // nearest Terraform.
+    let network = pick(&is_network).map(|i| {
+        let block = &terraform.blocks[i];
+        let resolved = terraform.resolve(block, &near);
+        let name = resolved
+            .find(&["name", "network_name", "vpc_name"])
+            .filter(|n| !n.contains("${"))
+            .unwrap_or(&block.name)
+            .to_owned();
+        let mut e = element(ElementKind::Network, &name, "The private network");
+        for key in [
+            "cidr",
+            "cidr_block",
+            "ip_range",
+            "ip_cidr_range",
+            "region",
+            "azs",
+            "private_subnets",
+            "public_subnets",
+            "database_subnets",
+        ] {
+            if let Some(v) = resolved.find(&[key]) {
+                e.properties.push((key.to_owned(), v.to_owned()));
             }
-            e.places.push(block.place.clone());
-            deployment.add(e)
-        });
-    let cluster_block = terraform.nearest(
-        |b| {
-            b.what == "aws_eks_cluster"
-                || (b.kind == BlockKind::Module && b.what.to_lowercase().contains("eks"))
-        },
-        &near,
-    );
+        }
+        e.places.push(block.place.clone());
+        deployment.add(e)
+    });
+    // The cluster Flux runs on: what the units that install it depend on.
+    let cluster_block = environment
+        .declared_in
+        .as_ref()
+        .and_then(|declared| {
+            terraform
+                .callers_of(declared)
+                .into_iter()
+                .find_map(|caller| {
+                    terraform
+                        .dependencies(caller)
+                        .into_iter()
+                        .find(|&d| is_cluster(&terraform.blocks[d]))
+                })
+        })
+        .or_else(|| pick(&is_cluster));
     let workloads_found = rendered.objects.iter().any(|o| {
         matches!(
             o.kind.as_str(),
@@ -260,12 +282,23 @@ pub fn deployment(
             let resolved = terraform.resolve(block, &near);
             e.name = resolved
                 .find(&["cluster_name", "name"])
+                .filter(|n| !n.contains("${"))
                 .unwrap_or(&block.name)
                 .to_owned();
             for key in [
                 "cluster_version",
+                "kubernetes_version",
+                "min_master_version",
                 "version",
+                "location",
+                "region",
+                "machine_type",
+                "node_config.machine_type",
                 "instance_types",
+                "size",
+                "node_count",
+                "autoscaling.min_node_count",
+                "autoscaling.max_node_count",
                 "min_size",
                 "max_size",
             ] {
@@ -437,49 +470,7 @@ pub fn deployment(
         let mut e = element(kind, &id.name, kind.label());
         e.places.extend(id.place.iter().cloned());
         match configures(terraform, &id, &near) {
-            Some((b, quality)) => {
-                let block = &terraform.blocks[b];
-                let resolved = terraform.resolve(block, &near);
-                e.properties.push((
-                    "configured by".into(),
-                    match block.kind {
-                        BlockKind::Module => format!("module {}", block.name),
-                        _ => format!("{} {}", block.what, block.name),
-                    },
-                ));
-                if block.kind == BlockKind::Module {
-                    e.properties
-                        .push(("module source".into(), block.what.clone()));
-                }
-                e.properties.push((
-                    "match".into(),
-                    match quality {
-                        Quality::Exact => "exact",
-                        Quality::Pattern => "by its pattern",
-                        Quality::Part => "by a shared part of its name",
-                        Quality::Nearest => {
-                            "the nearest of its kind (its id only exists once applied)"
-                        }
-                    }
-                    .into(),
-                ));
-                if kind == ElementKind::Database {
-                    for (label, keys) in [
-                        ("engine", &["engine"][..]),
-                        ("engine version", &["engine_version"][..]),
-                        ("instance class", &["instance_class", "class"][..]),
-                        (
-                            "instances",
-                            &["count", "instance_count", "replica_count"][..],
-                        ),
-                    ] {
-                        if let Some(v) = resolved.find(keys) {
-                            e.properties.push((label.into(), v.to_owned()));
-                        }
-                    }
-                }
-                e.places.insert(0, block.place.clone());
-            }
+            Some((b, quality)) => describe(&mut e, terraform, b, quality, &near),
             None => deployment.notes.push(format!(
                 "No Terraform block was found that makes the {} {}",
                 kind.label().to_lowercase(),
@@ -526,6 +517,20 @@ pub fn deployment(
             );
         }
     }
+
+    // What Terraform puts in the cluster for this environment: workloads
+    // and jobs, secrets the workloads read, and what those hold.
+    terraform_in_cluster(
+        &mut deployment,
+        terraform,
+        &own_units,
+        &all_units,
+        &near,
+        rendered,
+        &workload_of,
+        cluster,
+        network,
+    );
 
     // Services outside that the environment's services reach, and the
     // calls between its own.
@@ -580,6 +585,326 @@ pub fn deployment(
         ));
     }
     deployment
+}
+
+/// Whether a block makes a private network.
+fn is_network(b: &TfBlock) -> bool {
+    let what = b.what.to_lowercase();
+    matches!(
+        what.as_str(),
+        "aws_vpc" | "google_compute_network" | "digitalocean_vpc"
+    ) || (b.kind == BlockKind::Module && (what.contains("vpc") || what.contains("network")))
+}
+
+/// Whether a block makes a Kubernetes cluster.
+fn is_cluster(b: &TfBlock) -> bool {
+    let what = b.what.to_lowercase();
+    let module = what.rsplit('/').next().unwrap_or(&what);
+    matches!(
+        what.as_str(),
+        "aws_eks_cluster" | "google_container_cluster" | "digitalocean_kubernetes_cluster"
+    ) || (b.kind == BlockKind::Module
+        && ["eks", "gke", "doks", "aks", "kubernetes-cluster"]
+            .iter()
+            .any(|k| module.split(['-', '_']).any(|w| w == *k) || module == *k))
+}
+
+/// Says which Terraform block configures `e`, and how sure that is.
+fn describe(e: &mut Element, terraform: &Terraform, b: usize, quality: Quality, near: &[String]) {
+    let block = &terraform.blocks[b];
+    let resolved = terraform.resolve(block, near);
+    e.properties.push((
+        "configured by".into(),
+        match block.kind {
+            BlockKind::Module if block.place.path.ends_with("terragrunt.hcl") => {
+                format!("unit {}", block.folder)
+            }
+            BlockKind::Module => format!("module {}", block.name),
+            _ => format!("{} {}", block.what, block.name),
+        },
+    ));
+    if block.kind == BlockKind::Module {
+        e.properties
+            .push(("module source".into(), block.what.clone()));
+    }
+    e.properties.push((
+        "match".into(),
+        match quality {
+            Quality::Exact => "exact",
+            Quality::Pattern => "by its pattern",
+            Quality::Part => "by a shared part of its name",
+            Quality::Nearest => "the nearest of its kind (its id only exists once applied)",
+        }
+        .into(),
+    ));
+    if e.kind == ElementKind::Database {
+        for (label, keys) in [
+            ("engine", &["engine", "database_version"][..]),
+            ("engine version", &["engine_version", "version"][..]),
+            (
+                "instance class",
+                &["instance_class", "class", "tier", "settings.tier", "size"][..],
+            ),
+            (
+                "instances",
+                &["count", "instance_count", "replica_count", "node_count"][..],
+            ),
+        ] {
+            if let Some(v) = resolved.find(keys) {
+                e.properties.push((label.into(), v.to_owned()));
+            }
+        }
+    }
+    e.places.insert(0, block.place.clone());
+}
+
+/// The kinds of Terraform resources that run something in the cluster.
+const TERRAFORM_WORKLOADS: [&str; 9] = [
+    "kubernetes_deployment",
+    "kubernetes_deployment_v1",
+    "kubernetes_stateful_set",
+    "kubernetes_stateful_set_v1",
+    "kubernetes_daemonset",
+    "kubernetes_cron_job_v1",
+    "kubernetes_job",
+    "kubernetes_job_v1",
+    "helm_release",
+];
+
+/// The secrets a workload reads: from its variables, all of one, or a
+/// volume.
+fn secrets_read(object: &Object) -> Vec<String> {
+    let pod = if object.kind == "CronJob" {
+        &object.body["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    } else {
+        &object.body["spec"]["template"]["spec"]
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |name: Option<&str>| {
+        if let Some(name) = name
+            && !out.iter().any(|n| n == name)
+        {
+            out.push(name.to_owned());
+        }
+    };
+    for container in pod["containers"].as_array().into_iter().flatten() {
+        for from in container["envFrom"].as_array().into_iter().flatten() {
+            add(from["secretRef"]["name"].as_str());
+        }
+        for env in container["env"].as_array().into_iter().flatten() {
+            add(env["valueFrom"]["secretKeyRef"]["name"].as_str());
+        }
+    }
+    for volume in pod["volumes"].as_array().into_iter().flatten() {
+        add(volume["secret"]["secretName"].as_str());
+    }
+    out
+}
+
+/// What Terraform puts in the cluster for an environment, from its units:
+/// the workloads and jobs its own units deploy, each linked to the cloud
+/// resources its unit depends on; and the secrets the rendered workloads
+/// read that no manifest declares, found in the units that make them,
+/// linked to what their values come from.
+#[allow(clippy::too_many_arguments)]
+fn terraform_in_cluster(
+    deployment: &mut Deployment,
+    terraform: &Terraform,
+    own_units: &[usize],
+    all_units: &[usize],
+    near: &[String],
+    rendered: &Rendered,
+    workloads: &[(usize, &Object)],
+    cluster: Option<usize>,
+    network: Option<usize>,
+) {
+    // A unit a block depends on, as a cloud resource of the architecture.
+    let resource = |deployment: &mut Deployment, unit: usize| -> Option<usize> {
+        let block = &terraform.blocks[unit];
+        let kind = [
+            (CloudKind::Database, ElementKind::Database),
+            (CloudKind::Bucket, ElementKind::Bucket),
+            (CloudKind::Secret, ElementKind::Secret),
+        ]
+        .into_iter()
+        .find(|(k, _)| makes(block, *k))?
+        .1;
+        let resolved = terraform.resolve(block, near);
+        let name = resolved
+            .find(&[
+                "instance_name",
+                "name",
+                "bucket",
+                "secret_id",
+                "cluster_name",
+            ])
+            .filter(|n| !n.contains("${") && !n.contains('.'))
+            .unwrap_or(&block.name)
+            .to_owned();
+        let mut e = element(kind, &name, kind.label());
+        describe(&mut e, terraform, unit, Quality::Exact, near);
+        // Named by the unit, not matched by a name: say so.
+        if let Some(m) = e.properties.iter_mut().find(|(k, _)| k == "match") {
+            m.1 = "what a unit depends on".into();
+        }
+        let i = deployment.add(e);
+        if kind == ElementKind::Database
+            && let Some(network) = network
+        {
+            deployment.link(network, i, LinkKind::Contains, "");
+        }
+        Some(i)
+    };
+
+    for &unit in own_units {
+        let resolved = terraform.resolve(&terraform.blocks[unit], near);
+        let mut deployed: Vec<usize> = Vec::new();
+        for inner in &resolved.inner {
+            if !TERRAFORM_WORKLOADS.contains(&inner.what.as_str()) {
+                continue;
+            }
+            let value = |keys: &[&str]| {
+                keys.iter().find_map(|k| {
+                    inner
+                        .values
+                        .iter()
+                        .find(|(key, v)| key == k && !v.contains("var.") && !v.contains("${"))
+                        .map(|(_, v)| v.clone())
+                })
+            };
+            let Some(name) = value(&["metadata.name", "name"]) else {
+                continue;
+            };
+            let kind = if inner.what.contains("job") {
+                ElementKind::Job
+            } else {
+                ElementKind::Workload
+            };
+            let mut e = element(kind, &name, format!("{} in Terraform", inner.what));
+            e.namespace = value(&["metadata.namespace", "namespace"]);
+            e.service = Some(name.clone());
+            let replicas = value(&["spec.replicas"]).and_then(|r| r.parse::<u32>().ok());
+            e.replicas = Some((replicas.unwrap_or(1), replicas.unwrap_or(1)));
+            for (label, keys) in [
+                ("chart", &["chart"][..]),
+                ("chart version", &["version"][..]),
+                ("repository", &["repository"][..]),
+                ("image", &["spec.template.spec.container.image"][..]),
+            ] {
+                if let Some(v) = value(keys) {
+                    e.properties.push((label.into(), v));
+                }
+            }
+            e.places.push(inner.place.clone());
+            e.places.push(terraform.blocks[unit].place.clone());
+            let i = deployment.add(e);
+            if let Some(cluster) = cluster {
+                deployment.link(cluster, i, LinkKind::Contains, "");
+            }
+            deployed.push(i);
+        }
+        // What the unit depends on, its deployments use.
+        if !deployed.is_empty() {
+            for dependency in terraform.dependencies(unit) {
+                if let Some(target) = resource(deployment, dependency) {
+                    for &w in &deployed {
+                        deployment.link(w, target, LinkKind::Uses, "its unit depends on it");
+                    }
+                }
+            }
+        }
+    }
+
+    // Secrets the workloads read that no manifest declares.
+    let declared: Vec<(&Option<String>, &str)> = rendered
+        .objects
+        .iter()
+        .filter(|o| o.kind == "Secret")
+        .map(|o| (&o.namespace, o.name.as_str()))
+        .collect();
+    for (w, object) in workloads {
+        for secret in secrets_read(object) {
+            if declared
+                .iter()
+                .any(|(ns, n)| *n == secret && **ns == object.namespace)
+            {
+                continue;
+            }
+            // The unit that makes it, those of the environment first.
+            let made = all_units.iter().find_map(|&unit| {
+                let resolved = terraform.resolve(&terraform.blocks[unit], near);
+                resolved
+                    .inner
+                    .into_iter()
+                    .filter(|i| i.what.starts_with("kubernetes_secret"))
+                    .find(|i| {
+                        i.values
+                            .iter()
+                            .any(|(k, v)| k == "metadata.name" && *v == secret)
+                    })
+                    .map(|inner| (unit, inner))
+            });
+            let Some((unit, inner)) = made else {
+                continue;
+            };
+            let mut e = element(
+                ElementKind::Secret,
+                &secret,
+                "A Kubernetes secret Terraform makes",
+            );
+            e.namespace.clone_from(&object.namespace);
+            // Its keys, never its values.
+            let keys: Vec<(String, &str)> = inner
+                .values
+                .iter()
+                .filter_map(|(k, v)| {
+                    let key = k
+                        .strip_prefix("data.")
+                        .or_else(|| k.strip_prefix("string_data."))?;
+                    Some((key.to_owned(), v.as_str()))
+                })
+                .collect();
+            if !keys.is_empty() {
+                e.properties.push((
+                    "keys".into(),
+                    keys.iter()
+                        .map(|(k, _)| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
+            e.places.push(inner.place.clone());
+            e.places.push(terraform.blocks[unit].place.clone());
+            let s = deployment.add(e);
+            deployment.link(*w, s, LinkKind::Uses, "");
+            // A value taken from what a unit depends on: the workload uses
+            // it, through this key.
+            for (key, value) in keys {
+                for dependency in dependency_names(value) {
+                    if let Some(d) = terraform.dependency(unit, &dependency)
+                        && let Some(target) = resource(deployment, d)
+                    {
+                        deployment.link(*w, target, LinkKind::Uses, &key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The Terragrunt dependencies a value names: `dependency.NAME.outputs…`.
+fn dependency_names(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in value.split("dependency.").skip(1) {
+        let name: String = part
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// A release not rendered, as its settings describe it.
@@ -731,6 +1056,8 @@ fn ingress(
             format!("{class} load balancer"),
         );
         for (key, label) in [
+            ("cert-manager.io/cluster-issuer", "certificates from"),
+            ("cert-manager.io/issuer", "certificates from"),
             ("alb.ingress.kubernetes.io/scheme", "scheme"),
             ("alb.ingress.kubernetes.io/certificate-arn", "certificate"),
             ("alb.ingress.kubernetes.io/listen-ports", "listens on"),
@@ -815,6 +1142,7 @@ pub fn with_cloud(services: &Services, deployment: &Deployment) -> Services {
             operations: Vec::new(),
             tools: Vec::new(),
             cloud,
+            platforms: Vec::new(),
         });
         out.services.len() - 1
     };
@@ -959,6 +1287,7 @@ mod tests {
             manifests: Vec::new(),
             encrypted: Vec::new(),
             notes: Vec::new(),
+            declared_in: None,
         };
         let d = deployment(&environment, &rendered, &terraform, &Services::default());
         let find = |kind: ElementKind| d.elements.iter().position(|e| e.kind == kind).unwrap();
@@ -1035,5 +1364,131 @@ mod tests {
                 .iter()
                 .any(|l| l.from == api && l.to == db && l.via == crate::services::Via::Cloud)
         );
+    }
+
+    #[test]
+    fn terragrunt_units_flux_in_terraform_and_the_secrets_they_make() {
+        use crate::deploy::tests::write;
+        let dir = tempfile::tempdir().unwrap();
+        let ops = dir.path().join("ops");
+        let w = |path: &str, text: &str| write(&ops, path, text);
+        // Flux, installed by Terraform, builds a folder of plain manifests.
+        w(
+            "modules/flux/main.tf",
+            "resource \"kubectl_manifest\" \"prod\" {\n  yaml_body = <<-YAML\n    apiVersion: kustomize.toolkit.fluxcd.io/v1\n    kind: Kustomization\n    metadata:\n      name: prod\n    spec:\n      path: ./k8s/prod\n      targetNamespace: shop\n  YAML\n}\n",
+        );
+        w(
+            "k8s/prod/api.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  template:\n    spec:\n      containers:\n        - name: api\n          image: api:1\n          envFrom:\n            - secretRef:\n                name: shop-secrets\n",
+        );
+        w(
+            "modules/gke/main.tf",
+            "resource \"google_container_cluster\" \"this\" {\n  name     = var.name\n  location = var.region\n}\nvariable \"name\" {}\nvariable \"region\" {}\n",
+        );
+        w(
+            "modules/sql/main.tf",
+            "resource \"google_sql_database_instance\" \"this\" {\n  name             = var.instance_name\n  database_version = \"POSTGRES_16\"\n  settings {\n    tier = var.tier\n  }\n}\nvariable \"instance_name\" {}\nvariable \"tier\" {}\n",
+        );
+        w(
+            "modules/app/main.tf",
+            "resource \"kubernetes_namespace\" \"this\" {\n  metadata {\n    name = var.namespace\n  }\n}\nresource \"kubernetes_secret\" \"app\" {\n  metadata {\n    name      = \"shop-secrets\"\n    namespace = kubernetes_namespace.this.metadata[0].name\n  }\n  data = {\n    DATABASE_URL = var.database_url\n  }\n}\nresource \"helm_release\" \"auth\" {\n  name      = \"auth\"\n  namespace = kubernetes_namespace.this.metadata[0].name\n  chart     = \"auth\"\n}\nvariable \"namespace\" {}\nvariable \"database_url\" {}\n",
+        );
+        w(
+            "environments/shared/env.hcl",
+            "locals {\n  region = \"europe-west1\"\n}\n",
+        );
+        let unit = |source: &str, rest: &str| {
+            format!(
+                "locals {{\n  env = read_terragrunt_config(find_in_parent_folders(\"env.hcl\"))\n}}\nterraform {{\n  source = \"${{get_repo_root()}}/modules/{source}\"\n}}\n{rest}"
+            )
+        };
+        w(
+            "environments/shared/gke/terragrunt.hcl",
+            &unit(
+                "gke",
+                "inputs = {\n  name   = \"shop-cluster\"\n  region = local.env.locals.region\n}\n",
+            ),
+        );
+        w(
+            "environments/shared/sql/terragrunt.hcl",
+            &unit(
+                "sql",
+                "inputs = {\n  instance_name = \"shop-db\"\n  tier          = \"db-custom-1-3840\"\n}\n",
+            ),
+        );
+        w(
+            "environments/shared/flux/terragrunt.hcl",
+            &unit(
+                "flux",
+                "dependency \"gke\" {\n  config_path = \"../gke\"\n}\n",
+            ),
+        );
+        w(
+            "environments/prod/app/terragrunt.hcl",
+            &unit(
+                "app",
+                "dependency \"sql\" {\n  config_path = \"../../shared/sql\"\n}\ninputs = {\n  namespace    = \"shop\"\n  database_url = format(\"postgres://%s/shop\", dependency.sql.outputs.private_ip)\n}\n",
+            ),
+        );
+        let repos = Repos::new(&dir.path().join("app"), &[ops]);
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        let deploy = crate::deploy::deploy(&repos, &[]);
+        let env = &deploy.environments[0];
+        assert_eq!(env.name, "prod");
+        assert_eq!(
+            env.declared_in.as_ref().unwrap().path,
+            "modules/flux/main.tf"
+        );
+        let terraform = crate::terraform::terraform(&repos);
+        let rendered = Rendered {
+            objects: vec![Object {
+                kind: "Deployment".into(),
+                name: "api".into(),
+                namespace: Some("shop".into()),
+                service: None,
+                origin: None,
+                changed_by: Vec::new(),
+                body: json!({"spec": {"template": {"spec": {"containers": [
+                    {"name": "api", "image": "api:1", "envFrom": [{"secretRef": {"name": "shop-secrets"}}]}
+                ]}}}}),
+            }],
+            releases: Vec::new(),
+            notes: Vec::new(),
+        };
+        let d = deployment(env, &rendered, &terraform, &Services::default());
+        let named = |kind: ElementKind| d.elements.iter().position(|e| e.kind == kind).unwrap();
+        let cluster = &d.elements[named(ElementKind::Cluster)];
+        assert_eq!(cluster.name, "shop-cluster");
+        assert!(
+            cluster
+                .properties
+                .contains(&("location".into(), "europe-west1".into()))
+        );
+        let db = named(ElementKind::Database);
+        assert_eq!(d.elements[db].name, "shop-db");
+        assert!(
+            d.elements[db]
+                .properties
+                .contains(&("engine".into(), "POSTGRES_16".into()))
+        );
+        assert!(
+            d.elements[db]
+                .properties
+                .contains(&("instance class".into(), "db-custom-1-3840".into()))
+        );
+        let secret = &d.elements[named(ElementKind::Secret)];
+        assert_eq!(
+            secret.properties,
+            [("keys".to_owned(), "DATABASE_URL".to_owned())]
+        );
+        let api = d.elements.iter().position(|e| e.name == "api").unwrap();
+        assert!(
+            d.links
+                .iter()
+                .any(|l| l.from == api && l.to == db && l.label == "DATABASE_URL")
+        );
+        let auth = d.elements.iter().find(|e| e.name == "auth").unwrap();
+        assert_eq!(auth.namespace.as_deref(), Some("shop"));
+        assert!(auth.properties.contains(&("chart".into(), "auth".into())));
     }
 }

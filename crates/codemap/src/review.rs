@@ -214,7 +214,7 @@ fn area_of(path: &str) -> Area {
         return Area::Tests;
     }
     match Language::of(file) {
-        Language::TypeScript | Language::JavaScript => Area::FrontEnd,
+        Language::TypeScript | Language::JavaScript | Language::Dart => Area::FrontEnd,
         Language::Python | Language::Rust => Area::Backend,
         Language::Markdown => Area::Documents,
         _ if name.ends_with(".rst") || name.ends_with(".txt") => Area::Documents,
