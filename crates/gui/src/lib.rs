@@ -1490,7 +1490,6 @@ fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     }
     tree.set_offset(offset);
     let mut clicked = None;
-    let branch = tree.shows_changes_only();
     for (i, entry) in tree.rows().iter().enumerate().skip(offset).take(visible) {
         // The row standing for a folder's unchanged files: quiet, a click
         // away from showing them.
@@ -1531,12 +1530,11 @@ fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             "  "
         };
         let changed = app.is_changed(&entry.path, entry.is_dir);
-        // Looking at a branch, each change has git's letter and colour.
-        let letter = branch
-            .then(|| tree.git_status(&entry.path, entry.is_dir))
-            .flatten();
+        // Each change has git's letter and colour, in every mode: against
+        // the branch's base while it is looked at, else the last commit.
+        let letter = tree.git_status(&entry.path, entry.is_dir);
         let letter_colour = |letter: char| match letter {
-            'A' => theme::GREEN,
+            'A' | '?' => theme::GREEN,
             'D' => theme::RED,
             'R' => theme::CYAN,
             _ => YELLOW,

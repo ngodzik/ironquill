@@ -4723,8 +4723,9 @@ impl App {
     /// Keeps the tree and the open file in step with what the agent wrote.
     fn on_file_changed(&mut self, path: &str) {
         self.changed.insert(path.to_owned());
+        // Its own path opens; folders folded by hand elsewhere stay so.
         if let Some(tree) = &mut self.tree {
-            tree.refresh();
+            tree.reveal_one(path);
         }
         if let Some(file) = &mut self.file
             && file.path() == Path::new(path)
@@ -5551,13 +5552,13 @@ mod tests {
 
         app.run_command("review off");
         assert!(app.change_set().is_none());
-        assert!(
-            app.tree()
-                .unwrap()
-                .rows()
-                .iter()
-                .any(|r| r.name == "same.py")
-        );
+        // The branch's filter is lifted: the tree shows what is not
+        // committed, a.py, with git's letter against the last commit.
+        let tree = app.tree().unwrap();
+        assert!(!tree.shows_changes_only());
+        let rows: Vec<&str> = tree.rows().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(rows, ["a.py", "+2 unchanged"]);
+        assert_eq!(tree.git_status(Path::new("a.py"), false), Some('M'));
     }
 
     #[test]
