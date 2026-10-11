@@ -434,7 +434,7 @@ fn diff_block(ui: &mut Ui, diff: &[DiffLine]) {
 }
 
 /// A reply's Markdown, as much of it as reads better drawn: headings, bold,
-/// inline code, and fenced blocks with a copy button.
+/// inline code, quotes, and fenced blocks with a copy button.
 fn markdown(ui: &mut Ui, text: &str, effects: &mut Vec<Effect>) {
     let mut lines = text.lines().peekable();
     let mut paragraph: Vec<&str> = Vec::new();
@@ -449,6 +449,13 @@ fn markdown(ui: &mut Ui, text: &str, effects: &mut Vec<Effect>) {
                 code.push(inner);
             }
             code_block(ui, info.trim(), &code.join("\n"), effects);
+        } else if line.trim_start().starts_with('>') {
+            flush(ui, &mut paragraph);
+            let mut quoted = vec![line];
+            while let Some(next) = lines.next_if(|l| l.trim_start().starts_with('>')) {
+                quoted.push(next);
+            }
+            quote(ui, &unquoted(&quoted), effects);
         } else if let Some(heading) = heading(line) {
             flush(ui, &mut paragraph);
             ui.add_space(4.0);
@@ -461,6 +468,49 @@ fn markdown(ui: &mut Ui, text: &str, effects: &mut Vec<Effect>) {
         }
     }
     flush(ui, &mut paragraph);
+}
+
+/// A quote set apart by a bar on its left, its markers gone and its
+/// text drawn as Markdown again, with a button that copies it as written
+/// without them: a quoted draft is often what is wanted.
+fn quote(ui: &mut Ui, text: &str, effects: &mut Vec<Effect>) {
+    let shown = Frame::new()
+        .inner_margin(Margin {
+            left: 12,
+            right: 0,
+            top: 2,
+            bottom: 2,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                if ui.small_button(RichText::new("copy").color(DIM)).clicked() {
+                    effects.push(Effect::Copy(text.to_owned()));
+                }
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    markdown(ui, text, effects);
+                });
+            });
+        });
+    let rect = shown.response.rect;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
+        CornerRadius::same(1),
+        EDGE,
+    );
+}
+
+/// Quoted lines without their first `>` and the space after it.
+fn unquoted(lines: &[&str]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            let line = line.trim_start();
+            let line = line.strip_prefix('>').unwrap_or(line);
+            line.strip_prefix(' ').unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn heading(line: &str) -> Option<&str> {
@@ -595,6 +645,14 @@ mod tests {
     fn an_unclosed_marker_stays_as_written() {
         assert_eq!(pieces("a `b"), ["a `b"]);
         assert_eq!(pieces("2 ** 3"), ["2 ** 3"]);
+    }
+
+    #[test]
+    fn quotes_lose_one_marker_each() {
+        assert_eq!(
+            unquoted(&["> Dear team,", ">", "> > earlier", ">no space"]),
+            "Dear team,\n\n> earlier\nno space"
+        );
     }
 
     #[test]

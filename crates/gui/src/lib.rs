@@ -164,7 +164,11 @@ where
                 .set(bevy::log::LogPlugin {
                     level: bevy::log::Level::WARN,
                     ..default()
-                }),
+                })
+                // Pipelined, a frame reaches the screen only when the next
+                // one runs; the window sleeps between keys, so a character
+                // typed showed only at the next wake.
+                .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>(),
         )
         .add_plugins(EguiPlugin::default())
         // egui draws with the panels' camera, named rather than guessed:
@@ -349,6 +353,9 @@ fn universe_activity<M, D>(
 /// change. egui takes any event as a reason to draw again at once, so that
 /// one, sent each frame, kept the window from ever sleeping: two cores busy
 /// with nothing on screen moving.
+///
+/// It also asks egui to copy on Cmd-C (Ctrl-Shift-C off macOS, Ctrl-C
+/// being the state's): bevy_egui, built without its clipboard, never does.
 fn quiet_modifiers(mut inputs: Query<&mut EguiInput>, mut last: Local<Option<egui::Modifiers>>) {
     for mut input in &mut inputs {
         input.events.retain(|event| match event {
@@ -359,6 +366,20 @@ fn quiet_modifiers(mut inputs: Query<&mut EguiInput>, mut last: Local<Option<egu
             }
             _ => true,
         });
+        let copy = input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::C,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if keys::copies(*modifiers)
+            )
+        });
+        if copy {
+            input.events.push(egui::Event::Copy);
+        }
     }
 }
 
@@ -381,6 +402,7 @@ fn read_keys<M, D>(
             PhysicalKey::ShiftLeft | PhysicalKey::ShiftRight => held.shift = down,
             PhysicalKey::ControlLeft | PhysicalKey::ControlRight => held.control = down,
             PhysicalKey::AltLeft => held.alt = down,
+            PhysicalKey::SuperLeft | PhysicalKey::SuperRight => held.command = down,
             _ => {}
         }
         if !down {
@@ -661,6 +683,22 @@ where
         universe.architecture = arch.active;
     }
     windows::show(&ctx, &shell.app, &mut shell.keys);
+    // bevy_egui is built without its clipboard: what egui copies, such as
+    // a selection on Cmd-C, goes to the system's from here.
+    let copied: Vec<String> = ctx.output(|o| {
+        o.commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    });
+    for text in copied {
+        if let Err(e) = clipboard::copy(&text) {
+            shell.app.report_error(e);
+        }
+    }
     if !shell.effects.is_empty() || !shell.keys.is_empty() {
         ctx.request_repaint();
     }
