@@ -1,70 +1,49 @@
-# ironquill
+# universe
 
-[![CI](https://github.com/ngodzik/ironquill/actions/workflows/ci.yml/badge.svg)](https://github.com/ngodzik/ironquill/actions/workflows/ci.yml) [![Security](https://github.com/ngodzik/ironquill/actions/workflows/security.yml/badge.svg)](https://github.com/ngodzik/ironquill/actions/workflows/security.yml)
+[![CI](https://github.com/ngodzik/universe/actions/workflows/ci.yml/badge.svg)](https://github.com/ngodzik/universe/actions/workflows/ci.yml) [![Security](https://github.com/ngodzik/universe/actions/workflows/security.yml/badge.svg)](https://github.com/ngodzik/universe/actions/workflows/security.yml)
 
-**An experimental coding agent, and a work in progress. It is not stable, it comes with no guarantee of any kind, and it will keep changing a lot.**
+**An experimental coding agent. It is not stable, it comes with no guarantee of any kind, and it changes all the time.**
+
+The program is still called `ironquill` (its binary, its crates, `~/.ironquill`); that may change too.
 
 ## Read this first
 
-ironquill is a personal experiment, not a product. It is shaped by my own way of working and changes whenever that does.
+This is a personal experiment, not a product.
 
-- **It is not stable.** Commands, keys, views, file formats and settings change from one commit to the next, often without notice and without any way back. Whole features appear, get rewritten or disappear. Nothing here is a promise.
-- **It is barely tested in real use.** There are unit tests and CI, but few real sessions, on Linux mostly. On macOS it is only built and tested by CI; Windows is not supported.
-- **It changes your files without asking.** Edits are written to disk as the model makes them. Run it in a git repository, commit before you start, and read every diff.
-- **It spends money.** Requests go to a paid API, within a budget per request you set.
+- **It is not stable.** Commands, keys, views, settings and file formats change from one commit to the next, without notice and without a way back. Features appear, get rewritten or disappear.
+- **It is barely tested in real use.** There are tests and CI, but few real sessions, on Linux mostly. macOS is only built and tested by CI; Windows is not supported.
+- **It changes your files without asking.** Work in a git repository, commit before you start, and read every diff.
+- **It spends money.** Requests go to a paid API, within a budget you set.
 
-**If you want a coding agent to rely on, use one of these instead:** [OpenCode](https://opencode.ai), [Pi](https://pi.dev) or [Claude Code](https://code.claude.com/docs/en/overview). They are mature, well tested and supported. ironquill overlaps with them on purpose: writing one is how I learn what makes them work, and where I try ideas of my own.
+**If you want a coding agent to rely on, use [OpenCode](https://opencode.ai), [Pi](https://pi.dev) or [Claude Code](https://code.claude.com/docs/en/overview) instead.** This one overlaps with them on purpose: writing one is how I learn what makes them work, and where I try ideas of my own.
 
 ## The idea
 
-Deterministic tools before models. Compilers, tests, linters, language servers and git are cheap, fast and right, so they do what they can, and a model is called for the rest. Every request shows what it cost.
-
-The interface follows my editor habits: Vim-like modes and keys, a leader key, files opened and edited beside the conversation.
+Deterministic tools before models: compilers, tests, linters, language servers and git do what they can, and a model is called for the rest. Every request shows what it cost. The keys follow Vim's habits.
 
 ## What is there today
 
-All of it experimental, and all of it likely to change.
+All of it experimental, all of it likely to change.
 
-- **A conversation with a model**, in the terminal or in a window (`--gui`, drawn on the GPU with Bevy and egui). Requests for changes become edits shown as diffs. Any OpenAI compatible endpoint works, Requesty by default.
-- **A safety net for commands.** What cannot be undone, leaves the machine or cannot be read is held for you to approve, secrets are never shown to a model, and every command is written to an audit log. It reads commands as written: a net, not a sandbox.
-- **Teams of models.** A cheap model can hand tasks to stronger or cheaper ones, work in a pair with a planner that reviews, escalate when checks keep failing, or hand a task to Claude Code or Codex as sub-agents.
-- **Costs and context in view.** Cost, tokens and context per request and per conversation, a budget per request, a usage pane, and the conversation's context editable before it is sent or compacted by subject.
-- **Several conversations in one window.** `/newchat` opens one beside the others and `/chats` switches between them; hidden ones go on working, ticks included, and those open are reopened at the next start. `/task` and `/tasks` keep a list of things to do per project, each tied to a conversation.
-- **Warm caches.** With `/tick`, while a Claude Code session or a conversation with a provider's model is warm, a one-word tick every four minutes keeps its prompt cache from expiring, for up to an hour without a request, and the usage pane shows what the ticks cost against what they saved. Meanwhile the machine is kept from idle sleep (`caffeinate` on macOS, `systemd-inhibit` on Linux); `keep_awake = false` in `~/.ironquill/config.toml` lets it sleep.
-- **Views of the codebase** (in the window, Ctrl-N), read from the code by patterns, no model involved: its design as a plan in layers, its API from the OpenAPI specs, or from the routes the code declares when there is none, with what serves each route and which front end calls it (TypeScript, JavaScript or a Flutter app, whose platforms show), and its files as a universe in 3D, grouped into galaxies. Ctrl-F searches them.
-- **Where it runs.** The services view reads the deployment by the tools' own conventions (Compose, Helm, Kustomize, Flux, Terraform), from the project and the repositories `~/.ironquill/projects/<folder>.toml` links (`linked`, `centre`, `environments`). Per environment, `kustomize` and `helm` render it, every setting shows each layer that set it with its file and line, cloud identifiers are matched to the Terraform that configures them, and the architecture is drawn flat. Secrets are never read or shown; "Update repos" fast-forwards the linked repositories only where nothing can be lost.
-- **Every environment at once.** In the universe's window, "Deployments" beside "Group by" shows each environment as a galaxy, a cluster of stars per namespace, each service a star with the objects it deploys on orbits around it. The environments the settings name are rendered one after the other; the others are a checkbox away. Stars can be coloured by environment, by image (the same image the same colour everywhere, so a version that differs stands out) or by the deepest layer that set their values. A click on a service lays it out flat: its objects in columns the way a request goes, arrows for how they act on each other, its images beside the same service's in the other environments, and its values layer by layer, each a click away from its file.
-- **A folder deployed indirectly.** A folder named in `environments` becomes an environment of its own even when another repository's Flux `Kustomization` includes it, for instance a shared Kustomization whose `spec.path` each cluster patches: `{ name = "shop", path = "apps/prod" }`.
-- **Reviewing a branch.** `/review` and `/work` show only what a branch changed: the files it touched, each folded to its changes, the routes, migrations and models it changed, marked in every view.
-- **Walking what was just coded.** `/walk` shows what is not committed yet, each file folded to its changes; a message is then a question about the cursor's line or the selection, sent with the lines around it and the file's diff to the cheapest priced model, never the coder, named in the status line before you ask.
-- **A tree that shows the work.** The file tree shows what is not committed, coloured by git's status, the rest of each folder one click away and every folder of the root in reach. Local notes kept out of git with `.git/info/exclude` stay out of the tree and `/walk` without touching the shared `.gitignore`.
-- **Quiet backgrounds.** In the window, `/background` (or Ctrl-X) draws stars, waves, a grid or rain behind the panels, still or slowly moving, fading with the see-through window.
-- **Code navigation.** Go to a definition or list the uses of a name, through the language servers when they are installed (pyright, typescript-language-server, rust-analyzer), else through `git grep`.
+- **A conversation with a model**, in the terminal or in a window (`--gui`), its changes shown as diffs. Any OpenAI compatible endpoint works, Requesty by default; Claude Code and Codex can work as sub-agents.
+- **A safety net for commands**: what cannot be undone, leaves the machine or cannot be read waits for your approval, secrets are never shown to a model, and every command is logged. A net, not a sandbox.
+- **Costs and context in view**, per request and per conversation, with a budget per request.
+- **Views of the codebase** in the window (Ctrl-N), read from the code with no model: its design in layers, its API, its services, its database tables, and its files as a universe of stars.
+- **Where it runs**: the deployment read from Compose, Helm, Kustomize, Flux and Terraform, each environment rendered by `kustomize` and `helm`, every environment shown at once as galaxies, and each service laid out flat with its objects and its values layer by layer. Secrets are never read or shown.
+- **Reviewing and walking a branch**: `/review` shows what a branch changed, `/walk` what is not committed yet, with questions about it sent to the cheapest model.
 
-## What it does not do
-
-- Ask before writing a file, or before a command it does not hold
-- Stream answers as they are written
-- Run on Windows
-- Sandbox anything: commands and checks run as you would run them
+`/help` lists the commands and Ctrl-S every shortcut. They follow the code; this page does not always.
 
 ## Usage
 
 ```bash
-export REQUESTY_API_KEY=...         # your provider key; without one, only Claude Code and Codex answer
+export REQUESTY_API_KEY=...         # without one, only Claude Code and Codex answer
 cd your-project
 ironquill                           # in the terminal
 ironquill --gui                     # in a window
 ```
 
-`/help` lists the commands and Ctrl-S every shortcut, which are the only reliable reference: they follow the code, this page does not.
-
-### Claude through Requesty
-
-Claude can be reached through Requesty in two ways, side by side; each model is shown with how it is reached (`· Claude CLI`, `· Requesty`), since prices and caches differ.
-
-- **Through its API**: pick a Requesty id for a Claude model, such as `bedrock/claude-opus-5-5`; `IRONQUILL_BASE_URL` sets another of Requesty's routers than the default. ironquill marks what Claude caches itself. `cache_ttl = "1h"` in `~/.ironquill/config.toml` keeps the cache an hour, with no tick, at twice the input price per write instead of 1.25 times.
-- **Through Claude Code**: set `ANTHROPIC_BASE_URL` to Requesty's router (`https://router.requesty.ai`), `ANTHROPIC_AUTH_TOKEN` to the Requesty key, and `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to Requesty's ids. Claude Code prices its calls at Anthropic's list prices, whatever Requesty charges for the route.
+Settings live in `~/.ironquill/config.toml`, and a project's own (linked repositories, environments) in `~/.ironquill/projects/<folder>.toml`.
 
 ## Building
 
@@ -76,11 +55,11 @@ scripts/check.sh                    # what CI runs: formatting, lints, docs, tes
 git config core.hooksPath .githooks # run those checks before every commit
 ```
 
-The language servers are optional: `npm install -g pyright typescript@5 typescript-language-server`, and `rustup component add rust-analyzer`.
+Optional language servers: `npm install -g pyright typescript@5 typescript-language-server`, and `rustup component add rust-analyzer`.
 
 ## Data from others
 
-ironquill ships none of the data below. Each install fetches it for its own use, keeps a copy on the machine, and says where it comes from.
+None of this data ships with the program: each install fetches it for its own use and says where it comes from.
 
 - **Model prices** for Claude Code's and Codex's calls come from [LiteLLM](https://github.com/BerriAI/litellm)'s public list, [`model_prices_and_context_window.json`](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json), under the MIT licence. They are list prices: an estimate, not a bill.
 - **Model scores** come from [Artificial Analysis](https://artificialanalysis.ai/)' free API, with your own key in `ARTIFICIAL_ANALYSIS_API_KEY`, under their terms, which ask that they be credited; the model picker does so wherever scores show.
