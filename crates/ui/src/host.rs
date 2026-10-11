@@ -234,12 +234,13 @@ where
     }
 
     /// Ticks the warm sessions of the hidden conversation `chat`.
-    fn keep_warm(&mut self, chat: ChatId) {
-        let delegate = Arc::clone(&self.delegate);
+    fn keep_warm(&mut self, chat: ChatId, api: bool) {
+        let (model, delegate) = (Arc::clone(&self.model), Arc::clone(&self.delegate));
         let root = self.workspace.root().to_owned();
         let slot = self.slot(chat);
         spawn_ticks(
             Arc::clone(&slot.conversation),
+            (model, api),
             delegate,
             root,
             slot.tx.clone(),
@@ -334,7 +335,7 @@ where
                 let shown = app.chat_id();
                 for chat in app.chat_ids().into_iter().filter(|c| *c != shown) {
                     if app.with_chat(chat, App::keep_warm_due) == Some(true) {
-                        self.keep_warm(chat);
+                        self.keep_warm(chat, app.api_ticks());
                     }
                 }
                 app.keep_warm_due().then_some(Effect::KeepWarm)
@@ -504,6 +505,7 @@ where
             }
             Effect::KeepWarm => spawn_ticks(
                 Arc::clone(conversation),
+                (Arc::clone(model), app.api_ticks()),
                 Arc::clone(delegate),
                 workspace.root().to_owned(),
                 tx.clone(),
@@ -782,15 +784,36 @@ async fn resume(
 /// Ticks a conversation's warm sessions in the background, the
 /// conversation held only to list the ticks due and to mark them read,
 /// never during the calls: a request sent meanwhile is not kept waiting.
-fn spawn_ticks<D: Delegate + 'static>(
+/// The provider's model is ticked too when `api` says its cache needs it.
+fn spawn_ticks<M: ChatModel + 'static, D: Delegate + 'static>(
     conversation: Arc<Mutex<Conversation>>,
+    (model, api): (Arc<M>, bool),
     delegate: Arc<D>,
     root: std::path::PathBuf,
     tx: mpsc::UnboundedSender<AgentMessage>,
 ) {
     tokio::spawn(async move {
-        let ticks = conversation.lock().await.session.due_ticks(&root);
+        let (ticks, api_tick) = {
+            let session = &conversation.lock().await.session;
+            (
+                session.due_ticks(&root),
+                api.then(|| session.due_api_tick()).flatten(),
+            )
+        };
         let mut last = None;
+        if let Some(tick) = api_tick {
+            let events = tx.clone();
+            let read = tick
+                .run(&*model, |e| {
+                    let _ = events.send(AgentMessage::Event(e));
+                })
+                .await;
+            if read {
+                let at = crate::sessions::now();
+                conversation.lock().await.session.api_ticked(at);
+                last = Some(at);
+            }
+        }
         for tick in ticks {
             let events = tx.clone();
             let read = tick

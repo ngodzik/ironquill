@@ -9,6 +9,7 @@
 //! effort = "high"
 //! images = "auto"
 //! mermaid = ["mmdc", "-i", "{input}", "-o", "{output}", "-b", "transparent"]
+//! cache_ttl = "1h"
 //! ```
 //!
 //! Keys never go here: they come from the environment only.
@@ -17,6 +18,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use ironquill_core::CacheTtl;
 use serde::{Deserialize, Serialize};
 
 /// Whether replies show images, as `images` in `~/.ironquill/config.toml`
@@ -104,6 +106,10 @@ pub struct Defaults {
     /// first installed of mermaid-cli (`mmdc`) and `mmdr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mermaid: Option<Vec<String>>,
+    /// How long what Claude's cache marks write is kept, through an API:
+    /// `5m` (unsaid) or `1h`. Set in the file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<CacheTtl>,
 }
 
 impl Defaults {
@@ -202,6 +208,7 @@ mod tests {
             chat_width: Some(420.0),
             images: Some(Images::Off),
             mermaid: Some(vec!["mmdr".into(), "-i".into(), "{input}".into()]),
+            cache_ttl: Some(CacheTtl::OneHour),
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));
@@ -215,6 +222,19 @@ mod tests {
         assert_eq!(Defaults::load(&path).unwrap().images, Some(Images::Kitty));
         fs::write(&path, "images = \"sometimes\"").unwrap();
         assert!(Defaults::load(&path).unwrap_err().contains("sometimes"));
+    }
+
+    #[test]
+    fn the_cache_lasts_five_minutes_or_an_hour() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "cache_ttl = \"1h\"").unwrap();
+        assert_eq!(
+            Defaults::load(&path).unwrap().cache_ttl,
+            Some(CacheTtl::OneHour)
+        );
+        fs::write(&path, "cache_ttl = \"2h\"").unwrap();
+        assert!(Defaults::load(&path).unwrap_err().contains("2h"));
     }
 
     #[test]

@@ -22,4 +22,4 @@ pub use config::{
 };
 pub use error::AgentError;
 pub use event::{Event, Purpose};
-pub use run::{Compaction, Outcome, Session, Subject, Verdict, run};
+pub use run::{ApiTick, Compaction, Outcome, Session, Subject, Verdict, run};

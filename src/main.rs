@@ -39,7 +39,7 @@ struct Cli {
 
     /// API key for that endpoint. Read from the environment so that it never
     /// lands in the shell history.
-    #[arg(long, env = "IRONQUILL_API_KEY", hide_env_values = true, global = true)]
+    #[arg(long, env = "REQUESTY_API_KEY", hide_env_values = true, global = true)]
     api_key: Option<String>,
 
     /// Model tried first in the interface. Can be set later with `:model`.
@@ -155,6 +155,13 @@ async fn main() -> Result<()> {
         Some(key) => OpenAiCompatible::new(cli.base_url, key),
         None => OpenAiCompatible::without_key(cli.base_url),
     };
+    // A file that cannot be read is said by the interface, which reads it
+    // again; here it only leaves the cache at its default.
+    let cache_ttl = Defaults::path()
+        .and_then(|path| Defaults::load(&path).ok())
+        .and_then(|defaults| defaults.cache_ttl)
+        .unwrap_or_default();
+    let provider = provider.with_cache_ttl(cache_ttl);
 
     let Some(command) = cli.command else {
         // No log subscriber here: anything written to the terminal while the
@@ -187,7 +194,7 @@ async fn main() -> Result<()> {
 
     // The commands below only call the provider.
     if !keyed {
-        anyhow::bail!("no API key: set IRONQUILL_API_KEY");
+        anyhow::bail!("no API key: set REQUESTY_API_KEY");
     }
 
     tracing_subscriber::fmt()
@@ -302,7 +309,7 @@ async fn interface(
     let mut notes = Vec::new();
     if !keyed {
         notes.push(
-            "No IRONQUILL_API_KEY: the provider's models cannot answer. Claude Code and Codex \
+            "No REQUESTY_API_KEY: the provider's models cannot answer. Claude Code and Codex \
              can, with their own sign-in: Ctrl-E to pick claude-code/... or codex/..."
                 .to_owned(),
         );
@@ -428,6 +435,8 @@ async fn interface(
         chat_width: defaults.chat_width,
         images: defaults.images.unwrap_or_default(),
         mermaid: defaults.mermaid.clone(),
+        cache_ttl: defaults.cache_ttl.unwrap_or_default(),
+        provider: provider.name(),
         detect_checks,
         notes,
         catalog,

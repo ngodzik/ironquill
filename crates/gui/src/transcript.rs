@@ -241,7 +241,7 @@ fn welcome(ui: &mut Ui, app: &App) {
     if let Some(model) = app.current_model() {
         ui.horizontal(|ui| {
             ui.label(RichText::new("answers").color(DIM));
-            ui.label(RichText::new(model.to_string()).color(ACCENT));
+            ui.label(RichText::new(app.model_label(model)).color(ACCENT));
         });
     }
     ui.label(

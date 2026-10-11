@@ -1256,12 +1256,12 @@ fn input(ui: &mut Ui, app: &App) {
     if let Some(model) = app.current_model() {
         ui.horizontal(|ui| {
             ui.label(RichText::new("answers").small().color(DIM));
-            ui.label(RichText::new(model.to_string()).small().color(ACCENT));
+            ui.label(RichText::new(app.model_label(model)).small().color(ACCENT));
             let team: Vec<String> = app
                 .team()
                 .iter()
                 .filter(|m| *m != model)
-                .map(ToString::to_string)
+                .map(|m| app.model_label(m))
                 .collect();
             ui.label(RichText::new("· team").small().color(DIM));
             ui.label(
@@ -1371,7 +1371,7 @@ fn status(ui: &mut Ui, app: &App) {
                 .color(DIM),
             );
             if let Some(model) = app.current_model() {
-                ui.label(RichText::new(model.to_string()).small().color(ACCENT));
+                ui.label(RichText::new(app.model_label(model)).small().color(ACCENT));
             }
             if let Some(chats) = app.chats_label() {
                 let colour = if app.hidden_waiting() > 0 {

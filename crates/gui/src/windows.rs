@@ -397,7 +397,8 @@ fn model_picker(ctx: &Context, app: &App) {
                         " "
                     };
                     let team = if model.in_team { "✓" } else { " " };
-                    let name = RichText::new(format!("{mark} {team} {}", model.model));
+                    let name =
+                        RichText::new(format!("{mark} {team} {}", app.model_label(&model.model)));
                     ui.label(if model.offered {
                         name.color(TEXT)
                     } else {

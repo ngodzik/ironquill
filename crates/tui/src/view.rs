@@ -531,7 +531,7 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
             " "
         };
         let team = if row.in_team { "✓" } else { " " };
-        let name = format!("{mark} {team} {}", row.model);
+        let name = format!("{mark} {team} {}", app.model_label(&row.model));
         let gap = room.saturating_sub(name.chars().count() + row.note.chars().count() + 1);
         let mut style = Style::new();
         if !row.offered {
@@ -2066,12 +2066,12 @@ fn team_title(app: &App) -> Line<'static> {
         spans.push(Span::styled(format!(" {} ·", step.to_lowercase()), fg(DIM)));
     }
     spans.push(Span::styled(" answers ", fg(DIM)));
-    spans.push(Span::styled(lead.to_string(), fg(ACCENT)));
+    spans.push(Span::styled(app.model_label(lead), fg(ACCENT)));
     let team: Vec<String> = app
         .team()
         .iter()
         .filter(|m| *m != lead)
-        .map(ToString::to_string)
+        .map(|m| app.model_label(m))
         .collect();
     spans.push(Span::styled(" · team ", fg(DIM)));
     if team.is_empty() {
@@ -2123,14 +2123,13 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 
     let (usage, cost, complete) = app.totals();
     // The model in use stands out: it is what Ctrl-E changes.
+    let rest = app
+        .current_model()
+        .and_then(|m| app.chain().strip_prefix(m.as_str()).map(str::to_owned))
+        .unwrap_or_default();
     let current = app
         .current_model()
-        .map_or_else(|| "no model".to_owned(), ToString::to_string);
-    let rest = app
-        .chain()
-        .strip_prefix(&current)
-        .unwrap_or_default()
-        .to_owned();
+        .map_or_else(|| "no model".to_owned(), |m| app.model_label(m));
     let ticks = app
         .tick_label()
         .map(|t| format!("{t} · "))

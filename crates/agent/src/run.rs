@@ -284,6 +284,9 @@ struct Ctx<'a, M, D, O> {
     /// what its session is kept with.
     last_call: Option<Call>,
     last_context: Option<u64>,
+    /// The last request sent to a provider's model for the conversation:
+    /// what a tick sends again to keep its cache warm.
+    last_request: Option<ChatRequest>,
 }
 
 enum Attempt {
@@ -337,6 +340,11 @@ pub struct Session {
     /// its message: for /compact to show how old each exchange is.
     #[serde(default)]
     asked: BTreeMap<usize, u64>,
+    /// The last request sent to a provider's model in the conversation,
+    /// and when it was last read: what ticks send again. Not kept across
+    /// a restart, by which time the cache is gone anyway.
+    #[serde(skip)]
+    api_warm: Option<(ChatRequest, u64)>,
 }
 
 /// A summary of the conversation and how far it goes.
@@ -390,6 +398,7 @@ impl Session {
             windows: BTreeMap::new(),
             last_used: 0,
             asked: BTreeMap::new(),
+            api_warm: None,
         }
     }
 
@@ -442,6 +451,7 @@ impl Session {
             allowed_hosts: config.allowed_hosts.clone(),
             last_call: None,
             last_context: None,
+            last_request: None,
         };
         // A request keeps its own session warm; the other one is ticked
         // meanwhile, and the ticks count with the request.
@@ -487,6 +497,8 @@ impl Session {
         };
         self.windows = std::mem::take(&mut ctx.windows);
         self.last_used = now_secs();
+        // A request answered by an agent leaves no provider's cache to keep.
+        self.api_warm = ctx.last_request.take().map(|r| (r, self.last_used));
         Ok(ctx.ledger.outcome(verdict, ctx.toolbox))
     }
 
@@ -1260,6 +1272,7 @@ impl Session {
     /// conversation is then left as it was.
     pub fn apply_text(&mut self, text: &str) -> Result<(), String> {
         self.messages = crate::context::sanitize(crate::context::from_text(text)?);
+        self.api_warm = None;
         for thread in self.agents.values_mut() {
             thread.seen = thread.seen.min(self.messages.len());
         }
@@ -1326,6 +1339,30 @@ impl Session {
                     .then(|| Tick::new(pair, &thread.session, call, root))
             })
             .collect()
+    }
+
+    /// The tick due now for the provider's model the conversation last
+    /// sent to: its last request again, asking for one word, once it is
+    /// four minutes old and before the five its cache lives. Its effort is
+    /// left to the provider: a one word answer needs no thinking.
+    #[must_use]
+    pub fn due_api_tick(&self) -> Option<ApiTick> {
+        let (request, read) = self.api_warm.as_ref()?;
+        let since = now_secs().saturating_sub(*read);
+        if !(TICK_EVERY.as_secs()..THREAD_WARM_SECS).contains(&since) {
+            return None;
+        }
+        let mut request = request.clone();
+        request.messages.push(Message::user(TICK_PROMPT));
+        request.effort = None;
+        Some(ApiTick { request })
+    }
+
+    /// Notes that a tick read the provider's cache at `at`.
+    pub fn api_ticked(&mut self, at: u64) {
+        if let Some((_, read)) = &mut self.api_warm {
+            *read = (*read).max(at);
+        }
     }
 
     /// When a warm session was last read, chat's or pair's, in seconds
@@ -1503,6 +1540,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         allowed_hosts: config.allowed_hosts.clone(),
         last_call: None,
         last_context: None,
+        last_request: None,
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -2199,6 +2237,39 @@ impl Tick {
             }
         };
         delegate.run(&self.request, &mut on_event).await.is_ok()
+    }
+}
+
+/// A tick due for a provider's model: the conversation's last request
+/// sent again with a one word question, which reads it from the cache.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiTick {
+    request: ChatRequest,
+}
+
+impl ApiTick {
+    /// Sends it, telling what the call used; returns whether it was
+    /// answered.
+    pub async fn run<M: ChatModel>(
+        &self,
+        model: &M,
+        mut observe: impl FnMut(Event) + Send,
+    ) -> bool {
+        match model.complete(&self.request).await {
+            Ok(response) => {
+                observe(Event::Turn {
+                    model: self.request.model.clone(),
+                    usage: response.usage,
+                    cost: response.cost,
+                    subscription: false,
+                    context: None,
+                    cache: response.cache,
+                    purpose: Purpose::ChatTick,
+                });
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -3117,6 +3188,9 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             .complete(&request)
             .await
             .map_err(|e| AgentError::Model(Box::new(e)))?;
+        if ctx.purpose == Purpose::Chat {
+            ctx.last_request = Some(request);
+        }
 
         ctx.ledger.usage += response.usage;
         match response.cost {
@@ -5668,6 +5742,47 @@ mod tests {
         // Read now: the next tick is four minutes away.
         assert!(session.due_ticks(dir.path()).is_empty());
         assert!(session.last_read().is_some_and(|at| at + 5 >= now_secs()));
+    }
+
+    #[tokio::test]
+    async fn a_provider_model_is_ticked_with_its_last_request_while_warm() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![says("Hello."), says("ok")]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("bedrock/claude-opus-5-5@eu-west-1").unwrap())
+            .effort(Some(Effort::High))
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        session
+            .send(&model, &NoDelegate, &mut toolbox, &config, "hi", "", |_| {})
+            .await
+            .unwrap();
+        assert!(session.due_api_tick().is_none(), "just read");
+        let sent = model.seen.lock().unwrap()[0].clone();
+        session.api_warm = Some((sent.clone(), now_secs() - 250));
+        let tick = session.due_api_tick().unwrap();
+        // The very request read from the cache, with one more question.
+        assert_eq!(tick.request.messages[..sent.messages.len()], sent.messages);
+        assert_eq!(
+            tick.request.messages.last(),
+            Some(&Message::user(TICK_PROMPT))
+        );
+        assert_eq!(tick.request.effort, None);
+        let mut events = Vec::new();
+        assert!(tick.run(&model, |e| events.push(e)).await);
+        assert!(matches!(
+            events[..],
+            [Event::Turn {
+                purpose: Purpose::ChatTick,
+                ..
+            }]
+        ));
+        session.api_ticked(now_secs());
+        assert!(session.due_api_tick().is_none(), "ticked just now");
+        // Past five minutes, the cache is gone: nothing to keep.
+        session.api_warm = Some((sent, now_secs() - 6 * 60));
+        assert!(session.due_api_tick().is_none());
     }
 
     #[tokio::test]

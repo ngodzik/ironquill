@@ -122,6 +122,21 @@ pub struct CacheUse {
     pub rewrite_extra: Option<Usd>,
 }
 
+/// How long a provider keeps what is written to its prompt cache, for
+/// the models whose cache is asked for by marks (Claude's). An hour costs
+/// more to write, twice the input price against 1.25 times, but a pause
+/// of up to an hour then needs no tick to keep it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheTtl {
+    /// Five minutes, the providers' default.
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// An hour.
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
 impl Add for TokenCount {
     type Output = Self;
 

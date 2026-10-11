@@ -30,7 +30,7 @@ All of it experimental, and all of it likely to change.
 - **Teams of models.** A cheap model can hand tasks to stronger or cheaper ones, work in a pair with a planner that reviews, escalate when checks keep failing, or hand a task to Claude Code or Codex as sub-agents.
 - **Costs and context in view.** Cost, tokens and context per request and per conversation, a budget per request, a usage pane, and the conversation's context editable before it is sent or compacted by subject.
 - **Several conversations in one window.** `/newchat` opens one beside the others and `/chats` switches between them; hidden ones go on working, ticks included, and those open are reopened at the next start. `/task` and `/tasks` keep a list of things to do per project, each tied to a conversation.
-- **Warm caches.** With `/tick`, while a Claude Code session is warm, a one-word tick every four minutes keeps its prompt cache from expiring, for up to an hour without a request, and the usage pane shows what the ticks cost against what they saved. Meanwhile the machine is kept from idle sleep (`caffeinate` on macOS, `systemd-inhibit` on Linux); `keep_awake = false` in `~/.ironquill/config.toml` lets it sleep.
+- **Warm caches.** With `/tick`, while a Claude Code session or a conversation with a provider's model is warm, a one-word tick every four minutes keeps its prompt cache from expiring, for up to an hour without a request, and the usage pane shows what the ticks cost against what they saved. Meanwhile the machine is kept from idle sleep (`caffeinate` on macOS, `systemd-inhibit` on Linux); `keep_awake = false` in `~/.ironquill/config.toml` lets it sleep.
 - **Views of the codebase** (in the window, Ctrl-N), read from the code by patterns, no model involved: its design as a plan in layers, its API from the OpenAPI specs, or from the routes the code declares when there is none, with what serves each route and which front end calls it (TypeScript, JavaScript or a Flutter app, whose platforms show), and its files as a universe in 3D, grouped into galaxies. Ctrl-F searches them.
 - **Where it runs.** The services view reads the deployment by the tools' own conventions (Compose, Helm, Kustomize, Flux, Terraform), from the project and the repositories `~/.ironquill/projects/<folder>.toml` links (`linked`, `centre`, `environments`). Per environment, `kustomize` and `helm` render it, every setting shows each layer that set it with its file and line, cloud identifiers are matched to the Terraform that configures them, and the architecture is drawn flat or in 3D. Secrets are never read or shown; "Update repos" fast-forwards the linked repositories only where nothing can be lost.
 - **Reviewing a branch.** `/review` and `/work` show only what a branch changed: the files it touched, each folded to its changes, the routes, migrations and models it changed, marked in every view.
@@ -46,13 +46,20 @@ All of it experimental, and all of it likely to change.
 ## Usage
 
 ```bash
-export IRONQUILL_API_KEY=...        # your provider key; without one, only Claude Code and Codex answer
+export REQUESTY_API_KEY=...         # your provider key; without one, only Claude Code and Codex answer
 cd your-project
 ironquill                           # in the terminal
 ironquill --gui                     # in a window
 ```
 
 `/help` lists the commands and Ctrl-S every shortcut, which are the only reliable reference: they follow the code, this page does not.
+
+### Claude through Requesty
+
+Claude can be reached through Requesty in two ways, side by side; each model is shown with how it is reached (`· Claude CLI`, `· Requesty`), since prices and caches differ.
+
+- **Through its API**: pick a model such as `bedrock/claude-opus-5-5@eu-west-1`, with `IRONQUILL_BASE_URL=https://router.eu.requesty.ai/v1` for the EU router. ironquill marks what Claude caches itself. `cache_ttl = "1h"` in `~/.ironquill/config.toml` keeps the cache an hour, with no tick, at twice the input price per write instead of 1.25 times.
+- **Through Claude Code**: set `ANTHROPIC_BASE_URL=https://router.eu.requesty.ai`, `ANTHROPIC_AUTH_TOKEN` to the Requesty key, and `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to Requesty's ids. Claude Code prices its calls at Anthropic's list prices, without the regional routes' surcharge.
 
 ## Building
 
