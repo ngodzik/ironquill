@@ -42,7 +42,7 @@ impl ModelId {
     /// # Examples
     ///
     /// ```
-    /// use ironquill_core::{Agent, ModelId};
+    /// use universe_core::{Agent, ModelId};
     ///
     /// assert_eq!(
     ///     ModelId::new("claude-code/opus")?.delegate(),
@@ -50,7 +50,7 @@ impl ModelId {
     /// );
     /// assert_eq!(ModelId::new("codex")?.delegate(), Some((Agent::Codex, "")));
     /// assert_eq!(ModelId::new("deepseek/deepseek-chat")?.delegate(), None);
-    /// # Ok::<(), ironquill_core::CoreError>(())
+    /// # Ok::<(), universe_core::CoreError>(())
     /// ```
     pub fn delegate(&self) -> Option<(Agent, &str)> {
         Agent::ALL.into_iter().find_map(|agent| {
@@ -64,7 +64,7 @@ impl ModelId {
     }
 }
 
-/// A coding agent installed on the machine that ironquill can hand a task
+/// A coding agent installed on the machine that universe can hand a task
 /// to, through its command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Agent {
@@ -75,7 +75,7 @@ pub enum Agent {
 }
 
 impl Agent {
-    /// Every agent ironquill knows.
+    /// Every agent universe knows.
     pub const ALL: [Self; 2] = [Self::ClaudeCode, Self::Codex];
 
     /// The start of the model identifiers that hand a task to this agent.
@@ -241,12 +241,12 @@ impl Pricing {
     /// # Examples
     ///
     /// ```
-    /// use ironquill_core::{Pricing, TokenCount, Usage, Usd};
+    /// use universe_core::{Pricing, TokenCount, Usage, Usd};
     ///
     /// let pricing = Pricing::per_token(Usd(1e-6), Usd(4e-6))?;
     /// let usage = Usage { input: TokenCount(1_000), output: TokenCount(500) };
     /// assert!((pricing.cost(&usage).0 - 0.003).abs() < 1e-12);
-    /// # Ok::<(), ironquill_core::CoreError>(())
+    /// # Ok::<(), universe_core::CoreError>(())
     /// ```
     pub fn cost(&self, usage: &Usage) -> Usd {
         // Token counts stay far below 2^53, so the conversion is exact.
@@ -313,7 +313,7 @@ pub struct ToolCall {
 pub enum Message {
     /// Standing instructions for the model.
     System(String),
-    /// The person, or ironquill speaking on their behalf.
+    /// The person, or universe speaking on their behalf.
     User(String),
     /// What the model said, and the tools it asked to call.
     Assistant {
@@ -395,7 +395,7 @@ impl Effort {
     /// The level `steps` away, staying within the levels.
     ///
     /// ```
-    /// use ironquill_core::Effort;
+    /// use universe_core::Effort;
     ///
     /// assert_eq!(Effort::High.step(1), Effort::Xhigh);
     /// assert_eq!(Effort::Low.step(-1), Effort::Low);

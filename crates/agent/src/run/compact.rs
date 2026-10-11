@@ -1,12 +1,12 @@
-//! Compacting a conversation by subject: ironquill cuts it into exchanges,
+//! Compacting a conversation by subject: universe cuts it into exchanges,
 //! the cheapest model groups them by subject from their titles, the person
 //! picks what to keep, and the same model sums it up; or what is not kept
 //! is dropped, with no summary and no model at all.
 
-use ironquill_core::{
+use universe_core::{
     Agent, ChatModel, Delegate, DelegateRequest, Effort, Message, ModelId, TokenCount,
 };
-use ironquill_tools::Toolbox;
+use universe_tools::Toolbox;
 
 use super::{
     Ctx, Judges, Ledger, SUMMARY_INPUT_BYTES, SUMMARY_PROMPT, Session, Summary, ask_cheapest,
@@ -411,8 +411,8 @@ impl<'a, M, D, O> Ctx<'a, M, D, O> {
 mod tests {
     use std::sync::Mutex;
 
-    use ironquill_core::{ChatRequest, ChatResponse, Pricing, Usage, Usd};
-    use ironquill_tools::Workspace;
+    use universe_core::{ChatRequest, ChatResponse, Pricing, Usage, Usd};
+    use universe_tools::Workspace;
 
     use super::*;
 
@@ -446,8 +446,8 @@ mod tests {
         async fn run(
             &self,
             _: &DelegateRequest,
-            _: &mut (dyn FnMut(ironquill_core::DelegateEvent) + Send),
-        ) -> Result<ironquill_core::DelegateReply, Self::Error> {
+            _: &mut (dyn FnMut(universe_core::DelegateEvent) + Send),
+        ) -> Result<universe_core::DelegateReply, Self::Error> {
             panic!("no agent here")
         }
     }

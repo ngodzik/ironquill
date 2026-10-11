@@ -1,4 +1,4 @@
-//! The `ironquill` command.
+//! The `universe` command.
 
 #![deny(unsafe_code)]
 
@@ -11,15 +11,15 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use ironquill_agent::{AgentConfig, Event, Member, Outcome, Verdict};
-use ironquill_core::{ChatModel, ChatRequest, Effort, Message, ModelId, Usd};
-use ironquill_llm::{
+use tracing_subscriber::EnvFilter;
+use universe_agent::{AgentConfig, Event, Member, Outcome, Verdict};
+use universe_core::{ChatModel, ChatRequest, Effort, Message, ModelId, Usd};
+use universe_llm::{
     Agents, ArtificialAnalysis, ClaudeCode, Codex, Listed, OpenAiCompatible, RANKINGS_SOURCE,
     Ranking, find_ranking,
 };
-use ironquill_tools::{Check, ToolSummary, Toolbox, Workspace};
-use ironquill_ui::Defaults;
-use tracing_subscriber::EnvFilter;
+use universe_tools::{Check, ToolSummary, Toolbox, Workspace};
+use universe_ui::Defaults;
 
 /// How many tracked file names go to the model up front. Enough to orient it
 /// in a typical project, bounded so that a monorepo does not fill the context.
@@ -31,7 +31,7 @@ struct Cli {
     /// Base URL of an OpenAI compatible endpoint.
     #[arg(
         long,
-        env = "IRONQUILL_BASE_URL",
+        env = "UNIVERSE_BASE_URL",
         default_value = "https://router.requesty.ai/v1",
         global = true
     )]
@@ -44,8 +44,8 @@ struct Cli {
 
     /// Model tried first in the interface. Can be set later with `:model`.
     /// Typed here, it wins over the one kept for new sessions; from
-    /// IRONQUILL_MODEL, only when none was kept.
-    #[arg(long, env = "IRONQUILL_MODEL")]
+    /// UNIVERSE_MODEL, only when none was kept.
+    #[arg(long, env = "UNIVERSE_MODEL")]
     model: Option<String>,
 
     /// Stronger models for the interface, cheapest first.
@@ -56,7 +56,7 @@ struct Cli {
     /// the claude command is installed, `claude-code/opus` and
     /// `claude-code/sonnet` are offered too; when the codex command is,
     /// `codex/<model>` for each model Codex lists.
-    #[arg(long, env = "IRONQUILL_MODELS", value_delimiter = ',')]
+    #[arg(long, env = "UNIVERSE_MODELS", value_delimiter = ',')]
     models: Vec<String>,
 
     /// Checks for the interface. Defaults as for `do`.
@@ -65,13 +65,13 @@ struct Cli {
 
     /// How hard models think before answering: low, medium, high, xhigh
     /// or max. Defaults to the one kept for new sessions, or high.
-    #[arg(long, env = "IRONQUILL_EFFORT", global = true)]
+    #[arg(long, env = "UNIVERSE_EFFORT", global = true)]
     effort: Option<Effort>,
 
     /// The most one request may cost, in dollars. Past it the work stops
     /// and the model says where it is. Defaults to the one kept with
     /// /defaults, or 0.10.
-    #[arg(long, env = "IRONQUILL_BUDGET")]
+    #[arg(long, env = "UNIVERSE_BUDGET")]
     budget: Option<f64>,
 
     /// Continue this project's most recent conversation.
@@ -88,7 +88,7 @@ struct Cli {
     #[arg(long)]
     gui: bool,
 
-    /// Without a subcommand, ironquill opens its terminal interface, or its
+    /// Without a subcommand, universe opens its terminal interface, or its
     /// window with --gui.
     #[command(subcommand)]
     command: Option<Command>,
@@ -102,7 +102,7 @@ enum Command {
         prompt: String,
 
         /// The model that answers, as the provider names it.
-        #[arg(long, env = "IRONQUILL_MODEL")]
+        #[arg(long, env = "UNIVERSE_MODEL")]
         model: String,
     },
 
@@ -113,7 +113,7 @@ enum Command {
 
         /// The model tried first. Pick a cheap one: it is only kept if the
         /// checks pass.
-        #[arg(long, env = "IRONQUILL_MODEL")]
+        #[arg(long, env = "UNIVERSE_MODEL")]
         model: String,
 
         /// A stronger model to call if the previous one cannot make the checks
@@ -167,14 +167,14 @@ async fn main() -> Result<()> {
         // No log subscriber here: anything written to the terminal while the
         // interface owns it would tear the screen.
         let start = if cli.continue_last {
-            ironquill_ui::Start::Continue
+            universe_ui::Start::Continue
         } else if let Some(resume) = cli.resume {
             match resume {
-                Some(id) => ironquill_ui::Start::Id(id),
-                None => ironquill_ui::Start::Pick,
+                Some(id) => universe_ui::Start::Id(id),
+                None => universe_ui::Start::Pick,
             }
         } else {
-            ironquill_ui::Start::New
+            universe_ui::Start::New
         };
         let choices = Choices {
             model: Pick::new(cli.model, typed("model")),
@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
             builder = builder
                 .detect_checks(detect)
                 .instructions(Defaults::instructions())
-                .project_rules(ironquill_tools::project_instructions(Path::new(".")));
+                .project_rules(universe_tools::project_instructions(Path::new(".")));
             builder = builder.effort(Some(cli.effort.unwrap_or_default()));
             let kept = Defaults::path()
                 .and_then(|path| Defaults::load(&path).ok())
@@ -295,7 +295,7 @@ async fn interface(
     provider: OpenAiCompatible,
     keyed: bool,
     choices: Choices,
-    start: ironquill_ui::Start,
+    start: universe_ui::Start,
     screen: Screen,
 ) -> Result<()> {
     let workspace = Workspace::new(".")?;
@@ -403,7 +403,7 @@ async fn interface(
         })
         .collect();
 
-    let settings = ironquill_ui::Settings {
+    let settings = universe_ui::Settings {
         tiers,
         checks,
         rounds: 2,
@@ -422,7 +422,7 @@ async fn interface(
         usage_window: defaults
             .usage_window
             .as_deref()
-            .and_then(ironquill_ui::parse_window),
+            .and_then(universe_ui::parse_window),
         allowed_secrets: defaults.allowed_secrets.clone(),
         strict_commands: !defaults.lenient_commands,
         allowed_hosts: defaults.allowed_hosts.clone(),
@@ -436,7 +436,7 @@ async fn interface(
         images: defaults.images.unwrap_or_default(),
         mermaid: defaults.mermaid.clone(),
         cache_ttl: defaults.cache_ttl.unwrap_or_default(),
-        backdrop: ironquill_ui::backdrop::Backdrop {
+        backdrop: universe_ui::backdrop::Backdrop {
             pattern: defaults.background,
             motion: defaults.background_motion.unwrap_or_default(),
         },
@@ -454,7 +454,7 @@ async fn interface(
     };
     match screen {
         Screen::Terminal => {
-            ironquill_tui::run(
+            universe_tui::run(
                 Arc::new(provider),
                 Arc::new(agents),
                 workspace,
@@ -468,7 +468,7 @@ async fn interface(
             // the runtime's other threads carry its work meanwhile.
             let runtime = tokio::runtime::Handle::current();
             tokio::task::block_in_place(|| {
-                ironquill_gui::run(
+                universe_gui::run(
                     runtime,
                     Arc::new(provider),
                     Arc::new(agents),
@@ -484,9 +484,9 @@ async fn interface(
 
 /// List prices for Claude Code's messages, from LiteLLM's list kept a week
 /// next to the defaults, as ccusage prices them.
-async fn prices() -> Option<Arc<ironquill_llm::PriceTable>> {
+async fn prices() -> Option<Arc<universe_llm::PriceTable>> {
     let kept = Defaults::path()?.with_file_name("prices.json");
-    ironquill_llm::load_prices(&kept).await.map(Arc::new)
+    universe_llm::load_prices(&kept).await.map(Arc::new)
 }
 
 /// The scores kept from Artificial Analysis, and when they were fetched.
@@ -634,7 +634,7 @@ fn about(listed: &Listed, ranking: Option<&Ranking>) -> String {
 }
 
 /// The checks given on the command line. Without any, the project's own are
-/// found each time they are needed: see [`ironquill_tools::detect_checks`].
+/// found each time they are needed: see [`universe_tools::detect_checks`].
 fn checks_or_default(lines: Vec<String>) -> Result<Vec<Check>> {
     lines
         .iter()
@@ -674,7 +674,7 @@ async fn ask(provider: &OpenAiCompatible, prompt: &str, model: &str, effort: Eff
 
 async fn run_task(provider: &OpenAiCompatible, config: &AgentConfig, task: &str) -> Result<()> {
     let workspace = Workspace::new(".")?;
-    let context = ironquill_tools::project_context(workspace.root(), FILE_LIST_LIMIT).await;
+    let context = universe_tools::project_context(workspace.root(), FILE_LIST_LIMIT).await;
 
     let mut toolbox = Toolbox::new(workspace);
     let mut agents = Agents::find();
@@ -682,7 +682,7 @@ async fn run_task(provider: &OpenAiCompatible, config: &AgentConfig, task: &str)
     agents.claude = agents.claude.with_prices(prices.clone());
     let billed = agents.codex.uses_api_key();
     agents.codex = agents.codex.with_prices(prices).billed(billed);
-    let outcome = ironquill_agent::run(
+    let outcome = universe_agent::run(
         provider,
         &agents,
         &mut toolbox,
@@ -765,7 +765,7 @@ fn show(event: Event) {
             let who = match (model, effort) {
                 (Some(model), Some(effort)) => format!("{model} · effort {effort}"),
                 (Some(model), None) => model.to_string(),
-                (None, _) => "ironquill".to_owned(),
+                (None, _) => "universe".to_owned(),
             };
             eprintln!("━━ {number}/{of} {name} · {who}");
         }

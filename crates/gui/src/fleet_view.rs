@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use bevy_egui::egui::{self, Align, Color32, Id, Layout, RichText, Stroke, Ui, UiBuilder};
-use ironquill_codemap::{Fleet, LayerKind};
-use ironquill_ui::App;
+use universe_codemap::{Fleet, LayerKind};
+use universe_ui::App;
 
 use crate::infra::Infra;
 use crate::plan::Plan;
@@ -468,7 +468,7 @@ impl FleetView {
                         .iter()
                         .map(|s| {
                             query.is_empty()
-                                || ironquill_ui::search_matches(query, [s.name.as_str()])
+                                || universe_ui::search_matches(query, [s.name.as_str()])
                         })
                         .collect()
                 })
@@ -1238,7 +1238,7 @@ fn legend(ui: &Ui, rect: egui::Rect, view: &FleetView, fleet: &Fleet) {
 
 #[cfg(test)]
 mod tests {
-    use ironquill_codemap::{Galaxy, Place, Star};
+    use universe_codemap::{Galaxy, Place, Star};
 
     use super::*;
 

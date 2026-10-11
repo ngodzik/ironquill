@@ -1,6 +1,3 @@
-use ironquill_agent::Question;
-use ironquill_core::{Effort, ModelId, TokenCount};
-use ironquill_tools::{Container, DiffLine, LineMark, ToolSummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -9,15 +6,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, LegendPosition, Padding, Paragraph,
 };
+use universe_agent::Question;
+use universe_core::{Effort, ModelId, TokenCount};
+use universe_tools::{Container, DiffLine, LineMark, ToolSummary};
 
 use crate::markdown;
 use crate::pictures::{Picture, Pictures};
 use crate::wrap::wrap;
-use ironquill_ui::editor::{Editor, EditorMode, Kind, ScreenRow};
-use ironquill_ui::keymap::{Focus, Mode, Pending, SHORTCUTS};
-use ironquill_ui::references::{self, Reference};
-use ironquill_ui::sessions;
-use ironquill_ui::{App, ChatState, CompactRow, Entry, LineEditor, Panes, SubAgent};
+use universe_ui::editor::{Editor, EditorMode, Kind, ScreenRow};
+use universe_ui::keymap::{Focus, Mode, Pending, SHORTCUTS};
+use universe_ui::references::{self, Reference};
+use universe_ui::sessions;
+use universe_ui::{App, ChatState, CompactRow, Entry, LineEditor, Panes, SubAgent};
 
 const ACCENT: Color = Color::Rgb(215, 119, 87);
 // Changes since the last commit, in the open file. Backgrounds stay dark and
@@ -638,7 +638,7 @@ fn render_picker(frame: &mut Frame, app: &App) {
         .skip(first)
         .take(rows)
         .map(|(i, item)| {
-            // The id, for /resume <id> and ironquill -r <id>.
+            // The id, for /resume <id> and universe -r <id>.
             let details = format!(
                 "{} · {} request{} · {} · {}",
                 sessions::ago(item.updated, now),
@@ -755,13 +755,13 @@ fn render_panes(frame: &mut Frame, app: &App, pictures: &dyn Pictures, area: Rec
 }
 
 /// A colour of the state, as the terminal draws it.
-fn rgb(c: ironquill_ui::style::Rgb) -> Color {
+fn rgb(c: universe_ui::style::Rgb) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
 /// Where a pane was drawn, as the state reads it to match a click.
-fn cells(area: Rect) -> ironquill_ui::input::Rect {
-    ironquill_ui::input::Rect::new(area.x, area.y, area.width, area.height)
+fn cells(area: Rect) -> universe_ui::input::Rect {
+    universe_ui::input::Rect::new(area.x, area.y, area.width, area.height)
 }
 
 /// The border of a pane, bright when it has the focus.
@@ -1526,14 +1526,14 @@ fn entry_lines(
             effort,
         } => {
             // Who works, plain to see: the coder in the accent colour, the
-            // planner in the colour of handovers, ironquill in grey.
+            // planner in the colour of handovers, universe in grey.
             let coding = name.starts_with("Coding") || name.starts_with("Fixing");
             let colour = match (model, coding) {
                 (None, _) => Color::Gray,
                 (Some(_), true) => ACCENT,
                 (Some(_), false) => Color::Magenta,
             };
-            let title = ironquill_ui::step_title(*number, *of, name, model.as_ref(), *effort);
+            let title = universe_ui::step_title(*number, *of, name, model.as_ref(), *effort);
             let rule = width.saturating_sub(title.chars().count() + 6);
             out.push(Line::styled(
                 format!("━━ {title} {}", "━".repeat(rule.min(40))),
@@ -1746,7 +1746,7 @@ fn welcome(out: &mut Vec<Line<'static>>, app: &App, width: usize) {
     let checks = if !app.checks().is_empty() {
         app.checks()
             .iter()
-            .map(ironquill_tools::Check::command)
+            .map(universe_tools::Check::command)
             .collect::<Vec<_>>()
             .join(", ")
     } else if app.detects_checks() {
@@ -1755,10 +1755,7 @@ fn welcome(out: &mut Vec<Line<'static>>, app: &App, width: usize) {
         "none, changes are kept as written (/check adds one)".to_owned()
     };
     let rows: Vec<(String, Style)> = vec![
-        (
-            "✻ ironquill".into(),
-            fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
+        ("✻ universe".into(), fg(ACCENT).add_modifier(Modifier::BOLD)),
         (String::new(), Style::new()),
         (
             "  /help for commands, Ctrl-C to stop a request".into(),
@@ -1885,7 +1882,7 @@ fn render_transcript(frame: &mut Frame, app: &App, pictures: &dyn Pictures, area
         }
         // The copy marks of a reply's code blocks, as far as shown.
         if let Entry::Said(text) = entry {
-            let codes = ironquill_ui::blocks::code_blocks(text);
+            let codes = universe_ui::blocks::code_blocks(text);
             let marked = block.iter().enumerate().filter(|(_, line)| {
                 line.spans
                     .iter()
@@ -1970,7 +1967,7 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
             fg(Color::White).add_modifier(Modifier::BOLD),
         )),
         None if app.step().is_some() => {
-            spans.push(Span::styled("ironquill ", fg(Color::Gray)));
+            spans.push(Span::styled("universe ", fg(Color::Gray)));
         }
         None => {}
     }
@@ -2057,7 +2054,7 @@ fn team_title(app: &App) -> Line<'static> {
     if let Some(step) = app.step() {
         let who = app
             .working_model()
-            .map_or_else(|| "ironquill".to_owned(), ToString::to_string);
+            .map_or_else(|| "universe".to_owned(), ToString::to_string);
         spans.push(Span::styled(" now ", fg(DIM)));
         spans.push(Span::styled(
             who,
@@ -2191,10 +2188,7 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
     let from = now.saturating_sub(window);
     let span = window as f64;
     let block = pane_block(
-        format!(
-            " Usage · last {} ",
-            ironquill_ui::usage::window_name(window)
-        ),
+        format!(" Usage · last {} ", universe_ui::usage::window_name(window)),
         false,
     );
     let inner = block.inner(area);
@@ -2245,7 +2239,7 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
     let time_axis = || {
         Axis::default().bounds([0.0, span]).labels([
             Span::styled(
-                format!("-{}", ironquill_ui::usage::window_name(window)),
+                format!("-{}", universe_ui::usage::window_name(window)),
                 fg(DIM),
             ),
             Span::styled("now", fg(DIM)),
@@ -2329,12 +2323,12 @@ fn render_usage(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use std::path::PathBuf;
 
-    use ironquill_agent::{Approval, Compaction, Event, Question, Subject};
-    use ironquill_core::{CacheUse, ContextUse, ModelId, TokenCount, Usage, Usd};
-    use ironquill_tools::Check;
-    use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
-    use ironquill_ui::{AgentMessage, Effect, Settings};
     use tokio::sync::oneshot;
+    use universe_agent::{Approval, Compaction, Event, Question, Subject};
+    use universe_core::{CacheUse, ContextUse, ModelId, TokenCount, Usage, Usd};
+    use universe_tools::Check;
+    use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
+    use universe_ui::{AgentMessage, Effect, Settings};
 
     use super::*;
     use crate::pictures::NoPictures;
@@ -2424,7 +2418,7 @@ mod tests {
                     written: Some(TokenCount(written)),
                     rewrite_extra: None,
                 }),
-                purpose: ironquill_agent::Purpose::Chat,
+                purpose: universe_agent::Purpose::Chat,
             }));
         }
         type_text(&mut app, "/usage 6h");
@@ -2546,7 +2540,7 @@ mod tests {
 
     #[test]
     fn a_code_block_copies_with_a_click_and_only_its_mark_folds() {
-        use ironquill_ui::input::{MouseButton, MouseEvent, MouseEventKind};
+        use universe_ui::input::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = ready();
         let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
         said(
@@ -2582,7 +2576,7 @@ mod tests {
 
     #[test]
     fn a_cited_file_opens_at_its_line_with_a_click() {
-        use ironquill_ui::input::{MouseButton, MouseEvent, MouseEventKind};
+        use universe_ui::input::{MouseButton, MouseEvent, MouseEventKind};
         let (_dir, mut app) = project();
         said(
             &mut app,

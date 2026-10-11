@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use ironquill_core::{
+use universe_core::{
     Agent, CacheUse, ChatModel, ChatRequest, ContextUse, Delegate, DelegateEvent, DelegateReply,
     DelegateRequest, Effort, Message, ModelId, Pricing, TokenCount, ToolSpec, Usage, Usd,
 };
-use ironquill_tools::{Check, CheckFailure, CheckReport, Toolbox, Trial};
+use universe_tools::{Check, CheckFailure, CheckReport, Toolbox, Trial};
 
 use crate::config::{AgentConfig, Answer, Approval, Member, Pair, Question};
 use crate::delegate;
@@ -15,7 +15,7 @@ mod compact;
 
 pub use compact::{Compaction, Subject};
 
-/// For one task with no person in the loop: `ironquill do`, and the brief a
+/// For one task with no person in the loop: `universe do`, and the brief a
 /// stronger model gets when it takes over.
 const TASK_PROMPT: &str = "You are a careful software engineer working in a project through tools. \
 Make the smallest change that completes the task. Read a file before editing it. \
@@ -27,21 +27,21 @@ automatically and you will be shown any failure. Do not ask questions; when you 
 with one short sentence saying what you changed.";
 
 /// For a task handed to an agent such as Claude Code. It gets the task alone,
-/// not ironquill's conversation, and works in its own session.
-const DELEGATE_PROMPT: &str = "This task was handed to you by ironquill. Do what it asks and \
+/// not universe's conversation, and works in its own session.
+const DELEGATE_PROMPT: &str = "This task was handed to you by universe. Do what it asks and \
 nothing else: no fix or improvement nobody asked for, however tempting; mention it in your \
 report instead. Make the smallest change that completes the task, reading files before editing \
 them. A command that cannot be undone or reaches outside the machine may be refused: do the \
 rest, and say what you wanted to run and why, so that the person can approve it in their next \
-message. When ironquill runs checks after you, it sends you any failure. When you are done, end \
+message. When universe runs checks after you, it sends you any failure. When you are done, end \
 with a short report: what you changed and why, and anything left to do. Write the report in the \
 language the task is written in.";
 
 /// Codex reads and edits through commands, in a sandbox without network.
-const CODEX_PROMPT: &str = "This task was handed to you by ironquill. Do what it asks and \
+const CODEX_PROMPT: &str = "This task was handed to you by universe. Do what it asks and \
 nothing else: no fix or improvement nobody asked for; mention it in your report instead. Use \
 commands to read the project and make your changes, not to install anything. Make the smallest \
-change that completes the task. When ironquill runs checks after you, it sends you any failure. \
+change that completes the task. When universe runs checks after you, it sends you any failure. \
 When you are done, end with a short report: what you changed and why, and anything left to do. \
 Write the report in the language the task is written in.";
 
@@ -112,7 +112,7 @@ const CATCH_UP_BYTES: usize = 24_000;
 
 /// For the first model, once the plan is there.
 const IMPLEMENT_PROMPT: &str = "Implement this plan, exactly. Where it is unclear, choose the \
-simplest reading. Read only what you need and start writing early. As soon as you stop, ironquill \
+simplest reading. Read only what you need and start writing early. As soon as you stop, universe \
 runs the checks and tells you how they went. When you are done, reply with one short sentence.";
 /// For the planner, with the plan: what will judge the work.
 const CHECKS_RULE: &str = "End the plan with the commands that will judge the work, one per \
@@ -144,9 +144,9 @@ the code can help, reply with `STOP` on the first line, then the reason.";
 /// tools, for the cache's sake, and is told what it may do with them.
 const FORK_PLAN_PROMPT: &str = "From here on you are the planner of a pair: another model writes \
 the code, and you review it after. Change no file and run nothing that changes anything: you \
-read only, and ironquill stops the pair if a file changes.";
+read only, and universe stops the pair if a file changes.";
 
-/// The tools a planner reading through ironquill gets.
+/// The tools a planner reading through universe gets.
 const READ_TOOLS: [&str; 4] = ["search", "outline", "read_file", "list_dir"];
 
 /// The most of a diff a review reads, in bytes.
@@ -804,7 +804,7 @@ impl Session {
 
     /// Works on the request in three steps. The planner reads the code it
     /// needs itself and plans, naming the checks that will judge the work;
-    /// ironquill tries them before any change. The coder implements the
+    /// universe tries them before any change. The coder implements the
     /// plan, given in its message. The planner reviews the result from a
     /// copy of its planning, as it was right after the plan, so that it
     /// knows why without the noise of later rounds, and says OK, asks for
@@ -821,7 +821,7 @@ impl Session {
         };
         let planner = pair.planner.clone();
         // A planner reads the code itself: an agent with its own tools, a
-        // model with ironquill's tools that read. One without tools cannot.
+        // model with universe's tools that read. One without tools cannot.
         if planner.delegate().is_none()
             && ctx
                 .config
@@ -1197,7 +1197,7 @@ impl Session {
             return Ok(());
         };
         self.messages.push(Message::user(format!(
-            "(ironquill: the budget of {budget} for this request is spent, {spent} so far, so the \
+            "(universe: the budget of {budget} for this request is spent, {spent} so far, so the \
              work stopped here. Do not call any tool. In the language of the request, explain \
              briefly what was done, what is left and what made it cost this much, then ask what \
              to do next: for example go on with a bigger budget (/budget <dollars>), take \
@@ -1210,7 +1210,7 @@ impl Session {
             effort: ctx.effort,
         };
         // Saying where things stand may cost a tenth of the budget, no more:
-        // a conversation too long for that gets ironquill's own words.
+        // a conversation too long for that gets universe's own words.
         let likely = likely_cost(ctx.model.pricing(model).await, &request);
         if likely.0 > budget.0 * 0.1 {
             self.messages.pop();
@@ -1505,7 +1505,7 @@ impl Session {
 
 /// Runs one task to a verdict, with no person in the loop.
 ///
-/// `context` is handed to the model with the task: anything ironquill can
+/// `context` is handed to the model with the task: anything universe can
 /// work out for free, such as the list of tracked files, so that the model
 /// does not spend turns discovering it.
 ///
@@ -1885,7 +1885,7 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
         };
         // Its commands say nothing of the files they change: the project
         // before and after does.
-        let before = (!request.read_only).then(|| ironquill_tools::Snapshot::take(&root));
+        let before = (!request.read_only).then(|| universe_tools::Snapshot::take(&root));
         let reply = delegate
             .run(request, &mut on_event)
             .await
@@ -2034,7 +2034,7 @@ enum Planning {
         /// chat, or the conversation for a new session.
         preamble: String,
     },
-    /// A model's conversation, reading through ironquill's tools.
+    /// A model's conversation, reading through universe's tools.
     Model {
         planner: ModelId,
         effort: Effort,
@@ -2093,7 +2093,7 @@ impl Planning {
                 // for the cache's sake, is told not to change anything; the
                 // project says whether it did.
                 let root = ctx.toolbox.workspace().root().to_owned();
-                let before = (!call.read_only).then(|| ironquill_tools::Snapshot::take(&root));
+                let before = (!call.read_only).then(|| universe_tools::Snapshot::take(&root));
                 ctx.effort = call.effort;
                 let reply = run_agent(ctx, planner, &request).await?;
                 if let Some(before) = before {
@@ -2415,7 +2415,7 @@ async fn review_prompt<M, D, O>(
     let diff = if changed.is_empty() {
         "Nothing changed.".to_owned()
     } else {
-        ironquill_tools::changes_text(&root, &changed, REVIEW_DIFF_BYTES).await
+        universe_tools::changes_text(&root, &changed, REVIEW_DIFF_BYTES).await
     };
     let checks = match (checked, failure) {
         (None, _) => "No check judges the work.".to_owned(),
@@ -2611,7 +2611,7 @@ fn judged_by<M, D, O>(ctx: &Ctx<'_, M, D, O>) -> String {
 }
 
 /// Commands the planner may name as checks: the person's, then the
-/// project's own as ironquill finds them.
+/// project's own as universe finds them.
 fn check_suggestions<M, D, O>(ctx: &Ctx<'_, M, D, O>) -> String {
     let mut lines: Vec<String> = ctx
         .config
@@ -2621,7 +2621,7 @@ fn check_suggestions<M, D, O>(ctx: &Ctx<'_, M, D, O>) -> String {
         .collect();
     if ctx.config.detect_checks {
         lines.extend(
-            ironquill_tools::detect_checks(ctx.toolbox.workspace().root())
+            universe_tools::detect_checks(ctx.toolbox.workspace().root())
                 .iter()
                 .map(|c| {
                     format!(
@@ -2821,7 +2821,7 @@ fn spent_so_far<M, D, O>(ctx: &Ctx<'_, M, D, O>) -> String {
 fn identity(model: &ModelId, leads: bool, config: &AgentConfig) -> String {
     let team = &config.team;
     let mut text = format!(
-        "\n\nYou are the model `{model}`, used through ironquill, a coding agent in the \
+        "\n\nYou are the model `{model}`, used through universe, a coding agent in the \
          person's terminal. When asked which model you are, say `{model}`. Earlier replies in \
          this conversation may come from other models the person picked; they are not you."
     );
@@ -3070,7 +3070,7 @@ fn checks_now<M, D, O>(ctx: &Ctx<'_, M, D, O>) -> Vec<Check> {
         Judges::Nothing => Vec::new(),
         Judges::These(checks) => checks.clone(),
         Judges::Configured if ctx.config.checks.is_empty() && ctx.config.detect_checks => {
-            ironquill_tools::detect_checks(ctx.toolbox.workspace().root())
+            universe_tools::detect_checks(ctx.toolbox.workspace().root())
         }
         Judges::Configured => ctx.config.checks.clone(),
     }
@@ -3455,13 +3455,13 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
         Err(e) => return format!("error: the arguments are not valid: {e}"),
     };
     let root = ctx.toolbox.workspace().root().to_owned();
-    let mut known = ironquill_tools::known_hosts(&root);
+    let mut known = universe_tools::known_hosts(&root);
     known.extend(ctx.allowed_hosts.iter().cloned());
-    let policy = ironquill_tools::Policy {
+    let policy = universe_tools::Policy {
         strict: ctx.config.strict_commands,
         known_hosts: Some(known),
     };
-    let found = ironquill_tools::assess(&command, &root, &policy);
+    let found = universe_tools::assess(&command, &root, &policy);
     // A secret's value is never shown to a model, whoever would allow it.
     if !found.refused.is_empty() {
         audit(
@@ -3512,7 +3512,7 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
         && missing.is_empty()
         && found.hosts.is_empty()
         && !addresses_judge
-        && reasons.iter().all(|r| ironquill_tools::unreadable(r))
+        && reasons.iter().all(|r| universe_tools::unreadable(r))
     {
         let answer = ask_cheapest(
             ctx,
@@ -3590,8 +3590,8 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
             "ran, approved by the person".into()
         };
     }
-    let before = ironquill_tools::Snapshot::take(&root);
-    let result = ironquill_tools::run_command(&command, &root, &secrets).await;
+    let before = universe_tools::Snapshot::take(&root);
+    let result = universe_tools::run_command(&command, &root, &secrets).await;
     for path in before.changed(&root) {
         ctx.toolbox.mark_changed(path);
     }
@@ -3832,11 +3832,11 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
 
-    use ironquill_core::{ChatResponse, DelegateReply, ToolCall};
+    use universe_core::{ChatResponse, DelegateReply, ToolCall};
 
     use crate::config::{Answer, Approver, Question};
-    use ironquill_tools::{ToolSummary, Workspace};
     use serde_json::json;
+    use universe_tools::{ToolSummary, Workspace};
 
     use super::*;
 
@@ -6248,7 +6248,7 @@ mod tests {
         send(&mut session, "claude-code/opus", "first").await;
         send(&mut session, "claude-code/sonnet", "second").await;
         send(&mut session, "cheap", "elsewhere").await;
-        // As `ironquill -c` does after a restart.
+        // As `universe -c` does after a restart.
         let mut session: Session =
             serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
         send(&mut session, "claude-code/opus", "third").await;

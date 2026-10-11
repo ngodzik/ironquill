@@ -16,7 +16,7 @@ use std::rc::Rc;
 use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use regex::RegexBuilder;
 
-use ironquill_tools::{LineChanges, committed_lines, line_changes};
+use universe_tools::{LineChanges, committed_lines, line_changes};
 
 use crate::clipboard;
 use crate::command;
@@ -86,7 +86,7 @@ pub(crate) enum Outcome {
         text: String,
         close: bool,
     },
-    /// A `:` command the editor does not know, for ironquill to run, so that
+    /// A `:` command the editor does not know, for universe to run, so that
     /// its commands (`:context`, `:model`...) work from inside a file too.
     Command(String),
     Stay,
@@ -107,7 +107,7 @@ pub(crate) trait Clipboard {
     fn paste(&self) -> Result<String, String>;
 }
 
-/// The clipboard of the machine ironquill runs on.
+/// The clipboard of the machine universe runs on.
 pub(crate) struct SystemClipboard;
 
 impl Clipboard for SystemClipboard {
@@ -350,7 +350,7 @@ impl Editor {
             let path = self.path.strip_prefix(&self.root).unwrap_or(&self.path);
             let path = self.base_path.as_deref().unwrap_or(path);
             match &self.base_rev {
-                Some(rev) => ironquill_tools::lines_at(&self.root, path, rev),
+                Some(rev) => universe_tools::lines_at(&self.root, path, rev),
                 None => committed_lines(&self.root, path),
             }
         };
@@ -397,7 +397,7 @@ impl Editor {
             changes
                 .marks
                 .get(row)
-                .is_some_and(|m| *m != ironquill_tools::LineMark::Same)
+                .is_some_and(|m| *m != universe_tools::LineMark::Same)
                 || changes.removed.contains_key(&row)
         };
         // The start of the next run of changes, not each line of it.
@@ -527,7 +527,7 @@ impl Editor {
         let rows = self.lines.len();
         let mut near = vec![false; rows];
         for (row, mark) in self.changes.marks.iter().enumerate() {
-            if *mark != ironquill_tools::LineMark::Same {
+            if *mark != universe_tools::LineMark::Same {
                 near[row] = true;
             }
         }
@@ -2465,7 +2465,7 @@ mod tests {
         keys(&mut ed, "jddOnew\u{1b}");
         let changes = ed.changes().unwrap();
         assert_eq!(ed.lines(), ["one", "new", "three"]);
-        assert_eq!(changes.marks[1], ironquill_tools::LineMark::Changed);
+        assert_eq!(changes.marks[1], universe_tools::LineMark::Changed);
         assert_eq!(changes.removed[&1], ["two"]);
         assert_eq!(keys(&mut ed, ":w\n"), Outcome::Saved);
     }
@@ -2574,7 +2574,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_completes_editor_and_ironquill_commands() {
+    fn tab_completes_editor_and_universe_commands() {
         let (_dir, mut ed) = editor("x\n");
         keys(&mut ed, ":wq");
         ed.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));

@@ -150,7 +150,7 @@ impl Schema {
 ///     id: int | None = Field(default=None, primary_key=True)
 ///     team_id: int | None = Field(default=None, foreign_key="team.id")
 /// "#;
-/// let schema = ironquill_codemap::schema(&[("models.py".into(), text.into())]);
+/// let schema = universe_codemap::schema(&[("models.py".into(), text.into())]);
 /// let names: Vec<&str> = schema.tables.iter().map(|t| t.name.as_str()).collect();
 /// assert_eq!(names, ["hero", "team"]);
 /// let links = schema.foreign_keys();

@@ -17,7 +17,7 @@ const CONTEXT: usize = 1;
 /// # Examples
 ///
 /// ```
-/// use ironquill_tools::{DiffLine, line_diff};
+/// use universe_tools::{DiffLine, line_diff};
 ///
 /// assert_eq!(
 ///     line_diff("a = 1", "a = 2"),

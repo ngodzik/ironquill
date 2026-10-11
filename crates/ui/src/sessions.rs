@@ -1,8 +1,8 @@
 //! Conversations saved on disk, so that they can be resumed.
 //!
-//! One JSON file per conversation under `~/.ironquill/sessions/<project>/`,
+//! One JSON file per conversation under `~/.universe/sessions/<project>/`,
 //! where `<project>` is the project's path with its slashes turned into
-//! dashes. `IRONQUILL_HOME` replaces `~/.ironquill`. A file holds what the
+//! dashes. `UNIVERSE_HOME` replaces `~/.universe`. A file holds what the
 //! model saw, so that a resumed conversation continues where it stopped, and
 //! what the person saw, so that the screen comes back as it was.
 
@@ -11,9 +11,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ironquill_agent::Session;
-use ironquill_core::{Usage, Usd};
 use serde::{Deserialize, Serialize};
+use universe_agent::Session;
+use universe_core::{Usage, Usd};
 
 use crate::app::Entry;
 use crate::usage::UsageLog;
@@ -65,9 +65,9 @@ impl Store {
     /// The store for `project`, or `None` when there is no home directory
     /// to put it in.
     pub fn for_project(project: &Path) -> Option<Self> {
-        let base = match std::env::var_os("IRONQUILL_HOME") {
+        let base = match std::env::var_os("UNIVERSE_HOME") {
             Some(home) => PathBuf::from(home),
-            None => PathBuf::from(std::env::var_os("HOME")?).join(".ironquill"),
+            None => PathBuf::from(std::env::var_os("HOME")?).join(".universe"),
         };
         Some(Self::at(base.join("sessions").join(project_key(project))))
     }

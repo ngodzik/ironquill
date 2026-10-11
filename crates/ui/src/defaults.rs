@@ -1,5 +1,5 @@
 //! The choices each new session starts with, kept in
-//! `~/.ironquill/config.toml` (or `$IRONQUILL_HOME/config.toml`).
+//! `~/.universe/config.toml` (or `$UNIVERSE_HOME/config.toml`).
 //!
 //! ```toml
 //! model = "deepseek/deepseek-chat"
@@ -20,12 +20,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use ironquill_core::CacheTtl;
+use universe_core::CacheTtl;
 
 use crate::backdrop::{Motion, Pattern};
 use serde::{Deserialize, Serialize};
 
-/// Whether replies show images, as `images` in `~/.ironquill/config.toml`
+/// Whether replies show images, as `images` in `~/.universe/config.toml`
 /// says.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -69,7 +69,7 @@ pub struct Defaults {
     /// values stay in the environment, never here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_secrets: Vec<String>,
-    /// Whether a program ironquill does not know runs without asking, as
+    /// Whether a program universe does not know runs without asking, as
     /// `/strict off` chose; by default it asks.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lenient_commands: bool,
@@ -129,21 +129,21 @@ impl Defaults {
 
     /// Where the defaults live, or `None` without a home directory.
     pub fn path() -> Option<PathBuf> {
-        let base = match std::env::var_os("IRONQUILL_HOME") {
+        let base = match std::env::var_os("UNIVERSE_HOME") {
             Some(home) => PathBuf::from(home),
-            None => PathBuf::from(std::env::var_os("HOME")?).join(".ironquill"),
+            None => PathBuf::from(std::env::var_os("HOME")?).join(".universe"),
         };
         Some(base.join("config.toml"))
     }
 
     /// Where every command a model runs is written down:
-    /// `~/.ironquill/audit.log`.
+    /// `~/.universe/audit.log`.
     pub fn audit_log_path() -> Option<PathBuf> {
         Self::path().map(|p| p.with_file_name("audit.log"))
     }
 
     /// The person's own instructions for every model, next to the defaults:
-    /// `~/.ironquill/instructions.md`. Never in a project.
+    /// `~/.universe/instructions.md`. Never in a project.
     pub fn instructions_path() -> Option<PathBuf> {
         Self::path().map(|p| p.with_file_name("instructions.md"))
     }
@@ -151,7 +151,7 @@ impl Defaults {
     /// The person's instructions as they are now; `None` when there are none.
     pub fn instructions() -> Option<String> {
         let text = fs::read_to_string(Self::instructions_path()?).ok()?;
-        // The first lines, ironquill's own explanation, are not instructions.
+        // The first lines, universe's own explanation, are not instructions.
         let text: String = text
             .lines()
             .filter(|line| !line.starts_with("<!--"))

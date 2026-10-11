@@ -17,8 +17,8 @@ use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Painter, Pos2, Rect, RichText,
     ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
-use ironquill_codemap::{Architecture, CodeMap, ComponentKind};
-use ironquill_ui::{App, Entry, MapView};
+use universe_codemap::{Architecture, CodeMap, ComponentKind};
+use universe_ui::{App, Entry, MapView};
 
 use crate::theme::{self, ACCENT, CYAN, DIM, EDGE, MAGENTA, PANEL, RAISED, RED, TEXT, YELLOW};
 
@@ -120,7 +120,7 @@ impl Plan {
             let root = self.root.clone();
             std::thread::spawn(move || {
                 // The plan may be gone by then: nothing to tell.
-                let _ = send.send(ironquill_codemap::map(&root, MAX_FILES));
+                let _ = send.send(universe_codemap::map(&root, MAX_FILES));
             });
             self.reading = Some(receive);
             self.opened_at = now;
@@ -176,11 +176,11 @@ impl Plan {
         let Some(map) = &self.map else {
             return;
         };
-        let mut design = ironquill_codemap::architecture(map, &self.scope);
+        let mut design = universe_codemap::architecture(map, &self.scope);
         // A folder gone since: the whole instead.
         if design.components.is_empty() && !self.scope.is_empty() {
             self.scope.clear();
-            design = ironquill_codemap::architecture(map, "");
+            design = universe_codemap::architecture(map, "");
         }
         self.touches = (0..design.components.len()).map(|_| None).collect();
         if self.chosen.is_some_and(|c| c >= design.components.len()) {
@@ -276,7 +276,7 @@ fn arrange(painter: &Painter, design: &Architecture, project: &str) -> (Vec<Rect
     (cards, vec2(widest, tall))
 }
 
-fn title<'a>(component: &'a ironquill_codemap::Component, project: &'a str) -> &'a str {
+fn title<'a>(component: &'a universe_codemap::Component, project: &'a str) -> &'a str {
     if component.name.is_empty() {
         project
     } else {
@@ -284,7 +284,7 @@ fn title<'a>(component: &'a ironquill_codemap::Component, project: &'a str) -> &
     }
 }
 
-fn subtitle(component: &ironquill_codemap::Component) -> String {
+fn subtitle(component: &universe_codemap::Component) -> String {
     let files = component.files.len();
     let size = format!(
         "{} file{} · {} lines",
@@ -300,7 +300,7 @@ fn subtitle(component: &ironquill_codemap::Component) -> String {
 
 /// What a link is made of: `12 imports · 3 API calls · loop`, a call being
 /// a file calling, through the spec, a file that serves it.
-fn counts(link: &ironquill_codemap::Link) -> String {
+fn counts(link: &universe_codemap::Link) -> String {
     let mut said = Vec::new();
     if link.imports > 0 {
         said.push(format!(
@@ -323,7 +323,7 @@ fn counts(link: &ironquill_codemap::Link) -> String {
 }
 
 /// Whether a part opens onto parts of its own.
-fn opens(component: &ironquill_codemap::Component) -> bool {
+fn opens(component: &universe_codemap::Component) -> bool {
     component.kind != ComponentKind::File
 }
 
@@ -565,7 +565,7 @@ pub(crate) fn show(ui: &mut Ui, plan: &mut Plan, app: &mut App) {
             let searched = query.is_empty()
                 || plan.map.as_ref().is_some_and(|map| {
                     let files = c.files.iter().map(|&f| map.nodes[f].path.as_str());
-                    ironquill_ui::search_matches(
+                    universe_ui::search_matches(
                         &query,
                         [c.name.as_str(), c.path.as_str()].into_iter().chain(files),
                     )
@@ -1099,7 +1099,7 @@ fn header(
 }
 
 /// The way from the project to the level shown, each step a click away:
-/// `ironquill › providers › apache`. Returns the folder clicked.
+/// `universe › providers › apache`. Returns the folder clicked.
 fn trail(ui: &mut Ui, at: Pos2, level: &str, project: &str) -> Option<String> {
     let mut steps = vec![(project.to_owned(), String::new())];
     let mut path = String::new();
@@ -1183,7 +1183,7 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
 /// for, the caret while it is typed, a cross to clear it. A click starts
 /// typing it, as Ctrl-F does.
 fn search_box(ui: &mut Ui, area: Rect, app: &mut App) {
-    let typing = app.mode() == ironquill_ui::keymap::Mode::Search;
+    let typing = app.mode() == universe_ui::keymap::Mode::Search;
     let query = app.search_line().text().to_owned();
     let response = ui
         .interact(area, Id::new("map-search"), Sense::click())
@@ -1419,14 +1419,14 @@ fn details(ui: &mut Ui, rect: Rect, plan: &mut Plan, chosen: usize, app: &mut Ap
 
 fn lines(map: &CodeMap, node: usize) -> usize {
     match map.nodes[node].kind {
-        ironquill_codemap::NodeKind::File { lines, .. } => lines,
-        ironquill_codemap::NodeKind::Folder => 0,
+        universe_codemap::NodeKind::File { lines, .. } => lines,
+        universe_codemap::NodeKind::Folder => 0,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ironquill_tools::ToolSummary;
+    use universe_tools::ToolSummary;
 
     use super::*;
 
@@ -1500,7 +1500,7 @@ mod tests {
         write(dir.path(), "app/models/user.py", "");
         write(dir.path(), "web/main.ts", "");
         let mut plan = Plan::new(dir.path().to_owned());
-        plan.map = Some(ironquill_codemap::map(dir.path(), 100));
+        plan.map = Some(universe_codemap::map(dir.path(), 100));
         plan.open("", 0.0);
         let names = |plan: &Plan| -> Vec<String> {
             let design = plan.design.as_ref().unwrap();

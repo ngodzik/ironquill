@@ -168,7 +168,7 @@ impl Grouping {
 /// # Examples
 ///
 /// ```
-/// use ironquill_codemap::{Criterion, Key, Language, group};
+/// use universe_codemap::{Criterion, Key, Language, group};
 ///
 /// let dir = tempfile::tempdir().unwrap();
 /// let write = |path: &str| {
@@ -180,7 +180,7 @@ impl Grouping {
 /// write("app/view.py");
 /// write("app/README.md");
 /// write("lib/tools.py");
-/// let map = ironquill_codemap::map(dir.path(), 100);
+/// let map = universe_codemap::map(dir.path(), 100);
 ///
 /// let by_module = group(&map, &[], &[Criterion::Module, Criterion::Language]);
 /// let names: Vec<&str> = by_module.groups.iter().map(|g| g.label.as_str()).collect();

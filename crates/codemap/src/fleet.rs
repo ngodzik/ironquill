@@ -373,7 +373,7 @@ fn text(value: &serde_json::Value) -> Option<String> {
 ///     "kind": "Service",
 ///     "spec": {"type": "ClusterIP", "ports": [{"port": 80, "targetPort": 8000}]}
 /// });
-/// assert_eq!(ironquill_codemap::facts(&service), ["ClusterIP 80→8000"]);
+/// assert_eq!(universe_codemap::facts(&service), ["ClusterIP 80→8000"]);
 /// ```
 #[must_use]
 pub fn facts(object: &serde_json::Value) -> Vec<String> {

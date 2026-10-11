@@ -10,8 +10,8 @@ use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
-use ironquill_codemap::{Acts, Fleet, Interaction, Piece, Place, Star, interactions};
-use ironquill_ui::App;
+use universe_codemap::{Acts, Fleet, Interaction, Piece, Place, Star, interactions};
+use universe_ui::App;
 
 use crate::fleet_view::{egui_colour, image_colour, kind_colour, layer_colour};
 use crate::infra::Infra;
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn the_same_service_is_found_again_when_the_fleet_is_assembled_anew() {
-        use ironquill_codemap::{Galaxy, Place};
+        use universe_codemap::{Galaxy, Place};
         let star = |name: &str| Star {
             name: name.into(),
             namespace: None,

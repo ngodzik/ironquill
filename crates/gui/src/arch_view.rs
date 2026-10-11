@@ -9,8 +9,8 @@ use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
-use ironquill_codemap::{Deployment, Element, ElementKind, LinkKind, Place};
-use ironquill_ui::App;
+use universe_codemap::{Deployment, Element, ElementKind, LinkKind, Place};
+use universe_ui::App;
 
 use crate::infra::Infra;
 use crate::services_view::{ServicesView, open_at};
@@ -493,7 +493,7 @@ pub(crate) fn element_details(ui: &mut Ui, element: &Element) -> Option<Place> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironquill_codemap::ArchLink;
+    use universe_codemap::ArchLink;
 
     fn element(kind: ElementKind, name: &str) -> Element {
         Element {

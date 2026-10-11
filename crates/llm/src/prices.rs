@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use ironquill_core::Usd;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use universe_core::Usd;
 
 /// LiteLLM's list of models with their prices, under the MIT licence.
 pub const PRICES_URL: &str =

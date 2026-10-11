@@ -107,7 +107,7 @@ impl Workspace {
         }
         // Write then rename, so that an interrupted session never leaves a
         // half written source file behind.
-        let tmp = path.with_extension("ironquill.tmp");
+        let tmp = path.with_extension("universe.tmp");
         fs::write(&tmp, content).map_err(io)?;
         fs::rename(&tmp, &path).map_err(io)
     }

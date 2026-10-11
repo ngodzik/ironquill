@@ -1,4 +1,4 @@
-//! The ironquill interface's state, whatever draws it.
+//! The universe interface's state, whatever draws it.
 //!
 //! [`App`] holds everything on screen and decides what each key, click and
 //! message from the agent does. It performs no I/O: it returns an [`Effect`]

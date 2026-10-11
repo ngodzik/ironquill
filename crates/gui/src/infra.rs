@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use ironquill_codemap::{
+use universe_codemap::{
     Cache, Deploy, Deployment, Fleet, Place, Rendered, Repos, Services, Settings, Terraform,
     Update, cache_folder, read_settings, settings_file,
 };
-use ironquill_ui::App;
+use universe_ui::App;
 
 /// What is read of where the project runs.
 pub(crate) struct Read {
@@ -41,7 +41,7 @@ pub(crate) struct EnvView {
 #[derive(Default)]
 pub(crate) struct Infra {
     root: PathBuf,
-    /// ironquill's own folder, `~/.ironquill`: where the settings and the
+    /// universe's own folder, `~/.universe`: where the settings and the
     /// cache are. `None` without a home.
     base: Option<PathBuf>,
     read: Option<Arc<Read>>,
@@ -60,11 +60,11 @@ pub(crate) struct Infra {
     updating: Option<Receiver<Vec<(String, Update)>>>,
 }
 
-/// ironquill's own folder, as the rest of it finds it.
+/// universe's own folder, as the rest of it finds it.
 fn base() -> Option<PathBuf> {
-    match std::env::var_os("IRONQUILL_HOME") {
+    match std::env::var_os("UNIVERSE_HOME") {
         Some(home) => Some(PathBuf::from(home)),
-        None => Some(PathBuf::from(std::env::var_os("HOME")?).join(".ironquill")),
+        None => Some(PathBuf::from(std::env::var_os("HOME")?).join(".universe")),
     }
 }
 
@@ -268,7 +268,7 @@ impl Infra {
             return Some(Arc::clone(fleet));
         }
         let views = &self.views;
-        let fleet = Arc::new(ironquill_codemap::fleet(&read.deploy, |env| {
+        let fleet = Arc::new(universe_codemap::fleet(&read.deploy, |env| {
             views.get(&env.name).map(|v| &v.rendered)
         }));
         self.fleet = Some((self.views.len(), Arc::clone(&fleet)));
@@ -286,7 +286,7 @@ impl Infra {
         let (send, receive) = mpsc::channel();
         let repos = read.repos.clone();
         std::thread::spawn(move || {
-            let _ = send.send(ironquill_codemap::update_repos(&repos));
+            let _ = send.send(universe_codemap::update_repos(&repos));
         });
         self.updating = Some(receive);
     }
@@ -314,14 +314,14 @@ fn read(root: &Path, base: Option<&Path>) -> Result<Read, String> {
         None => Settings::default(),
     };
     let repos = Repos::new(root, &settings.linked);
-    let fingerprint = format!("{}|{:?}", ironquill_codemap::fingerprint(&repos), settings);
+    let fingerprint = format!("{}|{:?}", universe_codemap::fingerprint(&repos), settings);
     let cache = base.map(|b| Cache::new(&cache_folder(b, root)));
     let cached: Option<(Deploy, Terraform)> =
         cache.as_ref().and_then(|c| c.get("deploy", &fingerprint));
     let (deploy, terraform) = cached.unwrap_or_else(|| {
         let read = (
-            ironquill_codemap::deploy(&repos, &settings.environments),
-            ironquill_codemap::terraform(&repos),
+            universe_codemap::deploy(&repos, &settings.environments),
+            universe_codemap::terraform(&repos),
         );
         if let Some(cache) = &cache {
             let _ = cache.put("deploy", &fingerprint, &read);
@@ -332,7 +332,7 @@ fn read(root: &Path, base: Option<&Path>) -> Result<Read, String> {
     notes.extend(deploy.notes.iter().cloned());
     notes.extend(terraform.notes.iter().cloned());
     Ok(Read {
-        off_main: ironquill_codemap::off_main(&repos),
+        off_main: universe_codemap::off_main(&repos),
         settings,
         repos,
         deploy,
@@ -358,15 +358,15 @@ fn render(
         cache.as_ref().and_then(|c| c.get(&key, &read.fingerprint));
     let (rendered, deployment) = cached.unwrap_or_else(|| {
         let scratch = base.map_or_else(
-            || std::env::temp_dir().join("ironquill-render"),
+            || std::env::temp_dir().join("universe-render"),
             |b| {
                 cache_folder(b, root)
                     .join("scratch")
                     .join(chosen.to_string())
             },
         );
-        let rendered = ironquill_codemap::render(&read.repos, &read.deploy, env, &scratch);
-        let deployment = ironquill_codemap::deployment(env, &rendered, &read.terraform, services);
+        let rendered = universe_codemap::render(&read.repos, &read.deploy, env, &scratch);
+        let deployment = universe_codemap::deployment(env, &rendered, &read.terraform, services);
         let _ = std::fs::remove_dir_all(&scratch);
         if let Some(cache) = &cache {
             let _ = cache.put(&key, &read.fingerprint, &(&rendered, &deployment));

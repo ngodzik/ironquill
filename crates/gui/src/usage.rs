@@ -12,9 +12,9 @@ use egui_plot::{
     Corner, GridMark, HoverPosition, Legend, Line, MarkerShape, Plot, PlotPoints, Points,
     uniform_grid_spacer,
 };
-use ironquill_core::TokenCount;
-use ironquill_ui::sessions;
-use ironquill_ui::usage::{ModelUse, ROLES, TickBalance, UsageLog, window_name};
+use universe_core::TokenCount;
+use universe_ui::sessions;
+use universe_ui::usage::{ModelUse, ROLES, TickBalance, UsageLog, window_name};
 
 use crate::theme::{ACCENT, CYAN, DIM, EDGE, RAISED, TEXT, rgb};
 

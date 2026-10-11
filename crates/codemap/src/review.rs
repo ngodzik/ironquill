@@ -133,7 +133,7 @@ pub struct Review {
 /// # Examples
 ///
 /// ```
-/// use ironquill_codemap::{Area, Delta, Revised, review};
+/// use universe_codemap::{Area, Delta, Revised, review};
 ///
 /// let before = "openapi: 3.0.0\npaths:\n  /assets:\n    get:\n      summary: List\n";
 /// let after = "openapi: 3.0.0\npaths:\n  /assets:\n    get:\n      summary: List\n      \
@@ -446,7 +446,7 @@ pub(crate) fn call_at(text: &str, open: usize) -> &str {
 ///     with op.batch_alter_table("asset", schema=None) as batch_op:
 ///         batch_op.drop_index("idx_asset_uri")
 /// "#;
-/// let migration = ironquill_codemap::migration(text).unwrap();
+/// let migration = universe_codemap::migration(text).unwrap();
 /// assert_eq!(migration.title, "Add index on asset.uri.");
 /// assert_eq!(migration.revision.as_deref(), Some("c4e7"));
 /// assert_eq!(migration.steps.len(), 1);
@@ -631,7 +631,7 @@ fn tables(text: &str) -> BTreeMap<String, Table> {
 /// ```
 /// let before = "class Asset(Base):\n    __tablename__ = \"asset\"\n    uri: Mapped[str] = mapped_column(String(1500))\n    __table_args__ = (Index(\"idx_name\", name),)\n";
 /// let after = "class Asset(Base):\n    __tablename__ = \"asset\"\n    uri: Mapped[str] = mapped_column(String(1500))\n    group: Mapped[str] = mapped_column(String(100))\n    __table_args__ = (Index(\"idx_name\", name), Index(\"idx_asset_uri\", uri))\n";
-/// let changes = ironquill_codemap::model_changes(before, after);
+/// let changes = universe_codemap::model_changes(before, after);
 /// let lines: Vec<String> = changes.iter().map(|c| format!("{:?} {}", c.delta, c.what)).collect();
 /// assert_eq!(lines, ["Added column group", "Added index idx_asset_uri"]);
 /// ```

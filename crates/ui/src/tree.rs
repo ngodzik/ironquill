@@ -178,7 +178,7 @@ impl FileTree {
     /// when it still exists. Called when the agent may have added files.
     pub(crate) fn refresh(&mut self) {
         let keep = self.rows.get(self.selected).map(|r| r.path.clone());
-        self.git = ironquill_tools::file_status(&self.root);
+        self.git = universe_tools::file_status(&self.root);
         self.filter = self
             .only
             .clone()

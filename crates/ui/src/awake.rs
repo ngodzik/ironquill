@@ -3,7 +3,7 @@
 //! can run, released the moment they cannot.
 //!
 //! On macOS, `caffeinate -i -w <pid>`: idle sleep only (the display may
-//! sleep, closing the lid still sleeps the machine), tied to ironquill's
+//! sleep, closing the lid still sleeps the machine), tied to universe's
 //! process so that even a crash cannot leave the machine held awake. On
 //! Linux, `systemd-inhibit` on idle. Elsewhere, nothing.
 
@@ -22,7 +22,7 @@ fn program() -> Option<(&'static str, Vec<String>)> {
             "systemd-inhibit",
             vec![
                 "--what=idle".into(),
-                "--who=ironquill".into(),
+                "--who=universe".into(),
                 "--why=keeping prompt caches warm".into(),
                 "--mode=block".into(),
                 "sleep".into(),

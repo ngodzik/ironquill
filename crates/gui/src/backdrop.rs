@@ -9,8 +9,8 @@
 use std::f32::consts::TAU;
 
 use bevy_egui::egui::{self, Color32, Pos2, Rect, Shape, Stroke, Ui, pos2, vec2};
-use ironquill_ui::App;
-use ironquill_ui::backdrop::{Backdrop, Motion, Pattern};
+use universe_ui::App;
+use universe_ui::backdrop::{Backdrop, Motion, Pattern};
 
 /// The pattern's colour, a cold grey-blue that reads on the dark panels.
 const TINT: [u8; 3] = [150, 170, 215];

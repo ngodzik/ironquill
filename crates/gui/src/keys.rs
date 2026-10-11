@@ -5,7 +5,7 @@
 //! work the same in both.
 
 use bevy::input::keyboard::Key;
-use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
+use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 
 /// What a key pressed asks of the window.
 #[derive(Debug, Clone, PartialEq, Eq)]

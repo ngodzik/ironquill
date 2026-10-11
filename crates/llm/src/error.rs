@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// What can go wrong between ironquill and a provider.
+/// What can go wrong between universe and a provider.
 #[derive(Debug, Error)]
 pub enum LlmError {
     /// The request never got an HTTP answer: DNS, TLS, proxy, timeout.
