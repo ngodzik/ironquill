@@ -1624,6 +1624,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_folder_the_settings_name_is_an_environment_though_flux_includes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repos = project(dir.path());
+        // apps/prod is built only through the cluster's Kustomization:
+        // named, it shows on its own too.
+        let named = [NamedEnvironment {
+            name: "shop".into(),
+            path: "apps/prod".into(),
+        }];
+        let deploy = deploy(&repos, &named);
+        let shop = &deploy.environments[0];
+        assert_eq!((shop.name.as_str(), shop.chosen), ("shop", true));
+        assert_eq!(shop.parts[0].folder, "apps/prod");
+        assert_eq!(shop.releases[0].namespace.as_deref(), Some("shop"));
+        assert!(
+            deploy
+                .environments
+                .iter()
+                .any(|e| e.name == "clusters/prod")
+        );
+    }
+
+    #[test]
     fn a_patched_flux_path_is_followed_and_pieces_merge() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

@@ -15,15 +15,16 @@
 
 mod activity;
 mod api_view;
-mod arch3d;
 mod arch_view;
 mod backdrop;
 mod database_view;
 mod error;
+mod fleet_view;
 mod infra;
 mod keys;
 mod plan;
 mod review_view;
+mod service_board;
 mod services_view;
 mod theme;
 mod transcript;
@@ -185,7 +186,7 @@ where
         })
         .insert_non_send(shell)
         .insert_resource(universe)
-        .insert_resource(arch3d::Arch3d::default())
+        .insert_resource(fleet_view::FleetView::default())
         .add_systems(Startup, (panels_camera, universe::setup))
         .add_systems(
             PreUpdate,
@@ -199,10 +200,10 @@ where
                 read_keys::<M, D>,
                 drive::<M, D>,
                 universe::show_or_hide,
-                arch3d::spawn,
+                fleet_view::spawn,
                 universe_activity::<M, D>,
                 universe::animate,
-                arch3d::look,
+                fleet_view::animate,
             )
                 .chain(),
         )
@@ -434,7 +435,7 @@ fn drive<M, D>(
     mut winit: ResMut<WinitSettings>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
     mut universe: ResMut<Universe>,
-    arch: Res<arch3d::Arch3d>,
+    fleet: Res<fleet_view::FleetView>,
     mut panels: Query<&mut Camera, With<Camera2d>>,
 ) where
     M: ChatModel + 'static,
@@ -473,9 +474,8 @@ fn drive<M, D>(
     // Written only when it changes: a write wakes the loop, and a write
     // every frame would keep it from ever sleeping. The universe moves all
     // the time, and only it draws without rest.
-    // An architecture draws only while its camera moves: it never turns
-    // by itself.
-    let continuous = shown && (!arch.active || arch.needs_frames());
+    // A service's board is flat: the space behind it rests.
+    let continuous = shown && (!fleet.active || fleet.moving());
     // A moving background wakes the window about twelve times a second
     // while it has the focus; behind other windows it sleeps as before.
     let backdrop = shell.app.backdrop();
@@ -506,7 +506,7 @@ fn draw<M, D>(
     mut contexts: EguiContexts,
     mut shell: NonSendMut<Shell<M, D>>,
     mut universe: ResMut<Universe>,
-    mut arch: ResMut<arch3d::Arch3d>,
+    mut fleet: ResMut<fleet_view::FleetView>,
     mut styled: Local<bool>,
 ) -> Result
 where
@@ -585,8 +585,8 @@ where
                     | MapView::Api
                     | MapView::Review
                     | MapView::Database
-            )
-        ),
+            ) // The deployments need the services to render environments.
+        ) || (view == Some(MapView::Universe) && fleet.active),
         now,
         shell.app.transcript(),
     );
@@ -606,7 +606,7 @@ where
         );
         let window = ctx.content_rect().width().max(1.0);
         universe.covered = (window - chat.response.rect.left()).max(0.0) / window;
-        arch.covered = universe.covered;
+        fleet.covered = universe.covered;
         egui::CentralPanel::default()
             .frame(match view {
                 MapView::Universe => Frame::NONE,
@@ -617,19 +617,21 @@ where
                 | MapView::Database => Frame::NONE.fill(background),
             })
             .show(&mut root, |ui| match view {
-                MapView::Universe if arch.active => {
-                    let rect = ui.max_rect();
-                    let (open, leave) = arch3d::view(ui, &mut arch, rect);
-                    if let Some(place) = open {
-                        services_view::open_at(&shell.infra, &place, &mut shell.app);
-                    }
-                    if leave {
-                        arch.active = false;
-                        shell.app.show_map(Some(MapView::Services));
+                MapView::Universe if fleet.active => {
+                    if fleet_view::show(
+                        ui,
+                        &mut fleet,
+                        &mut shell.infra,
+                        &shell.plan,
+                        &mut shell.app,
+                    ) {
+                        fleet.active = false;
                     }
                 }
                 MapView::Universe => {
-                    universe_view(ui, &mut universe, &mut shell.app);
+                    if universe_view(ui, &mut universe, &mut shell.app) {
+                        fleet.active = true;
+                    }
                 }
                 MapView::Plan => plan::show(ui, &mut shell.plan, &mut shell.app),
                 MapView::Api => api_view::show(
@@ -681,18 +683,8 @@ where
             .show(&mut root, |ui| conversation(ui, shell));
     }
 
-    // The 3D architecture asked for: the universe window takes it.
-    if std::mem::take(&mut shell.services.open_3d)
-        && let Some(env) = shell.infra.view()
-    {
-        arch.open(env.deployment.clone());
-        shell.app.show_map(Some(MapView::Universe));
-    }
-    if shell.app.map_view() != Some(MapView::Universe) && arch.active {
-        arch.active = false;
-    }
-    if universe.architecture != arch.active {
-        universe.architecture = arch.active;
+    if universe.deployments != fleet.active {
+        universe.deployments = fleet.active;
     }
     windows::show(&ctx, &shell.app, &mut shell.keys);
     // bevy_egui is built without its clipboard: what egui copies, such as
@@ -754,8 +746,9 @@ const FEW_NAMED: usize = 40;
 /// The universe's own controls: dragging turns it, the wheel comes closer,
 /// a click centres a star, a double click opens its file, a click on a
 /// galaxy's name enters it. Names show for each galaxy, for the star under
-/// the pointer, the one chosen, and those the agent just touched.
-fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
+/// the pointer, the one chosen, and those the agent just touched. Returns
+/// whether the deployments were asked for.
+fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) -> bool {
     universe.search(app.map_search());
     let changed: Vec<String> = app
         .change_set()
@@ -811,7 +804,7 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
             egui::FontId::proportional(18.0),
             DIM,
         );
-        return;
+        return false;
     };
     // The names worth reading: under the pointer, chosen, or just touched;
     // and every file's, faint, once few enough are looked at to read them
@@ -1044,6 +1037,7 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
     // The criteria, to pick in order: the first makes the galaxies, the
     // second the clusters within them.
     let mut toggle = None;
+    let mut deployments = false;
     let chosen = universe.criteria().to_vec();
     let applied = universe.grouping().criteria.clone();
     ui.scope_builder(
@@ -1082,6 +1076,17 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
                 if ui.add(button).on_hover_text(hint).clicked() {
                     toggle = Some(criterion);
                 }
+            }
+            ui.add_space(10.0);
+            let button = egui::Button::new(RichText::new("Deployments").size(13.0).color(TEXT))
+                .fill(theme::see(RAISED, 0.9))
+                .stroke(Stroke::new(1.0, EDGE));
+            if ui
+                .add(button)
+                .on_hover_text("Every environment as a galaxy, each service a star")
+                .clicked()
+            {
+                deployments = true;
             }
         },
     );
@@ -1176,6 +1181,7 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) {
     } else if let Some(place) = narrow {
         universe.enter_legend(place);
     }
+    deployments
 }
 
 /// `text` with a dark shadow under it, to read over the stars.

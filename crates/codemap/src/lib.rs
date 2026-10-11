@@ -14,6 +14,7 @@ mod architecture;
 mod cache;
 mod deploy;
 mod deployment;
+mod fleet;
 mod grouping;
 mod hcl;
 mod imports;
@@ -37,6 +38,10 @@ pub use deploy::{
 };
 pub use deployment::{
     ArchLink, Deployment, Element, ElementKind, LinkKind, cloud_block, deployment, with_cloud,
+};
+pub use fleet::{
+    Acts, Fleet, Galaxy, Interaction, Layer, LayerKind, Piece, Star, Valued, facts, fleet,
+    interactions,
 };
 pub use grouping::{Criterion, Group, Grouping, Key, MAX_CRITERIA, Role, group};
 pub use layout::Layout;

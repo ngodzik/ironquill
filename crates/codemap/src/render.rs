@@ -338,6 +338,11 @@ fn helm(
         let copy = work.join("chart").join(&chart.name);
         copy_dir(&folder, &copy).map_err(|e| format!("its chart could not be copied: {e}"))?;
         point_dependencies(&folder, &copy).map_err(|e| e.to_string())?;
+        // Its lock names the paths as they were: helm would refuse to
+        // build from it, and resolves the dependencies again without.
+        if local {
+            let _ = std::fs::remove_file(copy.join("Chart.lock"));
+        }
         run(
             Command::new("helm")
                 .arg("dependency")
@@ -423,6 +428,9 @@ fn point_dependencies(original: &Path, copy: &Path) -> std::io::Result<()> {
         .lines()
         .map(|line| match line.split_once("file://") {
             Some((before, path)) => {
+                // The quote opening the path is before `file://`: dropped,
+                // as the path is quoted again whole.
+                let before = before.trim_end_matches(['"', '\'']);
                 let path = path.trim().trim_matches(['"', '\'']);
                 let absolute = normal(&original.join(path));
                 format!("{before}\"file://{}\"\n", absolute.display())
@@ -482,6 +490,18 @@ mod tests {
             &root.join("ops"),
             "apps/base/kustomization.yaml",
             "resources:\n  - api.yaml\n  - source.yaml\n  - account.yaml\n",
+        );
+        // The dependency's path quoted, and a lock as `helm dependency
+        // update` leaves it, naming the path as written.
+        write(
+            &app,
+            "charts/api/Chart.yaml",
+            "apiVersion: v2\nname: api\nversion: 1.4.0\ndependencies:\n  - name: common\n    version: 0.1.0\n    repository: \"file://../common\"\n",
+        );
+        write(
+            &app,
+            "charts/api/Chart.lock",
+            "dependencies:\n- name: common\n  repository: file://../common\n  version: 0.1.0\ndigest: sha256:0000000000000000000000000000000000000000000000000000000000000000\ngenerated: \"2024-01-01T00:00:00Z\"\n",
         );
         let deploy = crate::deploy::deploy(&repos, &[]);
         let prod = deploy
@@ -543,5 +563,35 @@ mod tests {
         assert!(!rendered.objects.iter().any(|o| o.kind == "HelmRelease"));
         // Nothing was written in the repositories.
         assert!(!app.join("charts/api/charts").exists());
+        assert!(app.join("charts/api/Chart.lock").exists());
+    }
+
+    #[test]
+    fn local_dependencies_point_at_the_original_however_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (original, copy) = (dir.path().join("app/charts/api"), dir.path().join("copy"));
+        std::fs::create_dir_all(&copy).unwrap();
+        for written in [
+            "file://../common",
+            "\"file://../common\"",
+            "'file://../common'",
+        ] {
+            std::fs::write(
+                copy.join("Chart.yaml"),
+                format!("name: api\ndependencies:\n  - name: common\n    repository: {written}\n"),
+            )
+            .unwrap();
+            point_dependencies(&original, &copy).unwrap();
+            let text = std::fs::read_to_string(copy.join("Chart.yaml")).unwrap();
+            let common = dir.path().join("app/charts/common");
+            assert!(
+                text.contains(&format!(
+                    "    repository: \"file://{}\"\n",
+                    common.display()
+                )),
+                "{written}: {text}"
+            );
+            assert!(yaml::doc(&text).is_some(), "{written}: {text}");
+        }
     }
 }

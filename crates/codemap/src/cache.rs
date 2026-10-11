@@ -14,7 +14,7 @@ use crate::terraform::git;
 
 /// Raised whenever what is read, or how, changes: older entries are then
 /// read again.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// The repositories' state, as a string.
 #[must_use]
