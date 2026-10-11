@@ -1,7 +1,8 @@
 //! Where the project runs, as the services view shows it: its settings,
 //! its repositories, its environments and their Terraform, read on a
 //! thread of their own and kept in the cache while the repositories do not
-//! change; each environment rendered by the tools on another when chosen;
+//! change; each environment rendered by the tools on another when chosen,
+//! and those the settings name after it, one at a time, for the fleet;
 //! and the linked repositories brought up to date on a third.
 
 use std::collections::HashMap;
@@ -10,8 +11,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use ironquill_codemap::{
-    Cache, Deploy, Deployment, Place, Rendered, Repos, Services, Settings, Terraform, Update,
-    cache_folder, read_settings, settings_file,
+    Cache, Deploy, Deployment, Fleet, Place, Rendered, Repos, Services, Settings, Terraform,
+    Update, cache_folder, read_settings, settings_file,
 };
 use ironquill_ui::App;
 
@@ -51,6 +52,11 @@ pub(crate) struct Infra {
     pub(crate) environment: Option<usize>,
     views: HashMap<String, Arc<EnvView>>,
     rendering: Option<(String, Receiver<EnvView>)>,
+    /// The environments to render after the chosen one, by their places.
+    queue: Vec<usize>,
+    /// Every environment, as last assembled, and how many were rendered
+    /// then: assembled again only when another is.
+    fleet: Option<(usize, Arc<Fleet>)>,
     updating: Option<Receiver<Vec<(String, Update)>>>,
 }
 
@@ -135,6 +141,7 @@ impl Infra {
                             .or_else(|| (!read.deploy.environments.is_empty()).then_some(0));
                     }
                     self.read = Some(Arc::new(read));
+                    self.fleet = None;
                 }
                 Ok(Err(e)) => {
                     self.reading = None;
@@ -170,18 +177,36 @@ impl Infra {
                     // Read again, whatever changed.
                     self.read = None;
                     self.views.clear();
+                    self.queue.clear();
+                    self.fleet = None;
                     self.want();
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => self.updating = None,
             }
         }
-        // The chosen environment, rendered once the services are read.
-        if self.rendering.is_none()
-            && let (Some(read), Some(chosen), Some(services)) =
-                (&self.read, self.environment, services)
+        // The chosen environment, rendered once the services are read;
+        // then those asked for after it.
+        if self.rendering.is_some() {
+            return;
+        }
+        let (Some(read), Some(services)) = (&self.read, services) else {
+            return;
+        };
+        let views = &self.views;
+        let unrendered = |i: &usize| {
+            read.deploy
+                .environments
+                .get(*i)
+                .is_some_and(|e| !views.contains_key(&e.name))
+        };
+        let next = self
+            .environment
+            .filter(unrendered)
+            .or_else(|| self.queue.iter().copied().find(unrendered));
+        self.queue.retain(|i| Some(*i) != next && unrendered(i));
+        if let Some(chosen) = next
             && let Some(env) = read.deploy.environments.get(chosen)
-            && !self.views.contains_key(&env.name)
         {
             let (send, receive) = mpsc::channel();
             let read = Arc::clone(read);
@@ -199,6 +224,55 @@ impl Infra {
     /// Chooses the environment at `index`.
     pub(crate) fn choose(&mut self, index: usize) {
         self.environment = Some(index);
+    }
+
+    /// Renders the environments the settings name, after the chosen one,
+    /// one at a time.
+    pub(crate) fn render_all(&mut self) {
+        let Some(read) = &self.read else {
+            return;
+        };
+        let named: Vec<usize> = (0..read.deploy.environments.len())
+            .filter(|i| read.deploy.environments[*i].chosen)
+            .collect();
+        for index in named {
+            self.render_one(index);
+        }
+    }
+
+    /// Renders the environment at `index` after those already asked for,
+    /// unless it is rendered or asked for.
+    pub(crate) fn render_one(&mut self, index: usize) {
+        let Some(env) = self
+            .read
+            .as_ref()
+            .and_then(|r| r.deploy.environments.get(index))
+        else {
+            return;
+        };
+        if !self.views.contains_key(&env.name)
+            && self.rendering() != Some(env.name.as_str())
+            && !self.queue.contains(&index)
+        {
+            self.queue.push(index);
+        }
+    }
+
+    /// Every environment, those rendered with their objects, assembled
+    /// again only when another was rendered.
+    pub(crate) fn fleet(&mut self) -> Option<Arc<Fleet>> {
+        let read = self.read.as_ref()?;
+        if let Some((count, fleet)) = &self.fleet
+            && *count == self.views.len()
+        {
+            return Some(Arc::clone(fleet));
+        }
+        let views = &self.views;
+        let fleet = Arc::new(ironquill_codemap::fleet(&read.deploy, |env| {
+            views.get(&env.name).map(|v| &v.rendered)
+        }));
+        self.fleet = Some((self.views.len(), Arc::clone(&fleet)));
+        Some(fleet)
     }
 
     /// Brings the linked repositories up to date, on a thread.

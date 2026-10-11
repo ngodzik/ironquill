@@ -68,8 +68,6 @@ pub(crate) struct ServicesView {
     pub(crate) element: Option<usize>,
     /// Whether the notes show.
     notes: bool,
-    /// The 3D architecture was asked for: the universe window takes it.
-    pub(crate) open_3d: bool,
 }
 
 /// A way's colour and name.
@@ -826,15 +824,6 @@ fn bar(ui: &mut Ui, rect: Rect, view: &mut ServicesView, infra: &mut Infra) -> f
                 if ui.add(egui::Button::selectable(on, text)).clicked() {
                     view.mode = mode;
                 }
-            }
-            let ready = infra.view().is_some();
-            if ui
-                .add_enabled(ready, egui::Button::new(RichText::new("3D").size(13.5)))
-                .on_hover_text("the environment's architecture in 3D, in the universe window")
-                .on_disabled_hover_text("once the environment is rendered")
-                .clicked()
-            {
-                view.open_3d = true;
             }
             ui.add_space(12.0);
             let linked = infra

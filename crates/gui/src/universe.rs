@@ -152,9 +152,9 @@ pub(crate) struct Universe {
     /// How much of the window's width the panels cover on the right: the
     /// view moves so that the universe is centred in what is left.
     pub(crate) covered: f32,
-    /// Whether the window shows an architecture rather than the code: the
-    /// stars rest, and the camera is the architecture's.
-    pub(crate) architecture: bool,
+    /// Whether the window shows the deployments rather than the code: the
+    /// stars rest, and the camera is the fleet's.
+    pub(crate) deployments: bool,
 }
 
 impl Universe {
@@ -194,7 +194,7 @@ impl Universe {
             chosen: None,
             on_screen: Vec::new(),
             covered: 0.0,
-            architecture: false,
+            deployments: false,
         }
     }
 
@@ -442,6 +442,10 @@ impl Universe {
 #[derive(Component)]
 pub(crate) struct InUniverse;
 
+/// A star of the code, to hide while the deployments show.
+#[derive(Component)]
+pub(crate) struct CodeStar;
+
 /// The universe's camera.
 #[derive(Component)]
 pub(crate) struct UniverseCamera;
@@ -456,7 +460,7 @@ pub(crate) struct Spark {
 /// Shared meshes and the sparks' material.
 #[derive(Resource)]
 pub(crate) struct Assets3d {
-    sphere: Handle<Mesh>,
+    pub(crate) sphere: Handle<Mesh>,
     spark: Handle<StandardMaterial>,
 }
 
@@ -807,6 +811,7 @@ pub(crate) fn show_or_hide(
                         .with_scale(Vec3::splat(size(node))),
                     Visibility::Visible,
                     InUniverse,
+                    CodeStar,
                 ))
                 .id()
         })
@@ -908,7 +913,7 @@ pub(crate) fn animate(
     mut camera: Query<CameraParts, CameraOnly>,
     mut gizmos: Gizmos,
 ) {
-    if !universe.shown || universe.architecture {
+    if !universe.shown || universe.deployments {
         return;
     }
     let dt = time.delta_secs().min(0.1);

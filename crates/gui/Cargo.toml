@@ -16,6 +16,7 @@ thiserror.workspace       = true
 bevy.workspace            = true
 bevy_egui.workspace       = true
 egui_plot.workspace       = true
+serde_json.workspace      = true
 tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
