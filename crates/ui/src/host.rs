@@ -815,7 +815,9 @@ async fn walk_prompt(root: &std::path::Path, question: &crate::app::WalkQuestion
             prompt.push_str(&format!("What changed since the last commit:\n{stat}"));
         }
     }
-    prompt
+    // The code may hold a secret of the environment, as a message may: it
+    // reaches the model as its name only.
+    ironquill_tools::redact_secrets(&prompt).0
 }
 
 const INSTRUCTIONS_TEMPLATE: &str = "<!-- Your own instructions for every model ironquill runs, in every project: \
@@ -1010,5 +1012,28 @@ fn find(
         uses: lookup.uses,
         places,
         by: "git grep".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_walk_question_carries_the_place_and_the_file_s_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("new.py"), "print(1)\n").unwrap();
+        let question = crate::app::WalkQuestion {
+            text: "what does it print?".into(),
+            path: Some("new.py".into()),
+            lines: Some((1, 1)),
+            excerpt: ">    1 print(1)".into(),
+            candidates: Vec::new(),
+        };
+        let prompt = walk_prompt(dir.path(), &question).await;
+        assert!(prompt.starts_with("Question: what does it print?"));
+        assert!(prompt.contains("About new.py, lines 1 to 1 (marked >):\n>    1 print(1)"));
+        // Outside a repository, the file as it is now.
+        assert!(prompt.contains("new file new.py:\nprint(1)"));
     }
 }
