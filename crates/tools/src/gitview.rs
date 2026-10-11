@@ -44,7 +44,7 @@ impl LineChanges {
 /// # Examples
 ///
 /// ```
-/// use ironquill_tools::{LineMark, line_changes};
+/// use universe_tools::{LineMark, line_changes};
 ///
 /// let base = ["a", "b", "c"].map(String::from);
 /// let now = ["a", "B", "c", "d"].map(String::from);
@@ -168,8 +168,8 @@ pub struct ChangedFile {
 ///
 /// ```no_run
 /// let root = std::path::Path::new(".");
-/// if let Some(base) = ironquill_tools::branch_base(root) {
-///     for file in ironquill_tools::changed_files(root, &base).unwrap_or_default() {
+/// if let Some(base) = universe_tools::branch_base(root) {
+///     for file in universe_tools::changed_files(root, &base).unwrap_or_default() {
 ///         println!("{} +{} -{}", file.path, file.added, file.removed);
 ///     }
 /// }
@@ -290,7 +290,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(root)
-        // The repository of the directory given, whatever started ironquill.
+        // The repository of the directory given, whatever started universe.
         .env_remove("GIT_DIR")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_WORK_TREE")

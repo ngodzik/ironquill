@@ -1,6 +1,6 @@
-//! The ironquill terminal interface.
+//! The universe terminal interface.
 //!
-//! The state, the keys and what each does live in `ironquill-ui`, which
+//! The state, the keys and what each does live in `universe-ui`, which
 //! knows nothing of terminals. This crate only:
 //! - draws that state with Ratatui (`view`), changing nothing;
 //! - shows pictures with Kitty's protocol (`graphics`, `pictures`);
@@ -22,16 +22,16 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use ironquill_core::{ChatModel, Delegate};
-use ironquill_tools::Workspace;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event as TermEvent, EventStream, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use tokio::sync::mpsc;
+use universe_core::{ChatModel, Delegate};
+use universe_tools::Workspace;
 
-use ironquill_ui::{App, Defaults, Host, Settings, Start, Waiting, input};
+use universe_ui::{App, Defaults, Host, Settings, Start, Waiting, input};
 
 pub use error::TuiError;
 
@@ -137,7 +137,7 @@ where
         if name != title {
             let _ = execute!(
                 std::io::stdout(),
-                ratatui::crossterm::terminal::SetTitle(format!("{name} · ironquill"))
+                ratatui::crossterm::terminal::SetTitle(format!("{name} · universe"))
             );
             title = name;
         }

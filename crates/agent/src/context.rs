@@ -5,7 +5,7 @@
 //! result, so that deleting the block removes both and the conversation
 //! stays one a provider accepts.
 
-use ironquill_core::{Message, ToolCall};
+use universe_core::{Message, ToolCall};
 
 const HEADER: &str = "=== ";
 

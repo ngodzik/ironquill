@@ -126,8 +126,8 @@ impl Architecture {
 /// };
 /// write("app/main.py", "import lib.tools\n");
 /// write("lib/tools.py", "");
-/// let map = ironquill_codemap::map(dir.path(), 100);
-/// let design = ironquill_codemap::architecture(&map, "");
+/// let map = universe_codemap::map(dir.path(), 100);
+/// let design = universe_codemap::architecture(&map, "");
 /// let names: Vec<&str> = design.components.iter().map(|c| c.name.as_str()).collect();
 /// assert_eq!(names, ["app", "lib"]);
 /// // lib uses nothing, so it is the foundation; app sits above it.

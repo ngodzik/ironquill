@@ -6,12 +6,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ironquill_agent::{AgentConfig, Answer, Approver, Session};
-use ironquill_core::{ChatModel, Delegate};
-use ironquill_tools::{Container, Servers, Toolbox, Workspace};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Interval;
+use universe_agent::{AgentConfig, Answer, Approver, Session};
+use universe_core::{ChatModel, Delegate};
+use universe_tools::{Container, Servers, Toolbox, Workspace};
 
 use crate::app::{AgentMessage, App, ChatId, Effect};
 use crate::defaults::Defaults;
@@ -472,7 +472,7 @@ where
                 let config = config
                     .with_instructions(Defaults::instructions())
                     .with_audit_log(Defaults::audit_log_path())
-                    .with_project_rules(ironquill_tools::project_instructions(app.root()))
+                    .with_project_rules(universe_tools::project_instructions(app.root()))
                     .with_approver(approver);
                 *task = Some(spawn_agent(
                     Arc::clone(model),
@@ -582,7 +582,7 @@ where
             Effect::FindCheapest(candidates) => {
                 let (model, tx) = (Arc::clone(model), tx.clone());
                 tokio::spawn(async move {
-                    let found = ironquill_agent::cheapest(&*model, &candidates, None).await;
+                    let found = universe_agent::cheapest(&*model, &candidates, None).await;
                     let _ = tx.send(AgentMessage::WalkModel(found.map(|(m, _)| m)));
                 });
             }
@@ -592,12 +592,12 @@ where
                 tokio::spawn(async move {
                     let prompt = walk_prompt(&root, &question).await;
                     let events = tx.clone();
-                    let answered = ironquill_agent::ask_cheapest(
+                    let answered = universe_agent::ask_cheapest(
                         &*model,
                         &question.candidates,
                         WALK_PROMPT,
                         prompt,
-                        ironquill_core::Effort::Low,
+                        universe_core::Effort::Low,
                         |e| {
                             let _ = events.send(AgentMessage::Event(e));
                         },
@@ -666,7 +666,7 @@ where
                 Err(e) => app.report_error(e),
             },
             Effect::Diff => {
-                let text = ironquill_tools::diff_stat(workspace.root())
+                let text = universe_tools::diff_stat(workspace.root())
                     .await
                     .unwrap_or_else(|_| "/diff needs the project to be a git repository".into());
                 app.on_diff(&text);
@@ -743,7 +743,7 @@ where
                     *docker_asking = true;
                     let tx = docker_tx.clone();
                     tokio::spawn(async move {
-                        let _ = tx.send(ironquill_tools::running_containers().await);
+                        let _ = tx.send(universe_tools::running_containers().await);
                     });
                 }
             }
@@ -804,12 +804,12 @@ async fn walk_prompt(root: &std::path::Path, question: &crate::app::WalkQuestion
                 question.excerpt
             ));
             let diff =
-                ironquill_tools::changes_text(root, std::slice::from_ref(path), WALK_DIFF_LIMIT)
+                universe_tools::changes_text(root, std::slice::from_ref(path), WALK_DIFF_LIMIT)
                     .await;
             prompt.push_str(&format!("Its changes since the last commit:\n{diff}"));
         }
         _ => {
-            let stat = ironquill_tools::diff_stat(root)
+            let stat = universe_tools::diff_stat(root)
                 .await
                 .unwrap_or_else(|e| e.to_string());
             prompt.push_str(&format!("What changed since the last commit:\n{stat}"));
@@ -817,10 +817,10 @@ async fn walk_prompt(root: &std::path::Path, question: &crate::app::WalkQuestion
     }
     // The code may hold a secret of the environment, as a message may: it
     // reaches the model as its name only.
-    ironquill_tools::redact_secrets(&prompt).0
+    universe_tools::redact_secrets(&prompt).0
 }
 
-const INSTRUCTIONS_TEMPLATE: &str = "<!-- Your own instructions for every model ironquill runs, in every project: \
+const INSTRUCTIONS_TEMPLATE: &str = "<!-- Your own instructions for every model universe runs, in every project: \
 the one that answers, the planner and the coder of /pair, the team. Lines like this one are \
 left out. Saved with :w, they count from the next request. -->\n";
 
@@ -915,7 +915,7 @@ where
         let mut guard = conversation.lock().await;
         let Conversation { session, toolbox } = &mut *guard;
         let root = toolbox.workspace().root().to_owned();
-        let context = ironquill_tools::project_context(&root, FILE_LIST_LIMIT).await;
+        let context = universe_tools::project_context(&root, FILE_LIST_LIMIT).await;
         let events = tx.clone();
         let result = session
             .send(
@@ -933,7 +933,7 @@ where
             .await;
         let message = match result {
             // Stopped before it began: the message goes back to the box.
-            Err(ironquill_agent::AgentError::NotSent) => AgentMessage::NotSent(text),
+            Err(universe_agent::AgentError::NotSent) => AgentMessage::NotSent(text),
             result => AgentMessage::Done(result.map_err(|e| error_chain(&e))),
         };
         let _ = tx.send(message);
@@ -981,9 +981,9 @@ fn find(
     };
     let here = lookup.path.to_string_lossy().into_owned();
     if let Ok(places) = asked {
-        let places: Vec<ironquill_tools::Definition> = places
+        let places: Vec<universe_tools::Definition> = places
             .into_iter()
-            .map(|p| ironquill_tools::Definition {
+            .map(|p| universe_tools::Definition {
                 text: line_of(&p.path, p.line),
                 path: p.path,
                 line: p.line,
@@ -1003,9 +1003,9 @@ fn find(
     }
     let lines: Vec<String> = lookup.text.lines().map(str::to_owned).collect();
     let places = if lookup.uses {
-        ironquill_tools::uses(root, &lookup.name)
+        universe_tools::uses(root, &lookup.name)
     } else {
-        ironquill_tools::definitions(root, &lookup.name, &lookup.path, &lines)
+        universe_tools::definitions(root, &lookup.name, &lookup.path, &lines)
     };
     crate::app::Found {
         name: lookup.name.clone(),

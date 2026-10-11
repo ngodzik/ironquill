@@ -1,11 +1,11 @@
-//! What a delegated agent's tool calls mean in ironquill's terms.
+//! What a delegated agent's tool calls mean in universe's terms.
 
 use std::path::Path;
 
-use ironquill_tools::{DiffLine, ToolSummary, line_diff};
 use serde_json::Value;
+use universe_tools::{DiffLine, ToolSummary, line_diff};
 
-/// A delegated tool call as ironquill shows and counts it.
+/// A delegated tool call as universe shows and counts it.
 pub(crate) struct ToolReport {
     /// The file it acted on, relative to the project when inside it.
     pub(crate) path: Option<String>,
@@ -25,7 +25,7 @@ pub(crate) fn action(name: &str, input: &Value) -> String {
 }
 
 /// Translates one of an agent's tool calls: `Read`, `Edit`, `MultiEdit`,
-/// `Write` and `Delete` map onto ironquill's own summaries, any other tool is
+/// `Write` and `Delete` map onto universe's own summaries, any other tool is
 /// shown by name with what it was given. Codex's changes come in these
 /// names too.
 pub(crate) fn report(

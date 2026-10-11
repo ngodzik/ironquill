@@ -20,10 +20,10 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
-use ironquill_codemap::{
+use universe_codemap::{
     CodeMap, Criterion, EdgeKind, Grouping, Key, Language, Layout, MAX_CRITERIA, NodeKind, Role,
 };
-use ironquill_ui::Entry;
+use universe_ui::Entry;
 
 /// The most files mapped: beyond, the layout would take too long to settle
 /// and the sky too busy to read.
@@ -392,7 +392,7 @@ impl Universe {
             return;
         };
         let keys: Vec<Key> = self.entered.iter().map(|(key, _)| key.clone()).collect();
-        self.grouping = ironquill_codemap::group(map, &keys, &self.criteria);
+        self.grouping = universe_codemap::group(map, &keys, &self.criteria);
         // The project's own package has no name of its own: it takes its
         // folder's.
         let project = self
@@ -565,7 +565,7 @@ fn found(map: &CodeMap, query: &str) -> Vec<bool> {
         .iter()
         .map(|n| {
             matches!(n.kind, NodeKind::File { .. })
-                && ironquill_ui::search_matches(query, [n.path.as_str()])
+                && universe_ui::search_matches(query, [n.path.as_str()])
         })
         .collect();
     let mut ways: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -738,7 +738,7 @@ fn srgb(colour: LinearRgba) -> [u8; 3] {
 }
 
 /// How big a node's star is: files by their length, the root the largest.
-fn size(node: &ironquill_codemap::Node) -> f32 {
+fn size(node: &universe_codemap::Node) -> f32 {
     match node.kind {
         NodeKind::Folder if node.depth == 0 => 0.5,
         NodeKind::Folder => 0.2,
@@ -790,7 +790,7 @@ pub(crate) fn show_or_hide(
         return;
     }
     // The files a branch changed come first: they show, whatever fits.
-    let map = ironquill_codemap::map_with(&universe.root, MAX_FILES, &universe.changed_paths);
+    let map = universe_codemap::map_with(&universe.root, MAX_FILES, &universe.changed_paths);
     let layout = Layout::new(&map);
     let stars = map
         .nodes
@@ -1111,8 +1111,8 @@ pub(crate) fn animate(
 #[cfg(test)]
 mod tests {
     use bevy::ecs::world::CommandQueue;
-    use ironquill_codemap::Node;
-    use ironquill_tools::ToolSummary;
+    use universe_codemap::Node;
+    use universe_tools::ToolSummary;
 
     use super::*;
 

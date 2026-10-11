@@ -3294,147 +3294,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
-name = "ironquill"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "ironquill-agent",
- "ironquill-core",
- "ironquill-gui",
- "ironquill-llm",
- "ironquill-tools",
- "ironquill-tui",
- "ironquill-ui",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "ironquill-agent"
-version = "0.1.0"
-dependencies = [
- "ironquill-core",
- "ironquill-tools",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
-name = "ironquill-codemap"
-version = "0.1.0"
-dependencies = [
- "ignore",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "toml",
- "yaml-rust2",
-]
-
-[[package]]
-name = "ironquill-core"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "ironquill-gui"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "bevy_egui",
- "egui_plot",
- "ironquill-agent",
- "ironquill-codemap",
- "ironquill-core",
- "ironquill-tools",
- "ironquill-ui",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
-name = "ironquill-llm"
-version = "0.1.0"
-dependencies = [
- "ironquill-core",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ironquill-tools"
-version = "0.1.0"
-dependencies = [
- "ignore",
- "ironquill-core",
- "regex",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tree-sitter",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
-]
-
-[[package]]
-name = "ironquill-tui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "futures",
- "ironquill-agent",
- "ironquill-core",
- "ironquill-tools",
- "ironquill-ui",
- "ratatui",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
-name = "ironquill-ui"
-version = "0.1.0"
-dependencies = [
- "ironquill-agent",
- "ironquill-core",
- "ironquill-tools",
- "regex",
- "serde",
- "serde_json",
- "syntect",
- "tempfile",
- "tokio",
- "toml",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6430,6 +6289,147 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "universe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "universe-agent",
+ "universe-core",
+ "universe-gui",
+ "universe-llm",
+ "universe-tools",
+ "universe-tui",
+ "universe-ui",
+]
+
+[[package]]
+name = "universe-agent"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "universe-core",
+ "universe-tools",
+]
+
+[[package]]
+name = "universe-codemap"
+version = "0.1.0"
+dependencies = [
+ "ignore",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "yaml-rust2",
+]
+
+[[package]]
+name = "universe-core"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "universe-gui"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_egui",
+ "egui_plot",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "universe-agent",
+ "universe-codemap",
+ "universe-core",
+ "universe-tools",
+ "universe-ui",
+]
+
+[[package]]
+name = "universe-llm"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "universe-core",
+]
+
+[[package]]
+name = "universe-tools"
+version = "0.1.0"
+dependencies = [
+ "ignore",
+ "regex",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "universe-core",
+]
+
+[[package]]
+name = "universe-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "futures",
+ "ratatui",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "universe-agent",
+ "universe-core",
+ "universe-tools",
+ "universe-ui",
+]
+
+[[package]]
+name = "universe-ui"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "syntect",
+ "tempfile",
+ "tokio",
+ "toml",
+ "universe-agent",
+ "universe-core",
+ "universe-tools",
+]
 
 [[package]]
 name = "untrusted"

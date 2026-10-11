@@ -1,5 +1,5 @@
-use ironquill_core::{CacheUse, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
-use ironquill_tools::ToolSummary;
+use universe_core::{CacheUse, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
+use universe_tools::ToolSummary;
 
 /// What a call to a model was for: what its cost is put down to, and what
 /// a tick kept warm.
@@ -129,7 +129,7 @@ pub enum Event {
         of: u8,
         /// What it does, such as `Planning`.
         name: String,
-        /// The model doing it; `None` when ironquill does it itself.
+        /// The model doing it; `None` when universe does it itself.
         model: Option<ModelId>,
         /// How hard that model thinks.
         effort: Option<Effort>,

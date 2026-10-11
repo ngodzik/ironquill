@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use ironquill_core::{
-    CacheUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount, Usage,
-};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
+use universe_core::{
+    CacheUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount, Usage,
+};
 
 use crate::error::LlmError;
 use crate::prices::{PriceTable, Tokens};
@@ -19,7 +19,7 @@ const STDERR_LIMIT: usize = 4_000;
 /// The Codex command line, run as an agent tasks are handed to.
 ///
 /// It runs the `codex` program installed on the machine, as published, with
-/// the person's own login: ironquill never reads or stores credentials.
+/// the person's own login: universe never reads or stores credentials.
 /// Codex reads and edits files by running commands, so it runs them in its
 /// own sandbox: it may write inside the project only, without network, and
 /// is never asked for an approval, since nobody is there to give it.
@@ -623,8 +623,8 @@ mod tests {
     #[test]
     fn the_command_line_sandboxes_codex_and_resumes_its_session() {
         let request = DelegateRequest {
-            agent: ironquill_core::Agent::Codex,
-            effort: Some(ironquill_core::Effort::Low),
+            agent: universe_core::Agent::Codex,
+            effort: Some(universe_core::Effort::Low),
             model: "gpt-5.5".into(),
             prompt: "-fix it".into(),
             instructions: "be \"brief\"".into(),

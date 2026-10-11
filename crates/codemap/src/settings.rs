@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// The settings file of a project: `<base>/projects/<folder>.toml`, the
-/// base being ironquill's own folder, `~/.ironquill`.
+/// base being universe's own folder, `~/.universe`.
 ///
 /// # Examples
 ///
 /// ```
 /// use std::path::Path;
-/// let file = ironquill_codemap::settings_file(Path::new("/home/me/.ironquill"), Path::new("/code/shop"));
-/// assert_eq!(file, Path::new("/home/me/.ironquill/projects/shop.toml"));
+/// let file = universe_codemap::settings_file(Path::new("/home/me/.universe"), Path::new("/code/shop"));
+/// assert_eq!(file, Path::new("/home/me/.universe/projects/shop.toml"));
 /// ```
 #[must_use]
 pub fn settings_file(base: &Path, root: &Path) -> PathBuf {

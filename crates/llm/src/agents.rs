@@ -1,4 +1,4 @@
-use ironquill_core::{Agent, Delegate, DelegateEvent, DelegateReply, DelegateRequest};
+use universe_core::{Agent, Delegate, DelegateEvent, DelegateReply, DelegateRequest};
 
 use crate::claude_code::ClaudeCode;
 use crate::codex::Codex;

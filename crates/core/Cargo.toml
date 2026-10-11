@@ -1,10 +1,10 @@
 [package]
-name    = "ironquill-core"
+name    = "universe-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Domain types and traits for ironquill: no I/O, no network."
+description = "Domain types and traits for universe: no I/O, no network."
 
 [dependencies]
 thiserror.workspace = true

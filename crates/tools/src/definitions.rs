@@ -38,7 +38,7 @@ pub struct Definition {
 ///
 /// ```no_run
 /// let lines = vec!["from app.models.asset import AssetModel".to_owned()];
-/// let found = ironquill_tools::definitions(
+/// let found = universe_tools::definitions(
 ///     std::path::Path::new("."),
 ///     "AssetModel",
 ///     std::path::Path::new("app/api/routes.py"),
@@ -123,7 +123,7 @@ pub fn definitions(root: &Path, name: &str, from: &Path, lines: &[String]) -> Ve
 /// # Examples
 ///
 /// ```no_run
-/// for place in ironquill_tools::uses(std::path::Path::new("."), "paginated_select") {
+/// for place in universe_tools::uses(std::path::Path::new("."), "paginated_select") {
 ///     println!("{}:{}", place.path, place.line);
 /// }
 /// ```

@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 
-use ironquill_core::{ToolCall, ToolSpec};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use universe_core::{ToolCall, ToolSpec};
 
 use crate::diff::{DiffLine, line_diff};
 use crate::error::ToolError;
@@ -58,7 +58,7 @@ pub struct ToolOutput {
 ///
 /// There is deliberately no shell. A model that could run commands could also
 /// run the checks itself, or edit around them; keeping execution on
-/// ironquill's side is what makes the verdict of a check trustworthy.
+/// universe's side is what makes the verdict of a check trustworthy.
 #[derive(Debug)]
 pub struct Toolbox {
     workspace: Workspace,

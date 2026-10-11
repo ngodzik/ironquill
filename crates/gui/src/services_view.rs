@@ -12,8 +12,8 @@ use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
-use ironquill_codemap::{CodeMap, Place, Services, ToolKind, Via};
-use ironquill_ui::{App, MapView};
+use universe_codemap::{CodeMap, Place, Services, ToolKind, Via};
+use universe_ui::{App, MapView};
 
 use crate::api_view::{self, ApiView};
 use crate::infra::Infra;
@@ -230,7 +230,7 @@ pub(crate) fn show(
     };
     let combined = infra
         .view()
-        .map(|v| ironquill_codemap::with_cloud(&map.services, &v.deployment));
+        .map(|v| universe_codemap::with_cloud(&map.services, &v.deployment));
     let services = combined.as_ref().unwrap_or(&map.services);
     let room_top = bar(ui, rect, view, infra);
     if view.mode == Mode::Architecture {
@@ -1038,7 +1038,7 @@ fn configuration(
         }
         ui.add_space(6.0);
         let filter = view.filter.to_lowercase();
-        let shown: Vec<&ironquill_codemap::Setting> = release
+        let shown: Vec<&universe_codemap::Setting> = release
             .settings
             .iter()
             .filter(|s| {
@@ -1136,7 +1136,7 @@ let value = ui
             // What the tools rendered of it: each object, where it was
             // declared and what changed it after.
             if let Some(rendered) = infra.view().map(|v| &v.rendered) {
-                let objects: Vec<&ironquill_codemap::Object> = rendered
+                let objects: Vec<&universe_codemap::Object> = rendered
                     .objects
                     .iter()
                     .filter(|o| o.service.as_deref() == Some(release.label.as_str()))
@@ -1198,7 +1198,7 @@ let value = ui
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironquill_codemap::{Service, ServiceLink};
+    use universe_codemap::{Service, ServiceLink};
 
     fn service(name: &str) -> Service {
         Service {

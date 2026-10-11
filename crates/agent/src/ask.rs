@@ -1,9 +1,7 @@
 //! One question to the cheapest model: for what needs no strong model,
 //! such as judging a command or explaining a few lines of code.
 
-use ironquill_core::{
-    ChatModel, ChatRequest, Effort, Message, ModelId, Pricing, TokenCount, Usage,
-};
+use universe_core::{ChatModel, ChatRequest, Effort, Message, ModelId, Pricing, TokenCount, Usage};
 
 use crate::event::{Event, Purpose};
 
@@ -53,7 +51,7 @@ pub struct Answered {
     /// What it used.
     pub usage: Usage,
     /// What it cost, when the provider says.
-    pub cost: Option<ironquill_core::Usd>,
+    pub cost: Option<universe_core::Usd>,
 }
 
 /// Asks `to` one question, without tools, telling `observe` what the call
@@ -110,7 +108,7 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Mutex;
 
-    use ironquill_core::{ChatResponse, Usd};
+    use universe_core::{ChatResponse, Usd};
 
     use super::*;
 

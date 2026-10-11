@@ -8,7 +8,7 @@
 /// # Examples
 ///
 /// ```
-/// use ironquill_ui::search_matches;
+/// use universe_ui::search_matches;
 ///
 /// assert!(search_matches("", ["anything"]));
 /// assert!(search_matches("GUI univ", ["crates/gui/src/universe.rs"]));

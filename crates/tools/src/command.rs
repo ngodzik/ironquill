@@ -47,7 +47,7 @@ pub struct Assessment {
 /// How strictly a command is read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Policy {
-    /// A program ironquill has no rule for waits too.
+    /// A program universe has no rule for waits too.
     pub strict: bool,
     /// The servers a command may reach without asking, as `host` or
     /// `*.domain`; `None` checks no server.
@@ -102,7 +102,7 @@ pub fn assess(command: &str, root: &Path, policy: &Policy) -> Assessment {
             }
         }
     }
-    // Strict: what ironquill does not know waits too.
+    // Strict: what universe does not know waits too.
     if strict {
         for (segment, _) in segments(command) {
             let all = words(&segment);
@@ -113,7 +113,7 @@ pub fn assess(command: &str, root: &Path, policy: &Policy) -> Assessment {
                 && !found.held.iter().any(|r| r.contains(program))
             {
                 found.held.push(format!(
-                    "in strict mode, {program} is not a program ironquill knows"
+                    "in strict mode, {program} is not a program universe knows"
                 ));
             }
         }
@@ -123,7 +123,7 @@ pub fn assess(command: &str, root: &Path, policy: &Policy) -> Assessment {
     found
 }
 
-/// The programs ironquill knows, in strict mode: those it has rules for,
+/// The programs universe knows, in strict mode: those it has rules for,
 /// those that only read, and the project's usual tools.
 const KNOWN: &[&str] = &[
     // Reading and looking around.
@@ -668,7 +668,7 @@ const PROTECTED: [&str; 16] = [
     ".zprofile",
     ".profile",
     ".config/fish",
-    ".ironquill/",
+    ".universe/",
     ".claude/",
     ".codex/",
     "/etc/",
@@ -2132,7 +2132,7 @@ mod tests {
         };
         assert_eq!(
             strict("mysterytool --all"),
-            ["in strict mode, mysterytool is not a program ironquill knows"]
+            ["in strict mode, mysterytool is not a program universe knows"]
         );
         assert!(strict("ls -la && git status && kubectl get pods").is_empty());
         assert!(held("mysterytool --all").is_empty());
@@ -2274,7 +2274,7 @@ mod tests {
         let all: Vec<(OsString, OsString)> = std::env::vars_os()
             .chain(
                 [
-                    ("IRONQUILL_TEST_TOKEN", "t0k3n-value"),
+                    ("UNIVERSE_TEST_TOKEN", "t0k3n-value"),
                     ("AWS_SECRET_ACCESS_KEY", "aws-secret-value"),
                 ]
                 .map(|(n, v)| (OsString::from(n), OsString::from(v))),
@@ -2288,18 +2288,15 @@ mod tests {
             async move { run_in(command, &dir, env, &all).await.unwrap().output }
         };
         // Not allowed: not there.
-        assert_eq!(
-            run("echo \"[$IRONQUILL_TEST_TOKEN]\"", vec![]).await,
-            "[]\n"
-        );
+        assert_eq!(run("echo \"[$UNIVERSE_TEST_TOKEN]\"", vec![]).await, "[]\n");
         // Allowed: there, and taken out of what it prints.
         assert_eq!(
             run(
-                "echo \"[$IRONQUILL_TEST_TOKEN]\"",
-                vec!["IRONQUILL_TEST_TOKEN".into()]
+                "echo \"[$UNIVERSE_TEST_TOKEN]\"",
+                vec!["UNIVERSE_TEST_TOKEN".into()]
             )
             .await,
-            "[<redacted:IRONQUILL_TEST_TOKEN>]\n"
+            "[<redacted:UNIVERSE_TEST_TOKEN>]\n"
         );
         // A program that reads its own keys gets them; others do not.
         let aws = environment(&all, "aws s3 ls", Path::new("/nonexistent"), &[]);

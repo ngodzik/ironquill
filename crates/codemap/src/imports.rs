@@ -18,7 +18,7 @@ static RUST_USE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([A-Za-z_]\w*)((?:::[A-Za-z_]\w*)*)").ok()
 });
 /// A path through a crate written in code rather than imported:
-/// `ironquill_gui::run(..)`.
+/// `universe_gui::run(..)`.
 static RUST_PATH: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"(?:^|[^\w:])([A-Za-z_]\w*)::").ok());
 static PY_FROM: LazyLock<Option<Regex>> =
@@ -95,7 +95,7 @@ impl Index {
 }
 
 /// The workspace's Rust crates, by the name code uses for them
-/// (`ironquill_ui`), with the file their path starts from.
+/// (`universe_ui`), with the file their path starts from.
 fn rust_crates(root: &Path, index: &Index) -> HashMap<String, String> {
     let Some(name) = CARGO_NAME.as_ref() else {
         return HashMap::new();

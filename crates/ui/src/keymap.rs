@@ -117,7 +117,7 @@ pub enum Action {
     FocusRight,
     /// Stop the running request.
     Cancel,
-    /// Leave ironquill.
+    /// Leave universe.
     Quit,
     /// Copy the selected reply, or command and its output.
     CopySelected,

@@ -382,9 +382,9 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use ironquill_agent::{Outcome, Verdict};
-    use ironquill_core::{ModelId, Usage, Usd};
-    use ironquill_tools::Check;
+    use universe_agent::{Outcome, Verdict};
+    use universe_core::{ModelId, Usage, Usd};
+    use universe_tools::Check;
 
     use super::*;
     use crate::app::{AgentMessage, Settings};

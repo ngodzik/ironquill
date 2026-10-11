@@ -6,7 +6,7 @@
 //! opens its model.
 //!
 //! The models are read on a thread of their own, from the files the plan
-//! read, by `ironquill-codemap`: never run, and the window never waits.
+//! read, by `universe-codemap`: never run, and the window never waits.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,8 +17,8 @@ use bevy_egui::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Rect, RichText, ScrollArea,
     Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
-use ironquill_codemap::{Delta, NodeKind, Schema, Table};
-use ironquill_ui::App;
+use universe_codemap::{Delta, NodeKind, Schema, Table};
+use universe_ui::App;
 
 use crate::plan::Plan;
 use crate::review_view::ReviewView;
@@ -124,7 +124,7 @@ fn read(root: &Path, paths: &[String]) -> Schema {
             defines.then(|| (path.clone(), text))
         })
         .collect();
-    ironquill_codemap::schema(&files)
+    universe_codemap::schema(&files)
 }
 
 /// The columns a card lists, by their place in the table: the primary key
@@ -395,7 +395,7 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, review: &ReviewView, ap
         .iter()
         .map(|t| {
             let searched = query.is_empty()
-                || ironquill_ui::search_matches(
+                || universe_ui::search_matches(
                     &query,
                     [
                         t.name.as_str(),
@@ -858,7 +858,7 @@ mod tests {
     use super::*;
 
     fn schema(text: &str) -> Schema {
-        ironquill_codemap::schema(&[("models.py".to_owned(), text.to_owned())])
+        universe_codemap::schema(&[("models.py".to_owned(), text.to_owned())])
     }
 
     #[test]

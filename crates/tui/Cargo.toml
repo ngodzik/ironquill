@@ -1,16 +1,16 @@
 [package]
-name    = "ironquill-tui"
+name    = "universe-tui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The ironquill terminal interface: draws the interface's state with Ratatui."
+description = "The universe terminal interface: draws the interface's state with Ratatui."
 
 [dependencies]
-ironquill-core.workspace  = true
-ironquill-tools.workspace = true
-ironquill-agent.workspace = true
-ironquill-ui.workspace    = true
+universe-core.workspace  = true
+universe-tools.workspace = true
+universe-agent.workspace = true
+universe-ui.workspace    = true
 thiserror.workspace       = true
 ratatui.workspace         = true
 crossterm.workspace       = true

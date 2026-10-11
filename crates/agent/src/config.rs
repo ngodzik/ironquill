@@ -3,8 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use ironquill_core::{Effort, ModelId, Usd};
-use ironquill_tools::Check;
+use universe_core::{Effort, ModelId, Usd};
+use universe_tools::Check;
 
 use crate::error::AgentError;
 
@@ -185,9 +185,9 @@ impl AgentConfig {
     /// # Examples
     ///
     /// ```
-    /// use ironquill_agent::AgentConfig;
-    /// use ironquill_core::{ModelId, Usd};
-    /// use ironquill_tools::Check;
+    /// use universe_agent::AgentConfig;
+    /// use universe_core::{ModelId, Usd};
+    /// use universe_tools::Check;
     ///
     /// let config = AgentConfig::builder()
     ///     .tier(ModelId::new("cheap/model")?)
@@ -234,7 +234,7 @@ impl AgentConfig {
         self
     }
 
-    /// Whether a command running a program ironquill does not know waits
+    /// Whether a command running a program universe does not know waits
     /// for the person too.
     pub fn with_strict_commands(mut self, strict: bool) -> Self {
         self.strict_commands = strict;

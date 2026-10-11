@@ -1,8 +1,8 @@
 //! What the agent touched, read from the conversation, for the codebase
 //! views to light up.
 
-use ironquill_tools::ToolSummary;
-use ironquill_ui::Entry;
+use universe_tools::ToolSummary;
+use universe_ui::Entry;
 
 /// The files the tool calls of `entries` read or edited, in order, with
 /// whether each was edited. A sub-agent's calls count as the agent's.

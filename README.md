@@ -4,8 +4,6 @@
 
 **An experimental coding agent. It is not stable, it comes with no guarantee of any kind, and it changes all the time.**
 
-The program is still called `ironquill` (its binary, its crates, `~/.ironquill`); that may change too.
-
 ## Read this first
 
 This is a personal experiment, not a product.
@@ -39,18 +37,18 @@ All of it experimental, all of it likely to change.
 ```bash
 export REQUESTY_API_KEY=...         # without one, only Claude Code and Codex answer
 cd your-project
-ironquill                           # in the terminal
-ironquill --gui                     # in a window
+universe                           # in the terminal
+universe --gui                     # in a window
 ```
 
-Settings live in `~/.ironquill/config.toml`, and a project's own (linked repositories, environments) in `~/.ironquill/projects/<folder>.toml`.
+Settings live in `~/.universe/config.toml`, and a project's own (linked repositories, environments) in `~/.universe/projects/<folder>.toml`.
 
 ## Building
 
 On Linux the window needs Wayland's client library: `sudo apt install libwayland-dev` on Debian and Ubuntu.
 
 ```bash
-cargo install --path .              # builds the ironquill binary into ~/.cargo/bin
+cargo install --path .              # builds the universe binary into ~/.cargo/bin
 scripts/check.sh                    # what CI runs: formatting, lints, docs, tests, dependency audit
 git config core.hooksPath .githooks # run those checks before every commit
 ```

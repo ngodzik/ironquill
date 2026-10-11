@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use ironquill_tools::{Change, ChangedFile};
+use universe_tools::{Change, ChangedFile};
 
 /// Why the changes are looked at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +60,7 @@ impl ChangeSet {
             Some(base) => base.to_owned(),
             // What is not committed yet.
             None if lens == Lens::Walk => "HEAD".to_owned(),
-            None => ironquill_tools::branch_base(root).ok_or_else(|| {
+            None => universe_tools::branch_base(root).ok_or_else(|| {
                 format!(
                     "Nothing to compare with: this branch is where main is. /{} <commit or \
                      branch> compares with that",
@@ -68,9 +68,9 @@ impl ChangeSet {
                 )
             })?,
         };
-        let files = ironquill_tools::changed_files(root, &base)
+        let files = universe_tools::changed_files(root, &base)
             .ok_or_else(|| format!("{base} is not a commit of this repository"))?;
-        let base_line = ironquill_tools::commit_line(root, &base).unwrap_or_else(|| base.clone());
+        let base_line = universe_tools::commit_line(root, &base).unwrap_or_else(|| base.clone());
         Ok(Self {
             lens,
             base,

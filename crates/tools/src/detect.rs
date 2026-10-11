@@ -1,5 +1,5 @@
 //! Finding how to test a project when nobody said, from its files: what a
-//! person would run, for the languages ironquill knows.
+//! person would run, for the languages universe knows.
 
 use std::collections::BTreeMap;
 use std::fs;

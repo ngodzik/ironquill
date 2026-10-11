@@ -1,13 +1,13 @@
 [package]
-name    = "ironquill-llm"
+name    = "universe-llm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Model providers for ironquill, starting with OpenAI compatible endpoints."
+description = "Model providers for universe, starting with OpenAI compatible endpoints."
 
 [dependencies]
-ironquill-core.workspace = true
+universe-core.workspace = true
 thiserror.workspace      = true
 serde.workspace          = true
 serde_json.workspace     = true

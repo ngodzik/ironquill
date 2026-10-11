@@ -1,6 +1,6 @@
 //! The `:` commands.
 
-use ironquill_core::{Agent, Effort};
+use universe_core::{Agent, Effort};
 
 /// A parsed `:` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub(crate) enum Command {
     /// `/secrets` lists the secrets commands may use; `/secrets forget
     /// <name>` takes one back.
     Secrets(Option<String>),
-    /// `/strict [on|off]`: whether a program ironquill does not know asks.
+    /// `/strict [on|off]`: whether a program universe does not know asks.
     Strict(Option<String>),
     /// `/hosts` lists the servers allowed besides the known ones; `/hosts
     /// forget <host>` takes one back.
@@ -218,7 +218,7 @@ pub(crate) const NAMES: &[&str] = &[
     "bg",
 ];
 
-/// Commands of the Vim editor, completed on top of ironquill's inside a file.
+/// Commands of the Vim editor, completed on top of universe's inside a file.
 pub(crate) const EDITOR_NAMES: &[&str] = &["e!", "q!", "w", "wq", "x"];
 
 /// Where Tab completion stands while it cycles through several candidates.
@@ -336,14 +336,14 @@ Type a question or a change and press Enter. Changes are checked before they are
 /claude <task>       hand one task to Claude Code, told what it missed of this conversation
 /codex <task>        the same with Codex, which runs commands in its sandbox, without network
 /instructions        your own instructions for every model, in every project, kept
-                     in ~/.ironquill/instructions.md; :w saves, the next request
+                     in ~/.universe/instructions.md; :w saves, the next request
                      uses them
 /copy                the conversation as text in the editor: v or V selects,
                      y copies to the clipboard, :q closes
 /context             edit what the next request sends: delete, shorten, annotate; :w applies
 /claude-reset        end Claude Code's session: its next request starts from nothing
 /codex-reset         end Codex's session
-/escalate <id> ...   stronger models for `ironquill do`, when the checks keep failing
+/escalate <id> ...   stronger models for `universe do`, when the checks keep failing
 /check <command>     a check offered to /pair's planner, run without a shell;
                      /check alone lists them. A request in the chat runs none
 /nocheck             remove every check
@@ -371,13 +371,13 @@ Type a question or a change and press Enter. Changes are checked before they are
                      conversation, t ties it to this one, d deletes it
 /name <title>        name this conversation (it is saved after every request)
 /resume [id]         continue a saved conversation: pick it, or give its id or
-                     the start of it (ironquill -c: the last one, -r <id>)
+                     the start of it (universe -c: the last one, -r <id>)
 /cost                what this conversation has cost
 /usage [1h|6h|24h]   a pane of cost per model, context and cache rebuilds over time
 /secrets             the secrets commands may use; /secrets forget <name>
-/strict [on|off]     whether a program ironquill does not know asks first (on)
+/strict [on|off]     whether a program universe does not know asks first (on)
 /hosts               servers allowed besides those already used; /hosts forget
-                     (every command is written down in ~/.ironquill/audit.log)
+                     (every command is written down in ~/.universe/audit.log)
 /q                   quit
 Files: Ctrl-B, or Esc then ,n, shows the file tree. Arrows move, → or Enter opens,
   ← closes a folder, q hides the pane. Files the agent changed are marked ●.

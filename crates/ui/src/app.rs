@@ -4,13 +4,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ironquill_agent::{
+use tokio::sync::oneshot;
+use universe_agent::{
     AgentConfig, Answer, Approval, Compaction, Event, Member, Outcome, Pair, Question, Session,
     Verdict,
 };
-use ironquill_core::{Agent, CacheTtl, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
-use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
-use tokio::sync::oneshot;
+use universe_core::{Agent, CacheTtl, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
+use universe_tools::{Check, Container, DiffLine, ToolSummary};
 
 use crate::blocks;
 use crate::command::{self, Command};
@@ -136,7 +136,7 @@ pub struct Settings {
     /// The secrets of the environment commands may use, as the person
     /// allowed them.
     pub allowed_secrets: Vec<String>,
-    /// Whether a command running a program ironquill does not know asks.
+    /// Whether a command running a program universe does not know asks.
     pub strict_commands: bool,
     /// Servers commands may reach besides those already used.
     pub allowed_hosts: Vec<String>,
@@ -363,7 +363,7 @@ pub struct Found {
     /// Whether its uses were looked for, rather than its definition.
     pub uses: bool,
     /// The places, the likeliest first.
-    pub places: Vec<ironquill_tools::Definition>,
+    pub places: Vec<universe_tools::Definition>,
     /// What found them: a language server, or `git grep`.
     pub by: String,
 }
@@ -396,7 +396,7 @@ pub enum AgentMessage {
     /// The model that answers while walking; `None` when none is priced.
     WalkModel(Option<ModelId>),
     /// The answer to a question asked while walking, or why there is none.
-    WalkAnswer(Result<ironquill_agent::Answered, String>),
+    WalkAnswer(Result<universe_agent::Answered, String>),
 }
 
 /// One item in the transcript. Saved with the conversation, so that a
@@ -405,7 +405,7 @@ pub enum AgentMessage {
 pub enum Entry {
     /// The greeting a new conversation opens with.
     Welcome,
-    /// A note from ironquill itself.
+    /// A note from universe itself.
     Info(String),
     /// How a pair ended, who did what and what changed, in one line.
     Ended(String),
@@ -1036,7 +1036,7 @@ pub struct DefinitionChoice {
     /// What found them.
     pub by: String,
     /// Where it is defined, the most likely first.
-    pub items: Vec<ironquill_tools::Definition>,
+    pub items: Vec<universe_tools::Definition>,
     /// The one chosen, by its place.
     pub selected: usize,
 }
@@ -1342,7 +1342,7 @@ impl App {
     }
 
     /// Goes to a definition found, remembering where it left from.
-    fn go_to_found(&mut self, found: ironquill_tools::Definition) {
+    fn go_to_found(&mut self, found: universe_tools::Definition) {
         if let Some(here) = self.here() {
             self.back.push(here);
             self.ahead.clear();
@@ -1506,7 +1506,7 @@ impl App {
             .files
             .iter()
             .map(|f| PathBuf::from(&f.path))
-            .filter(|p| ironquill_tools::Servers::program_for(p).is_some())
+            .filter(|p| universe_tools::Servers::program_for(p).is_some())
             .collect()
     }
 
@@ -1566,7 +1566,7 @@ impl App {
             self.error("Still answering the last question: wait for it");
             return None;
         }
-        let (text, _) = ironquill_tools::redact_secrets(&text);
+        let (text, _) = universe_tools::redact_secrets(&text);
         let mut question = WalkQuestion {
             text: text.clone(),
             path: None,
@@ -1613,8 +1613,8 @@ impl App {
             .to_string_lossy()
             .into_owned();
         match changes.find(&path).map(|f| &f.change) {
-            Some(ironquill_tools::Change::Deleted) => file.show_deleted(changes.base.clone()),
-            Some(ironquill_tools::Change::Renamed { from }) => {
+            Some(universe_tools::Change::Deleted) => file.show_deleted(changes.base.clone()),
+            Some(universe_tools::Change::Renamed { from }) => {
                 file.compare_with_moved(changes.base.clone(), PathBuf::from(from));
             }
             _ => file.compare_with(changes.base.clone()),
@@ -1646,7 +1646,7 @@ impl App {
         self.panes.set(panes);
     }
 
-    /// The checks a request is judged by, for `ironquill do` and pairs.
+    /// The checks a request is judged by, for `universe do` and pairs.
     pub fn checks(&self) -> &[Check] {
         &self.settings.checks
     }
@@ -2248,7 +2248,7 @@ impl App {
             if let Reference::Commit(hash) = &reference
                 && !self.known_references.borrow().contains_key(&reference)
             {
-                let exists = ironquill_tools::is_commit(&self.root, hash);
+                let exists = universe_tools::is_commit(&self.root, hash);
                 self.known_references.borrow_mut().insert(reference, exists);
             }
         }
@@ -2272,7 +2272,7 @@ impl App {
         let highlighter = Rc::clone(self.highlighter.get_or_init(|| Rc::new(Highlighter::new())));
         self.unzoom();
         let mut editor = Editor::open(&self.root, self.root.join(path), highlighter);
-        if let Some(base) = ironquill_tools::branch_base(&self.root) {
+        if let Some(base) = universe_tools::branch_base(&self.root) {
             editor.compare_with(base);
         }
         if let Some(line) = line {
@@ -2599,7 +2599,7 @@ impl App {
         }
         // A secret pasted with a log does not reach a model, nor the saved
         // conversation.
-        let (text, secrets) = ironquill_tools::redact_secrets(&text);
+        let (text, secrets) = universe_tools::redact_secrets(&text);
         if !secrets.is_empty() {
             self.info(format!(
                 "Took the value of {} out of the message",
@@ -2922,9 +2922,9 @@ impl App {
                     }
                 }
                 self.info(if self.settings.strict_commands {
-                    "Strict: a command running a program ironquill does not know asks first"
+                    "Strict: a command running a program universe does not know asks first"
                 } else {
-                    "Not strict: what ironquill does not know runs, unless it looks dangerous"
+                    "Not strict: what universe does not know runs, unless it looks dangerous"
                 });
             }
             Command::Secrets(None) => self.info(if self.settings.allowed_secrets.is_empty() {
@@ -3760,7 +3760,7 @@ impl App {
 
     fn open_model_picker(&mut self) {
         if self.models().is_empty() && self.settings.catalog.is_empty() {
-            self.error("No model configured: start with --model, or set IRONQUILL_MODELS");
+            self.error("No model configured: start with --model, or set UNIVERSE_MODELS");
             return;
         }
         let selected = self
@@ -4860,7 +4860,7 @@ fn first_sentence(text: &str) -> &str {
     text.find(". ").map_or(text, |end| &text[..end])
 }
 
-/// `3/4 Planning · tensorx/glm-5.3 · effort high`, or `by ironquill`.
+/// `3/4 Planning · tensorx/glm-5.3 · effort high`, or `by universe`.
 pub fn step_title(
     number: u8,
     of: u8,
@@ -4871,7 +4871,7 @@ pub fn step_title(
     let who = match (model, effort) {
         (Some(model), Some(effort)) => format!("{model} · effort {effort}"),
         (Some(model), None) => model.to_string(),
-        (None, _) => "by ironquill, no model".to_owned(),
+        (None, _) => "by universe, no model".to_owned(),
     };
     // A step outside the numbered ones, such as the summary at the end.
     if of == 0 {
@@ -4945,7 +4945,7 @@ mod tests {
 
     #[test]
     fn the_usage_pane_shows_what_each_model_used() {
-        use ironquill_core::CacheUse;
+        use universe_core::CacheUse;
         let mut app = ready();
         for (model, cost, written) in [("glm", 0.01, 500), ("opus", 0.2, 9_000), ("glm", 0.01, 400)]
         {
@@ -4966,7 +4966,7 @@ mod tests {
                     written: Some(TokenCount(written)),
                     rewrite_extra: None,
                 }),
-                purpose: ironquill_agent::Purpose::Chat,
+                purpose: universe_agent::Purpose::Chat,
             }));
         }
         type_text(&mut app, "/usage 6h");
@@ -5267,7 +5267,7 @@ mod tests {
 
     #[test]
     fn compact_lets_the_person_pick_what_to_keep() {
-        use ironquill_agent::Subject;
+        use universe_agent::Subject;
         let mut app = ready();
         type_text(&mut app, "/compact");
         assert!(matches!(
@@ -5434,7 +5434,7 @@ mod tests {
                 subscription: false,
                 context: None,
                 cache: None,
-                purpose: ironquill_agent::Purpose::Chat,
+                purpose: universe_agent::Purpose::Chat,
             }));
         }
         let (usage, cost, complete) = app.totals();
@@ -5667,7 +5667,7 @@ mod tests {
         assert!(app.walk_asking());
         assert!(!app.is_running(), "the agent is not asked");
 
-        app.on_agent(AgentMessage::WalkAnswer(Ok(ironquill_agent::Answered {
+        app.on_agent(AgentMessage::WalkAnswer(Ok(universe_agent::Answered {
             text: "A rename.".into(),
             model: ModelId::new("glm").unwrap(),
             usage: Usage::default(),
@@ -5718,7 +5718,7 @@ mod tests {
         );
         assert_eq!(lookup.path, PathBuf::from("b.py"));
         let lines: Vec<String> = lookup.text.lines().map(str::to_owned).collect();
-        let places = ironquill_tools::definitions(&app.root, "f", &lookup.path, &lines);
+        let places = universe_tools::definitions(&app.root, "f", &lookup.path, &lines);
         app.on_agent(AgentMessage::Found(Found {
             name: "f".into(),
             uses: false,
@@ -5756,7 +5756,7 @@ mod tests {
             panic!("gr asks the loop to find, not {effect:?}");
         };
         assert!(lookup.uses);
-        let places = ironquill_tools::uses(&app.root, "f");
+        let places = universe_tools::uses(&app.root, "f");
         assert_eq!(places.len(), 4);
         app.on_agent(AgentMessage::Found(Found {
             name: "f".into(),
@@ -5870,7 +5870,7 @@ mod tests {
             subscription: false,
             context: None,
             cache: None,
-            purpose: ironquill_agent::Purpose::Chat,
+            purpose: universe_agent::Purpose::Chat,
         }));
         let finished = app.on_agent(AgentMessage::Done(Ok(Outcome {
             verdict: Verdict::Answered,
@@ -6162,7 +6162,7 @@ mod tests {
                 subscription: false,
                 context: None,
                 cache: None,
-                purpose: ironquill_agent::Purpose::Chat,
+                purpose: universe_agent::Purpose::Chat,
             })
         };
         app.on_agent(AgentMessage::Event(Event::Delegating {
@@ -6181,7 +6181,7 @@ mod tests {
             subscription: false,
             context: None,
             cache: None,
-            purpose: ironquill_agent::Purpose::Chat,
+            purpose: universe_agent::Purpose::Chat,
         }));
         app.on_agent(AgentMessage::Event(Event::Said {
             model: id("strong"),
@@ -6332,7 +6332,7 @@ mod tests {
         app.settings.planner = Some(id("smart"));
 
         // A real case: the only cheaper model cannot use tools. The best
-        // still plans, and ironquill says why nobody can code rather than
+        // still plans, and universe says why nobody can code rather than
         // swapping the roles.
         let no_tools = Member {
             tools: false,
@@ -6376,7 +6376,7 @@ mod tests {
                 subscription: false,
                 context: None,
                 cache: None,
-                purpose: ironquill_agent::Purpose::Chat,
+                purpose: universe_agent::Purpose::Chat,
             })
         };
         type_text(&mut app, "do it");
@@ -6468,7 +6468,7 @@ mod tests {
             subscription: true,
             context: None,
             cache: None,
-            purpose: ironquill_agent::Purpose::Chat,
+            purpose: universe_agent::Purpose::Chat,
         }));
         let (usage, cost, complete) = app.totals();
         assert_eq!(usage.input, TokenCount(30_000));

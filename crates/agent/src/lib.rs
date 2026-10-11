@@ -1,7 +1,7 @@
-//! The ironquill loop.
+//! The universe loop.
 //!
-//! A model edits files through the [`Toolbox`](ironquill_tools::Toolbox).
-//! When it says it is done, ironquill runs the checks itself. If they pass,
+//! A model edits files through the [`Toolbox`](universe_tools::Toolbox).
+//! When it says it is done, universe runs the checks itself. If they pass,
 //! the session ends. If they fail, the same model gets the failure and another
 //! round; after its rounds are spent, the next model in the list starts from a
 //! short brief rather than the whole conversation, which keeps a strong model

@@ -1,10 +1,10 @@
-//! Model providers for ironquill.
+//! Model providers for universe.
 //!
 //! The first provider speaks the OpenAI compatible chat completions protocol,
 //! which routers such as Requesty or OpenRouter expose for hundreds of models
 //! behind one key. Providers for other protocols are added next to it, each as
-//! an implementation of [`ironquill_core::ChatModel`]. Claude Code and Codex,
-//! agents rather than models, implement [`ironquill_core::Delegate`].
+//! an implementation of [`universe_core::ChatModel`]. Claude Code and Codex,
+//! agents rather than models, implement [`universe_core::Delegate`].
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

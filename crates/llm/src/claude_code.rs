@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use ironquill_core::{
-    CacheUse, ContextUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount,
-    Usage, Usd,
-};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
+use universe_core::{
+    CacheUse, ContextUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, TokenCount,
+    Usage, Usd,
+};
 
 use crate::error::LlmError;
 use crate::prices::{PriceTable, Tokens};
@@ -28,8 +28,8 @@ const STDERR_LIMIT: usize = 4_000;
 /// The Claude Code command line, run as an agent tasks are handed to.
 ///
 /// It runs the `claude` program installed on the machine, as published, with
-/// the person's own login: ironquill never reads or stores credentials. Each
-/// task is a fresh Claude Code session that knows nothing of ironquill's
+/// the person's own login: universe never reads or stores credentials. Each
+/// task is a fresh Claude Code session that knows nothing of universe's
 /// conversation; a follow-up, such as a failing check, continues that session.
 #[derive(Debug, Clone)]
 pub struct ClaudeCode {
@@ -668,8 +668,8 @@ mod tests {
     #[test]
     fn the_command_line_hands_over_the_task_with_its_own_safety_checks() {
         let request = DelegateRequest {
-            agent: ironquill_core::Agent::ClaudeCode,
-            effort: Some(ironquill_core::Effort::Max),
+            agent: universe_core::Agent::ClaudeCode,
+            effort: Some(universe_core::Effort::Max),
             model: "opus".into(),
             prompt: "fix it".into(),
             instructions: "be brief".into(),

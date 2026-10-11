@@ -77,7 +77,7 @@ struct Known {
 pub(crate) struct Gallery {
     terminal: Option<Terminal>,
     renderer: Option<Renderer>,
-    /// Where drawn diagrams are kept: `~/.ironquill/cache/diagrams`.
+    /// Where drawn diagrams are kept: `~/.universe/cache/diagrams`.
     cache: Option<PathBuf>,
     root: PathBuf,
     /// The size of a cell in pixels.
@@ -401,7 +401,7 @@ mod tests {
     }
 
     fn kitty() -> Option<Terminal> {
-        graphics::detect(ironquill_ui::defaults::Images::Kitty, |_| None)
+        graphics::detect(universe_ui::defaults::Images::Kitty, |_| None)
     }
 
     #[test]

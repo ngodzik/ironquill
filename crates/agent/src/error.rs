@@ -1,5 +1,5 @@
-use ironquill_tools::ToolError;
 use thiserror::Error;
+use universe_tools::ToolError;
 
 /// What stops a session before it reaches a verdict.
 ///

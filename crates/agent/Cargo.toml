@@ -1,14 +1,14 @@
 [package]
-name    = "ironquill-agent"
+name    = "universe-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The ironquill loop: a model edits, deterministic checks judge, a stronger model is called only on failure."
+description = "The universe loop: a model edits, deterministic checks judge, a stronger model is called only on failure."
 
 [dependencies]
-ironquill-core.workspace  = true
-ironquill-tools.workspace = true
+universe-core.workspace  = true
+universe-tools.workspace = true
 thiserror.workspace       = true
 serde.workspace           = true
 serde_json.workspace      = true

@@ -234,7 +234,7 @@ pub(crate) fn worth(path: &Path) -> u8 {
 /// std::fs::create_dir(dir.path().join("src")).unwrap();
 /// std::fs::write(dir.path().join("src/lib.rs"), "mod a;\n").unwrap();
 /// std::fs::write(dir.path().join("src/a.rs"), "").unwrap();
-/// let map = ironquill_codemap::map(dir.path(), 100);
+/// let map = universe_codemap::map(dir.path(), 100);
 /// let lib = map.find("src/lib.rs").unwrap();
 /// let a = map.find("src/a.rs").unwrap();
 /// assert!(map.edges.iter().any(|e| e.from == lib && e.to == a));
@@ -254,7 +254,7 @@ pub fn map(root: &Path, limit: usize) -> CodeMap {
 /// let dir = tempfile::tempdir().unwrap();
 /// std::fs::write(dir.path().join("a.rs"), "").unwrap();
 /// std::fs::write(dir.path().join("notes.md"), "").unwrap();
-/// let map = ironquill_codemap::map_with(dir.path(), 1, &["notes.md".to_owned()]);
+/// let map = universe_codemap::map_with(dir.path(), 1, &["notes.md".to_owned()]);
 /// assert!(map.find("notes.md").is_some());
 /// assert!(map.find("a.rs").is_none());
 /// ```

@@ -1,4 +1,4 @@
-//! Domain types and traits shared by every ironquill crate.
+//! Domain types and traits shared by every universe crate.
 //!
 //! This crate does no I/O and knows nothing about any particular provider.
 //! Everything that talks to the network or the filesystem lives in a crate

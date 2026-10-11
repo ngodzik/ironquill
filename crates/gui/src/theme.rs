@@ -4,7 +4,7 @@
 use bevy_egui::egui::{
     self, Color32, CornerRadius, FontFamily, FontId, Margin, Stroke, TextStyle, Visuals,
 };
-use ironquill_ui::style::Rgb;
+use universe_ui::style::Rgb;
 
 /// Behind everything: what the GPU clears to.
 pub(crate) const BACKGROUND: Color32 = Color32::from_rgb(11, 13, 18);

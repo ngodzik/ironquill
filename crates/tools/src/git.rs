@@ -9,7 +9,7 @@ async fn git(dir: &Path, args: &[&str]) -> Result<String, ToolError> {
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
-        // The repository of the directory given, whatever started ironquill.
+        // The repository of the directory given, whatever started universe.
         .env_remove("GIT_DIR")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_WORK_TREE")
@@ -188,7 +188,7 @@ mod tests {
         std::fs::write(dir.path().join("README.md"), "").unwrap();
         std::fs::write(dir.path().join("target/debug/app"), "").unwrap();
         std::fs::write(dir.path().join(".hidden/x"), "").unwrap();
-        std::fs::write(dir.path().join("ironquill"), [0x7f, b'E', b'L', b'F', 0]).unwrap();
+        std::fs::write(dir.path().join("universe"), [0x7f, b'E', b'L', b'F', 0]).unwrap();
 
         let files = project_files(dir.path(), 100).await;
 

@@ -1,6 +1,6 @@
-//! The ironquill window: the interface's state drawn on the GPU.
+//! The universe window: the interface's state drawn on the GPU.
 //!
-//! The state, the keys and what each does live in `ironquill-ui`, and the
+//! The state, the keys and what each does live in `universe-ui`, and the
 //! effects are carried out by its `Host`, as in the terminal. This crate
 //! only:
 //! - reads the window's keys and hands them to the state (`keys`);
@@ -51,15 +51,15 @@ use bevy_egui::{
     EguiContexts, EguiGlobalSettings, EguiInput, EguiInputSet, EguiPlugin, EguiPreUpdateSet,
     EguiPrimaryContextPass, PrimaryEguiContext,
 };
-use ironquill_codemap::NodeKind;
-use ironquill_core::{ChatModel, Delegate};
-use ironquill_tools::Workspace;
-use ironquill_ui::backdrop::Motion;
-use ironquill_ui::editor::{EditorMode, ScreenRow};
-use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
-use ironquill_ui::keymap::{Focus, Mode, Pending};
-use ironquill_ui::{App, Effect, Host, MapView, Settings, Start, Waiting, clipboard};
 use tokio::runtime::Handle;
+use universe_codemap::NodeKind;
+use universe_core::{ChatModel, Delegate};
+use universe_tools::Workspace;
+use universe_ui::backdrop::Motion;
+use universe_ui::editor::{EditorMode, ScreenRow};
+use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
+use universe_ui::keymap::{Focus, Mode, Pending};
+use universe_ui::{App, Effect, Host, MapView, Settings, Start, Waiting, clipboard};
 
 pub use error::GuiError;
 
@@ -125,7 +125,7 @@ where
     let mut app = App::new(settings, workspace.root().to_owned());
     let mut host = Host::new(model, delegate, workspace);
     runtime.block_on(host.start(&mut app, start));
-    let title = format!("{} · ironquill", app.name());
+    let title = format!("{} · universe", app.name());
     let universe = Universe::new(app.root().to_owned());
     let plan = Plan::new(app.root().to_owned());
     let shell = Shell {
@@ -453,7 +453,7 @@ fn drive<M, D>(
     }
     shell.carry_out(None);
 
-    let title = format!("{} · ironquill", shell.app.name());
+    let title = format!("{} · universe", shell.app.name());
     if window.title != title {
         window.title = title;
     }
@@ -522,7 +522,7 @@ where
     let shell = &mut *shell;
     let mut root = Ui::new(
         ctx.clone(),
-        Id::new("ironquill"),
+        Id::new("universe"),
         UiBuilder::new()
             .layer_id(LayerId::background())
             .max_rect(ctx.content_rect()),
@@ -956,7 +956,7 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) -> bool {
     let imports = map
         .edges
         .iter()
-        .filter(|e| e.kind == ironquill_codemap::EdgeKind::Imports)
+        .filter(|e| e.kind == universe_codemap::EdgeKind::Imports)
         .filter(|e| inside(&e.from) && inside(&e.to))
         .count();
     let left_out = map.left_out;
@@ -1050,7 +1050,7 @@ fn universe_view(ui: &mut Ui, universe: &mut Universe, app: &mut App) -> bool {
         |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(RichText::new("Group by").size(12.0).color(DIM));
-            for criterion in ironquill_codemap::Criterion::ALL {
+            for criterion in universe_codemap::Criterion::ALL {
                 let place = chosen.iter().position(|c| *c == criterion);
                 let text = match place {
                     Some(at) => format!("{} {}", at + 1, criterion.name()),
@@ -1688,7 +1688,7 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
                 let added = changes
                     .marks
                     .iter()
-                    .filter(|m| **m != ironquill_tools::LineMark::Same)
+                    .filter(|m| **m != universe_tools::LineMark::Same)
                     .count();
                 let removed: usize = changes.removed.values().map(Vec::len).sum();
                 ui.label(
@@ -1776,7 +1776,7 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
         let current = i == cursor_row;
         let mark = changes
             .and_then(|c| c.marks.get(i).copied())
-            .unwrap_or(ironquill_tools::LineMark::Same);
+            .unwrap_or(universe_tools::LineMark::Same);
         // One piece of text per line, its runs coloured: a widget per run
         // made every key cost a frame of hundreds of them.
         let mut job = egui::text::LayoutJob::default();
@@ -1821,10 +1821,10 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
         job.wrap.max_width = f32::INFINITY;
         let background = match mark {
             _ if current => SELECTED,
-            ironquill_tools::LineMark::Added => theme::GREEN.gamma_multiply(0.1),
-            ironquill_tools::LineMark::Changed => theme::LINK.gamma_multiply(0.1),
-            ironquill_tools::LineMark::Same if fold.is_some() => RAISED,
-            ironquill_tools::LineMark::Same => Color32::TRANSPARENT,
+            universe_tools::LineMark::Added => theme::GREEN.gamma_multiply(0.1),
+            universe_tools::LineMark::Changed => theme::LINK.gamma_multiply(0.1),
+            universe_tools::LineMark::Same if fold.is_some() => RAISED,
+            universe_tools::LineMark::Same => Color32::TRANSPARENT,
         };
         let shown = Frame::new().fill(background).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1834,9 +1834,9 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
         // The change's mark, between the number and the text, as in the
         // terminal.
         let sign = match mark {
-            ironquill_tools::LineMark::Added => Some(theme::GREEN),
-            ironquill_tools::LineMark::Changed => Some(theme::LINK),
-            ironquill_tools::LineMark::Same => None,
+            universe_tools::LineMark::Added => Some(theme::GREEN),
+            universe_tools::LineMark::Changed => Some(theme::LINK),
+            universe_tools::LineMark::Same => None,
         };
         if let Some(colour) = sign {
             ui.painter().rect_filled(

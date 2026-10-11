@@ -5,8 +5,8 @@ use bevy_egui::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke,
     TextFormat, Ui, text::LayoutJob,
 };
-use ironquill_tools::{DiffLine, ToolSummary};
-use ironquill_ui::{App, Effect, Entry, step_title};
+use universe_tools::{DiffLine, ToolSummary};
+use universe_ui::{App, Effect, Entry, step_title};
 
 use crate::theme::{
     ACCENT, BODY_SIZE, CODE, CYAN, DIM, EDGE, GREEN, LINK, MAGENTA, RAISED, RED, SELECTED, TEXT,
@@ -235,7 +235,7 @@ fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<Effect>) {
 /// The greeting: the project, the model, and how to start.
 fn welcome(ui: &mut Ui, app: &App) {
     ui.add_space(8.0);
-    ui.label(RichText::new("ironquill").size(26.0).strong().color(ACCENT));
+    ui.label(RichText::new("universe").size(26.0).strong().color(ACCENT));
     ui.label(RichText::new(app.root().display().to_string()).color(DIM));
     ui.add_space(4.0);
     if let Some(model) = app.current_model() {

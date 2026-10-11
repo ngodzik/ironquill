@@ -5,11 +5,11 @@
 use bevy_egui::egui::{
     self, Align2, Color32, Context, Frame, Margin, RichText, ScrollArea, Stroke, Ui,
 };
-use ironquill_agent::Question;
-use ironquill_core::{Effort, TokenCount};
-use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
-use ironquill_ui::keymap::SHORTCUTS;
-use ironquill_ui::{App, ChatState, CompactRow, sessions};
+use universe_agent::Question;
+use universe_core::{Effort, TokenCount};
+use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
+use universe_ui::keymap::SHORTCUTS;
+use universe_ui::{App, ChatState, CompactRow, sessions};
 
 use crate::theme::{ACCENT, CYAN, DIM, RAISED, RED, SELECTED, TEXT, YELLOW};
 

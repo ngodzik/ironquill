@@ -1,4 +1,4 @@
-//! Deterministic tools for ironquill.
+//! Deterministic tools for universe.
 //!
 //! Everything here gives the same answer for the same input and costs no
 //! tokens: reading and editing files inside a sandboxed workspace, running the

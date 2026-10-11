@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use ironquill_core::{
+use serde::Deserialize;
+use serde_json::{Value, json};
+use universe_core::{
     CacheTtl, CacheUse, ChatModel, ChatRequest, ChatResponse, Message, ModelId, Pricing,
     TokenCount, ToolCall, ToolSpec, Usage, Usd,
 };
-use serde::Deserialize;
-use serde_json::{Value, json};
 
 use crate::error::LlmError;
 
@@ -163,7 +163,7 @@ impl ChatModel for OpenAiCompatible {
             // of it can be a cache hit, billed at a fraction of the price.
             // Claude caches only what is marked, at its provider (Bedrock,
             // Vertex): Requesty's own marks go on the largest blocks and can
-            // leave the end of a growing conversation out, so ironquill
+            // leave the end of a growing conversation out, so universe
             // places them. Other models are left to Requesty.
             let claude = is_claude(&request.model);
             if claude {
