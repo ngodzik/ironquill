@@ -164,6 +164,8 @@ pub struct Settings {
     pub mermaid: Option<Vec<String>>,
     /// How long Claude's cache is kept through an API, as configured.
     pub cache_ttl: CacheTtl,
+    /// The pattern behind the window's panels, and whether it moves.
+    pub backdrop: crate::backdrop::Backdrop,
     /// What the provider's models are reached through, such as
     /// "Requesty": shown with them, since the same model may be reached
     /// through an agent too, at another price, with another cache.
@@ -1931,6 +1933,17 @@ impl App {
                 };
                 self.show_map(next);
             }
+            Action::NextBackdrop => {
+                let backdrop = &mut self.settings.backdrop;
+                backdrop.pattern = crate::backdrop::Pattern::next(backdrop.pattern);
+                self.notice = Some(match backdrop.pattern {
+                    Some(pattern) => format!(
+                        "Background: {} (Ctrl-X: the next one; /background slow moves it)",
+                        pattern.name()
+                    ),
+                    None => "No background".to_owned(),
+                });
+            }
             Action::ToggleSeeThrough => {
                 self.settings.see_through = !self.settings.see_through;
                 self.notice = Some(
@@ -2983,6 +2996,11 @@ impl App {
             Command::Walk(argument) => {
                 return self.look_at_changes(crate::changes::Lens::Walk, argument);
             }
+            Command::Background(None) => self.info(self.settings.backdrop.describe()),
+            Command::Background(Some(words)) => match self.settings.backdrop.apply(&words) {
+                Ok(said) => self.info(said),
+                Err(e) => self.error(e),
+            },
             Command::Budget(None) => match self.settings.budget {
                 Some(budget) => self.info(format!("Budget: {budget} per request")),
                 None => self.info("No budget: requests may cost any amount"),
@@ -4134,6 +4152,9 @@ impl App {
             // Set in the file only: kept as written there.
             cache_ttl: (self.settings.cache_ttl != CacheTtl::default())
                 .then_some(self.settings.cache_ttl),
+            background: self.settings.backdrop.pattern,
+            background_motion: (self.settings.backdrop.motion != crate::backdrop::Motion::Still)
+                .then_some(self.settings.backdrop.motion),
         }
     }
 
@@ -4399,6 +4420,11 @@ impl App {
     /// and the next, in whole points.
     pub fn set_chat_width(&mut self, width: f32) {
         self.settings.chat_width = Some(width.round());
+    }
+
+    /// The pattern behind the window's panels, and whether it moves.
+    pub fn backdrop(&self) -> crate::backdrop::Backdrop {
+        self.settings.backdrop
     }
 
     /// How opaque the window's background is now: 1 unless see-through.
@@ -6086,6 +6112,8 @@ mod tests {
                 images: None,
                 mermaid: None,
                 cache_ttl: None,
+                background: None,
+                background_motion: None,
             }
         );
     }

@@ -131,6 +131,8 @@ pub enum Action {
     NextMap,
     /// Search the codebase's maps, while one is shown.
     Search,
+    /// The next pattern behind the window's panels, then none.
+    NextBackdrop,
 }
 
 /// Every shortcut, as Ctrl-S lists them. Kept next to the bindings above so
@@ -168,6 +170,10 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (
                 "Ctrl-F",
                 "search the plan, the API and the universe: Enter keeps the search, Esc clears it (--gui only)",
+            ),
+            (
+                "Ctrl-X",
+                "the pattern behind the panels: stars, waves, grid, rain, then none (/background, --gui only)",
             ),
             ("Ctrl-S", "this list"),
             ("Ctrl-C", "stop the request; twice to quit"),
@@ -299,6 +305,8 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         KeyCode::Char('n') if ctrl => return Some(Action::NextMap),
         // F for find, as in most applications.
         KeyCode::Char('f') if ctrl => return Some(Action::Search),
+        // X, beside the other keys of the window's look on the bottom row.
+        KeyCode::Char('x') if ctrl => return Some(Action::NextBackdrop),
         // E, right above the left Ctrl key on AZERTY and QWERTY keyboards alike.
         KeyCode::Char('e') if ctrl => return Some(Action::PickModel),
         _ => {}

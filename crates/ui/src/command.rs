@@ -94,6 +94,9 @@ pub(crate) enum Command {
     /// `/walk [off]`: what is not committed yet, a message being a question
     /// about the place in it, for the cheapest model.
     Walk(Option<String>),
+    /// `/background [pattern|off] [still|slow]`: what is drawn behind the
+    /// window's panels; alone, what is set.
+    Background(Option<String>),
 }
 
 /// Parses the text typed after `:`. Errors are messages for the person.
@@ -157,6 +160,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "review" => Ok(Command::Review(rest_opt)),
         "work" => Ok(Command::Work(rest_opt)),
         "walk" => Ok(Command::Walk(rest_opt)),
+        "background" | "bg" => Ok(Command::Background(rest_opt)),
         "" => Err("Empty command".into()),
         other => Err(format!("Unknown command /{other}, see /help")),
     }
@@ -210,6 +214,8 @@ pub(crate) const NAMES: &[&str] = &[
     "review",
     "work",
     "walk",
+    "background",
+    "bg",
 ];
 
 /// Commands of the Vim editor, completed on top of ironquill's inside a file.
@@ -352,6 +358,10 @@ Type a question or a change and press Enter. Changes are checked before they are
                      place or the selection, with the file's diff, answered by
                      the cheapest priced model, never the coder. /walk off ends it
 /diff                what changed since the last commit
+/background [p] [m]  a quiet pattern behind the window's panels (/bg): stars, waves,
+                     grid, rain or off; still (costs nothing) or slow (about twelve
+                     frames a second while the window has the focus). Ctrl-X: the
+                     next one. Alone, what is set
 /clear               start a new conversation in place of this one
 /newchat             open a new conversation beside this one, which goes on
 /chats               the open conversations: Enter shows one, n opens a new one,

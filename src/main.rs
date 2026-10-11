@@ -436,6 +436,10 @@ async fn interface(
         images: defaults.images.unwrap_or_default(),
         mermaid: defaults.mermaid.clone(),
         cache_ttl: defaults.cache_ttl.unwrap_or_default(),
+        backdrop: ironquill_ui::backdrop::Backdrop {
+            pattern: defaults.background,
+            motion: defaults.background_motion.unwrap_or_default(),
+        },
         provider: provider.name(),
         detect_checks,
         notes,

@@ -11,6 +11,7 @@
 
 mod app;
 mod awake;
+pub mod backdrop;
 pub mod blocks;
 pub mod changes;
 pub mod clipboard;
