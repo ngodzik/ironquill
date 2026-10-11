@@ -143,7 +143,10 @@ fn run(command: &mut Command, tool: &str) -> Result<String, String> {
 
 /// The path from `from` to `to`, both absolute.
 fn relative(from: &Path, to: &Path) -> PathBuf {
-    let (from, to) = (normal(from), normal(to));
+    // Resolved first: kustomize climbs `..` from the real folder, so one
+    // side behind a symlink (macOS' `/var`) would climb out of it.
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| normal(p));
+    let (from, to) = (real(from), real(to));
     let from: Vec<_> = from.components().collect();
     let to: Vec<_> = to.components().collect();
     let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
@@ -161,6 +164,8 @@ fn relative(from: &Path, to: &Path) -> PathBuf {
 /// kustomize for every object's origin and transformations.
 fn kustomize(repos: &Repos, folder: &Path, wrapper: &Path) -> Result<Vec<Object>, String> {
     std::fs::create_dir_all(wrapper).map_err(|e| e.to_string())?;
+    // The origins kustomize reports are from the wrapper's real folder.
+    let wrapper = &std::fs::canonicalize(wrapper).unwrap_or_else(|_| wrapper.to_owned());
     let has_tree = ["kustomization.yaml", "kustomization.yml", "Kustomization"]
         .iter()
         .any(|n| folder.join(n).is_file());
@@ -443,8 +448,21 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let repos = project(dir.path());
-        let app = dir.path().join("app");
+        // Everything read through a symlink at another depth, as macOS'
+        // `/var` is: linked repositories are resolved, the tools climb `..`
+        // from real folders and report real paths.
+        let real = dir.path().join("a/b/real");
+        std::fs::create_dir_all(&real).unwrap();
+        #[cfg(unix)]
+        let root = {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            link
+        };
+        #[cfg(not(unix))]
+        let root = real;
+        let repos = project(&root);
+        let app = root.join("app");
         write(
             &app,
             "charts/api/templates/deployment.yaml",
@@ -456,12 +474,12 @@ mod tests {
             "apiVersion: v1\nkind: Secret\nmetadata:\n  name: api\nstringData:\n  password: {{ .Values.database.password }}\n",
         );
         write(
-            &dir.path().join("ops"),
+            &root.join("ops"),
             "apps/base/account.yaml",
             "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: api\n  annotations:\n    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/shop-prod-api\n",
         );
         write(
-            &dir.path().join("ops"),
+            &root.join("ops"),
             "apps/base/kustomization.yaml",
             "resources:\n  - api.yaml\n  - source.yaml\n  - account.yaml\n",
         );
@@ -471,7 +489,7 @@ mod tests {
             .iter()
             .find(|e| e.name == "clusters/prod")
             .unwrap();
-        let scratch = dir.path().join("scratch");
+        let scratch = root.join("scratch");
         let rendered = render(&repos, &deploy, prod, &scratch);
         assert_eq!(rendered.releases, ["api"], "{:?}", rendered.notes);
         let deployment = rendered

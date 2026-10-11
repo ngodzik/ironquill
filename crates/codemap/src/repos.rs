@@ -115,7 +115,12 @@ impl Repos {
         self.repos
             .iter()
             .filter_map(|r| {
-                let rel = path.strip_prefix(normal(&r.root)).ok()?;
+                // A tool may report the real path of a root behind a symlink.
+                let real = std::fs::canonicalize(&r.root).ok();
+                let rel = path
+                    .strip_prefix(normal(&r.root))
+                    .ok()
+                    .or_else(|| path.strip_prefix(real.as_deref()?).ok())?;
                 Some((r, rel.to_string_lossy().replace('\\', "/")))
             })
             .max_by_key(|(r, _)| r.root.components().count())
@@ -195,5 +200,19 @@ mod tests {
             Place::new("deploy", "a.yaml", 3).to_string(),
             "deploy:a.yaml:3"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_path_is_found_in_a_repository_behind_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("a/app");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("app");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let repos = Repos::new(&link, &[]);
+        let real = real.canonicalize().unwrap();
+        let (repo, rel) = repos.locate(&real.join("k8s/api.yaml")).unwrap();
+        assert_eq!((repo.name.as_str(), rel.as_str()), ("app", "k8s/api.yaml"));
     }
 }

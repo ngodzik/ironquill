@@ -64,6 +64,13 @@ jobs:
       - name: Wayland headers
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      # Without them the rendering test returns early, and a regression such
+      # as macOS' `/var` symlink would not show. Linux images ship both.
+      - name: Kustomize and Helm
+        if: runner.os == 'macOS'
+        run: brew install kustomize helm
+      - name: Kustomize and Helm are there
+        run: kustomize version && helm version
       - name: Tests
         run: cargo test --workspace --all-features
 
