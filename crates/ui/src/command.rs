@@ -91,6 +91,9 @@ pub(crate) enum Command {
     Review(Option<String>),
     /// `/work [base|off]`: the branch's changes, to go on with.
     Work(Option<String>),
+    /// `/walk [off]`: what is not committed yet, a message being a question
+    /// about the place in it, for the cheapest model.
+    Walk(Option<String>),
 }
 
 /// Parses the text typed after `:`. Errors are messages for the person.
@@ -153,6 +156,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "keys" | "shortcuts" => Ok(Command::Keys),
         "review" => Ok(Command::Review(rest_opt)),
         "work" => Ok(Command::Work(rest_opt)),
+        "walk" => Ok(Command::Walk(rest_opt)),
         "" => Err("Empty command".into()),
         other => Err(format!("Unknown command /{other}, see /help")),
     }
@@ -205,6 +209,7 @@ pub(crate) const NAMES: &[&str] = &[
     "team",
     "review",
     "work",
+    "walk",
 ];
 
 /// Commands of the Vim editor, completed on top of ironquill's inside a file.
@@ -342,6 +347,10 @@ Type a question or a change and press Enter. Changes are checked before they are
                      nothing can be edited; against where it left main, or <base>.
                      /review off ends it
 /work [base]         the same, to go on with the work: files stay editable
+/walk                what is not committed yet, new files included, each folded to
+                     its changes; a message is then a question about the cursor's
+                     place or the selection, with the file's diff, answered by
+                     the cheapest priced model, never the coder. /walk off ends it
 /diff                what changed since the last commit
 /clear               start a new conversation in place of this one
 /newchat             open a new conversation beside this one, which goes on

@@ -1219,6 +1219,9 @@ fn activity(ui: &mut Ui, app: &App) {
     let Some(elapsed) = app.elapsed() else {
         if let Some(matches) = app.completions() {
             ui.label(RichText::new(matches.join("   ")).color(DIM));
+        } else if let Some(walk) = app.walk_label() {
+            // Right above the message box: where the message goes.
+            ui.label(RichText::new(format!("WALK · {walk}")).color(YELLOW));
         }
         return;
     };
@@ -1377,6 +1380,16 @@ fn status(ui: &mut Ui, app: &App) {
                 "/{} off ends it",
                 changes.lens.name().to_lowercase()
             ));
+            // Who answers while walking: never a surprise.
+            if let Some(walk) = app.walk_label() {
+                Frame::new()
+                    .fill(YELLOW.gamma_multiply(0.3))
+                    .corner_radius(4)
+                    .inner_margin(Margin::symmetric(6, 1))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(walk).small().strong().color(TEXT));
+                    });
+            }
         }
         match app.pending() {
             Some(Pending::Leader) => {

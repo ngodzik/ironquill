@@ -590,9 +590,17 @@ impl Editor {
         }
     }
 
-    /// Unfolds every unchanged run: the whole file shows.
+    /// Unfolds every unchanged run: the whole file shows, the cursor's
+    /// line kept at its height on screen, what was folded coming above and
+    /// below it, so that nobody has to find their line again.
     pub(crate) fn unfold_unchanged(&mut self) {
+        let hidden = self.hidden();
+        let above = (self.scroll..self.row)
+            .filter(|r| !hidden.get(*r).copied().unwrap_or(false))
+            .count();
         self.unchanged.clear();
+        self.scroll = self.row.saturating_sub(above);
+        self.keep_visible();
     }
 
     /// Lets the file be read but not changed, saying `why` when a change is
@@ -2358,6 +2366,8 @@ mod tests {
             ed.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
         }
         assert!(!ed.shows_changes_only());
+        // Line 13 stays second on screen, under what was folded above it.
+        assert_eq!((ed.cursor().0, ed.scroll()), (12, 11));
         for key in ['z', 'M'] {
             ed.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
         }

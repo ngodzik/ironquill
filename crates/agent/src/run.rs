@@ -3680,36 +3680,13 @@ async fn cheapest_model<M: ChatModel, D, O>(
     besides: Option<&ModelId>,
 ) -> Option<(ModelId, Pricing)> {
     let config = ctx.config;
-    let reference = Usage {
-        input: TokenCount(10_000),
-        output: TokenCount(1_000),
-    };
-    let mut cheapest: Option<(ModelId, Pricing)> = None;
-    for model in config
+    let candidates: Vec<ModelId> = config
         .tiers
         .iter()
         .chain(config.team.iter().map(|m| &m.model))
-        .filter(|m| m.delegate().is_none())
-    {
-        let Some(pricing) = ctx.model.pricing(model).await else {
-            continue;
-        };
-        // Another than `besides` when there is one: a model judging its
-        // own command would judge little.
-        let other = |m: &ModelId| Some(m) != besides;
-        let better = match &cheapest {
-            None => true,
-            Some((current, p)) => match (other(model), other(current)) {
-                (true, false) => true,
-                (false, true) => false,
-                _ => pricing.cost(&reference).0 < p.cost(&reference).0,
-            },
-        };
-        if better {
-            cheapest = Some((model.clone(), pricing));
-        }
-    }
-    cheapest
+        .cloned()
+        .collect();
+    crate::ask::cheapest(ctx.model, &candidates, besides).await
 }
 
 /// Asks the cheapest model one question, without tools, as a step named

@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod ask;
 mod config;
 mod context;
 mod delegate;
@@ -17,6 +18,7 @@ mod error;
 mod event;
 mod run;
 
+pub use ask::{Answered, ask, ask_cheapest, cheapest};
 pub use config::{
     AgentConfig, AgentConfigBuilder, Answer, Approval, Approver, COMPACT_AT, Member, Pair, Question,
 };
