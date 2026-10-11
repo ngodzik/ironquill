@@ -53,7 +53,7 @@ pub(crate) const BODY_SIZE: f32 = 14.5;
 
 /// Fonts the system may have, tried after egui's own for the characters
 /// those lack: the spinner's braille, arrows, ✗, ⎿.
-const FALLBACK_FONTS: [(&str, &str); 3] = [
+const FALLBACK_FONTS: [(&str, &str); 5] = [
     (
         "dejavu-sans",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -66,6 +66,13 @@ const FALLBACK_FONTS: [(&str, &str); 3] = [
         "noto-sans",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     ),
+    // macOS: arrows, boxes, braille and ● in the first, ✓ and ✗ in the
+    // second; together every non-ASCII character the window writes.
+    (
+        "arial-unicode",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ),
+    ("apple-symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
 ];
 
 /// Adds the fallback fonts the system has. One missing costs only its

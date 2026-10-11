@@ -236,6 +236,8 @@ impl Session {
             compacted.extend_from_slice(&self.messages[start..end]);
         }
         self.messages = compacted;
+        // Its cache no longer matches what is sent next.
+        self.api_warm = None;
         self.asked = asked;
         // Their sessions held what was just dropped.
         self.agents.clear();
@@ -273,6 +275,8 @@ impl Session {
             self.summary = None;
         }
         self.messages = kept;
+        // Its cache no longer matches what is sent next.
+        self.api_warm = None;
         self.asked = asked;
         self.agents.clear();
         self.planners.clear();
@@ -398,6 +402,7 @@ impl<'a, M, D, O> Ctx<'a, M, D, O> {
             allowed_hosts: Vec::new(),
             last_call: None,
             last_context: None,
+            last_request: None,
         }
     }
 }

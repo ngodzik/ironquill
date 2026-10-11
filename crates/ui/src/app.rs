@@ -8,7 +8,7 @@ use ironquill_agent::{
     AgentConfig, Answer, Approval, Compaction, Event, Member, Outcome, Pair, Question, Session,
     Verdict,
 };
-use ironquill_core::{Agent, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
+use ironquill_core::{Agent, CacheTtl, ContextUse, Effort, ModelId, TokenCount, Usage, Usd};
 use ironquill_tools::{Check, Container, DiffLine, ToolSummary};
 use tokio::sync::oneshot;
 
@@ -162,6 +162,12 @@ pub struct Settings {
     /// The command that draws Mermaid diagrams, as configured; `None` finds
     /// one.
     pub mermaid: Option<Vec<String>>,
+    /// How long Claude's cache is kept through an API, as configured.
+    pub cache_ttl: CacheTtl,
+    /// What the provider's models are reached through, such as
+    /// "Requesty": shown with them, since the same model may be reached
+    /// through an agent too, at another price, with another cache.
+    pub provider: String,
 }
 
 /// Tokens and cost of one part of a request.
@@ -1497,6 +1503,22 @@ impl App {
     /// Whether the person asked to quit.
     pub fn should_quit(&self) -> bool {
         self.quit
+    }
+
+    /// What `model` is reached through: an agent's command, or the
+    /// provider.
+    pub fn channel(&self, model: &ModelId) -> &str {
+        match model.delegate() {
+            Some((Agent::ClaudeCode, _)) => "Claude CLI",
+            Some((Agent::Codex, _)) => "Codex CLI",
+            None if self.settings.provider.is_empty() => "API",
+            None => &self.settings.provider,
+        }
+    }
+
+    /// `model` with what it is reached through, as it is shown.
+    pub fn model_label(&self, model: &ModelId) -> String {
+        format!("{model} · {}", self.channel(model))
     }
 
     /// The model chain as shown to the person: `cheap → strong`.
@@ -3572,6 +3594,12 @@ impl App {
         }
     }
 
+    /// Whether ticks also keep the provider's cache warm: only while it
+    /// lives five minutes; an hour's needs none.
+    pub fn api_ticks(&self) -> bool {
+        self.settings.cache_ttl == CacheTtl::FiveMinutes
+    }
+
     /// Where ticks stand, for the status line.
     pub fn tick_status(&self) -> TickStatus {
         if !self.settings.tick {
@@ -3894,6 +3922,9 @@ impl App {
             chat_width: self.settings.chat_width,
             images: (self.settings.images != Images::Auto).then_some(self.settings.images),
             mermaid: self.settings.mermaid.clone(),
+            // Set in the file only: kept as written there.
+            cache_ttl: (self.settings.cache_ttl != CacheTtl::default())
+                .then_some(self.settings.cache_ttl),
         }
     }
 
@@ -4648,6 +4679,32 @@ mod tests {
             },
             PathBuf::from("/p"),
         )
+    }
+
+    #[test]
+    fn each_model_shows_how_it_is_reached() {
+        let mut app = App::new(
+            Settings {
+                provider: "Requesty".into(),
+                ..Settings::default()
+            },
+            PathBuf::from("/p"),
+        );
+        let label = |app: &App, id: &str| app.model_label(&ModelId::new(id).unwrap());
+        assert_eq!(
+            label(&app, "claude-code/opus"),
+            "claude-code/opus · Claude CLI"
+        );
+        assert_eq!(label(&app, "codex"), "codex · Codex CLI");
+        assert_eq!(
+            label(&app, "bedrock/claude-opus-5-5"),
+            "bedrock/claude-opus-5-5 · Requesty"
+        );
+        app.settings.provider.clear();
+        assert_eq!(label(&app, "glm"), "glm · API");
+        assert!(app.api_ticks());
+        app.settings.cache_ttl = CacheTtl::OneHour;
+        assert!(!app.api_ticks());
     }
 
     #[test]
@@ -5713,6 +5770,7 @@ mod tests {
                 chat_width: None,
                 images: None,
                 mermaid: None,
+                cache_ttl: None,
             }
         );
     }

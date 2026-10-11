@@ -12,8 +12,9 @@ use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 pub(crate) enum Pressed {
     /// A key for the state.
     Key(KeyEvent),
-    /// Paste the clipboard: Ctrl-V, Ctrl-Shift-V or Shift-Insert, as in
-    /// most applications. The terminal pastes by itself; a window must ask.
+    /// Paste the clipboard: Ctrl-V, Ctrl-Shift-V, Cmd-V or Shift-Insert, as
+    /// in most applications. The terminal pastes by itself; a window must
+    /// ask.
     Paste,
 }
 
@@ -25,6 +26,8 @@ pub(crate) struct Held {
     /// The left Alt only: the right one is AltGr on many layouts, which types
     /// `{`, `@` or `#` and must reach the state as the character alone.
     pub(crate) alt: bool,
+    /// Cmd on macOS, the Super key elsewhere.
+    pub(crate) command: bool,
 }
 
 impl Held {
@@ -43,14 +46,29 @@ impl Held {
     }
 }
 
+/// Whether the modifiers egui reports with C ask for a copy: Cmd on
+/// macOS; Ctrl-Shift elsewhere, Ctrl-C alone being the state's.
+pub(crate) fn copies(modifiers: bevy_egui::egui::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.mac_cmd
+    } else {
+        modifiers.ctrl && modifiers.shift
+    }
+}
+
 /// What pressing `key` with `held` asks for, or `None` for a key alone that
 /// means nothing, such as Shift: the terminal never reports those either.
 pub(crate) fn translate(key: &Key, held: Held) -> Option<Pressed> {
     let code = match key {
         Key::Character(text) => {
             let c = text.chars().next()?;
-            if held.control && c.eq_ignore_ascii_case(&'v') {
+            if (held.control || held.command) && c.eq_ignore_ascii_case(&'v') {
                 return Some(Pressed::Paste);
+            }
+            // Cmd with a letter is the system's (Cmd-C copies, through
+            // egui), never the letter typed; so is the copy off macOS.
+            if held.command || (held.control && held.shift && c.eq_ignore_ascii_case(&'c')) {
+                return None;
             }
             // With Control held, the state reads the letter as typed without
             // Shift, as the terminal reports Ctrl-O.
@@ -155,6 +173,14 @@ mod tests {
             ..Held::default()
         };
         assert_eq!(translate(&character("v"), control), Some(Pressed::Paste));
+        let command = Held {
+            command: true,
+            ..Held::default()
+        };
+        assert_eq!(translate(&character("v"), command), Some(Pressed::Paste));
+        // Any other Cmd-letter is the system's, not typed.
+        assert_eq!(translate(&character("c"), command), None);
+        assert_eq!(translate(&character("q"), command), None);
         let shift = Held {
             shift: true,
             ..Held::default()

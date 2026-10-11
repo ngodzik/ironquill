@@ -3,8 +3,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use ironquill_core::{
-    CacheUse, ChatModel, ChatRequest, ChatResponse, Message, ModelId, Pricing, TokenCount,
-    ToolCall, ToolSpec, Usage, Usd,
+    CacheTtl, CacheUse, ChatModel, ChatRequest, ChatResponse, Message, ModelId, Pricing,
+    TokenCount, ToolCall, ToolSpec, Usage, Usd,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -28,6 +28,8 @@ pub struct OpenAiCompatible {
     api_key: Option<String>,
     /// Context windows and prices by model, read once from the model list.
     known: Arc<Mutex<Option<HashMap<String, Known>>>>,
+    /// How long what Claude's marks write stays in the cache.
+    cache_ttl: CacheTtl,
 }
 
 impl fmt::Debug for OpenAiCompatible {
@@ -36,6 +38,7 @@ impl fmt::Debug for OpenAiCompatible {
         f.debug_struct("OpenAiCompatible")
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
+            .field("cache_ttl", &self.cache_ttl)
             .finish()
     }
 }
@@ -58,7 +61,34 @@ impl OpenAiCompatible {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key,
             known: Arc::new(Mutex::new(None)),
+            cache_ttl: CacheTtl::default(),
         }
+    }
+
+    /// The same provider, keeping what Claude's cache marks write for
+    /// `ttl`.
+    #[must_use]
+    pub fn with_cache_ttl(mut self, ttl: CacheTtl) -> Self {
+        self.cache_ttl = ttl;
+        self
+    }
+
+    /// What the provider is called where a model is shown with how it is
+    /// reached: "Requesty", else its host.
+    #[must_use]
+    pub fn name(&self) -> String {
+        if self.is_requesty() {
+            return "Requesty".to_owned();
+        }
+        self.host().unwrap_or(&self.base_url).to_owned()
+    }
+
+    fn host(&self) -> Option<&str> {
+        self.base_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .filter(|host| !host.is_empty())
     }
 
     /// The key, or why there is none to call `url` with.
@@ -70,10 +100,7 @@ impl OpenAiCompatible {
 
     /// Whether the endpoint is Requesty, which takes options of its own.
     fn is_requesty(&self) -> bool {
-        self.base_url
-            .split("://")
-            .nth(1)
-            .and_then(|rest| rest.split(['/', ':']).next())
+        self.host()
             .is_some_and(|host| host == "requesty.ai" || host.ends_with(".requesty.ai"))
     }
 
@@ -132,11 +159,17 @@ impl ChatModel for OpenAiCompatible {
             payload["reasoning_effort"] = json!(effort.as_str());
         }
         if self.is_requesty() {
-            // Requesty marks what can be cached for providers that need it
-            // and bills cache hits at a fraction of the price; it does so by
-            // itself only for the tools it knows. Each call of the agent
-            // resends the whole conversation, so most of it is a hit.
-            payload["requesty"] = json!({"auto_cache": true});
+            // Each call of the agent resends the whole conversation, so most
+            // of it can be a cache hit, billed at a fraction of the price.
+            // Claude caches only what is marked, at its provider (Bedrock,
+            // Vertex): Requesty's own marks go on the largest blocks and can
+            // leave the end of a growing conversation out, so ironquill
+            // places them. Other models are left to Requesty.
+            let claude = is_claude(&request.model);
+            if claude {
+                mark_cache(&mut payload, self.cache_ttl);
+            }
+            payload["requesty"] = json!({"auto_cache": !claude});
         }
         // A connection that could not be made is tried again, twice, after a
         // pause: the request never left, so it cannot be billed twice. Any
@@ -293,6 +326,37 @@ pub(crate) async fn read_body(url: &str, response: reqwest::Response) -> Result<
     Ok(body)
 }
 
+/// Whether `model` is one of Anthropic's, whatever route serves it, such
+/// as `bedrock/claude-opus-5-5`.
+fn is_claude(model: &ModelId) -> bool {
+    model.as_str().contains("claude")
+}
+
+/// Marks the system message and the last message with text as cached
+/// until there, for a provider that caches only what is marked: the system
+/// message with the tools before it, then the whole conversation, read back
+/// on the next call. The text becomes a content block to carry the mark.
+fn mark_cache(body: &mut Value, ttl: CacheTtl) {
+    let mut mark = json!({"type": "ephemeral"});
+    if ttl == CacheTtl::OneHour {
+        mark["ttl"] = json!("1h");
+    }
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    let has_text = |m: &Value| m["content"].as_str().is_some_and(|t| !t.is_empty());
+    let system = messages
+        .iter()
+        .position(|m| m["role"] == "system" && has_text(m));
+    let last = messages.iter().rposition(has_text);
+    for i in system.into_iter().chain(last) {
+        let message = &mut messages[i];
+        if let Some(text) = message["content"].as_str().map(str::to_owned) {
+            message["content"] = json!([{"type": "text", "text": text, "cache_control": mark}]);
+        }
+    }
+}
+
 /// The request body. Built as JSON values rather than derived, because the
 /// core message type is protocol neutral and this is the one place that knows
 /// how OpenAI spells it.
@@ -398,6 +462,9 @@ struct WireUsage {
 struct WirePromptDetails {
     #[serde(default)]
     cached_tokens: Option<u64>,
+    /// What was written to the cache, as Requesty says it.
+    #[serde(default)]
+    caching_tokens: Option<u64>,
 }
 
 impl WireUsage {
@@ -406,7 +473,10 @@ impl WireUsage {
         let read = self
             .cache_read_input_tokens
             .or_else(|| self.prompt_tokens_details.as_ref()?.cached_tokens);
-        let written = self.cache_creation_input_tokens.map(TokenCount);
+        let written = self
+            .cache_creation_input_tokens
+            .or_else(|| self.prompt_tokens_details.as_ref()?.caching_tokens)
+            .map(TokenCount);
         (read.is_some() || written.is_some()).then(|| CacheUse {
             read: TokenCount(read.unwrap_or(0)),
             written,
@@ -597,6 +667,92 @@ mod tests {
         assert!(!OpenAiCompatible::new("https://openrouter.ai/api/v1", "k").is_requesty());
         assert!(!OpenAiCompatible::new("https://requesty.ai.evil.test/v1", "k").is_requesty());
         assert!(!OpenAiCompatible::new("http://127.0.0.1:8080/v1", "k").is_requesty());
+    }
+
+    #[test]
+    fn cache_reads_and_writes_as_requesty_reports_them() {
+        // The shape of a Requesty answer for a Claude model on Bedrock.
+        let body = r#"{
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 14600, "completion_tokens": 12, "total_tokens": 14612,
+                "prompt_tokens_details": {"cached_tokens": 9921, "caching_tokens": 4614,
+                    "caching_token_details": {"caching_5m_tokens": 0, "caching_1h_tokens": 4614}},
+                "cost": 0.0412}
+        }"#;
+        let cache = parse_completion(URL, body).unwrap().cache.unwrap();
+        assert_eq!(cache.read, TokenCount(9921));
+        assert_eq!(cache.written, Some(TokenCount(4614)));
+        // Anthropic's own fields, when a gateway passes them, still win.
+        let body = r#"{
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1,
+                "cache_read_input_tokens": 7, "cache_creation_input_tokens": 3}
+        }"#;
+        let cache = parse_completion(URL, body).unwrap().cache.unwrap();
+        assert_eq!(
+            (cache.read, cache.written),
+            (TokenCount(7), Some(TokenCount(3)))
+        );
+    }
+
+    #[test]
+    fn claude_gets_marks_on_its_system_message_and_last_text() {
+        let model = ModelId::new("bedrock/claude-opus-5-5").unwrap();
+        assert!(is_claude(&model));
+        assert!(!is_claude(&ModelId::new("deepseek/deepseek-chat").unwrap()));
+        let request = ChatRequest {
+            model,
+            messages: vec![
+                Message::System("rules".into()),
+                Message::user("go"),
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+                Message::Tool {
+                    call_id: "call_1".into(),
+                    content: "text".into(),
+                },
+            ],
+            tools: vec![],
+            effort: None,
+        };
+        let mut body = wire_request(&request);
+        mark_cache(&mut body, CacheTtl::FiveMinutes);
+        let messages = &body["messages"];
+        assert_eq!(messages[0]["content"][0]["text"], "rules");
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        // Only the system message and the last with text are marked.
+        assert_eq!(messages[1]["content"], "go");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["content"][0]["text"], "text");
+        assert!(messages[3]["content"][0]["cache_control"].is_object());
+
+        let mut body = wire_request(&request);
+        mark_cache(&mut body, CacheTtl::OneHour);
+        assert_eq!(
+            body["messages"][3]["content"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+    }
+
+    #[test]
+    fn a_provider_is_named_by_its_host() {
+        assert_eq!(
+            OpenAiCompatible::new("https://router.requesty.ai/v1", "k").name(),
+            "Requesty"
+        );
+        assert_eq!(
+            OpenAiCompatible::new("http://127.0.0.1:8080/v1", "k").name(),
+            "127.0.0.1"
+        );
     }
 
     #[test]
