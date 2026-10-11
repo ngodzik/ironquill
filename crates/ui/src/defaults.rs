@@ -10,6 +10,8 @@
 //! images = "auto"
 //! mermaid = ["mmdc", "-i", "{input}", "-o", "{output}", "-b", "transparent"]
 //! cache_ttl = "1h"
+//! background = "stars"
+//! background_motion = "slow"
 //! ```
 //!
 //! Keys never go here: they come from the environment only.
@@ -19,6 +21,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use ironquill_core::CacheTtl;
+
+use crate::backdrop::{Motion, Pattern};
 use serde::{Deserialize, Serialize};
 
 /// Whether replies show images, as `images` in `~/.ironquill/config.toml`
@@ -110,6 +114,13 @@ pub struct Defaults {
     /// `5m` (unsaid) or `1h`. Set in the file only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
+    /// The pattern behind the window's panels: stars, waves, grid or
+    /// rain; unsaid, none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<Pattern>,
+    /// Whether it moves: still (unsaid) or slow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_motion: Option<Motion>,
 }
 
 impl Defaults {
@@ -209,6 +220,8 @@ mod tests {
             images: Some(Images::Off),
             mermaid: Some(vec!["mmdr".into(), "-i".into(), "{input}".into()]),
             cache_ttl: Some(CacheTtl::OneHour),
+            background: Some(Pattern::Rain),
+            background_motion: Some(Motion::Slow),
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));

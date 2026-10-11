@@ -579,6 +579,37 @@ where
                     let _ = tx.send(AgentMessage::Found(find(&servers, &root, &lookup)));
                 });
             }
+            Effect::FindCheapest(candidates) => {
+                let (model, tx) = (Arc::clone(model), tx.clone());
+                tokio::spawn(async move {
+                    let found = ironquill_agent::cheapest(&*model, &candidates, None).await;
+                    let _ = tx.send(AgentMessage::WalkModel(found.map(|(m, _)| m)));
+                });
+            }
+            Effect::AskWalk(question) => {
+                let (model, tx) = (Arc::clone(model), tx.clone());
+                let root = workspace.root().to_owned();
+                tokio::spawn(async move {
+                    let prompt = walk_prompt(&root, &question).await;
+                    let events = tx.clone();
+                    let answered = ironquill_agent::ask_cheapest(
+                        &*model,
+                        &question.candidates,
+                        WALK_PROMPT,
+                        prompt,
+                        ironquill_core::Effort::Low,
+                        |e| {
+                            let _ = events.send(AgentMessage::Event(e));
+                        },
+                    )
+                    .await
+                    .ok_or_else(|| {
+                        "The cheapest model did not answer: none is priced, or the call failed"
+                            .to_owned()
+                    });
+                    let _ = tx.send(AgentMessage::WalkAnswer(answered));
+                });
+            }
             Effect::WarmServers(paths) => {
                 let servers = Arc::clone(servers);
                 tokio::task::spawn_blocking(move || {
@@ -752,6 +783,43 @@ async fn save(store: Option<&Store>, app: &mut App, conversation: &Mutex<Convers
 }
 
 /// What `/instructions` starts from when the file does not exist yet.
+/// For the cheapest model, while the person walks what was just coded.
+const WALK_PROMPT: &str = "You help a developer read code that was just written and not \
+committed yet. Answer their question about the place they point at, using the lines around it \
+and the file's changes since the last commit. Be brief and concrete: what the code does, why, \
+and anything wrong you see. Say so when the answer is not in what you were given.";
+
+/// The most of a file's diff a question while walking carries, in bytes.
+const WALK_DIFF_LIMIT: usize = 24_000;
+
+/// What the cheapest model is told while walking: the question, the
+/// place, and the file's changes since the last commit, or what changed
+/// as a whole when no file is open.
+async fn walk_prompt(root: &std::path::Path, question: &crate::app::WalkQuestion) -> String {
+    let mut prompt = format!("Question: {}\n\n", question.text);
+    match (&question.path, question.lines) {
+        (Some(path), Some((first, last))) => {
+            prompt.push_str(&format!(
+                "About {path}, lines {first} to {last} (marked >):\n{}\n\n",
+                question.excerpt
+            ));
+            let diff =
+                ironquill_tools::changes_text(root, std::slice::from_ref(path), WALK_DIFF_LIMIT)
+                    .await;
+            prompt.push_str(&format!("Its changes since the last commit:\n{diff}"));
+        }
+        _ => {
+            let stat = ironquill_tools::diff_stat(root)
+                .await
+                .unwrap_or_else(|e| e.to_string());
+            prompt.push_str(&format!("What changed since the last commit:\n{stat}"));
+        }
+    }
+    // The code may hold a secret of the environment, as a message may: it
+    // reaches the model as its name only.
+    ironquill_tools::redact_secrets(&prompt).0
+}
+
 const INSTRUCTIONS_TEMPLATE: &str = "<!-- Your own instructions for every model ironquill runs, in every project: \
 the one that answers, the planner and the coder of /pair, the team. Lines like this one are \
 left out. Saved with :w, they count from the next request. -->\n";
@@ -944,5 +1012,28 @@ fn find(
         uses: lookup.uses,
         places,
         by: "git grep".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_walk_question_carries_the_place_and_the_file_s_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("new.py"), "print(1)\n").unwrap();
+        let question = crate::app::WalkQuestion {
+            text: "what does it print?".into(),
+            path: Some("new.py".into()),
+            lines: Some((1, 1)),
+            excerpt: ">    1 print(1)".into(),
+            candidates: Vec::new(),
+        };
+        let prompt = walk_prompt(dir.path(), &question).await;
+        assert!(prompt.starts_with("Question: what does it print?"));
+        assert!(prompt.contains("About new.py, lines 1 to 1 (marked >):\n>    1 print(1)"));
+        // Outside a repository, the file as it is now.
+        assert!(prompt.contains("new file new.py:\nprint(1)"));
     }
 }

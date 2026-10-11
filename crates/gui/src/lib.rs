@@ -17,6 +17,7 @@ mod activity;
 mod api_view;
 mod arch3d;
 mod arch_view;
+mod backdrop;
 mod database_view;
 mod error;
 mod infra;
@@ -52,6 +53,7 @@ use bevy_egui::{
 use ironquill_codemap::NodeKind;
 use ironquill_core::{ChatModel, Delegate};
 use ironquill_tools::Workspace;
+use ironquill_ui::backdrop::Motion;
 use ironquill_ui::editor::{EditorMode, ScreenRow};
 use ironquill_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use ironquill_ui::keymap::{Focus, Mode, Pending};
@@ -85,6 +87,10 @@ const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// How long the text cursor stays lit, then dark, while typing: the window
 /// wakes at this pace to blink it, and no faster.
 const BLINK: Duration = Duration::from_millis(530);
+
+/// How long it may sleep while a background moves: about twelve frames a
+/// second, enough for a slow pattern.
+const BACKDROP_WAIT: Duration = Duration::from_millis(80);
 
 /// The frames of the spinner, as in the terminal.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -470,8 +476,14 @@ fn drive<M, D>(
     // An architecture draws only while its camera moves: it never turns
     // by itself.
     let continuous = shown && (!arch.active || arch.needs_frames());
+    // A moving background wakes the window about twelve times a second
+    // while it has the focus; behind other windows it sleeps as before.
+    let backdrop = shell.app.backdrop();
+    let moving = backdrop.pattern.is_some() && backdrop.motion == Motion::Slow;
     let focused = if continuous {
         UpdateMode::Continuous
+    } else if moving {
+        UpdateMode::reactive(wait.min(BACKDROP_WAIT))
     } else {
         UpdateMode::reactive(wait)
     };
@@ -1187,6 +1199,7 @@ pub(crate) fn shadowed(
 
 /// The conversation, following new output unless a key scrolled it back.
 fn conversation<M, D>(ui: &mut Ui, shell: &mut Shell<M, D>) {
+    backdrop::paint(ui, &shell.app);
     let row = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
     let back = shell.app.scroll_back();
     let delta = back as f32 - shell.scroll_seen as f32;
@@ -1219,6 +1232,9 @@ fn activity(ui: &mut Ui, app: &App) {
     let Some(elapsed) = app.elapsed() else {
         if let Some(matches) = app.completions() {
             ui.label(RichText::new(matches.join("   ")).color(DIM));
+        } else if let Some(walk) = app.walk_label() {
+            // Right above the message box: where the message goes.
+            ui.label(RichText::new(format!("WALK · {walk}")).color(YELLOW));
         }
         return;
     };
@@ -1377,6 +1393,16 @@ fn status(ui: &mut Ui, app: &App) {
                 "/{} off ends it",
                 changes.lens.name().to_lowercase()
             ));
+            // Who answers while walking: never a surprise.
+            if let Some(walk) = app.walk_label() {
+                Frame::new()
+                    .fill(YELLOW.gamma_multiply(0.3))
+                    .corner_radius(4)
+                    .inner_margin(Margin::symmetric(6, 1))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(walk).small().strong().color(TEXT));
+                    });
+            }
         }
         match app.pending() {
             Some(Pending::Leader) => {
@@ -1444,6 +1470,7 @@ fn status(ui: &mut Ui, app: &App) {
 
 /// The file tree, the selected row kept in view.
 fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
+    backdrop::paint(ui, app);
     let Some(tree) = app.tree() else {
         return;
     };
@@ -1477,7 +1504,6 @@ fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
     }
     tree.set_offset(offset);
     let mut clicked = None;
-    let branch = tree.shows_changes_only();
     for (i, entry) in tree.rows().iter().enumerate().skip(offset).take(visible) {
         // The row standing for a folder's unchanged files: quiet, a click
         // away from showing them.
@@ -1518,12 +1544,11 @@ fn tree(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             "  "
         };
         let changed = app.is_changed(&entry.path, entry.is_dir);
-        // Looking at a branch, each change has git's letter and colour.
-        let letter = branch
-            .then(|| tree.git_status(&entry.path, entry.is_dir))
-            .flatten();
+        // Each change has git's letter and colour, in every mode: against
+        // the branch's base while it is looked at, else the last commit.
+        let letter = tree.git_status(&entry.path, entry.is_dir);
         let letter_colour = |letter: char| match letter {
-            'A' => theme::GREEN,
+            'A' | '?' => theme::GREEN,
             'D' => theme::RED,
             'R' => theme::CYAN,
             _ => YELLOW,
@@ -1607,6 +1632,7 @@ fn wheel_lines(ui: &Ui, area: egui::Rect, rest: &mut f32, row: f32) -> i32 {
 /// The open file, its lines numbered and coloured by its language, the
 /// cursor's line lit; the editor's mode and message under it.
 fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
+    backdrop::paint(ui, app);
     let Some(editor) = app.file() else {
         return;
     };

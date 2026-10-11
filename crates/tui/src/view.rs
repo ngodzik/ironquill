@@ -2114,9 +2114,14 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let lens = app.change_set().map_or_else(String::new, |c| {
         format!("  {} {} files", c.lens.name(), c.files.len())
     });
+    // Who answers while walking: never a surprise.
+    let walk = app
+        .walk_label()
+        .map_or_else(String::new, |w| format!(" · {w}"));
     let left = Line::from(vec![
         Span::styled(format!("  {mode}"), fg(DIM)),
         Span::styled(lens, fg(Color::Cyan)),
+        Span::styled(walk, fg(Color::Yellow)),
         Span::styled(waiting, fg(Color::Gray)),
         label,
     ]);

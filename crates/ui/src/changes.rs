@@ -14,6 +14,9 @@ pub enum Lens {
     Review,
     /// One's own work in progress, to go on with.
     Work,
+    /// What was just coded and not committed yet, to walk through and ask
+    /// the cheapest model about.
+    Walk,
 }
 
 impl Lens {
@@ -22,6 +25,7 @@ impl Lens {
         match self {
             Self::Review => "REVIEW",
             Self::Work => "WORK",
+            Self::Walk => "WALK",
         }
     }
 
@@ -30,6 +34,7 @@ impl Lens {
         match self {
             Self::Review => "review",
             Self::Work => "work",
+            Self::Walk => "walk",
         }
     }
 }
@@ -53,6 +58,8 @@ impl ChangeSet {
     pub(crate) fn read(root: &Path, lens: Lens, base: Option<&str>) -> Result<Self, String> {
         let base = match base {
             Some(base) => base.to_owned(),
+            // What is not committed yet.
+            None if lens == Lens::Walk => "HEAD".to_owned(),
             None => ironquill_tools::branch_base(root).ok_or_else(|| {
                 format!(
                     "Nothing to compare with: this branch is where main is. /{} <commit or \

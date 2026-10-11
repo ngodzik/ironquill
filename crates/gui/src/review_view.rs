@@ -301,6 +301,7 @@ pub(crate) fn show(
         match changes.lens {
             ironquill_ui::changes::Lens::Review => "Review",
             ironquill_ui::changes::Lens::Work => "Work",
+            ironquill_ui::changes::Lens::Walk => "Walk",
         },
         FontId::proportional(26.0),
         TEXT,

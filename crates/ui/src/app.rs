@@ -164,6 +164,8 @@ pub struct Settings {
     pub mermaid: Option<Vec<String>>,
     /// How long Claude's cache is kept through an API, as configured.
     pub cache_ttl: CacheTtl,
+    /// The pattern behind the window's panels, and whether it moves.
+    pub backdrop: crate::backdrop::Backdrop,
     /// What the provider's models are reached through, such as
     /// "Requesty": shown with them, since the same model may be reached
     /// through an agent too, at another price, with another cache.
@@ -293,6 +295,47 @@ pub enum Effect {
     /// Start the language servers for these files, from the project's
     /// root, so that they read the project before they are asked.
     WarmServers(Vec<PathBuf>),
+    /// Find the cheapest priced of these models, to answer while walking.
+    FindCheapest(Vec<ModelId>),
+    /// Put a question about what was just coded to the cheapest model.
+    AskWalk(WalkQuestion),
+}
+
+/// A question asked while walking what was just coded: about a place in
+/// the open file, or the changes as a whole when none is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkQuestion {
+    /// What the person asked.
+    pub text: String,
+    /// The open file, from the project's root.
+    pub path: Option<String>,
+    /// The lines asked about, from 1, first and last.
+    pub lines: Option<(usize, usize)>,
+    /// The lines around them, numbered, those asked about marked `>`.
+    pub excerpt: String,
+    /// The models that may answer: the cheapest priced of them does.
+    pub candidates: Vec<ModelId>,
+}
+
+/// How many lines show on each side of the place asked about.
+const WALK_AROUND: usize = 7;
+
+/// The lines around `first` to `last` (from 0), numbered from 1, those
+/// asked about marked `>`.
+fn walk_excerpt(lines: &[String], first: usize, last: usize) -> String {
+    let from = first.saturating_sub(WALK_AROUND);
+    let to = (last + WALK_AROUND + 1).min(lines.len());
+    (from..to)
+        .map(|i| {
+            let mark = if (first..=last).contains(&i) {
+                '>'
+            } else {
+                ' '
+            };
+            format!("{mark}{:>5} {}", i + 1, lines[i])
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A name to find, where it was asked about.
@@ -350,6 +393,10 @@ pub enum AgentMessage {
     Dropped(TokenCount, TokenCount),
     /// The request ended: how, or why it failed.
     Done(Result<Outcome, String>),
+    /// The model that answers while walking; `None` when none is priced.
+    WalkModel(Option<ModelId>),
+    /// The answer to a question asked while walking, or why there is none.
+    WalkAnswer(Result<ironquill_agent::Answered, String>),
 }
 
 /// One item in the transcript. Saved with the conversation, so that a
@@ -893,6 +940,10 @@ pub struct App {
     tree: Option<FileTree>,
     /// The branch's changes, while a review or a piece of work is looked at.
     changes: Option<crate::changes::ChangeSet>,
+    /// While walking: the model that answers, once found.
+    walk_model: Option<ModelId>,
+    /// While walking: whether a question waits for its answer.
+    walk_asking: bool,
     file: Option<Editor>,
     /// Files the agent changed during this conversation, relative to the root.
     changed: BTreeSet<String>,
@@ -1042,6 +1093,8 @@ impl App {
             search_from: Mode::Insert,
             tree: None,
             changes: None,
+            walk_model: None,
+            walk_asking: false,
             file: None,
             changed: BTreeSet::new(),
             panes: Cell::new(Panes::default()),
@@ -1371,6 +1424,8 @@ impl App {
         argument: Option<String>,
     ) -> Option<Effect> {
         if argument.as_deref() == Some("off") {
+            self.walk_model = None;
+            self.walk_asking = false;
             if self.changes.take().is_some() {
                 if let Some(tree) = &mut self.tree {
                     tree.show_everything();
@@ -1382,12 +1437,39 @@ impl App {
             }
             return None;
         }
+        // Walking reads only what is not committed yet.
+        let argument = argument.filter(|_| lens != crate::changes::Lens::Walk);
         match crate::changes::ChangeSet::read(&self.root, lens, argument.as_deref()) {
             Err(e) => {
                 self.error(e);
                 None
             }
+            Ok(changes) if lens == crate::changes::Lens::Walk => {
+                let (added, removed) = changes.lines();
+                let count = changes.files.len();
+                self.info(format!(
+                    "Walking: {count} file{} not committed, +{added} −{removed}. The tree \
+                     shows only them; a file opens folded to its changes (zR: whole, zM: \
+                     back). A message is now a question about the cursor's place or the \
+                     selection, answered by the cheapest model, not the agent. /walk off \
+                     ends it",
+                    if count == 1 { "" } else { "s" },
+                ));
+                self.walk_model = None;
+                self.walk_asking = false;
+                self.chat.queued = self.chat.queued.take().or_else(|| {
+                    let files = Self::served(&changes);
+                    (!files.is_empty()).then_some(Effect::WarmServers(files))
+                });
+                self.changes = Some(changes);
+                self.unzoom();
+                self.tree = Some(self.new_tree());
+                self.focus_on(Focus::Tree);
+                Some(Effect::FindCheapest(self.walk_candidates()))
+            }
             Ok(changes) => {
+                self.walk_model = None;
+                self.walk_asking = false;
                 let (added, removed) = changes.lines();
                 let count = changes.files.len();
                 self.info(format!(
@@ -1396,24 +1478,19 @@ impl App {
                      /{} off ends it",
                     match lens {
                         crate::changes::Lens::Review => "Reviewing",
-                        crate::changes::Lens::Work => "Working",
+                        _ => "Working",
                     },
                     if count == 1 { "" } else { "s" },
                     changes.base_line,
                     match lens {
                         crate::changes::Lens::Review => "; nothing can be edited",
-                        crate::changes::Lens::Work => "",
+                        _ => "",
                     },
                     lens.command(),
                 ));
                 // The language servers start reading the project now, to
                 // answer at once when asked.
-                let files: Vec<PathBuf> = changes
-                    .files
-                    .iter()
-                    .map(|f| PathBuf::from(&f.path))
-                    .filter(|p| ironquill_tools::Servers::program_for(p).is_some())
-                    .collect();
+                let files = Self::served(&changes);
                 self.changes = Some(changes);
                 self.unzoom();
                 self.tree = Some(self.new_tree());
@@ -1421,6 +1498,105 @@ impl App {
                 (!files.is_empty()).then_some(Effect::WarmServers(files))
             }
         }
+    }
+
+    /// The changed files a language server reads.
+    fn served(changes: &crate::changes::ChangeSet) -> Vec<PathBuf> {
+        changes
+            .files
+            .iter()
+            .map(|f| PathBuf::from(&f.path))
+            .filter(|p| ironquill_tools::Servers::program_for(p).is_some())
+            .collect()
+    }
+
+    /// Who may answer while walking: the team, the chain and the models
+    /// offered, the cheapest priced of them chosen by the host.
+    fn walk_candidates(&self) -> Vec<ModelId> {
+        let mut candidates: Vec<ModelId> = Vec::new();
+        for model in self
+            .settings
+            .team
+            .iter()
+            .chain(&self.settings.tiers)
+            .chain(&self.settings.models)
+        {
+            if !candidates.contains(model) {
+                candidates.push(model.clone());
+            }
+        }
+        candidates
+    }
+
+    /// Whether what was just coded is walked through: a message is then a
+    /// question for the cheapest model.
+    pub fn walking(&self) -> bool {
+        self.changes
+            .as_ref()
+            .is_some_and(|c| c.lens == crate::changes::Lens::Walk)
+    }
+
+    /// While walking, the model that answers, once found.
+    pub fn walk_model(&self) -> Option<&ModelId> {
+        self.walk_model.as_ref().filter(|_| self.walking())
+    }
+
+    /// While walking, whether a question waits for its answer.
+    pub fn walk_asking(&self) -> bool {
+        self.walk_asking && self.walking()
+    }
+
+    /// While walking, who answers questions, for the status line: so that
+    /// it is never a surprise.
+    pub fn walk_label(&self) -> Option<String> {
+        if !self.walking() {
+            return None;
+        }
+        Some(match (&self.walk_model, self.walk_asking) {
+            (Some(model), true) => format!("{model} is answering…"),
+            (Some(model), false) => format!("questions → {model} (cheapest)"),
+            (None, _) => "finding the cheapest model…".to_owned(),
+        })
+    }
+
+    /// Puts `text` to the cheapest model, about the cursor's place or the
+    /// selection in the open file, or the changes as a whole.
+    fn ask_walk(&mut self, text: String) -> Option<Effect> {
+        if self.walk_asking {
+            self.error("Still answering the last question: wait for it");
+            return None;
+        }
+        let (text, _) = ironquill_tools::redact_secrets(&text);
+        let mut question = WalkQuestion {
+            text: text.clone(),
+            path: None,
+            lines: None,
+            excerpt: String::new(),
+            candidates: self.walk_candidates(),
+        };
+        if let Some(file) = &self.file {
+            let path = file.path();
+            let path = path.strip_prefix(&self.root).unwrap_or(path);
+            let (first, last) = match file.selection() {
+                Some(selection) => (selection.start.0, selection.end.0),
+                None => (file.cursor().0, file.cursor().0),
+            };
+            question.path = Some(path.to_string_lossy().into_owned());
+            question.lines = Some((first + 1, last + 1));
+            question.excerpt = walk_excerpt(file.lines(), first, last);
+        }
+        let place = match (&question.path, question.lines) {
+            (Some(path), Some((first, last))) if first == last => format!("{path}:{first}"),
+            (Some(path), Some((first, last))) => format!("{path}:{first}-{last}"),
+            _ => "the changes".to_owned(),
+        };
+        self.input.take();
+        self.chat
+            .transcript
+            .push(Entry::User(format!("{text} (walk: about {place})")));
+        self.chat.scroll_back.set(0);
+        self.walk_asking = true;
+        Some(Effect::AskWalk(question))
     }
 
     /// Shows the file just opened as the changes looked at want it:
@@ -1756,6 +1932,17 @@ impl App {
                     Some(MapView::Universe) => None,
                 };
                 self.show_map(next);
+            }
+            Action::NextBackdrop => {
+                let backdrop = &mut self.settings.backdrop;
+                backdrop.pattern = crate::backdrop::Pattern::next(backdrop.pattern);
+                self.notice = Some(match backdrop.pattern {
+                    Some(pattern) => format!(
+                        "Background: {} (Ctrl-X: the next one; /background slow moves it)",
+                        pattern.name()
+                    ),
+                    None => "No background".to_owned(),
+                });
             }
             Action::ToggleSeeThrough => {
                 self.settings.see_through = !self.settings.see_through;
@@ -2387,6 +2574,10 @@ impl App {
     }
 
     fn submit(&mut self, text: String) -> Option<Effect> {
+        // Walking, a message is a question about the code, not a request.
+        if self.walking() && !text.is_empty() {
+            return self.ask_walk(text);
+        }
         let tiers = self.settings.tiers.clone();
         self.submit_to(text, tiers)
     }
@@ -2802,6 +2993,14 @@ impl App {
             Command::Work(argument) => {
                 return self.look_at_changes(crate::changes::Lens::Work, argument);
             }
+            Command::Walk(argument) => {
+                return self.look_at_changes(crate::changes::Lens::Walk, argument);
+            }
+            Command::Background(None) => self.info(self.settings.backdrop.describe()),
+            Command::Background(Some(words)) => match self.settings.backdrop.apply(&words) {
+                Ok(said) => self.info(said),
+                Err(e) => self.error(e),
+            },
             Command::Budget(None) => match self.settings.budget {
                 Some(budget) => self.info(format!("Budget: {budget} per request")),
                 None => self.info("No budget: requests may cost any amount"),
@@ -2875,6 +3074,34 @@ impl App {
     /// which is when the conversation is saved.
     pub fn on_agent(&mut self, message: AgentMessage) -> bool {
         match message {
+            AgentMessage::WalkModel(model) => {
+                if model.is_none() && self.walking() {
+                    self.error(
+                        "No model with a known price to answer while walking: add one with \
+                         Ctrl-E",
+                    );
+                }
+                self.walk_model = model;
+                false
+            }
+            AgentMessage::WalkAnswer(answer) => {
+                self.walk_asking = false;
+                match answer {
+                    Ok(answered) => {
+                        self.chat.transcript.push(Entry::Said(answered.text));
+                        let cost = answered
+                            .cost
+                            .map_or_else(|| "cost unknown".to_owned(), |c| c.to_string());
+                        self.info(format!(
+                            "Answered by {}, the cheapest model, {cost}",
+                            answered.model
+                        ));
+                    }
+                    Err(e) => self.error(e),
+                }
+                self.chat.scroll_back.set(0);
+                false
+            }
             AgentMessage::Event(event) => {
                 self.on_event(event);
                 false
@@ -3925,6 +4152,9 @@ impl App {
             // Set in the file only: kept as written there.
             cache_ttl: (self.settings.cache_ttl != CacheTtl::default())
                 .then_some(self.settings.cache_ttl),
+            background: self.settings.backdrop.pattern,
+            background_motion: (self.settings.backdrop.motion != crate::backdrop::Motion::Still)
+                .then_some(self.settings.backdrop.motion),
         }
     }
 
@@ -4190,6 +4420,11 @@ impl App {
     /// and the next, in whole points.
     pub fn set_chat_width(&mut self, width: f32) {
         self.settings.chat_width = Some(width.round());
+    }
+
+    /// The pattern behind the window's panels, and whether it moves.
+    pub fn backdrop(&self) -> crate::backdrop::Backdrop {
+        self.settings.backdrop
     }
 
     /// How opaque the window's background is now: 1 unless see-through.
@@ -4514,8 +4749,9 @@ impl App {
     /// Keeps the tree and the open file in step with what the agent wrote.
     fn on_file_changed(&mut self, path: &str) {
         self.changed.insert(path.to_owned());
+        // Its own path opens; folders folded by hand elsewhere stay so.
         if let Some(tree) = &mut self.tree {
-            tree.refresh();
+            tree.reveal_one(path);
         }
         if let Some(file) = &mut self.file
             && file.path() == Path::new(path)
@@ -5342,13 +5578,118 @@ mod tests {
 
         app.run_command("review off");
         assert!(app.change_set().is_none());
-        assert!(
-            app.tree()
+        // The branch's filter is lifted: the tree shows what is not
+        // committed, a.py, with git's letter against the last commit.
+        let tree = app.tree().unwrap();
+        assert!(!tree.shows_changes_only());
+        let rows: Vec<&str> = tree.rows().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(rows, ["a.py", "+2 unchanged"]);
+        assert_eq!(tree.git_status(Path::new("a.py"), false), Some('M'));
+    }
+
+    #[test]
+    fn walking_a_message_is_a_question_for_the_cheapest_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .output()
                 .unwrap()
-                .rows()
-                .iter()
-                .any(|r| r.name == "same.py")
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let body: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.path().join("a.py"), &body).unwrap();
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(
+            dir.path().join("a.py"),
+            body.replace("line 20\n", "line twenty\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("new.py"), "print(1)\n").unwrap();
+        let mut app = App::new(
+            Settings {
+                tiers: vec![ModelId::new("claude-code/opus").unwrap()],
+                team: vec![ModelId::new("cheap").unwrap()],
+                models: vec![ModelId::new("glm").unwrap()],
+                rounds: 2,
+                max_turns: 30,
+                ..Settings::default()
+            },
+            dir.path().to_owned(),
         );
+
+        // What is not committed, new files too; the cheapest is looked for
+        // among the team, the chain and the models offered.
+        let Some(Effect::FindCheapest(candidates)) = app.run_command("walk") else {
+            panic!("walking looks for the cheapest model");
+        };
+        let ids: Vec<&str> = candidates.iter().map(ModelId::as_str).collect();
+        assert_eq!(ids, ["cheap", "claude-code/opus", "glm"]);
+        let files: Vec<&str> = app
+            .change_set()
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(files, ["a.py", "new.py"]);
+        assert!(app.walking());
+        assert_eq!(app.walk_label().unwrap(), "finding the cheapest model…");
+        app.on_agent(AgentMessage::WalkModel(Some(ModelId::new("glm").unwrap())));
+        assert_eq!(app.walk_label().unwrap(), "questions → glm (cheapest)");
+
+        // A question about the cursor's line, with the lines around it.
+        app.open_path_at(PathBuf::from("a.py"), 20);
+        app.focus_on(Focus::Chat);
+        app.mode = Mode::Insert;
+        type_text(&mut app, "why twenty?");
+        let Some(Effect::AskWalk(question)) = press(&mut app, KeyCode::Enter) else {
+            panic!("a message is a question while walking");
+        };
+        assert_eq!(question.path.as_deref(), Some("a.py"));
+        assert_eq!(question.lines, Some((20, 20)));
+        assert!(question.excerpt.contains(">   20 line twenty"));
+        assert!(question.excerpt.contains("    13 line 13"));
+        assert!(!question.excerpt.contains("line 12\n"));
+        assert!(matches!(
+            app.transcript().last(),
+            Some(Entry::User(text)) if text == "why twenty? (walk: about a.py:20)"
+        ));
+        assert!(app.walk_asking());
+        assert!(!app.is_running(), "the agent is not asked");
+
+        app.on_agent(AgentMessage::WalkAnswer(Ok(ironquill_agent::Answered {
+            text: "A rename.".into(),
+            model: ModelId::new("glm").unwrap(),
+            usage: Usage::default(),
+            cost: Some(Usd(0.0002)),
+        })));
+        let last: Vec<&Entry> = app.transcript().iter().rev().take(2).collect();
+        assert!(matches!(last[1], Entry::Said(text) if text == "A rename."));
+        assert!(
+            matches!(last[0], Entry::Info(text) if text.starts_with("Answered by glm, the cheapest model"))
+        );
+        assert!(!app.walk_asking());
+
+        // Off, a message goes to the agent again.
+        app.run_command("walk off");
+        assert!(!app.walking());
+        app.focus_on(Focus::Chat);
+        app.mode = Mode::Insert;
+        type_text(&mut app, "go on");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::Send { .. })
+        ));
     }
 
     #[test]
@@ -5771,6 +6112,8 @@ mod tests {
                 images: None,
                 mermaid: None,
                 cache_ttl: None,
+                background: None,
+                background_motion: None,
             }
         );
     }
