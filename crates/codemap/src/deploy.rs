@@ -142,6 +142,10 @@ pub struct Environment {
     pub encrypted: Vec<Place>,
     /// What could not be read.
     pub notes: Vec<String>,
+    /// Where the Flux `Kustomization` that builds it is declared, when
+    /// Terraform declares it: the cluster it runs on is the one that
+    /// Terraform installs Flux on.
+    pub declared_in: Option<Place>,
 }
 
 /// What the repositories say of where the project runs.
@@ -177,6 +181,7 @@ pub fn deploy(repos: &Repos, named: &[NamedEnvironment]) -> Deploy {
     let mut deploy = Deploy::default();
     let mut kustomizations: Vec<PathBuf> = Vec::new();
     let mut sources: Vec<(Node, Place)> = Vec::new();
+    let mut declared: Vec<(Node, Place)> = Vec::new();
     for repo in &repos.repos {
         for (path, rel) in files(&repo.root) {
             let name = rel.rsplit('/').next().unwrap_or(&rel);
@@ -187,6 +192,14 @@ pub fn deploy(repos: &Repos, named: &[NamedEnvironment]) -> Deploy {
             } else if KUSTOMIZATION.contains(&name) {
                 if let Some(dir) = path.parent() {
                     kustomizations.push(dir.to_owned());
+                }
+            } else if rel.ends_with(".tf") {
+                // Flux's objects written in Terraform, as a manifest's
+                // YAML: those that say which folders the cluster builds.
+                if let Ok(text) = std::fs::read_to_string(&path)
+                    && text.contains("kustomize.toolkit.fluxcd.io")
+                {
+                    declared.extend(flux_in_terraform(&text, &repo.name, &rel));
                 }
             } else if (rel.ends_with(".yaml") || rel.ends_with(".yml")) && !encrypted_name(&rel) {
                 let Ok(text) = std::fs::read_to_string(&path) else {
@@ -216,7 +229,7 @@ pub fn deploy(repos: &Repos, named: &[NamedEnvironment]) -> Deploy {
     for dir in &kustomizations {
         included.extend(includes(repos, dir));
     }
-    let mut roots: Vec<(PathBuf, String, String)> = kustomizations
+    let mut roots: Vec<Root> = kustomizations
         .iter()
         .filter(|dir| !included.contains(&normal(dir)))
         .filter(|dir| {
@@ -225,16 +238,81 @@ pub fn deploy(repos: &Repos, named: &[NamedEnvironment]) -> Deploy {
         })
         .filter_map(|dir| {
             let (repo, rel) = repos.locate(dir)?;
-            Some((dir.clone(), repo.name.clone(), rel))
+            Some(Root {
+                dir: normal(dir),
+                repo: repo.name.clone(),
+                folder: rel,
+                flux: None,
+            })
         })
         .collect();
-    roots.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+    // A folder Flux builds, as Terraform declares it, is an environment,
+    // with or without a tree of its own.
+    for (i, (doc, place)) in declared.iter().enumerate() {
+        let Some(target) = doc.str_at(&["spec", "path"]) else {
+            continue;
+        };
+        let Some(dir) = repos
+            .file(place)
+            .and_then(|from| flux_path(repos, &from, target))
+        else {
+            deploy.notes.push(format!(
+                "{place} builds {target}, which is in none of the repositories read"
+            ));
+            continue;
+        };
+        match roots.iter_mut().find(|r| r.dir == dir) {
+            Some(root) => root.flux = Some(i),
+            None => {
+                if let Some((repo, rel)) = repos.locate(&dir) {
+                    roots.push(Root {
+                        dir,
+                        repo: repo.name.clone(),
+                        folder: rel,
+                        flux: Some(i),
+                    });
+                }
+            }
+        }
+    }
+    // A folder the settings name is one too, its manifests read as Flux
+    // reads a folder without a tree.
+    for named in named {
+        if roots.iter().any(|r| same_folder(&named.path, &r.folder)) {
+            continue;
+        }
+        let found = repos
+            .repos
+            .iter()
+            .map(|r| (r, normal(&r.root.join(named.path.trim_start_matches("./")))))
+            .find(|(_, dir)| dir.is_dir());
+        if let Some((repo, dir)) = found
+            && let Some((_, rel)) = repos.locate(&dir)
+        {
+            roots.push(Root {
+                dir,
+                repo: repo.name.clone(),
+                folder: rel,
+                flux: None,
+            });
+        }
+    }
+    roots.sort_by(|a, b| (&a.repo, &a.folder).cmp(&(&b.repo, &b.folder)));
 
     let mut environments: Vec<Environment> = roots
         .iter()
-        .map(|(dir, repo, folder)| {
-            let chosen = named.iter().find(|n| same_folder(&n.path, folder));
-            let mut environment = environment(repos, dir, repo, folder, &sources, &deploy.charts);
+        .map(|root| {
+            let chosen = named.iter().find(|n| same_folder(&n.path, &root.folder));
+            let flux = root.flux.map(|i| &declared[i]);
+            let mut environment = environment(
+                repos,
+                &root.dir,
+                &root.repo,
+                &root.folder,
+                flux,
+                &sources,
+                &deploy.charts,
+            );
             if let Some(chosen) = chosen {
                 environment.name.clone_from(&chosen.name);
                 environment.chosen = true;
@@ -242,13 +320,22 @@ pub fn deploy(repos: &Repos, named: &[NamedEnvironment]) -> Deploy {
             environment
         })
         .collect();
+    // Two of the same name are told apart by their folders.
+    let names: Vec<String> = environments.iter().map(|e| e.name.clone()).collect();
+    for environment in environments.iter_mut().filter(|e| !e.chosen) {
+        if names.iter().filter(|n| **n == environment.name).count() > 1
+            && let Some(part) = environment.parts.first()
+        {
+            environment.name = format!("{} ({})", environment.name, part.folder);
+        }
+    }
     for named in named {
         if !environments
             .iter()
             .any(|e| e.chosen && e.name == named.name)
         {
             deploy.notes.push(format!(
-                "The environment {} is at {}, where no Kustomize tree was found",
+                "The environment {} is at {}, which is in none of the repositories read",
                 named.name, named.path
             ));
         }
@@ -264,6 +351,57 @@ pub fn deploy(repos: &Repos, named: &[NamedEnvironment]) -> Deploy {
     });
     deploy.environments = environments;
     deploy
+}
+
+/// A folder an environment is built from.
+struct Root {
+    dir: PathBuf,
+    repo: String,
+    folder: String,
+    /// The Flux `Kustomization` that Terraform declares for it, by its
+    /// place among those read.
+    flux: Option<usize>,
+}
+
+/// The Flux `Kustomization`s written in a Terraform file's strings (a
+/// manifest's YAML in a heredoc), each with its line.
+fn flux_in_terraform(text: &str, repo: &str, rel: &str) -> Vec<(Node, Place)> {
+    fn strings<'a>(value: &'a crate::hcl::Hcl, line: usize, out: &mut Vec<(&'a str, usize)>) {
+        match value {
+            crate::hcl::Hcl::Str(s) => out.push((s, line)),
+            crate::hcl::Hcl::List(items) => items.iter().for_each(|i| strings(i, line, out)),
+            crate::hcl::Hcl::Object(entries) => {
+                entries.iter().for_each(|(_, v)| strings(v, line, out));
+            }
+            _ => {}
+        }
+    }
+    fn walk<'a>(body: &'a crate::hcl::Body, out: &mut Vec<(&'a str, usize)>) {
+        for a in &body.attributes {
+            strings(&a.value, a.line, out);
+        }
+        for b in &body.blocks {
+            walk(&b.body, out);
+        }
+    }
+    let body = crate::hcl::parse(text);
+    let mut found = Vec::new();
+    walk(&body, &mut found);
+    let mut out = Vec::new();
+    for (text, line) in found {
+        if !text.contains("Kustomization") {
+            continue;
+        }
+        for mut doc in yaml::docs(text) {
+            if is_flux_kustomization(&doc) {
+                // A heredoc's text starts on the line after its attribute.
+                shift(&mut doc, line);
+                let at = doc.line;
+                out.push((doc, Place::new(repo, rel, at)));
+            }
+        }
+    }
+    out
 }
 
 fn same_folder(a: &str, b: &str) -> bool {
@@ -853,6 +991,7 @@ fn environment(
     dir: &Path,
     repo: &str,
     folder: &str,
+    flux: Option<&(Node, Place)>,
     sources: &[(Node, Place)],
     charts: &[Chart],
 ) -> Environment {
@@ -868,6 +1007,9 @@ fn environment(
         folder: folder.to_owned(),
     }];
     let mut docs = loader.tree(dir);
+    if let Some(namespace) = flux.and_then(|(f, _)| f.str_at(&["spec", "targetNamespace"])) {
+        into_namespace(&mut docs, namespace);
+    }
     // Follow Flux's Kustomizations, as patched, to the trees they build.
     let mut next = 0;
     while next < docs.len() {
@@ -883,7 +1025,10 @@ fn environment(
             };
             if !parts.contains(&part) {
                 parts.push(part);
-                let more = loader.tree(&found);
+                let mut more = loader.tree(&found);
+                if let Some(namespace) = docs[next].node.str_at(&["spec", "targetNamespace"]) {
+                    into_namespace(&mut more, namespace);
+                }
                 docs.extend(more);
             }
         }
@@ -968,18 +1113,38 @@ fn environment(
     }
     loader.encrypted.sort();
     loader.encrypted.dedup();
+    let name = flux
+        .and_then(|(f, _)| f.str_at(&["metadata", "name"]))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if folder.is_empty() {
+                repo.to_owned()
+            } else {
+                folder.to_owned()
+            }
+        });
     Environment {
-        name: if folder.is_empty() {
-            repo.to_owned()
-        } else {
-            folder.to_owned()
-        },
+        name,
         chosen: false,
         parts,
         releases,
         manifests,
         encrypted: loader.encrypted,
         notes: loader.notes,
+        declared_in: flux.map(|(_, place)| place.clone()),
+    }
+}
+
+/// Puts the objects in `namespace`, as a Flux `Kustomization`'s target
+/// namespace does.
+fn into_namespace(docs: &mut [Doc], namespace: &str) {
+    for d in docs {
+        if !cluster_wide(d.node.str_at(&["kind"]).unwrap_or("")) {
+            d.node.set(
+                &["metadata".into(), "namespace".into()],
+                Node::scalar(namespace, d.node.line),
+            );
+        }
     }
 }
 

@@ -78,7 +78,14 @@ fn arrange(deployment: &Deployment, room: Rect) -> Vec<Option<Rect>> {
         (e.kind, e.namespace.clone(), e.name.clone())
     });
     for i in order {
-        if let Some(c) = column(deployment.elements[i].kind) {
+        let e = &deployment.elements[i];
+        // A Kubernetes secret is in the cluster, not the cloud.
+        let c = if e.kind == ElementKind::Secret && e.namespace.is_some() {
+            Some(1)
+        } else {
+            column(e.kind)
+        };
+        if let Some(c) = c {
             columns[c].push(i);
         }
     }

@@ -120,9 +120,6 @@ fn subtitle(services: &Services, service: usize) -> String {
     if s.external {
         return "outside the project".to_owned();
     }
-    if s.folder.is_none() && s.operations.is_empty() && s.tools.is_empty() {
-        return "deployed".to_owned();
-    }
     let tools = s.tools.iter().filter(|t| t.kind == ToolKind::Tool).count();
     let mut parts = Vec::new();
     if !s.operations.is_empty() {
