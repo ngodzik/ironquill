@@ -327,7 +327,7 @@ pub(crate) async fn read_body(url: &str, response: reqwest::Response) -> Result<
 }
 
 /// Whether `model` is one of Anthropic's, whatever route serves it, such
-/// as `bedrock/claude-opus-5-5@eu-west-1`.
+/// as `bedrock/claude-opus-5-5`.
 fn is_claude(model: &ModelId) -> bool {
     model.as_str().contains("claude")
 }
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn claude_gets_marks_on_its_system_message_and_last_text() {
-        let model = ModelId::new("bedrock/claude-opus-5-5@eu-west-1").unwrap();
+        let model = ModelId::new("bedrock/claude-opus-5-5").unwrap();
         assert!(is_claude(&model));
         assert!(!is_claude(&ModelId::new("deepseek/deepseek-chat").unwrap()));
         let request = ChatRequest {
@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn a_provider_is_named_by_its_host() {
         assert_eq!(
-            OpenAiCompatible::new("https://router.eu.requesty.ai/v1", "k").name(),
+            OpenAiCompatible::new("https://router.requesty.ai/v1", "k").name(),
             "Requesty"
         );
         assert_eq!(

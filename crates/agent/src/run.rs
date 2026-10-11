@@ -5749,7 +5749,7 @@ mod tests {
         let (_dir, mut toolbox) = setup();
         let model = Scripted::new(vec![says("Hello."), says("ok")]);
         let config = AgentConfig::builder()
-            .tier(ModelId::new("bedrock/claude-opus-5-5@eu-west-1").unwrap())
+            .tier(ModelId::new("bedrock/claude-opus-5-5").unwrap())
             .effort(Some(Effort::High))
             .build()
             .unwrap();

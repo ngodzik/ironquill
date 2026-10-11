@@ -58,8 +58,8 @@ ironquill --gui                     # in a window
 
 Claude can be reached through Requesty in two ways, side by side; each model is shown with how it is reached (`· Claude CLI`, `· Requesty`), since prices and caches differ.
 
-- **Through its API**: pick a model such as `bedrock/claude-opus-5-5@eu-west-1`, with `IRONQUILL_BASE_URL=https://router.eu.requesty.ai/v1` for the EU router. ironquill marks what Claude caches itself. `cache_ttl = "1h"` in `~/.ironquill/config.toml` keeps the cache an hour, with no tick, at twice the input price per write instead of 1.25 times.
-- **Through Claude Code**: set `ANTHROPIC_BASE_URL=https://router.eu.requesty.ai`, `ANTHROPIC_AUTH_TOKEN` to the Requesty key, and `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to Requesty's ids. Claude Code prices its calls at Anthropic's list prices, without the regional routes' surcharge.
+- **Through its API**: pick a Requesty id for a Claude model, such as `bedrock/claude-opus-5-5`; `IRONQUILL_BASE_URL` sets another of Requesty's routers than the default. ironquill marks what Claude caches itself. `cache_ttl = "1h"` in `~/.ironquill/config.toml` keeps the cache an hour, with no tick, at twice the input price per write instead of 1.25 times.
+- **Through Claude Code**: set `ANTHROPIC_BASE_URL` to Requesty's router (`https://router.requesty.ai`), `ANTHROPIC_AUTH_TOKEN` to the Requesty key, and `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to Requesty's ids. Claude Code prices its calls at Anthropic's list prices, whatever Requesty charges for the route.
 
 ## Building
 

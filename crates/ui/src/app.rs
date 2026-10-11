@@ -4697,8 +4697,8 @@ mod tests {
         );
         assert_eq!(label(&app, "codex"), "codex · Codex CLI");
         assert_eq!(
-            label(&app, "bedrock/claude-opus-5-5@eu-west-1"),
-            "bedrock/claude-opus-5-5@eu-west-1 · Requesty"
+            label(&app, "bedrock/claude-opus-5-5"),
+            "bedrock/claude-opus-5-5 · Requesty"
         );
         app.settings.provider.clear();
         assert_eq!(label(&app, "glm"), "glm · API");
