@@ -77,6 +77,8 @@ pub struct Service {
     pub tools: Vec<Tool>,
     /// What it is when a cloud resource: a database, a bucket, a role.
     pub cloud: Option<crate::deployment::ElementKind>,
+    /// The platforms it is built for, when an app: `Android`, `Web`.
+    pub platforms: Vec<String>,
 }
 
 /// Where a link was read.
@@ -180,6 +182,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
                 operations: Vec::new(),
                 tools: Vec::new(),
                 cloud: None,
+                platforms: Vec::new(),
             })
             .collect(),
         ..Services::default()
@@ -208,6 +211,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
                 operations: Vec::new(),
                 tools: Vec::new(),
                 cloud: None,
+                platforms: Vec::new(),
             });
         }
     }
@@ -408,6 +412,7 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
                         operations: Vec::new(),
                         tools: Vec::new(),
                         cloud: None,
+                        platforms: Vec::new(),
                     });
                     services.services.len() - 1
                 }
@@ -420,8 +425,127 @@ pub(crate) fn read(root: &Path, map: &CodeMap, sources: &[(usize, String)]) -> S
     }
 
     services.links = links.into_values().collect();
+    apps(root, map, sources, &mut services);
     services.centre = centre(&services);
     services
+}
+
+/// The Flutter apps of the project and the platforms each is built for:
+/// those its folder holds (`android`, `ios`, `web`), and those a build
+/// script, a workflow or a Dockerfile builds (`flutter build appbundle`).
+/// Each app is its own service, or adds its platforms to the service that
+/// builds it.
+fn apps(root: &Path, map: &CodeMap, sources: &[(usize, String)], services: &mut Services) {
+    static BUILD: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"flutter\s+build\s+(apk|appbundle|ipa|ios|web|macos|windows|linux)\b").ok()
+    });
+    let platform = |target: &str| match target {
+        "apk" | "appbundle" | "android" => "Android",
+        "ipa" | "ios" => "iOS",
+        "web" => "Web",
+        "macos" => "macOS",
+        "windows" => "Windows",
+        _ => "Linux",
+    };
+    let apps: Vec<String> = sources
+        .iter()
+        .filter(|(n, text)| {
+            map.nodes[*n].name() == "pubspec.yaml"
+                && (text.contains("sdk: flutter") || text.contains("\nflutter:"))
+        })
+        .map(|(n, _)| {
+            let path = &map.nodes[*n].path;
+            path.rsplit_once('/').map_or("", |(f, _)| f).to_owned()
+        })
+        .collect();
+    if apps.is_empty() {
+        return;
+    }
+    let mut built: Vec<Vec<String>> = vec![Vec::new(); apps.len()];
+    for (i, app) in apps.iter().enumerate() {
+        for target in ["android", "ios", "web", "macos", "windows", "linux"] {
+            let folder = if app.is_empty() {
+                target.to_owned()
+            } else {
+                format!("{app}/{target}")
+            };
+            if map.find(&folder).is_some() {
+                built[i].push(platform(target).to_owned());
+            }
+        }
+    }
+    // The files read, and the CI's workflows, which hide in a folder the
+    // map leaves out.
+    let mut scripts: Vec<(String, String)> = sources
+        .iter()
+        .map(|(n, t)| (map.nodes[*n].path.clone(), t.clone()))
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(root.join(".github/workflows")) {
+        for entry in entries.filter_map(Result::ok) {
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                scripts.push((
+                    format!(".github/workflows/{}", entry.file_name().to_string_lossy()),
+                    text,
+                ));
+            }
+        }
+    }
+    for (path, text) in &scripts {
+        let Some(re) = BUILD.as_ref() else { break };
+        for c in re.captures_iter(text) {
+            // The app it builds: the one it is in, or names, or the only one.
+            let i = apps
+                .iter()
+                .position(|a| !a.is_empty() && within(path, a))
+                .or_else(|| {
+                    let named: Vec<usize> = (0..apps.len())
+                        .filter(|&i| !apps[i].is_empty() && text.contains(apps[i].as_str()))
+                        .collect();
+                    (named.len() == 1).then(|| named[0])
+                })
+                .or_else(|| (apps.len() == 1).then_some(0));
+            if let Some(i) = i {
+                let p = platform(&c[1]).to_owned();
+                if !built[i].contains(&p) {
+                    built[i].push(p);
+                }
+            }
+        }
+    }
+    for (app, platforms) in apps.iter().zip(built) {
+        let probe = if app.is_empty() {
+            "pubspec.yaml".to_owned()
+        } else {
+            format!("{app}/pubspec.yaml")
+        };
+        let service = match services.owner(&probe) {
+            Some(s) => s,
+            None => {
+                let name = app
+                    .rsplit('/')
+                    .next()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or("app");
+                services.services.push(Service {
+                    name: name.to_owned(),
+                    folder: Some(app.clone()),
+                    external: false,
+                    operations: Vec::new(),
+                    tools: Vec::new(),
+                    cloud: None,
+                    platforms: Vec::new(),
+                });
+                services.services.len() - 1
+            }
+        };
+        let mut platforms = platforms;
+        platforms.sort_by_key(|p| {
+            ["Android", "iOS", "Web", "macOS", "Windows", "Linux"]
+                .iter()
+                .position(|x| x == p)
+        });
+        services.services[service].platforms = platforms;
+    }
 }
 
 /// The service linked to the most others, then serving the most.
@@ -556,12 +680,19 @@ fn compose(
         };
         let context = match &service["build"] {
             Yaml::String(s) => Some(s.clone()),
-            Yaml::Hash(_) => Some(
-                service["build"]["context"]
-                    .as_str()
-                    .unwrap_or(".")
-                    .to_owned(),
-            ),
+            Yaml::Hash(_) => {
+                let context = service["build"]["context"].as_str().unwrap_or(".");
+                // Built from a wider folder with a Dockerfile in one of its
+                // own (`dockerfile: backend/Dockerfile`): that folder is the
+                // service's, not the whole context.
+                let dockerfile = service["build"]["dockerfile"].as_str().unwrap_or("");
+                match dockerfile.rsplit_once('/') {
+                    Some((inside, _)) if !inside.is_empty() => {
+                        Some(format!("{}/{inside}", context.trim_end_matches('/')))
+                    }
+                    _ => Some(context.to_owned()),
+                }
+            }
             _ => None,
         };
         let mut environment = Vec::new();
@@ -854,6 +985,7 @@ mod tests {
                     operations: Vec::new(),
                     tools: Vec::new(),
                     cloud: None,
+                    platforms: Vec::new(),
                 },
                 Service {
                     name: "backend".into(),
@@ -862,6 +994,7 @@ mod tests {
                     operations: Vec::new(),
                     tools: Vec::new(),
                     cloud: None,
+                    platforms: Vec::new(),
                 },
             ],
             ..Services::default()

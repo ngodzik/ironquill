@@ -120,6 +120,17 @@ fn subtitle(services: &Services, service: usize) -> String {
     if s.external {
         return "outside the project".to_owned();
     }
+    if !s.platforms.is_empty() {
+        let mut text = match s.platforms.as_slice() {
+            [one] => format!("app for {one}"),
+            [rest @ .., last] => format!("app for {} and {last}", rest.join(", ")),
+            [] => String::new(),
+        };
+        if !s.operations.is_empty() {
+            text.push_str(&format!(" · {} routes", s.operations.len()));
+        }
+        return text;
+    }
     let tools = s.tools.iter().filter(|t| t.kind == ToolKind::Tool).count();
     let mut parts = Vec::new();
     if !s.operations.is_empty() {
@@ -1208,6 +1219,7 @@ mod tests {
             operations: Vec::new(),
             tools: Vec::new(),
             cloud: None,
+            platforms: Vec::new(),
         }
     }
 

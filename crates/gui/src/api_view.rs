@@ -223,10 +223,16 @@ pub(crate) fn show(
     painter.text(
         corner + vec2(0.0, 34.0),
         Align2::LEFT_TOP,
-        format!(
-            "{project} · {routes_found} in {specs} spec{} · {served} served · {called} called by the front end",
-            if specs == 1 { "" } else { "s" },
-        ),
+        if operations.iter().all(|o| o.from_code) {
+            format!(
+                "{project} · {routes_found} read from the code, there being no spec · {called} called by the front end"
+            )
+        } else {
+            format!(
+                "{project} · {routes_found} in {specs} spec{} · {served} served · {called} called by the front end",
+                if specs == 1 { "" } else { "s" },
+            )
+        },
         FontId::proportional(13.0),
         DIM,
     );
@@ -641,9 +647,16 @@ fn sheet(
                 );
             }
             ui.label(
-                RichText::new(format!("from {}", map.nodes[operation.spec].path))
-                    .size(11.5)
-                    .color(DIM),
+                RichText::new(if operation.from_code {
+                    format!(
+                        "declared in {}, read from the code: there is no spec",
+                        map.nodes[operation.spec].path
+                    )
+                } else {
+                    format!("from {}", map.nodes[operation.spec].path)
+                })
+                .size(11.5)
+                .color(DIM),
             );
             if !operation.description.is_empty() && operation.description != operation.summary {
                 ui.add_space(6.0);

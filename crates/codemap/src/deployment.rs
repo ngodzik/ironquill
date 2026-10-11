@@ -1142,6 +1142,7 @@ pub fn with_cloud(services: &Services, deployment: &Deployment) -> Services {
             operations: Vec::new(),
             tools: Vec::new(),
             cloud,
+            platforms: Vec::new(),
         });
         out.services.len() - 1
     };

@@ -28,6 +28,10 @@ static PY_IMPORT: LazyLock<Option<Regex>> =
 static JS_IMPORT: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r#"(?:\bfrom\s+|\bimport\s*\(?\s*|\brequire\(\s*)['"]([^'"\s]+)['"]"#).ok()
 });
+static DART_IMPORT: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r#"(?m)^\s*(?:import|export|part)\s+['"]([^'"]+)['"]"#).ok());
+static PUBSPEC_NAME: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?m)^name:\s*([A-Za-z_]\w*)").ok());
 static CARGO_NAME: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r#"(?m)^\s*name\s*=\s*"([^"]+)""#).ok());
 
@@ -39,6 +43,9 @@ pub(crate) struct Index {
     crates: HashMap<String, String>,
     python_modules: HashMap<String, String>,
     aliases: HashMap<String, Vec<Alias>>,
+    /// Dart packages by name, with the `lib` folder `package:` imports of
+    /// them start from.
+    dart_packages: HashMap<String, String>,
 }
 
 /// A TypeScript path alias: imports starting with `prefix` (and, for a
@@ -66,10 +73,12 @@ impl Index {
             crates: HashMap::new(),
             python_modules: HashMap::new(),
             aliases: HashMap::new(),
+            dart_packages: HashMap::new(),
         };
         index.crates = rust_crates(root, &index);
         index.python_modules = python_modules(&index);
         index.aliases = typescript_aliases(root, &index);
+        index.dart_packages = dart_packages(root, &index);
         index
     }
 
@@ -308,6 +317,7 @@ pub(crate) fn of(path: &str, language: Language, text: &str, index: &Index) -> V
         Language::Rust => rust(path, text, index),
         Language::Python => python(path, text, index),
         Language::TypeScript | Language::JavaScript => javascript(path, text, index),
+        Language::Dart => dart(path, text, index),
         _ => Vec::new(),
     };
     let mut nodes: Vec<usize> = found.iter().filter_map(|p| index.file(p)).collect();
@@ -487,6 +497,47 @@ fn javascript(path: &str, text: &str, index: &Index) -> Vec<String> {
         }
     }
     found
+}
+
+/// The project's Dart packages, by the name their `pubspec.yaml` gives.
+fn dart_packages(root: &Path, index: &Index) -> HashMap<String, String> {
+    let Some(name) = PUBSPEC_NAME.as_ref() else {
+        return HashMap::new();
+    };
+    let mut packages = HashMap::new();
+    for path in index.paths().filter(|p| file_name(p) == "pubspec.yaml") {
+        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+            continue;
+        };
+        if let Some(found) = name.captures(&text).and_then(|c| c.get(1)) {
+            packages.insert(found.as_str().to_owned(), join(parent(path), "lib"));
+        }
+    }
+    packages
+}
+
+/// What a Dart file imports, exports or is made of: `package:` imports
+/// of the project's own packages, from their `lib`, and relative ones.
+fn dart(path: &str, text: &str, index: &Index) -> Vec<String> {
+    let Some(re) = DART_IMPORT.as_ref() else {
+        return Vec::new();
+    };
+    let dir = parent(path);
+    re.captures_iter(text)
+        .filter_map(|c| {
+            let written = &c[1];
+            if written.starts_with("dart:") {
+                return None;
+            }
+            match written.strip_prefix("package:") {
+                Some(rest) => {
+                    let (package, inside) = rest.split_once('/')?;
+                    Some(join(index.dart_packages.get(package)?, inside))
+                }
+                None => Some(join(dir, written)),
+            }
+        })
+        .collect()
 }
 
 /// The file `target` names, as bundlers and TypeScript look: the path as

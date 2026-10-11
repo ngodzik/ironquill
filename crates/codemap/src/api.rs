@@ -63,8 +63,12 @@ pub struct Operation {
     pub tags: Vec<String>,
     /// Whether the spec says it is deprecated.
     pub deprecated: bool,
-    /// The spec it is from, as a node of the map.
+    /// The spec it is from, as a node of the map; for a route read from
+    /// the code, the file that declares it.
     pub spec: usize,
+    /// Whether it was read from the code's route decorators, there being no
+    /// spec.
+    pub from_code: bool,
     /// The file and the line, from 1, of the function that serves it.
     pub handler: Option<(usize, usize)>,
     /// The front end's files that call it.
@@ -146,10 +150,19 @@ pub(crate) fn read(
             operations.extend(operations_of(*node, text));
         }
     }
+    // Without a spec, the routes the code declares, as FastAPI and Flask
+    // write them.
     if operations.is_empty() {
-        return (Vec::new(), Vec::new());
+        operations = routes_in_code(map, texts);
+        if operations.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
     }
-    let wanted: HashSet<&str> = operations.iter().map(|o| o.id.as_str()).collect();
+    let wanted: HashSet<&str> = operations
+        .iter()
+        .filter(|o| !o.from_code)
+        .map(|o| o.id.as_str())
+        .collect();
 
     // The functions under a route decorator, by name, with their line.
     let mut handlers: HashMap<String, Vec<(usize, usize, bool)>> = HashMap::new();
@@ -187,6 +200,9 @@ pub(crate) fn read(
     let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, operation) in operations.iter_mut().enumerate() {
         let spec_path = &map.nodes[operation.spec].path;
+        if operation.from_code {
+            continue;
+        }
         operation.handler = handlers.get(&operation.id).and_then(|candidates| {
             candidates
                 .iter()
@@ -243,6 +259,9 @@ pub(crate) fn read(
         }
     }
 
+    // And those whose paths they write: `'$baseUrl/users/me'`.
+    path_callers(map, texts, &mut operations);
+
     let mut calls = HashSet::new();
     for operation in &mut operations {
         operation.callers.sort_unstable();
@@ -254,6 +273,363 @@ pub(crate) fn read(
     let mut calls: Vec<(usize, usize)> = calls.into_iter().collect();
     calls.sort_unstable();
     (operations, calls)
+}
+
+/// The routes Python code declares with decorators, there being no spec:
+/// `@router.get("/me")` under `router = APIRouter(prefix="/users")`, that
+/// router included with `app.include_router(users.router, prefix="/api")`.
+fn routes_in_code(map: &CodeMap, texts: &[(usize, String)]) -> Vec<Operation> {
+    static ROUTER: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^\s*(\w+)\s*(?::[^=\n]+)?=\s*(?:\w+\.)*(APIRouter|FastAPI|Blueprint|Flask)\(([^)]*)\)",
+        )
+        .ok()
+    });
+    static PREFIX: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r#"\b(?:prefix|url_prefix|root_path)\s*=\s*["']([^"']*)["']"#).ok()
+    });
+    static TAG: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r#"\btags\s*=\s*\[\s*["']([^"']+)["']"#).ok());
+    static INCLUDE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"(\w+)\.(?:include_router|register_blueprint)\(\s*([\w.]+)\s*(?:,([^)]*))?\)")
+            .ok()
+    });
+    static IMPORT: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*from\s+([\w.]+)\s+import\s+([^\n#]+)").ok());
+    static DECORATOR: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?m)^\s*@(\w+)\.(get|post|put|patch|delete|head|options|websocket|api_route|route)\(\s*["']([^"']*)["']([^)]*)\)"#,
+        )
+        .ok()
+    });
+    static METHODS_ARG: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"\bmethods\s*=\s*\[([^\]]*)\]").ok());
+    let (Some(router), Some(include), Some(import), Some(decorator), Some(def)) = (
+        ROUTER.as_ref(),
+        INCLUDE.as_ref(),
+        IMPORT.as_ref(),
+        DECORATOR.as_ref(),
+        DEF.as_ref(),
+    ) else {
+        return Vec::new();
+    };
+    let python: Vec<&(usize, String)> = texts
+        .iter()
+        .filter(|(n, _)| {
+            matches!(
+                map.nodes[*n].kind,
+                NodeKind::File {
+                    language: Language::Python,
+                    ..
+                }
+            ) && designed(map, *n)
+        })
+        .collect();
+    let capture = |re: &LazyLock<Option<Regex>>, text: &str| {
+        re.as_ref()
+            .and_then(|r| r.captures(text))
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_owned())
+    };
+    // Each router: its file and name, with its own prefix and its tag.
+    let mut routers: HashMap<(usize, String), (String, Option<String>)> = HashMap::new();
+    for (node, text) in &python {
+        for c in router.captures_iter(text) {
+            let args = &c[3];
+            routers.insert(
+                (*node, c[1].to_owned()),
+                (
+                    capture(&PREFIX, args).unwrap_or_default(),
+                    capture(&TAG, args),
+                ),
+            );
+        }
+    }
+    // Where each router is included, and under which prefix.
+    let module_file = |module: &str| -> Option<usize> {
+        let path = module.replace('.', "/");
+        let candidates = [format!("{path}.py"), format!("{path}/__init__.py")];
+        python.iter().map(|(n, _)| *n).find(|n| {
+            let p = &map.nodes[*n].path;
+            candidates
+                .iter()
+                .any(|c| p == c || p.ends_with(&format!("/{c}")))
+        })
+    };
+    let mut included: HashMap<(usize, String), (usize, String, String)> = HashMap::new();
+    for (node, text) in &python {
+        // What the file imports, by the name it uses.
+        let mut imported: HashMap<String, (String, String)> = HashMap::new();
+        for c in import.captures_iter(text) {
+            let module = c[1].to_owned();
+            for name in c[2].trim_matches(['(', ')', ' ']).split(',') {
+                let mut words = name.split_whitespace();
+                let Some(original) = words.next() else {
+                    continue;
+                };
+                let alias = match (words.next(), words.next()) {
+                    (Some("as"), Some(alias)) => alias,
+                    _ => original,
+                };
+                imported.insert(alias.to_owned(), (module.clone(), original.to_owned()));
+            }
+        }
+        for c in include.captures_iter(text) {
+            let target = &c[2];
+            let prefix = c
+                .get(3)
+                .and_then(|a| capture(&PREFIX, a.as_str()))
+                .unwrap_or_default();
+            let resolved = match target.rsplit_once('.') {
+                // `users.router`: the module `users`, as imported.
+                Some((module, var)) => imported
+                    .get(module)
+                    .map(|(from, name)| format!("{from}.{name}"))
+                    .or_else(|| Some(module.to_owned()))
+                    .and_then(|m| module_file(&m))
+                    .map(|n| (n, var.to_owned())),
+                // `ws_router`: imported under that name, or the file's own.
+                None => match imported.get(target) {
+                    Some((from, name)) => module_file(from).map(|n| (n, name.clone())),
+                    None => Some((*node, target.to_owned())),
+                },
+            };
+            if let Some(key) = resolved {
+                included.insert(key, (*node, c[1].to_owned(), prefix));
+            }
+        }
+    }
+    let mut operations = Vec::new();
+    for (node, text) in &python {
+        for c in decorator.captures_iter(text) {
+            let key = (*node, c[1].to_owned());
+            if !routers.contains_key(&key) && !included.contains_key(&key) {
+                continue;
+            }
+            let Some(whole) = c.get(0) else {
+                continue;
+            };
+            let after = &text[whole.end()..];
+            let Some(name) = def.captures(after).and_then(|d| d.get(1)) else {
+                continue;
+            };
+            let line = text[..whole.end() + name.start()].matches('\n').count() + 1;
+            let path = format!("{}{}", full_prefix(&key, &routers, &included, 0), &c[3]);
+            let path = if path.is_empty() {
+                "/".to_owned()
+            } else {
+                path.replace("//", "/")
+            };
+            let methods: Vec<String> = match &c[2] {
+                "websocket" => vec!["WEBSOCKET".to_owned()],
+                "route" | "api_route" => METHODS_ARG
+                    .as_ref()
+                    .and_then(|re| re.captures(&c[4]))
+                    .map(|m| {
+                        m[1].split(',')
+                            .map(|w| w.trim().trim_matches(['"', '\'']).to_uppercase())
+                            .filter(|w| !w.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec!["GET".to_owned()]),
+                method => vec![method.to_uppercase()],
+            };
+            let summary = docstring(&after[name.end()..]);
+            let parameters: Vec<Parameter> = path
+                .split('/')
+                .filter_map(|s| s.strip_prefix('{').and_then(|s| s.strip_suffix('}')))
+                .map(|p| Parameter {
+                    name: p.split(':').next().unwrap_or(p).to_owned(),
+                    location: "path".to_owned(),
+                    required: true,
+                    kind: String::new(),
+                    description: String::new(),
+                    example: None,
+                })
+                .collect();
+            let tag = routers.get(&key).and_then(|(_, t)| t.clone());
+            for method in methods {
+                operations.push(Operation {
+                    id: name.as_str().to_owned(),
+                    method,
+                    path: path.clone(),
+                    summary: summary.clone(),
+                    description: String::new(),
+                    parameters: parameters.clone(),
+                    body: None,
+                    responses: Vec::new(),
+                    secured: false,
+                    server: None,
+                    tags: tag.iter().cloned().collect(),
+                    deprecated: false,
+                    spec: *node,
+                    from_code: true,
+                    handler: Some((*node, line)),
+                    callers: Vec::new(),
+                });
+            }
+        }
+    }
+    operations.sort_by(|a, b| (&a.path, &a.method).cmp(&(&b.path, &b.method)));
+    operations
+}
+
+/// A router's whole prefix: those of the routers that include it, then
+/// its own.
+fn full_prefix(
+    key: &(usize, String),
+    routers: &HashMap<(usize, String), (String, Option<String>)>,
+    included: &HashMap<(usize, String), (usize, String, String)>,
+    depth: usize,
+) -> String {
+    let own = routers.get(key).map_or("", |(p, _)| p.as_str());
+    match included.get(key) {
+        Some((node, var, prefix)) if depth < 8 => format!(
+            "{}{prefix}{own}",
+            full_prefix(&(*node, var.clone()), routers, included, depth + 1)
+        ),
+        _ => own.to_owned(),
+    }
+}
+
+/// The first line of the docstring that opens a function's body.
+fn docstring(after_name: &str) -> String {
+    let Some(colon) = after_name.find("):").or_else(|| after_name.find(":\n")) else {
+        return String::new();
+    };
+    let body = after_name[colon..].split_once('\n').map_or("", |(_, b)| b);
+    let first = body.trim_start();
+    for quote in ["\"\"\"", "'''"] {
+        if let Some(rest) = first.strip_prefix(quote) {
+            return rest
+                .split(quote)
+                .next()
+                .unwrap_or("")
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("")
+                .to_owned();
+        }
+    }
+    String::new()
+}
+
+/// The front end's files that write an operation's path, as a client
+/// calls it: `'$baseUrl/users/me'`, `` `${API}/dags/${id}` ``. The written
+/// path must be the operation's whole path, or its end after a base the
+/// client's URL holds (`/api`, `/v1`); a method called next to it narrows
+/// it to that method's operation.
+fn path_callers(map: &CodeMap, texts: &[(usize, String)], operations: &mut [Operation]) {
+    static STRING: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r#"'([^'\n]*/[^'\n]*)'|"([^"\n]*/[^"\n]*)"|`([^`\n]*/[^`\n]*)`"#).ok()
+    });
+    static METHOD: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"(?i)\b(get|post|put|patch|delete)\s*(?:<[^>]*>)?\s*\(").ok());
+    let Some(string) = STRING.as_ref() else {
+        return;
+    };
+    let wanted: Vec<Vec<String>> = operations
+        .iter()
+        .map(|o| {
+            o.path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .collect();
+    for (node, text) in texts {
+        let client = matches!(
+            map.nodes[*node].kind,
+            NodeKind::File {
+                language: Language::TypeScript | Language::JavaScript | Language::Dart,
+                ..
+            }
+        );
+        if !client || !designed(map, *node) || generated(&map.nodes[*node].path, text) {
+            continue;
+        }
+        for c in string.captures_iter(text) {
+            let Some(found) = c.get(1).or_else(|| c.get(2)).or_else(|| c.get(3)) else {
+                continue;
+            };
+            let Some(written) = written_path(found.as_str()) else {
+                continue;
+            };
+            // A method called on this line or the two before.
+            let start = text[..found.start()]
+                .rmatch_indices('\n')
+                .nth(2)
+                .map_or(0, |(i, _)| i);
+            let method = METHOD.as_ref().and_then(|re| {
+                re.captures_iter(&text[start..found.start()])
+                    .last()
+                    .map(|m| m[1].to_uppercase())
+            });
+            for (operation, path) in operations.iter_mut().zip(&wanted) {
+                if method.as_ref().is_some_and(|m| *m != operation.method)
+                    || !path_matches(path, &written)
+                {
+                    continue;
+                }
+                if !operation.callers.contains(node) {
+                    operation.callers.push(*node);
+                }
+            }
+        }
+    }
+}
+
+/// The parts of the path a string writes, `*` for what is put in, or
+/// `None` when it writes none.
+fn written_path(text: &str) -> Option<Vec<String>> {
+    static PUT_IN: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"^(?:\$\{[^}]*\}|\$[A-Za-z_]\w*|\{[^}]*\})+").ok());
+    let mut rest = text.trim();
+    // An address's path.
+    if let Some((_, after)) = rest.split_once("://") {
+        rest = after.find('/').map_or("", |i| &after[i..]);
+    }
+    // What a base URL put in before it.
+    if let Some(m) = PUT_IN.as_ref().and_then(|re| re.find(rest)) {
+        rest = &rest[m.end()..];
+    }
+    if !rest.starts_with('/') || rest.contains(' ') {
+        return None;
+    }
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let parts: Vec<String> = rest
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.contains('$') || s.starts_with(':') || s.starts_with('{') {
+                "*".to_owned()
+            } else {
+                s.to_owned()
+            }
+        })
+        .collect();
+    (!parts.is_empty() && parts.iter().any(|p| p != "*")).then_some(parts)
+}
+
+/// Whether a written path is an operation's: all of it, or its end after
+/// a base of `api`, `rest` or a version.
+fn path_matches(operation: &[String], written: &[String]) -> bool {
+    if written.len() > operation.len() {
+        return false;
+    }
+    let base = operation.len() - written.len();
+    let base_ok = operation[..base].iter().all(|s| {
+        s == "api"
+            || s == "rest"
+            || (s.len() > 1 && s.starts_with('v') && s[1..].chars().all(|c| c.is_ascii_digit()))
+    });
+    base_ok
+        && operation[base..].iter().zip(written).all(|(o, w)| {
+            let parameter = o.starts_with('{') && o.ends_with('}');
+            if parameter { w == "*" } else { o == w }
+        })
 }
 
 /// The operations a spec's text declares, in its order, with no handler
@@ -315,6 +691,7 @@ fn operations_of(spec: usize, text: &str) -> Vec<Operation> {
                 None => secured_by_default,
             };
             operations.push(Operation {
+                from_code: false,
                 id,
                 method: method.to_uppercase(),
                 path: path.to_owned(),
@@ -1063,5 +1440,125 @@ components:
         assert!(curl.contains("-H \"Content-Type: application/json\""));
         // A quote in the body is escaped for the shell.
         assert!(curl.contains("it'\\''s late"));
+    }
+
+    #[test]
+    fn routes_read_from_the_code_and_called_by_the_paths_an_app_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "compose.yaml",
+            "services:\n  api:\n    build:\n      context: .\n      dockerfile: server/Dockerfile\n  web:\n    build:\n      context: .\n      dockerfile: app/Dockerfile.web\n",
+        );
+        write(
+            root,
+            "server/main.py",
+            "from fastapi import FastAPI\nfrom server.routers import orders\nfrom server.live import router as live_router\n\napp = FastAPI()\napp.include_router(orders.router, prefix=\"/api\")\napp.include_router(live_router)\n\n@app.get(\"/health\")\ndef health():\n    return {}\n",
+        );
+        write(
+            root,
+            "server/routers/orders.py",
+            "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/orders\", tags=[\"orders\"])\n\n@router.get(\"/{order_id}\")\nasync def get_order(order_id: int):\n    \"\"\"One order.\"\"\"\n    return {}\n\n@router.post(\"\")\ndef create_order():\n    return {}\n",
+        );
+        write(
+            root,
+            "server/live.py",
+            "from fastapi import APIRouter\nrouter = APIRouter()\n\n@router.websocket(\"/ws/live\")\nasync def live(ws):\n    pass\n",
+        );
+        write(
+            root,
+            "app/pubspec.yaml",
+            "name: shop_app\nenvironment:\n  sdk: ^3.0.0\ndependencies:\n  flutter:\n    sdk: flutter\n",
+        );
+        write(
+            root,
+            "app/Dockerfile.web",
+            "FROM flutter AS build\nRUN flutter build web --release\n",
+        );
+        write(
+            root,
+            ".github/workflows/android.yml",
+            "jobs:\n  build:\n    steps:\n      - run: flutter build appbundle\n",
+        );
+        write(
+            root,
+            "app/lib/main.dart",
+            "import 'package:shop_app/services/client.dart';\nimport 'dart:async';\nvoid main() {}\n",
+        );
+        write(
+            root,
+            "app/lib/services/client.dart",
+            "import '../models/order.dart';\nFuture<void> load(int id) async {\n  await http.get(Uri.parse('$baseUrl/orders/$id'));\n  await http.post(\n    Uri.parse('$baseUrl/orders'),\n  );\n  final ws = connect('${wsBase}/ws/live');\n}\n",
+        );
+        write(root, "app/lib/models/order.dart", "class Order {}\n");
+        let map = map(root, 100);
+        let found: Vec<String> = map
+            .operations
+            .iter()
+            .map(|o| format!("{} {} {}", o.method, o.path, o.id))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "POST /api/orders create_order",
+                "GET /api/orders/{order_id} get_order",
+                "GET /health health",
+                "WEBSOCKET /ws/live live",
+            ]
+        );
+        let order = map.operations.iter().find(|o| o.id == "get_order").unwrap();
+        assert!(order.from_code);
+        assert_eq!(order.summary, "One order.");
+        assert_eq!(order.tags, ["orders"]);
+        assert_eq!(
+            map.nodes[order.handler.unwrap().0].path,
+            "server/routers/orders.py"
+        );
+        let client = map.find("app/lib/services/client.dart").unwrap();
+        for id in ["get_order", "create_order", "live"] {
+            let o = map.operations.iter().find(|o| o.id == id).unwrap();
+            assert_eq!(o.callers, [client], "{id}");
+        }
+        assert!(
+            map.operations
+                .iter()
+                .find(|o| o.id == "health")
+                .unwrap()
+                .callers
+                .is_empty()
+        );
+        // Dart imports: a package's own, and a relative one.
+        let main = map.find("app/lib/main.dart").unwrap();
+        let imports = |from: usize| -> Vec<&str> {
+            map.edges
+                .iter()
+                .filter(|e| e.from == from && e.kind == EdgeKind::Imports)
+                .map(|e| map.nodes[e.to].path.as_str())
+                .collect()
+        };
+        assert_eq!(imports(main), ["app/lib/services/client.dart"]);
+        assert_eq!(imports(client), ["app/lib/models/order.dart"]);
+        // The app is built for the web by its Dockerfile and for Android by
+        // a workflow; it reaches the server through its routes.
+        let services = &map.services;
+        let web = services
+            .services
+            .iter()
+            .position(|s| s.name == "web")
+            .unwrap();
+        let api = services
+            .services
+            .iter()
+            .position(|s| s.name == "api")
+            .unwrap();
+        assert_eq!(services.services[web].folder.as_deref(), Some("app"));
+        assert_eq!(services.services[web].platforms, ["Android", "Web"]);
+        assert!(
+            services
+                .links
+                .iter()
+                .any(|l| l.from == web && l.to == api && l.via == crate::services::Via::OpenApi)
+        );
     }
 }

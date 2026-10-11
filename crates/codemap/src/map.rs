@@ -23,6 +23,8 @@ pub enum Language {
     TypeScript,
     /// `.js`, `.jsx`, `.mjs`, `.cjs`
     JavaScript,
+    /// `.dart`
+    Dart,
     /// `.md`
     Markdown,
     /// Settings: `.toml`, `.json`, `.yaml`, `.yml`
@@ -40,6 +42,7 @@ impl Language {
             Some("py" | "pyi") => Self::Python,
             Some("ts" | "tsx") => Self::TypeScript,
             Some("js" | "jsx" | "mjs" | "cjs") => Self::JavaScript,
+            Some("dart") => Self::Dart,
             Some("md") => Self::Markdown,
             Some("toml" | "json" | "yaml" | "yml") => Self::Config,
             _ => Self::Other,
@@ -54,6 +57,7 @@ impl Language {
             Self::Python => "Python",
             Self::TypeScript => "TypeScript",
             Self::JavaScript => "JavaScript",
+            Self::Dart => "Dart",
             Self::Markdown => "Markdown",
             Self::Config => "Settings",
             Self::Other => "Other",
@@ -186,7 +190,13 @@ pub(crate) fn worth(path: &Path) -> u8 {
         .collect();
     let names_packages = matches!(
         name,
-        "Cargo.toml" | "pyproject.toml" | "setup.py" | "setup.cfg" | "package.json" | "go.mod"
+        "Cargo.toml"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "package.json"
+            | "go.mod"
+            | "pubspec.yaml"
     ) || name.starts_with("tsconfig") && name.ends_with(".json");
     if names_packages {
         return 0;
