@@ -66,15 +66,18 @@ pub(crate) fn show(ui: &mut Ui, app: &App, seen: &mut usize, effects: &mut Vec<E
                     if delta != 0.0 {
                         ui.scroll_with_delta(egui::vec2(0.0, delta * row));
                     }
+                    // Apart, as in the conversation.
                     for entry in &sub.work {
                         transcript::entry_ui(ui, app, entry, effects);
+                        ui.add_space(8.0);
                     }
                     if sub.work.is_empty() {
                         ui.label(RichText::new("starting…").color(DIM));
                     }
                 });
             let rows = (output.content_size.y - output.inner_rect.height()).max(0.0) / row;
-            app.set_sub_max(rows as usize);
+            // Rounded up, so that the keys reach a first line cut in half.
+            app.set_sub_max(rows.ceil() as usize);
         });
     // Read without taking the click from a link or a button under it.
     ui.rect_contains_pointer(shown.response.rect) && ui.input(|i| i.pointer.primary_clicked())

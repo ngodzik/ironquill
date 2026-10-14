@@ -71,8 +71,8 @@ pub(crate) fn show(ui: &mut Ui, app: &App, keys: &mut Vec<KeyEvent>) -> Option<C
             Grid::new("containers")
                 .num_columns(4)
                 .spacing([18.0, 3.0])
-                // The header is the grid's first row.
-                .with_row_color(move |row, _| (chosen == row.checked_sub(1)).then_some(SELECTED))
+                // The header is the grid's first row, and never chosen.
+                .with_row_color(move |row, _| lit(chosen, row).then_some(SELECTED))
                 .show(ui, |ui| {
                     for header in ["NAME", "IMAGE", "STATUS", "PORTS"] {
                         ui.label(RichText::new(header).monospace().small().color(DIM));
@@ -124,6 +124,12 @@ pub(crate) fn height(ui: &Ui, containers: usize, room: f32) -> f32 {
     wanted.clamp(row * 3.0 + 28.0, (room / 3.0).max(row * 3.0 + 28.0))
 }
 
+/// Whether the grid's `row` is lit: the container `chosen`, below the
+/// header, and none while nothing is.
+fn lit(chosen: Option<usize>, row: usize) -> bool {
+    chosen.is_some() && chosen == row.checked_sub(1)
+}
+
 /// Whether a container whose status reads `status` is running well.
 fn healthy(status: &str) -> bool {
     status.starts_with("Up") && !status.contains("unhealthy")
@@ -132,6 +138,16 @@ fn healthy(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_chosen_container_is_lit_never_the_header() {
+        assert!(!lit(None, 0));
+        assert!(!lit(None, 1));
+        assert!(!lit(Some(0), 0));
+        assert!(lit(Some(0), 1));
+        assert!(lit(Some(2), 3));
+        assert!(!lit(Some(2), 2));
+    }
 
     #[test]
     fn up_and_not_unhealthy_reads_as_healthy() {
