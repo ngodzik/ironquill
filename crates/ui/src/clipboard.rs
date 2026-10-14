@@ -2,8 +2,9 @@
 //!
 //! Through the platform's own command when there is one: `pbcopy` on macOS,
 //! `wl-copy` on Wayland, `xclip` or `xsel` on X11. Without any, copying falls
-//! back to the OSC 52 escape sequence, which most terminals turn into a
-//! clipboard write, over SSH too. Pasting has no such fallback.
+//! back to the OSC 52 escape sequence, which the terminal the program was
+//! started from, if any, most often turns into a clipboard write. Pasting
+//! has no such fallback.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -62,8 +63,8 @@ pub fn paste() -> Result<String, String> {
     Err("No clipboard command found (pbpaste, wl-paste, xclip or xsel)".into())
 }
 
-/// Asks the terminal to set its clipboard. The sequence draws nothing, so it
-/// is safe to send while the interface owns the screen.
+/// Asks the terminal the program was started from to set its clipboard.
+/// The sequence draws nothing, so it is safe to send whatever is there.
 fn osc52(text: &str) -> Result<(), String> {
     let mut out = std::io::stdout();
     write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))

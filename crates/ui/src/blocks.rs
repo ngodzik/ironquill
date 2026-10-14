@@ -30,28 +30,6 @@ pub(crate) fn diff_blocks(text: &str) -> Vec<(usize, String)> {
     blocks
 }
 
-/// The code blocks of `text`, as written, in order: what each copy mark
-/// copies.
-pub fn code_blocks(text: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
-    let mut current: Option<Vec<&str>> = None;
-    for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            match current.take() {
-                Some(lines) => blocks.push(lines.join("\n")),
-                None => current = Some(Vec::new()),
-            }
-        } else if let Some(lines) = current.as_mut() {
-            lines.push(line);
-        }
-    }
-    // A block left open still copies what it has.
-    if let Some(lines) = current {
-        blocks.push(lines.join("\n"));
-    }
-    blocks
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -63,6 +63,7 @@ use universe_ui::backdrop::Motion;
 use universe_ui::editor::{EditorMode, ScreenRow};
 use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use universe_ui::keymap::{Focus, Mode, Pending};
+use universe_ui::references::Reference;
 use universe_ui::workspaces::Relaunch;
 use universe_ui::{App, Effect, Host, MapView, Settings, Start, Waiting, clipboard};
 
@@ -846,6 +847,14 @@ where
 
     if universe.deployments != fleet.active {
         universe.deployments = fleet.active;
+    }
+    // A file or commit a reply cites, clicked while drawing.
+    let cited = ctx.data_mut(|d| d.remove_temp::<Option<Reference>>(Id::new(transcript::CITED)));
+    if let Some(reference) = cited.flatten() {
+        if let Some(effect) = shell.app.open_cited(reference) {
+            shell.effects.push(effect);
+        }
+        ctx.request_repaint();
     }
     windows::show(&ctx, &shell.app, &mut shell.keys);
     if !shell.effects.is_empty() || !shell.keys.is_empty() {

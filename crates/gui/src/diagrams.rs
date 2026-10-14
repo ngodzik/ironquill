@@ -1,9 +1,11 @@
 //! Mermaid diagrams in the window: each drawn once on a thread, by the
 //! interface's renderer, into its cache; the PNG decoded and shown as a
-//! texture. Its code shows while it draws, and stays if it fails.
+//! texture. Its code shows while it draws, and stays if it fails. A
+//! picture a reply cited is read the same way.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use bevy_egui::egui::{self, ColorImage, TextureHandle, TextureOptions, Ui};
@@ -19,7 +21,31 @@ enum State {
 /// A diagram drawn on a thread: its key, and its pixels or why it failed.
 type Drawn = (u64, Result<ColorImage, String>);
 
-/// The diagrams of the conversation, shared with the threads that draw them.
+/// What an image is, for what is said while it is made or when it fails.
+#[derive(Clone, Copy)]
+enum Kind {
+    Diagram,
+    Picture,
+}
+
+impl Kind {
+    fn waiting(self) -> &'static str {
+        match self {
+            Self::Diagram => "◌ drawing the diagram…",
+            Self::Picture => "◌ reading the picture…",
+        }
+    }
+
+    fn failed(self) -> &'static str {
+        match self {
+            Self::Diagram => "The diagram could not be drawn",
+            Self::Picture => "The picture could not be read",
+        }
+    }
+}
+
+/// The diagrams and pictures of the conversation, shared with the threads
+/// that make them.
 #[derive(Clone)]
 pub(crate) struct Diagrams {
     renderer: Option<Renderer>,
@@ -47,8 +73,37 @@ impl Diagrams {
         let (Some(renderer), Some(cache)) = (&self.renderer, &self.cache) else {
             return false;
         };
-        self.take_drawn(ui.ctx());
         let key = renderer.key(source);
+        let (renderer, cache, source) = (renderer.clone(), cache.clone(), source.to_owned());
+        self.image(ui, key, Kind::Diagram, move || {
+            let done = cache.join(format!("{key:016x}.png"));
+            let path = if done.is_file() {
+                Ok(done)
+            } else {
+                renderer.draw(&source, &cache)
+            };
+            path.and_then(|p| decode(&p))
+        })
+    }
+
+    /// Draws the PNG file at `path`, read once on a thread; `false` while it
+    /// is read or when it cannot be.
+    pub(crate) fn picture(&self, ui: &mut Ui, path: &Path) -> bool {
+        let mut hasher = DefaultHasher::new();
+        ("picture", path).hash(&mut hasher);
+        let path = path.to_owned();
+        self.image(ui, hasher.finish(), Kind::Picture, move || decode(&path))
+    }
+
+    /// Draws the image kept under `key`, once `read` on a thread made it.
+    fn image(
+        &self,
+        ui: &mut Ui,
+        key: u64,
+        kind: Kind,
+        read: impl FnOnce() -> Result<ColorImage, String> + Send + 'static,
+    ) -> bool {
+        self.take_drawn(ui.ctx());
         let Ok(mut states) = self.states.lock() else {
             return false;
         };
@@ -62,7 +117,7 @@ impl Diagrams {
             }
             Some(State::Failed(why)) => {
                 ui.label(
-                    egui::RichText::new(format!("The diagram could not be drawn: {why}"))
+                    egui::RichText::new(format!("{}: {why}", kind.failed()))
                         .small()
                         .color(crate::theme::DIM),
                 );
@@ -70,7 +125,7 @@ impl Diagrams {
             }
             Some(State::Drawing) => {
                 ui.label(
-                    egui::RichText::new("◌ drawing the diagram…")
+                    egui::RichText::new(kind.waiting())
                         .small()
                         .color(crate::theme::DIM),
                 );
@@ -78,17 +133,9 @@ impl Diagrams {
             }
             None => {
                 states.insert(key, State::Drawing);
-                let (renderer, cache, source) =
-                    (renderer.clone(), cache.clone(), source.to_owned());
                 let (drawn, ctx) = (Arc::clone(&self.drawn), ui.ctx().clone());
                 std::thread::spawn(move || {
-                    let done = cache.join(format!("{key:016x}.png"));
-                    let path = if done.is_file() {
-                        Ok(done)
-                    } else {
-                        renderer.draw(&source, &cache)
-                    };
-                    let image = path.and_then(|p| decode(&p));
+                    let image = read();
                     if let Ok(mut drawn) = drawn.lock() {
                         drawn.push((key, image));
                     }

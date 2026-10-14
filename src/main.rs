@@ -444,7 +444,6 @@ async fn interface(
         opacity: defaults.opacity,
         text_size: defaults.text_size,
         chat_width: defaults.chat_width,
-        images: defaults.images.unwrap_or_default(),
         mermaid: defaults.mermaid.clone(),
         cache_ttl: defaults.cache_ttl.unwrap_or_default(),
         backdrop: universe_ui::backdrop::Backdrop {

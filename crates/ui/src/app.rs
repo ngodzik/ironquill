@@ -14,12 +14,10 @@ use universe_tools::{Check, Container, DiffLine, ToolSummary};
 
 use crate::blocks;
 use crate::command::{self, Command};
-use crate::defaults::{Defaults, Images};
+use crate::defaults::Defaults;
 use crate::editor::{Editor, Outcome as EditorOutcome};
 use crate::highlight::Highlighter;
-use crate::input::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, Position, Rect,
-};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use crate::keymap::{self, Action, Focus, Mode, Pending};
 use crate::references::{self, Reference};
 use crate::sessions::{self, Saved, Summary};
@@ -45,25 +43,6 @@ const MIN_OPACITY: f32 = 0.2;
 
 /// The opacities Ctrl-M goes through, after opaque.
 const OPACITY_STEPS: [f32; 3] = [0.8, 0.6, 0.4];
-
-/// Lines moved by one turn of the mouse wheel.
-const WHEEL_LINES: i32 = 3;
-
-/// Where each pane was drawn, written by the view so that a mouse click can be
-/// matched to a pane. Areas include the pane's border.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Panes {
-    /// The file tree, when open.
-    pub tree: Option<Rect>,
-    /// The open file, when one is.
-    pub file: Option<Rect>,
-    /// The conversation.
-    pub chat: Rect,
-    /// The Docker pane, when open.
-    pub docker: Option<Rect>,
-    /// The sub-agent pane, when a task handed over is shown.
-    pub sub: Option<Rect>,
-}
 
 /// How the window draws the codebase instead of the panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,8 +152,6 @@ pub struct Settings {
     /// How wide the window's conversation is beside a file or the
     /// codebase, as last dragged; `None` leaves it to the window.
     pub chat_width: Option<f32>,
-    /// Whether replies show images, and in which terminals.
-    pub images: Images,
     /// The command that draws Mermaid diagrams, as configured; `None` finds
     /// one.
     pub mermaid: Option<Vec<String>>,
@@ -599,8 +576,8 @@ pub enum Entry {
         #[serde(default)]
         runs: Vec<(ModelId, Spent)>,
     },
-    /// A PNG file the person opened from a reply, shown where the terminal
-    /// draws images.
+    /// A PNG file the person opened from a reply, shown in the
+    /// conversation.
     Image(String),
 }
 
@@ -1043,7 +1020,6 @@ pub struct App {
     file: Option<Editor>,
     /// Files the agent changed during this conversation, relative to the root.
     changed: BTreeSet<String>,
-    panes: Cell<Panes>,
     /// Loaded on the first file opened: the grammars take a moment, and a
     /// session that never opens a file should not pay for them.
     highlighter: OnceCell<Rc<Highlighter>>,
@@ -1065,21 +1041,8 @@ pub struct App {
     ahead: Vec<Place>,
     /// Asks the view to scroll the selected reply into sight.
     reveal: Cell<bool>,
-    /// Where each entry was drawn, as (entry, first line, last line) in the
-    /// whole transcript, and the transcript's first visible line and area,
-    /// written by the view so that a click finds its entry.
-    entry_lines: RefCell<Vec<(usize, usize, usize)>>,
-    transcript_view: Cell<(usize, Rect)>,
-    /// The transcript's lines a click folds, and those that copy a block.
-    fold_marks: RefCell<Vec<usize>>,
-    copy_marks: RefCell<Vec<(usize, String)>>,
-    /// The references drawn: line, first and last column, what they open.
-    link_marks: RefCell<Vec<(usize, usize, usize, Reference)>>,
     /// Whether a cited file or commit exists, as found out.
     known_references: RefCell<HashMap<Reference, bool>>,
-    /// Whether the screen draws pictures, so that a cited PNG shows in the
-    /// conversation rather than open as a file.
-    pictures_shown: bool,
     /// How the window shows the codebase, if it does.
     map: Option<MapView>,
     /// The conversation has the whole screen; the other panes keep their
@@ -1205,7 +1168,6 @@ impl App {
             walk_asking: false,
             file: None,
             changed: BTreeSet::new(),
-            panes: Cell::new(Panes::default()),
             highlighter: OnceCell::new(),
             spinner: 0,
             quit: false,
@@ -1217,13 +1179,7 @@ impl App {
             back: Vec::new(),
             ahead: Vec::new(),
             reveal: Cell::new(false),
-            entry_lines: RefCell::new(Vec::new()),
-            transcript_view: Cell::new((0, Rect::default())),
-            fold_marks: RefCell::new(Vec::new()),
-            copy_marks: RefCell::new(Vec::new()),
-            link_marks: RefCell::new(Vec::new()),
             known_references: RefCell::new(HashMap::new()),
-            pictures_shown: false,
             map: None,
             zoomed: false,
             zoom_focus: None,
@@ -1748,11 +1704,6 @@ impl App {
         } else {
             self.changed.contains(path.as_ref())
         }
-    }
-
-    /// Records where each pane was drawn, so that a click finds its pane.
-    pub fn set_panes(&self, panes: Panes) {
-        self.panes.set(panes);
     }
 
     /// The checks a request is judged by, for `universe do` and pairs.
@@ -2359,18 +2310,6 @@ impl App {
         self.reveal.replace(false)
     }
 
-    /// Records the conversation's lines that fold a reply, copy a block or open a reference, as the view drew them, so that a click finds them.
-    pub fn set_marks(
-        &self,
-        fold: Vec<usize>,
-        copy: Vec<(usize, String)>,
-        links: Vec<(usize, usize, usize, Reference)>,
-    ) {
-        *self.fold_marks.borrow_mut() = fold;
-        *self.copy_marks.borrow_mut() = copy;
-        *self.link_marks.borrow_mut() = links;
-    }
-
     /// Whether `reference` exists: a file is looked at when first drawn; a
     /// commit is known only once git was asked about it as its reply
     /// arrived, so that drawing never runs git.
@@ -2409,11 +2348,6 @@ impl App {
         }
     }
 
-    /// Says whether the screen draws pictures.
-    pub fn show_pictures(&mut self, shown: bool) {
-        self.pictures_shown = shown;
-    }
-
     /// Opens a file a reply cited, at its line, showing what the branch
     /// changed in it.
     fn open_reference(&mut self, path: &str, line: Option<usize>) {
@@ -2435,12 +2369,6 @@ impl App {
         }
         self.file = Some(editor);
         self.focus_on(Focus::File);
-    }
-
-    /// Records where each entry was drawn, in lines of the whole transcript, the first line in view and the area it was drawn in, so that a click finds its entry.
-    pub fn set_entry_lines(&self, lines: Vec<(usize, usize, usize)>, top: usize, area: Rect) {
-        *self.entry_lines.borrow_mut() = lines;
-        self.transcript_view.set((top, area));
     }
 
     /// Whether the conversation has the whole screen.
@@ -2584,110 +2512,21 @@ impl App {
         self.focus_on(Focus::File);
     }
 
-    /// Does what a click or a turn of the wheel asks for, and returns what only the loop can do.
-    pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Effect> {
-        let at = Position::new(mouse.column, mouse.row);
-        let panes = self.panes.get();
-        let hit = if panes.docker.is_some_and(|r| r.contains(at)) {
-            Focus::Docker
-        } else if panes.sub.is_some_and(|r| r.contains(at)) {
-            Focus::SubAgent
-        } else if panes.tree.is_some_and(|r| r.contains(at)) {
-            Focus::Tree
-        } else if panes.file.is_some_and(|r| r.contains(at)) {
-            Focus::File
-        } else if panes.chat.contains(at) {
-            Focus::Chat
-        } else {
-            return None;
-        };
-
-        match mouse.kind {
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let lines = if mouse.kind == MouseEventKind::ScrollUp {
-                    -WHEEL_LINES
-                } else {
-                    WHEEL_LINES
-                };
-                self.wheel(hit, lines);
+    /// Opens what a reply cites, clicked in the conversation: a picture
+    /// shows in it, a file opens at its line, a commit is shown.
+    pub fn open_cited(&mut self, reference: Reference) -> Option<Effect> {
+        match reference {
+            Reference::File { path, .. } if path.to_lowercase().ends_with(".png") => {
+                self.chat.transcript.push(Entry::Image(path));
+                self.chat.scroll_back.set(0);
+                None
             }
-            MouseEventKind::Down(MouseButton::Left) => {
-                if hit == Focus::Chat {
-                    self.focus = Focus::Chat;
-                    let (top, area) = self.transcript_view.get();
-                    if area.contains(at) {
-                        let line = top + usize::from(mouse.row - area.y);
-                        // A code block's mark copies it as written.
-                        let code = self
-                            .copy_marks
-                            .borrow()
-                            .iter()
-                            .find(|(at, _)| *at == line)
-                            .map(|(_, code)| code.clone());
-                        if let Some(code) = code {
-                            return Some(Effect::Copy(code));
-                        }
-                        // A cited file or commit opens.
-                        let column = usize::from(mouse.column.saturating_sub(area.x));
-                        let link = self
-                            .link_marks
-                            .borrow()
-                            .iter()
-                            .find(|(at, from, to, _)| *at == line && (*from..*to).contains(&column))
-                            .map(|(_, _, _, r)| r.clone());
-                        match link {
-                            // A picture shows in the conversation, where
-                            // the terminal draws them.
-                            Some(Reference::File { path, .. })
-                                if self.pictures_shown && path.to_lowercase().ends_with(".png") =>
-                            {
-                                self.chat.transcript.push(Entry::Image(path));
-                                self.chat.scroll_back.set(0);
-                                return None;
-                            }
-                            Some(Reference::File { path, line }) => {
-                                self.open_reference(&path, line);
-                                return None;
-                            }
-                            Some(Reference::Commit(hash)) => return Some(Effect::ShowCommit(hash)),
-                            None => {}
-                        }
-                        // Only a fold mark folds: a click elsewhere in a
-                        // reply should not make it jump.
-                        let entry = self
-                            .entry_lines
-                            .borrow()
-                            .iter()
-                            .find(|(_, first, last)| (*first..=*last).contains(&line))
-                            .map(|(e, _, _)| *e);
-                        if let Some(entry) = entry
-                            && self.fold_marks.borrow().contains(&line)
-                        {
-                            self.toggle_fold(entry);
-                        }
-                    }
-                    return None;
-                }
-                self.focus_on(hit);
-                if hit == Focus::File
-                    && let (Some(area), Some(file)) = (panes.file, &mut self.file)
-                {
-                    // Inside the border, in text rows and columns.
-                    let row = usize::from(mouse.row.saturating_sub(area.y + 1));
-                    let column = usize::from(mouse.column.saturating_sub(area.x + 1));
-                    file.click(row, column);
-                }
-                if hit == Focus::Tree
-                    && let (Some(area), Some(tree)) = (panes.tree, &self.tree)
-                {
-                    // One row of border above the first entry.
-                    let row = usize::from(mouse.row.saturating_sub(area.y + 1));
-                    self.click_tree(tree.offset() + row);
-                }
+            Reference::File { path, line } => {
+                self.open_reference(&path, line);
+                None
             }
-            _ => {}
+            Reference::Commit(hash) => Some(Effect::ShowCommit(hash)),
         }
-        None
     }
 
     /// Scrolls `pane` by `lines`, down when positive, without moving the
@@ -3658,11 +3497,6 @@ impl App {
         &self.root
     }
 
-    /// Whether the project's own checks are found when checking.
-    pub fn detects_checks(&self) -> bool {
-        self.settings.detect_checks
-    }
-
     /// How hard models think before answering.
     pub fn effort(&self) -> Effort {
         self.settings.effort
@@ -4528,7 +4362,6 @@ impl App {
             opacity: self.settings.opacity,
             text_size: self.settings.text_size,
             chat_width: self.settings.chat_width,
-            images: (self.settings.images != Images::Auto).then_some(self.settings.images),
             mermaid: self.settings.mermaid.clone(),
             // Set in the file only: kept as written there.
             cache_ttl: (self.settings.cache_ttl != CacheTtl::default())
@@ -6563,6 +6396,37 @@ mod tests {
     }
 
     #[test]
+    fn a_cited_file_opens_at_its_line_a_picture_shows_and_a_commit_is_shown() {
+        let (dir, mut app) = project();
+        let file = Reference::File {
+            path: "src/lib.rs".into(),
+            line: Some(2),
+        };
+        assert!(app.reference_exists(&file));
+        assert!(app.open_cited(file).is_none());
+        let opened = app.file().unwrap();
+        assert_eq!(opened.path(), dir.path().join("src/lib.rs"));
+        assert_eq!(opened.cursor().0, 1);
+        assert_eq!(app.focus(), Focus::File);
+
+        let picture = Reference::File {
+            path: "shot.PNG".into(),
+            line: None,
+        };
+        assert!(app.open_cited(picture).is_none());
+        assert_eq!(
+            app.transcript().last(),
+            Some(&Entry::Image("shot.PNG".into()))
+        );
+
+        let commit = Reference::Commit("abc1234".into());
+        assert!(matches!(
+            app.open_cited(commit),
+            Some(Effect::ShowCommit(hash)) if hash == "abc1234"
+        ));
+    }
+
+    #[test]
     fn streamed_text_builds_one_reply_and_a_new_block_starts_another() {
         let mut app = ready();
         let saying = |text: &str, new_block: bool| {
@@ -6714,7 +6578,6 @@ mod tests {
                 opacity: None,
                 text_size: None,
                 chat_width: None,
-                images: None,
                 mermaid: None,
                 cache_ttl: None,
                 background: None,

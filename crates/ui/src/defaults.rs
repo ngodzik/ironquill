@@ -7,7 +7,6 @@
 //! team = ["anthropic/claude-sonnet-4-5"]
 //! budget = 0.10
 //! effort = "high"
-//! images = "auto"
 //! mermaid = ["mmdc", "-i", "{input}", "-o", "{output}", "-b", "transparent"]
 //! cache_ttl = "1h"
 //! background = "stars"
@@ -28,21 +27,6 @@ use universe_core::McpServer;
 
 use crate::backdrop::{Motion, Pattern};
 use serde::{Deserialize, Serialize};
-
-/// Whether replies show images, as `images` in `~/.universe/config.toml`
-/// says.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Images {
-    /// In a terminal known to draw them.
-    #[default]
-    Auto,
-    /// With Kitty's protocol, whatever the terminal seems to be: for a
-    /// terminal that speaks it but is not recognised.
-    Kitty,
-    /// Never.
-    Off,
-}
 
 /// What a new session starts with, unless the command line says otherwise.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -118,10 +102,6 @@ pub struct Defaults {
     /// codebase, in points, as last dragged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_width: Option<f32>,
-    /// Whether replies show images: `auto` in a terminal known to draw
-    /// them, `kitty` with Kitty's protocol whatever the terminal, `off`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub images: Option<Images>,
     /// The command that draws a Mermaid diagram as a PNG image, `{input}`
     /// and `{output}` standing for the files; `[]` draws none. Unsaid, the
     /// first installed of mermaid-cli (`mmdc`) and `mmdr`.
@@ -264,7 +244,6 @@ mod tests {
             opacity: Some(0.7),
             text_size: Some(1.25),
             chat_width: Some(420.0),
-            images: Some(Images::Off),
             mermaid: Some(vec!["mmdr".into(), "-i".into(), "{input}".into()]),
             cache_ttl: Some(CacheTtl::OneHour),
             background: Some(Pattern::Rain),
@@ -300,16 +279,6 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "its tokens are its owner's");
         }
-    }
-
-    #[test]
-    fn images_are_auto_kitty_or_off() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "images = \"kitty\"").unwrap();
-        assert_eq!(Defaults::load(&path).unwrap().images, Some(Images::Kitty));
-        fs::write(&path, "images = \"sometimes\"").unwrap();
-        assert!(Defaults::load(&path).unwrap_err().contains("sometimes"));
     }
 
     #[test]

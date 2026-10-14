@@ -116,14 +116,10 @@ impl App {
         true
     }
 
-    /// What the window showed of the conversation left: it belongs to it.
+    /// What the window showed over the conversation left: it belongs to it.
     fn leave_chat(&mut self) {
         self.chats_open = None;
         self.picker = None;
-        self.entry_lines.borrow_mut().clear();
-        self.fold_marks.borrow_mut().clear();
-        self.copy_marks.borrow_mut().clear();
-        self.link_marks.borrow_mut().clear();
     }
 
     /// Closes a conversation not shown, when no request runs in it; its

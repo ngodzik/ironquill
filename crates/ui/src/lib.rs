@@ -12,7 +12,7 @@
 mod app;
 mod awake;
 pub mod backdrop;
-pub mod blocks;
+mod blocks;
 pub mod changes;
 pub mod clipboard;
 mod command;
@@ -36,9 +36,9 @@ pub mod workspaces;
 
 pub use app::{
     AgentMessage, App, ChatRow, ChatState, CompactRow, DEFAULT_OPACITY, DefinitionChoice,
-    DockerPane, Effect, Entry, Found, LineEditor, Lookup, MapView, Panes, Settings, Shown,
-    SubAgent, TaskRow, TickStatus, TicketView, parse_window, step_title,
+    DockerPane, Effect, Entry, Found, LineEditor, Lookup, MapView, Settings, Shown, SubAgent,
+    TaskRow, TickStatus, TicketView, parse_window, step_title,
 };
-pub use defaults::{Defaults, Images};
+pub use defaults::Defaults;
 pub use host::{Host, Incoming, Start, Waiting};
 pub use search::search_matches;
