@@ -19,6 +19,9 @@ pub(crate) fn show(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
     if app.picker().is_some() {
         resume(ctx, app);
     }
+    if app.workspace_picker().is_some() {
+        workspace(ctx, app, keys);
+    }
     if app.model_picker().is_some() {
         model_picker(ctx, app);
     }
@@ -76,8 +79,18 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
     };
     // What cannot be undone in red; going on costs only money, in cyan.
     let (colour, title, answers): (Color32, &str, Vec<(char, String)>) = match &approval.question {
-        Question::Command { secrets, hosts, .. } => {
-            let lasting: Vec<&str> = secrets.iter().chain(hosts).map(String::as_str).collect();
+        Question::Command {
+            secrets,
+            hosts,
+            programs,
+            ..
+        } => {
+            let lasting: Vec<&str> = secrets
+                .iter()
+                .chain(hosts)
+                .chain(programs)
+                .map(String::as_str)
+                .collect();
             let mut answers = vec![('y', "Run it".to_owned())];
             if !lasting.is_empty() {
                 answers.push(('a', format!("Always allow {}", lasting.join(", "))));
@@ -103,6 +116,14 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
                 ('n', "Stop".to_owned()),
             ],
         ),
+        Question::AddFolder { .. } => (
+            YELLOW,
+            "Add a folder?",
+            vec![
+                ('y', "Add it for this conversation".to_owned()),
+                ('n', "Refuse".to_owned()),
+            ],
+        ),
         Question::MoreTurns { .. } => (
             CYAN,
             "Go on?",
@@ -112,16 +133,39 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
     window(ctx, title, colour, |ui| {
         match &approval.question {
             Question::Command {
-                command, reasons, ..
+                command,
+                description,
+                reasons,
+                ..
             } => {
                 ui.label(RichText::new(format!("{} wants to run:", approval.model)).color(DIM));
+                if !description.is_empty() {
+                    ui.label(RichText::new(format!("It says: {description}")).color(TEXT));
+                }
+                // A long command stays within the screen and scrolls, with
+                // the wheel or ↑ ↓.
+                let line = ui.text_style_height(&egui::TextStyle::Monospace);
                 Frame::new()
                     .fill(RAISED)
                     .corner_radius(6)
                     .inner_margin(Margin::same(10))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new(command).monospace().color(RED).strong());
+                        // ↑ ↓ move it when they were pressed; the wheel
+                        // any time in between.
+                        let keyed = egui::Id::new("held-command-keyed");
+                        let wanted = app.approval_scroll();
+                        let last = ui.data(|d| d.get_temp::<usize>(keyed));
+                        let mut area = ScrollArea::vertical()
+                            .id_salt("held-command")
+                            .max_height(line * 14.0);
+                        if last != Some(wanted) {
+                            ui.data_mut(|d| d.insert_temp(keyed, wanted));
+                            area = area.vertical_scroll_offset(wanted as f32 * line);
+                        }
+                        area.show(ui, |ui| {
+                            ui.label(RichText::new(command).monospace().color(RED).strong());
+                        });
                     });
                 for reason in reasons {
                     ui.label(RichText::new(format!("· {reason}")).color(DIM));
@@ -143,6 +187,15 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
                 ui.label(format!(
                     "No request for {minutes} minutes. Each read of the warm sessions costs a \
                      little; letting them cool, the next request writes them to the cache again."
+                ));
+            }
+            Question::AddFolder { path, folder } => {
+                ui.label(format!(
+                    "{} wants {}, outside the workspace. Add {} for the rest of the \
+                     conversation?",
+                    approval.model,
+                    path.display(),
+                    folder.display()
                 ));
             }
             Question::MoreTurns { turns } => {
@@ -199,6 +252,53 @@ fn resume(ctx: &Context, app: &App) {
             }
         });
         hint(ui, "↑ ↓ to move · Enter to choose · Esc to close");
+    });
+}
+
+/// The folder a new conversation works in: those the settings list, the
+/// current one, or a path typed.
+fn workspace(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
+    let Some(picker) = app.workspace_picker() else {
+        return;
+    };
+    window(ctx, "Where does this conversation work?", ACCENT, |ui| {
+        for (i, folder) in picker.options.iter().enumerate() {
+            let chosen = row(ui, i == picker.selected, |ui| {
+                ui.label(RichText::new(folder.display().to_string()).color(TEXT));
+                if folder == picker.here() {
+                    ui.label(RichText::new("here").small().color(DIM));
+                }
+            });
+            // A click chooses it: as many ↑ ↓ as it takes, then Enter.
+            if chosen.interact(egui::Sense::click()).clicked() {
+                let key = if i < picker.selected {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                };
+                for _ in 0..i.abs_diff(picker.selected) {
+                    keys.push(key.into());
+                }
+                keys.push(KeyCode::Enter.into());
+            }
+        }
+        ui.add_space(6.0);
+        let typing = picker.selected == picker.options.len();
+        row(ui, typing, |ui| {
+            ui.label(RichText::new("Path:").color(DIM));
+            ui.label(
+                RichText::new(format!("{}{}", picker.typed, if typing { "▏" } else { "" }))
+                    .monospace()
+                    .color(TEXT),
+            );
+        });
+        if let Some(error) = &picker.error {
+            ui.label(RichText::new(error).color(RED));
+        }
+        hint(
+            ui,
+            "↑ ↓ to choose · type a path · Enter to go there · Esc to stay here",
+        );
     });
 }
 

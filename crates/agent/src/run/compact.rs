@@ -400,6 +400,7 @@ impl<'a, M, D, O> Ctx<'a, M, D, O> {
             windows: Default::default(),
             allowed_secrets: Vec::new(),
             allowed_hosts: Vec::new(),
+            allowed_programs: Vec::new(),
             last_call: None,
             last_context: None,
             last_request: None,

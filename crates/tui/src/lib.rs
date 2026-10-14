@@ -31,6 +31,7 @@ use tokio::sync::mpsc;
 use universe_core::{ChatModel, Delegate};
 use universe_tools::Workspace;
 
+use universe_ui::workspaces::Relaunch;
 use universe_ui::{App, Defaults, Host, Settings, Start, Waiting, input};
 
 pub use error::TuiError;
@@ -48,7 +49,7 @@ pub async fn run<M, D>(
     workspace: Workspace,
     settings: Settings,
     start: Start,
-) -> Result<(), TuiError>
+) -> Result<Option<Relaunch>, TuiError>
 where
     M: ChatModel + 'static,
     D: Delegate + 'static,
@@ -81,7 +82,7 @@ async fn event_loop<M, D>(
     workspace: Workspace,
     settings: Settings,
     start: Start,
-) -> Result<(), TuiError>
+) -> Result<Option<Relaunch>, TuiError>
 where
     M: ChatModel + 'static,
     D: Delegate + 'static,
@@ -180,7 +181,7 @@ where
     if let Some(screen) = screen.as_mut() {
         write_raw(&screen.clear());
     }
-    Ok(())
+    Ok(app.take_relaunch())
 }
 
 /// Writes escapes straight to the terminal, past the drawing: images are

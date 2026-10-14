@@ -55,6 +55,9 @@ pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
     if app.picker().is_some() {
         render_picker(frame, app);
     }
+    if app.workspace_picker().is_some() {
+        render_workspace_picker(frame, app);
+    }
     if app.model_picker().is_some() {
         render_model_picker(frame, app);
     }
@@ -136,17 +139,23 @@ fn render_approval(frame: &mut Frame, app: &App) {
     let (color, title, keys, mut lines) = match &approval.question {
         Question::Command {
             command,
+            description,
             reasons,
             secrets,
             hosts,
+            programs,
         } => {
-            let mut lines = vec![
-                Line::styled(
-                    format!(" {} wants to run:", approval.model),
-                    fg(Color::Gray),
-                ),
-                Line::default(),
-            ];
+            let mut lines = vec![Line::styled(
+                format!(" {} wants to run:", approval.model),
+                fg(Color::Gray),
+            )];
+            if !description.is_empty() {
+                lines.push(Line::styled(
+                    format!(" It says: {description}"),
+                    fg(Color::White),
+                ));
+            }
+            lines.push(Line::default());
             for row in wrap_plain(command, inner_width.saturating_sub(2)) {
                 lines.push(Line::styled(
                     format!(" {row}"),
@@ -157,12 +166,17 @@ fn render_approval(frame: &mut Frame, app: &App) {
             for reason in reasons {
                 lines.push(Line::styled(format!(" · {reason}"), fg(Color::Gray)));
             }
-            let lasting: Vec<&str> = secrets.iter().chain(hosts).map(String::as_str).collect();
+            let lasting: Vec<&str> = secrets
+                .iter()
+                .chain(hosts)
+                .chain(programs)
+                .map(String::as_str)
+                .collect();
             let keys = if lasting.is_empty() {
-                " y: run it · n: refuse · c: copy ".to_owned()
+                " y: run it · n: refuse · c: copy · ↑↓ scroll ".to_owned()
             } else {
                 format!(
-                    " y: run it · a: always allow {} · n: refuse · c: copy ",
+                    " y: run it · a: always allow {} · n: refuse · c: copy · ↑↓ scroll ",
                     lasting.join(", ")
                 )
             };
@@ -191,6 +205,17 @@ fn render_approval(frame: &mut Frame, app: &App) {
             vec![Line::raw(format!(
                 " No request for {minutes} minutes. Each read of the warm sessions costs a \
                  little; letting them cool, the next request writes them to the cache again."
+            ))],
+        ),
+        Question::AddFolder { path, folder } => (
+            Color::Yellow,
+            " Add a folder? ",
+            " y: add it for this conversation · n: refuse ".to_owned(),
+            vec![Line::raw(format!(
+                " {} wants {}, outside the workspace. Add {} for the rest of the conversation?",
+                approval.model,
+                path.display(),
+                folder.display()
             ))],
         ),
         Question::MoreTurns { turns } => (
@@ -231,7 +256,10 @@ fn render_approval(frame: &mut Frame, app: &App) {
         .title_bottom(Line::styled(keys, fg(color)).centered());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    // A command longer than the screen scrolls, never past its end.
+    let most = lines.len().saturating_sub(usize::from(inner.height));
+    let scroll = u16::try_from(app.approval_scroll().min(most)).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 }
 
 /// `line` with the references in it drawn as links, and where they are:
@@ -605,6 +633,67 @@ fn render_definitions(frame: &mut Frame, app: &App) {
             ]
         })
         .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The folder a new conversation works in: those the settings list, the
+/// current one, or a path typed.
+fn render_workspace_picker(frame: &mut Frame, app: &App) {
+    let Some(picker) = app.workspace_picker() else {
+        return;
+    };
+    let screen = frame.area();
+    let width = (screen.width * 4 / 5).clamp(30, 90).min(screen.width);
+    let rows = picker.options.len() + 2 + usize::from(picker.error.is_some());
+    let height = (rows as u16 + 2).min(screen.height);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = pane_block(" Where does this conversation work? ".into(), true).title_bottom(
+        Line::styled(
+            " ↑↓ choose · type a path · Enter: go · Esc: stay here ",
+            fg(DIM),
+        )
+        .centered(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let style = |selected: bool| {
+        if selected {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new()
+        }
+    };
+    let mut lines: Vec<Line> = picker
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, folder)| {
+            let here = if folder == picker.here() {
+                "  (here)"
+            } else {
+                ""
+            };
+            Line::styled(
+                format!(" {}{here}", folder.display()),
+                style(i == picker.selected),
+            )
+        })
+        .collect();
+    lines.push(Line::default());
+    let typing = picker.selected == picker.options.len();
+    lines.push(Line::styled(
+        format!(" Path: {}{}", picker.typed, if typing { "▏" } else { "" }),
+        style(typing),
+    ));
+    if let Some(error) = &picker.error {
+        lines.push(Line::styled(format!(" {error}"), fg(Color::Red)));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -2461,10 +2550,12 @@ mod tests {
             Approval {
                 model: ModelId::new("cheap").unwrap(),
                 question: Question::Command {
+                    description: String::new(),
                     command: "curl -H \"X: $API_TOKEN\" https://x.example.com".into(),
                     reasons: vec!["it uses the secret API_TOKEN".into()],
                     secrets: vec!["API_TOKEN".into()],
                     hosts: vec![],
+                    programs: vec![],
                 },
             },
             answer,

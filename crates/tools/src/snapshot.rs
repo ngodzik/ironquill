@@ -1,7 +1,7 @@
 //! Which files a command changed, when it says nothing of it: the project as
 //! it was before, compared with the project after.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -10,14 +10,18 @@ use ignore::WalkBuilder;
 
 /// The project's files that may change, each with a hash of what it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Snapshot(BTreeMap<String, u64>);
+pub struct Snapshot(BTreeMap<String, u64>, BTreeSet<String>);
 
 impl Snapshot {
     /// The project as it is: in a git repository, the files that differ
     /// from the last commit, which is quick in a large one; elsewhere every
     /// file git would not ignore.
     pub fn take(root: &Path) -> Self {
-        let paths = dirty(root).unwrap_or_else(|| all_files(root));
+        let (paths, new) = dirty(root).unwrap_or_else(|| {
+            let all = all_files(root);
+            let new = all.iter().cloned().collect();
+            (all, new)
+        });
         Self(
             paths
                 .into_iter()
@@ -26,7 +30,18 @@ impl Snapshot {
                     (path, hash)
                 })
                 .collect(),
+            new,
         )
+    }
+
+    /// The files that did not exist when this snapshot was taken and do
+    /// now: those git does not track yet, or outside git, any new one.
+    pub fn created(&self, root: &Path) -> Vec<String> {
+        Self::take(root)
+            .1
+            .into_iter()
+            .filter(|path| !self.0.contains_key(path) && root.join(path).is_file())
+            .collect()
     }
 
     /// The files that changed since this snapshot was taken, in order.
@@ -53,7 +68,9 @@ impl Snapshot {
 
 /// The files git lists as changed, added or untracked, `None` outside a
 /// repository.
-fn dirty(root: &Path) -> Option<Vec<String>> {
+/// The files git lists as changed, added or untracked, and among them the
+/// untracked ones; `None` outside a repository.
+fn dirty(root: &Path) -> Option<(Vec<String>, BTreeSet<String>)> {
     let output = Command::new("git")
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(root)
@@ -69,11 +86,15 @@ fn dirty(root: &Path) -> Option<Vec<String>> {
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut paths = Vec::new();
+    let mut untracked = BTreeSet::new();
     let mut entries = text.split('\0').filter(|e| !e.is_empty());
     while let Some(entry) = entries.next() {
         let Some(path) = entry.get(3..) else {
             continue;
         };
+        if entry.starts_with("??") {
+            untracked.insert(path.to_owned());
+        }
         paths.push(path.to_owned());
         // A rename gives the old path next.
         if (entry.starts_with('R') || entry.starts_with('C'))
@@ -82,7 +103,7 @@ fn dirty(root: &Path) -> Option<Vec<String>> {
             paths.push(old.to_owned());
         }
     }
-    Some(paths)
+    Some((paths, untracked))
 }
 
 /// Every file of the project git would not ignore, relative to its root.

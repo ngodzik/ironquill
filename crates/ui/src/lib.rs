@@ -29,6 +29,7 @@ pub mod sessions;
 pub mod style;
 pub mod tree;
 pub mod usage;
+pub mod workspaces;
 
 pub use app::{
     AgentMessage, App, ChatRow, ChatState, CompactRow, DEFAULT_OPACITY, DefinitionChoice,

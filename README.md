@@ -43,6 +43,8 @@ universe --gui                     # in a window
 
 Settings live in `~/.universe/config.toml`, and a project's own (linked repositories, environments) in `~/.universe/projects/<folder>.toml`.
 
+With `workspaces = ["~/code/app", ...]` in the settings, a new conversation asks which folder it works in and starts again there (`--here` skips the question). `allowed_programs = [...]` lists a project's own tools, which strict mode then lets run without asking.
+
 ## Building
 
 On Linux the window needs Wayland's client library: `sudo apt install libwayland-dev` on Debian and Ubuntu.

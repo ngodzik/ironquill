@@ -223,7 +223,7 @@ where
             Start::Pick => {
                 app.show_picker(self.store.as_ref().map(Store::list).unwrap_or_default())
             }
-            Start::New => {}
+            Start::New => app.ask_workspace(),
         }
         if hidden > 0 {
             app.report_info(&format!(

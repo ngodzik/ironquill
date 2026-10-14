@@ -88,6 +88,11 @@ struct Cli {
     #[arg(long)]
     gui: bool,
 
+    /// Work in the current folder without asking which of `workspaces` a
+    /// new conversation works in.
+    #[arg(long)]
+    here: bool,
+
     /// Without a subcommand, universe opens its terminal interface, or its
     /// window with --gui.
     #[command(subcommand)]
@@ -189,7 +194,12 @@ async fn main() -> Result<()> {
         } else {
             Screen::Terminal
         };
-        return interface(provider, keyed, choices, start, screen).await;
+        let ask = !cli.here && matches!(start, universe_ui::Start::New);
+        let relaunch = interface(provider, keyed, choices, start, screen, ask).await?;
+        return match relaunch {
+            Some(relaunch) => Err(relaunch_in(&relaunch)),
+            None => Ok(()),
+        };
     };
 
     // The commands below only call the provider.
@@ -238,6 +248,7 @@ async fn main() -> Result<()> {
                 .with_audit_log(Defaults::audit_log_path())
                 .with_allowed_secrets(kept.allowed_secrets)
                 .with_allowed_hosts(kept.allowed_hosts)
+                .with_allowed_programs(kept.allowed_programs)
                 .with_strict_commands(!kept.lenient_commands);
             run_task(&provider, &config, &task).await
         }
@@ -297,7 +308,8 @@ async fn interface(
     choices: Choices,
     start: universe_ui::Start,
     screen: Screen,
-) -> Result<()> {
+    ask_workspace: bool,
+) -> Result<Option<universe_ui::workspaces::Relaunch>> {
     let workspace = Workspace::new(".")?;
     let defaults = match Defaults::path() {
         Some(path) => Defaults::load(&path).map_err(anyhow::Error::msg)?,
@@ -404,6 +416,8 @@ async fn interface(
         .collect();
 
     let settings = universe_ui::Settings {
+        workspaces: defaults.workspaces.clone(),
+        ask_workspace,
         tiers,
         checks,
         rounds: 2,
@@ -426,6 +440,7 @@ async fn interface(
         allowed_secrets: defaults.allowed_secrets.clone(),
         strict_commands: !defaults.lenient_commands,
         allowed_hosts: defaults.allowed_hosts.clone(),
+        allowed_programs: defaults.allowed_programs.clone(),
         // With Claude Code installed, a pair is Opus planning, Sonnet coding.
         pair_mode: defaults.pair_mode.unwrap_or(claude.is_some()),
         tick: defaults.tick,
@@ -452,7 +467,7 @@ async fn interface(
         claude: claude.unwrap_or_else(|| ClaudeCode::new("claude")),
         codex: codex.unwrap_or_else(|| Codex::new("codex")),
     };
-    match screen {
+    Ok(match screen {
         Screen::Terminal => {
             universe_tui::run(
                 Arc::new(provider),
@@ -461,7 +476,7 @@ async fn interface(
                 settings,
                 start,
             )
-            .await?;
+            .await?
         }
         Screen::Window => {
             // The window needs the main thread, which this task runs on:
@@ -476,10 +491,73 @@ async fn interface(
                     settings,
                     start,
                 )
-            })?;
+            })?
+        }
+    })
+}
+
+/// The arguments the program was started with, for a relaunch in another
+/// folder: without what chose the conversation, with `--here` so that it
+/// does not ask again, and `-r <id>` for a conversation to open.
+fn relaunch_args(
+    given: impl Iterator<Item = std::ffi::OsString>,
+    conversation: Option<&str>,
+) -> Vec<std::ffi::OsString> {
+    let mut args = Vec::new();
+    let mut given = given.peekable();
+    while let Some(arg) = given.next() {
+        let text = arg.to_string_lossy();
+        match text.as_ref() {
+            "-c" | "--continue" | "--here" => {}
+            "-r" | "--resume" => {
+                // Its id, if one follows.
+                if given
+                    .peek()
+                    .is_some_and(|next| !next.to_string_lossy().starts_with('-'))
+                {
+                    given.next();
+                }
+            }
+            _ if text.starts_with("--resume=") => {}
+            _ => args.push(arg),
         }
     }
-    Ok(())
+    args.push("--here".into());
+    if let Some(id) = conversation {
+        args.push("-r".into());
+        args.push(id.into());
+    }
+    args
+}
+
+/// Starts the program again in another folder, in place of this one.
+/// Returns only when it could not.
+fn relaunch_in(relaunch: &universe_ui::workspaces::Relaunch) -> anyhow::Error {
+    let program = match std::env::current_exe() {
+        Ok(program) => program,
+        Err(e) => return anyhow::Error::new(e).context("the program cannot find itself"),
+    };
+    let args = relaunch_args(
+        std::env::args_os().skip(1),
+        relaunch.conversation.as_deref(),
+    );
+    let mut command = std::process::Command::new(program);
+    command.args(args).current_dir(&relaunch.dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        anyhow::Error::new(error)
+            .context(format!("cannot start again in {}", relaunch.dir.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        match command.status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+            Err(e) => anyhow::Error::new(e)
+                .context(format!("cannot start again in {}", relaunch.dir.display())),
+        }
+    }
 }
 
 /// List prices for Claude Code's messages, from LiteLLM's list kept a week
@@ -858,5 +936,24 @@ fn summarize(outcome: &Outcome) -> Result<()> {
             bail!("no model made the checks pass")
         }
         Verdict::OverBudget { budget } => bail!("the budget of {budget} was spent first"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relaunch_keeps_the_options_and_drops_what_chose_the_conversation() {
+        let given = ["--gui", "-r", "abc", "--model", "m", "-c"].map(std::ffi::OsString::from);
+        assert_eq!(
+            relaunch_args(given.into_iter(), None),
+            ["--gui", "--model", "m", "--here"]
+        );
+        let given = ["--resume", "--gui"].map(std::ffi::OsString::from);
+        assert_eq!(
+            relaunch_args(given.into_iter(), Some("1791-ab")),
+            ["--gui", "--here", "-r", "1791-ab"]
+        );
     }
 }
