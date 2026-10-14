@@ -1034,6 +1034,10 @@ async fn read_ticket<M: ChatModel>(
             .unwrap_or_default(),
         None => String::new(),
     };
+    // What a tracker says is kept and sent to a model: the environment's
+    // secrets are taken out first, as from a command's output.
+    let (issue, _) = universe_tools::redact_secrets(&issue);
+    let (comments, _) = universe_tools::redact_secrets(&comments);
     // Its title, from the issue alone: a field when it is JSON, else its
     // first line.
     let title = serde_json::from_str::<serde_json::Value>(&issue)
@@ -1102,7 +1106,9 @@ async fn check_progress<M: ChatModel>(
             (hunk, generated)
         })
         .collect();
-    let question = crate::tickets::judge_question(tickets, notes, &marked);
+    // The diff goes to a model: the environment's secrets are taken out.
+    let (question, _) =
+        universe_tools::redact_secrets(&crate::tickets::judge_question(tickets, notes, &marked));
     let answer = ask_one(
         model,
         chosen,
