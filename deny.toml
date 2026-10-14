@@ -19,6 +19,12 @@ ignore = [
     # with a font of the system; no font from outside is ever parsed with it.
     # To revisit when winit or sctk-adwaita moves off it.
     { id = "RUSTSEC-2026-0192", reason = "winit parses only system fonts with it, for the Wayland title bar" },
+    # ruzstd 0.8 can be made to allocate without bound by a crafted input,
+    # fixed in 0.9.1, which bevy_image 0.19 does not accept yet. bevy_image
+    # uses it only to decompress KTX2 textures, and the window loads none: it
+    # draws with egui and meshes made in code. To revisit when Bevy moves to
+    # ruzstd 0.9.
+    { id = "RUSTSEC-2026-0344", reason = "bevy_image decompresses only KTX2 textures with it, and none is loaded" },
 ]
 
 [licenses]

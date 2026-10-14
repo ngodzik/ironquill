@@ -9,10 +9,16 @@ use thiserror::Error;
 /// abort the session.
 #[derive(Debug, Error)]
 pub enum ToolError {
-    /// The path is absolute, climbs out with `..`, or resolves outside the
-    /// workspace through a symbolic link.
-    #[error("{0} is outside the workspace")]
-    OutsideWorkspace(PathBuf),
+    /// The path climbs out with `..`, is absolute outside the workspace
+    /// and the folders added to it, or resolves outside through a symbolic
+    /// link. The root is said, so that a model can correct itself.
+    #[error("{path} is outside the workspace {}: give paths relative to it", root.display())]
+    OutsideWorkspace {
+        /// The path asked for.
+        path: PathBuf,
+        /// The workspace's root.
+        root: PathBuf,
+    },
 
     /// The path is inside `.git`: a hook or the repository's configuration
     /// runs code later, and is not the model's to write.

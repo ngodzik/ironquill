@@ -140,6 +140,8 @@ pub struct Settings {
     pub strict_commands: bool,
     /// Servers commands may reach besides those already used.
     pub allowed_hosts: Vec<String>,
+    /// Programs strict mode knows besides its own.
+    pub allowed_programs: Vec<String>,
     /// `/pair` with Claude Code's Opus planning and its Sonnet coding.
     pub pair_mode: bool,
     /// Whether the warm sessions are kept warm while the conversation
@@ -166,6 +168,12 @@ pub struct Settings {
     pub cache_ttl: CacheTtl,
     /// The pattern behind the window's panels, and whether it moves.
     pub backdrop: crate::backdrop::Backdrop,
+    /// The folders a new conversation may work in, as written in the
+    /// settings: kept there as written.
+    pub workspaces: Vec<String>,
+    /// Whether to ask which of them a new conversation works in: not when
+    /// started with `--here`, as a relaunch is.
+    pub ask_workspace: bool,
     /// What the provider's models are reached through, such as
     /// "Requesty": shown with them, since the same model may be reached
     /// through an agent too, at another price, with another cache.
@@ -932,6 +940,12 @@ pub struct App {
     usage_open: bool,
     /// Whether the machine is kept from idle sleep now.
     kept_awake: bool,
+    /// How far a long held command is scrolled, in lines.
+    approval_scroll: usize,
+    /// The folder a new conversation works in, being chosen.
+    workspace_picker: Option<crate::workspaces::WorkspacePicker>,
+    /// The program started again elsewhere once the interface closes.
+    relaunch: Option<crate::workspaces::Relaunch>,
     command: LineEditor,
     /// The search of the codebase's maps, kept after Enter; and the mode
     /// it was started from, to go back to.
@@ -1088,6 +1102,9 @@ impl App {
             usage_window,
             usage_open: false,
             kept_awake: false,
+            approval_scroll: 0,
+            workspace_picker: None,
+            relaunch: None,
             command: LineEditor::default(),
             search: LineEditor::default(),
             search_from: Mode::Insert,
@@ -1721,6 +1738,9 @@ impl App {
             // their mind.
             self.quit_armed = false;
             self.notice = None;
+            if self.workspace_key(key) {
+                return None;
+            }
             if let Some(effect) = self.approval_key(key) {
                 return effect;
             }
@@ -2639,6 +2659,7 @@ impl App {
                 let config = config
                     .with_allowed_secrets(allowed)
                     .with_allowed_hosts(self.settings.allowed_hosts.clone())
+                    .with_allowed_programs(self.settings.allowed_programs.clone())
                     .with_strict_commands(self.settings.strict_commands);
                 self.input.take();
                 self.chat.transcript.push(Entry::User(text.clone()));
@@ -3897,11 +3918,17 @@ impl App {
 
     fn approval_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
         let (approval, _) = self.chat.approval.as_ref()?;
-        let (secrets, hosts) = match &approval.question {
-            Question::Command { secrets, hosts, .. } => (secrets.clone(), hosts.clone()),
-            Question::MoreTurns { .. } | Question::KeepWarm { .. } | Question::ColdStart { .. } => {
-                (Vec::new(), Vec::new())
-            }
+        let (secrets, hosts, programs) = match &approval.question {
+            Question::Command {
+                secrets,
+                hosts,
+                programs,
+                ..
+            } => (secrets.clone(), hosts.clone(), programs.clone()),
+            Question::MoreTurns { .. }
+            | Question::KeepWarm { .. }
+            | Question::ColdStart { .. }
+            | Question::AddFolder { .. } => (Vec::new(), Vec::new(), Vec::new()),
         };
         let answer = match key.code {
             KeyCode::Char('y' | 'Y') => Answer::Yes,
@@ -3910,7 +3937,31 @@ impl App {
                 Answer::Stop
             }
             // The secrets it names, from now on: kept with the defaults.
-            KeyCode::Char('a' | 'A') if !secrets.is_empty() || !hosts.is_empty() => {
+            // A long command scrolls.
+            KeyCode::Up => {
+                self.approval_scroll = self.approval_scroll.saturating_sub(1);
+                return Some(None);
+            }
+            KeyCode::Down => {
+                self.approval_scroll += 1;
+                return Some(None);
+            }
+            KeyCode::PageUp => {
+                self.approval_scroll = self.approval_scroll.saturating_sub(10);
+                return Some(None);
+            }
+            KeyCode::PageDown => {
+                self.approval_scroll += 10;
+                return Some(None);
+            }
+            KeyCode::Char('a' | 'A')
+                if !secrets.is_empty() || !hosts.is_empty() || !programs.is_empty() =>
+            {
+                for program in programs {
+                    if !self.settings.allowed_programs.contains(&program) {
+                        self.settings.allowed_programs.push(program);
+                    }
+                }
                 for name in secrets {
                     if !self.settings.allowed_secrets.contains(&name) {
                         self.settings.allowed_secrets.push(name);
@@ -3930,7 +3981,8 @@ impl App {
                     Question::Command { command, .. } => Some(Effect::Copy(command.clone())),
                     Question::MoreTurns { .. }
                     | Question::KeepWarm { .. }
-                    | Question::ColdStart { .. } => None,
+                    | Question::ColdStart { .. }
+                    | Question::AddFolder { .. } => None,
                 });
             }
             _ => return Some(None),
@@ -3939,6 +3991,7 @@ impl App {
             // The agent may have been stopped meanwhile.
             let _ = sender.send(answer);
         }
+        self.approval_scroll = 0;
         Some(None)
     }
 
@@ -3946,6 +3999,61 @@ impl App {
     pub fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
         self.usage_open
             .then_some((&self.chat.usage_log, self.usage_window))
+    }
+
+    /// Asks which folder a new conversation works in, when the settings
+    /// list some and the program was not started with `--here`.
+    pub fn ask_workspace(&mut self) {
+        if !self.settings.ask_workspace {
+            return;
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let folders: Vec<PathBuf> = self
+            .settings
+            .workspaces
+            .iter()
+            .map(|w| crate::workspaces::expand(w, home.as_deref()))
+            .collect();
+        self.workspace_picker = crate::workspaces::WorkspacePicker::new(&folders, &self.root);
+    }
+
+    /// The folder being chosen for a new conversation, if it is.
+    pub fn workspace_picker(&self) -> Option<&crate::workspaces::WorkspacePicker> {
+        self.workspace_picker.as_ref()
+    }
+
+    /// Where the program starts again once the interface closes, if it does.
+    pub fn take_relaunch(&mut self) -> Option<crate::workspaces::Relaunch> {
+        self.relaunch.take()
+    }
+
+    /// Starts the program again in `dir`, on `conversation` or a new one,
+    /// once the interface closes.
+    pub(crate) fn relaunch_in(&mut self, dir: PathBuf, conversation: Option<String>) {
+        self.relaunch = Some(crate::workspaces::Relaunch { dir, conversation });
+        self.quit = true;
+    }
+
+    /// Keys while the folder is chosen. Returns whether the key was for it.
+    fn workspace_key(&mut self, key: KeyEvent) -> bool {
+        let Some(picker) = &mut self.workspace_picker else {
+            return false;
+        };
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        match picker.key(key, home.as_deref()) {
+            crate::workspaces::Picked::Choosing => {}
+            crate::workspaces::Picked::Here => self.workspace_picker = None,
+            crate::workspaces::Picked::There(dir) => {
+                self.workspace_picker = None;
+                self.relaunch_in(dir, None);
+            }
+        }
+        true
+    }
+
+    /// How far a long held command is scrolled, in lines.
+    pub fn approval_scroll(&self) -> usize {
+        self.approval_scroll
     }
 
     /// The command waiting for the person's answer, if any.
@@ -4139,6 +4247,7 @@ impl App {
             allowed_secrets: self.settings.allowed_secrets.clone(),
             lenient_commands: !self.settings.strict_commands,
             allowed_hosts: self.settings.allowed_hosts.clone(),
+            allowed_programs: self.settings.allowed_programs.clone(),
             pair_mode: Some(self.settings.pair_mode),
             tick: self.settings.tick,
             // Set in the file only: kept as written there.
@@ -4155,6 +4264,8 @@ impl App {
             background: self.settings.backdrop.pattern,
             background_motion: (self.settings.backdrop.motion != crate::backdrop::Motion::Still)
                 .then_some(self.settings.backdrop.motion),
+            // Set in the file only: kept as written there.
+            workspaces: self.settings.workspaces.clone(),
         }
     }
 
@@ -5161,10 +5272,12 @@ mod tests {
             Approval {
                 model: ModelId::new("cheap").unwrap(),
                 question: Question::Command {
+                    description: String::new(),
                     command: "curl -H \"X: $API_TOKEN\" https://x.example.com".into(),
                     reasons: vec!["it uses the secret API_TOKEN".into()],
                     secrets: vec!["API_TOKEN".into()],
                     hosts: vec![],
+                    programs: vec![],
                 },
             },
             answer,
@@ -5175,6 +5288,33 @@ mod tests {
         type_text(&mut app, "/secrets forget API_TOKEN");
         press(&mut app, KeyCode::Enter);
         assert!(app.defaults().allowed_secrets.is_empty());
+    }
+
+    #[test]
+    fn a_project_program_may_be_allowed_for_good_and_a_long_command_scrolls() {
+        let mut app = ready();
+        let (answer, mut answered) = oneshot::channel();
+        app.on_agent(AgentMessage::Approve(
+            Approval {
+                model: ModelId::new("cheap").unwrap(),
+                question: Question::Command {
+                    command: "migrate up".into(),
+                    description: "Applies the pending migrations".into(),
+                    reasons: vec!["in strict mode, migrate is not a program universe knows".into()],
+                    secrets: vec![],
+                    hosts: vec![],
+                    programs: vec!["migrate".into()],
+                },
+            },
+            answer,
+        ));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.approval_scroll(), 2);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(answered.try_recv(), Ok(Answer::Always));
+        assert_eq!(app.defaults().allowed_programs, ["migrate"]);
+        assert_eq!(app.approval_scroll(), 0);
     }
 
     #[test]
@@ -5316,10 +5456,12 @@ mod tests {
         let approval = || Approval {
             model: ModelId::new("cheap").unwrap(),
             question: Question::Command {
+                description: String::new(),
                 command: "git push origin main".into(),
                 reasons: vec!["it sends commits to another repository".into()],
                 secrets: vec![],
                 hosts: vec![],
+                programs: vec![],
             },
         };
         let (answer, mut answered) = oneshot::channel();
@@ -6103,6 +6245,7 @@ mod tests {
                 allowed_secrets: vec![],
                 lenient_commands: true,
                 allowed_hosts: vec![],
+                allowed_programs: vec![],
                 pair_mode: Some(false),
                 tick: false,
                 keep_awake: None,
@@ -6114,6 +6257,7 @@ mod tests {
                 cache_ttl: None,
                 background: None,
                 background_motion: None,
+                workspaces: vec![],
             }
         );
     }

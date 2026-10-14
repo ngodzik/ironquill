@@ -77,6 +77,10 @@ pub struct Defaults {
     /// person allowed them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_hosts: Vec<String>,
+    /// The project's own programs, which strict mode knows as if it had a
+    /// rule for them: a migration tool, say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_programs: Vec<String>,
     /// Whether `/pair` has Claude Code's Opus plan and its Sonnet code; when
     /// unsaid, it does when Claude Code is installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +125,10 @@ pub struct Defaults {
     /// Whether it moves: still (unsaid) or slow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_motion: Option<Motion>,
+    /// The folders a new conversation may work in, `~` allowed: asked at
+    /// the start, the first chosen. Set in the file only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<String>,
 }
 
 impl Defaults {
@@ -211,6 +219,7 @@ mod tests {
             allowed_secrets: vec!["API_TOKEN".into()],
             lenient_commands: true,
             allowed_hosts: vec!["api.example.com".into()],
+            allowed_programs: vec!["migrate".into()],
             pair_mode: Some(true),
             tick: true,
             keep_awake: None,
@@ -222,6 +231,7 @@ mod tests {
             cache_ttl: Some(CacheTtl::OneHour),
             background: Some(Pattern::Rain),
             background_motion: Some(Motion::Slow),
+            workspaces: vec!["~/code/shop".into()],
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));

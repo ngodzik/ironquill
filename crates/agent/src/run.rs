@@ -280,6 +280,8 @@ struct Ctx<'a, M, D, O> {
     allowed_secrets: Vec<String>,
     /// The servers the person allowed besides the known ones.
     allowed_hosts: Vec<String>,
+    /// The programs the person allowed besides the known ones.
+    allowed_programs: Vec<String>,
     /// The settings of the last call to an agent, and its context's size:
     /// what its session is kept with.
     last_call: Option<Call>,
@@ -449,6 +451,7 @@ impl Session {
             windows: std::mem::take(&mut self.windows),
             allowed_secrets: config.allowed_secrets.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
+            allowed_programs: config.allowed_programs.clone(),
             last_call: None,
             last_context: None,
             last_request: None,
@@ -1538,6 +1541,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         windows: BTreeMap::new(),
         allowed_secrets: config.allowed_secrets.clone(),
         allowed_hosts: config.allowed_hosts.clone(),
+        allowed_programs: config.allowed_programs.clone(),
         last_call: None,
         last_context: None,
         last_request: None,
@@ -3256,7 +3260,26 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 });
                 continue;
             }
-            let result = ctx.toolbox.call(call);
+            let mut result = ctx.toolbox.call(call);
+            // Outside the workspace: the person may add a folder for the
+            // rest of the conversation, and the call is made again.
+            if let Err(universe_tools::ToolError::OutsideWorkspace { path, .. }) = &result
+                && let Some(folder) = universe_tools::Workspace::folder_to_offer(path)
+                && let Some(approver) = ctx.config.approver.clone()
+            {
+                let answer = approver
+                    .ask(Approval {
+                        model: model_id.clone(),
+                        question: Question::AddFolder {
+                            path: path.clone(),
+                            folder: folder.clone(),
+                        },
+                    })
+                    .await;
+                if answer.yes() && ctx.toolbox.add_folder(&folder).is_ok() {
+                    result = ctx.toolbox.call(call);
+                }
+            }
             (ctx.observe)(Event::Tool {
                 name: call.name.clone(),
                 path: path_argument(&call.arguments),
@@ -3431,9 +3454,13 @@ fn command_spec() -> ToolSpec {
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "The command line, run with sh."}
+                "command": {"type": "string", "description": "The command line, run with sh."},
+                "description": {
+                    "type": "string",
+                    "description": "What the command does and why, in one short line of plain English, for the person who may have to approve it."
+                }
             },
-            "required": ["command"]
+            "required": ["command", "description"]
         }),
     }
 }
@@ -3449,9 +3476,13 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
     #[derive(serde::Deserialize)]
     struct Args {
         command: String,
+        // Required by the tool's schema; a model that leaves it out still
+        // gets its command judged.
+        #[serde(default)]
+        description: String,
     }
-    let command = match serde_json::from_str::<Args>(arguments) {
-        Ok(args) => args.command,
+    let (command, description) = match serde_json::from_str::<Args>(arguments) {
+        Ok(args) => (args.command, args.description.trim().to_owned()),
         Err(e) => return format!("error: the arguments are not valid: {e}"),
     };
     let root = ctx.toolbox.workspace().root().to_owned();
@@ -3460,6 +3491,8 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
     let policy = universe_tools::Policy {
         strict: ctx.config.strict_commands,
         known_hosts: Some(known),
+        allowed_programs: ctx.allowed_programs.clone(),
+        created: ctx.toolbox.created().map(|p| root.join(p)).collect(),
     };
     let found = universe_tools::assess(&command, &root, &policy);
     // A secret's value is never shown to a model, whoever would allow it.
@@ -3541,9 +3574,11 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
             model: model.clone(),
             question: Question::Command {
                 command: command.clone(),
+                description: description.clone(),
                 reasons: reasons.clone(),
                 secrets: missing.clone(),
                 hosts: found.hosts.clone(),
+                programs: found.unknown.clone(),
             },
         };
         let answer = match &ctx.config.approver {
@@ -3582,6 +3617,7 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
         if answer == Answer::Always {
             ctx.allowed_secrets.extend(missing.iter().cloned());
             ctx.allowed_hosts.extend(found.hosts.iter().cloned());
+            ctx.allowed_programs.extend(found.unknown.iter().cloned());
         }
         secrets.extend(missing);
         decision = if answer == Answer::Always {
@@ -3592,6 +3628,9 @@ async fn command<M: ChatModel, D, O: FnMut(Event) + Send>(
     }
     let before = universe_tools::Snapshot::take(&root);
     let result = universe_tools::run_command(&command, &root, &secrets).await;
+    for path in before.created(&root) {
+        ctx.toolbox.mark_created(path);
+    }
     for path in before.changed(&root) {
         ctx.toolbox.mark_changed(path);
     }
@@ -4711,6 +4750,51 @@ mod tests {
         assert_eq!(model.seen.lock().unwrap().len(), 2);
     }
 
+    #[tokio::test]
+    async fn a_file_outside_the_workspace_adds_a_folder_once_the_person_says_yes() {
+        let (_dir, mut toolbox) = setup();
+        let other = tempfile::tempdir().unwrap();
+        let target = other.path().join("notes/plan.md");
+        let model = Scripted::new(vec![
+            calls(
+                "write_file",
+                json!({"path": target.display().to_string(), "content": "plan"}),
+            ),
+            says("Wrote the plan."),
+        ]);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap()
+            .with_approver({
+                let asked = Arc::clone(&asked);
+                Approver::new(move |approval: Approval| {
+                    asked.lock().unwrap().push(approval);
+                    async { Answer::Yes }
+                })
+            });
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "write the plan",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "plan");
+        let asked = asked.lock().unwrap();
+        assert!(matches!(
+            &asked[0].question,
+            Question::AddFolder { folder, .. } if *folder == other.path().canonicalize().unwrap()
+        ));
+        assert_eq!(toolbox.workspace().folders().len(), 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_model_runs_commands_and_what_cannot_be_undone_waits_for_the_person() {
@@ -4774,10 +4858,12 @@ mod tests {
         assert_eq!(
             asked[0].question,
             Question::Command {
+                description: String::new(),
                 command: "rm old.txt".into(),
                 reasons: vec!["it deletes files".into()],
                 secrets: vec![],
                 hosts: vec![],
+                programs: vec![],
             }
         );
         assert_eq!(

@@ -63,6 +63,9 @@ pub struct ToolOutput {
 pub struct Toolbox {
     workspace: Workspace,
     changed: BTreeSet<String>,
+    /// The files created during this request, by these tools or by the
+    /// agent's commands: it may remove them without asking.
+    created: BTreeSet<String>,
     /// Edits made so far, by these tools or by an agent: whether anything
     /// was done since a given moment.
     edits: u64,
@@ -111,6 +114,7 @@ impl Toolbox {
         Self {
             workspace,
             changed: BTreeSet::new(),
+            created: BTreeSet::new(),
             edits: 0,
         }
     }
@@ -352,6 +356,9 @@ impl Toolbox {
         for_model: &str,
     ) -> ToolOutput {
         self.changed.insert(path.clone());
+        if created {
+            self.created.insert(path.clone());
+        }
         self.edits += 1;
         ToolOutput {
             for_model: for_model.into(),
@@ -381,6 +388,26 @@ impl Toolbox {
     /// from here. A conversation does this before each request.
     pub fn reset_changes(&mut self) {
         self.changed.clear();
+        self.created.clear();
+    }
+
+    /// Adds a folder to the workspace for the rest of the conversation.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::Io`] if the folder does not exist.
+    pub fn add_folder(&mut self, folder: &std::path::Path) -> Result<(), ToolError> {
+        self.workspace.add_folder(folder)
+    }
+
+    /// Records a file created by a command of the agent.
+    pub fn mark_created(&mut self, path: impl Into<String>) {
+        self.created.insert(path.into());
+    }
+
+    /// The files created during this request, relative to the root.
+    pub fn created(&self) -> impl Iterator<Item = &str> {
+        self.created.iter().map(String::as_str)
     }
 
     fn list(&self, relative: &str) -> Result<String, ToolError> {

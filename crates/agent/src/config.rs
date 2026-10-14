@@ -27,6 +27,7 @@ pub struct AgentConfig {
     pub(crate) allowed_secrets: Vec<String>,
     pub(crate) strict_commands: bool,
     pub(crate) allowed_hosts: Vec<String>,
+    pub(crate) allowed_programs: Vec<String>,
     pub(crate) audit_log: Option<std::path::PathBuf>,
 }
 
@@ -46,6 +47,8 @@ pub enum Question {
     Command {
         /// The command, as it would run.
         command: String,
+        /// What the model says it does, in a line.
+        description: String,
         /// What it does that cannot be undone, leaves the machine or
         /// cannot be read from the command.
         reasons: Vec<String>,
@@ -55,6 +58,9 @@ pub enum Question {
         /// The servers it reaches that were not known: they may be allowed
         /// for good.
         hosts: Vec<String>,
+        /// The programs strict mode does not know: they may be allowed for
+        /// good.
+        programs: Vec<String>,
     },
     /// The conversation's cache has expired: start again from its summary
     /// (yes), go on as it is, writing it all to the cache (no), or stop, to
@@ -72,6 +78,15 @@ pub enum Question {
         /// How long the conversation has waited.
         minutes: u64,
     },
+    /// A file tool reached outside the workspace: whether to add a folder
+    /// for the rest of the conversation.
+    AddFolder {
+        /// The path asked for.
+        path: std::path::PathBuf,
+        /// The folder that would be added: the repository holding it, else
+        /// its nearest existing folder.
+        folder: std::path::PathBuf,
+    },
     /// Whether the model may go on, having used all its turns.
     MoreTurns {
         /// How many more it would get.
@@ -84,7 +99,7 @@ pub enum Question {
 pub enum Answer {
     /// Yes, this once.
     Yes,
-    /// Yes, and the secrets and servers it names from now on.
+    /// Yes, and the secrets, servers and programs it names from now on.
     Always,
     /// No.
     No,
@@ -254,6 +269,13 @@ impl AgentConfig {
         self
     }
 
+    /// The project's own programs, which strict mode knows as if it had a
+    /// rule for them.
+    pub fn with_allowed_programs(mut self, programs: Vec<String>) -> Self {
+        self.allowed_programs = programs;
+        self
+    }
+
     /// The secrets of the environment the person allowed commands to use.
     pub fn with_allowed_secrets(mut self, names: Vec<String>) -> Self {
         self.allowed_secrets = names;
@@ -399,6 +421,7 @@ impl AgentConfigBuilder {
             allowed_secrets: Vec::new(),
             strict_commands: false,
             allowed_hosts: Vec::new(),
+            allowed_programs: Vec::new(),
             audit_log: None,
             instructions: self.instructions,
             project_rules: self.project_rules,

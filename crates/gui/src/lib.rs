@@ -59,6 +59,7 @@ use universe_ui::backdrop::Motion;
 use universe_ui::editor::{EditorMode, ScreenRow};
 use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use universe_ui::keymap::{Focus, Mode, Pending};
+use universe_ui::workspaces::Relaunch;
 use universe_ui::{App, Effect, Host, MapView, Settings, Start, Waiting, clipboard};
 
 pub use error::GuiError;
@@ -115,7 +116,7 @@ pub fn run<M, D>(
     workspace: Workspace,
     settings: Settings,
     start: Start,
-) -> Result<(), GuiError>
+) -> Result<Option<Relaunch>, GuiError>
 where
     M: ChatModel + 'static,
     D: Delegate + 'static,
@@ -126,6 +127,9 @@ where
     let mut host = Host::new(model, delegate, workspace);
     runtime.block_on(host.start(&mut app, start));
     let title = format!("{} · universe", app.name());
+    // Where the program starts again, as the state said when it quit: read
+    // once the window is gone.
+    let relaunch: Arc<std::sync::Mutex<Option<Relaunch>>> = Arc::default();
     let universe = Universe::new(app.root().to_owned());
     let plan = Plan::new(app.root().to_owned());
     let shell = Shell {
@@ -144,6 +148,7 @@ where
         scroll_seen: 0,
         wheel_rest: 0.0,
         transcript_rows: 0,
+        relaunch: Arc::clone(&relaunch),
     };
 
     let exit = bevy::app::App::new()
@@ -210,7 +215,7 @@ where
         .add_systems(EguiPrimaryContextPass, draw::<M, D>)
         .run();
     match exit {
-        AppExit::Success => Ok(()),
+        AppExit::Success => Ok(relaunch.lock().ok().and_then(|mut r| r.take())),
         AppExit::Error(code) => Err(GuiError::Exited(code.get())),
     }
 }
@@ -246,6 +251,8 @@ struct Shell<M, D> {
     /// What the wheel or the touchpad moved short of a whole line, kept for
     /// the next move: a touchpad sends many small ones.
     wheel_rest: f32,
+    /// Where the program starts again once the window is gone.
+    relaunch: Arc<std::sync::Mutex<Option<Relaunch>>>,
 }
 
 impl<M, D> Shell<M, D>
@@ -496,6 +503,11 @@ fn drive<M, D>(
         };
     }
     if shell.app.should_quit() {
+        if let Some(relaunch) = shell.app.take_relaunch()
+            && let Ok(mut kept) = shell.relaunch.lock()
+        {
+            *kept = Some(relaunch);
+        }
         exit.write(AppExit::Success);
     }
 }
