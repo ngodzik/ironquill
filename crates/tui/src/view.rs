@@ -220,6 +220,18 @@ fn render_approval(frame: &mut Frame, app: &App) {
                  little; letting them cool, the next request writes them to the cache again."
             ))],
         ),
+        Question::ExternalTool { name, arguments } => (
+            Color::Red,
+            " Run this tool? ",
+            " y: run it · n: refuse ".to_owned(),
+            vec![
+                Line::raw(format!(
+                    " {} wants {name}, a tool that may change something, with:",
+                    approval.model
+                )),
+                Line::styled(format!(" {arguments}"), fg(Color::Red)),
+            ],
+        ),
         Question::AddFolder { path, folder } => (
             Color::Yellow,
             " Add a folder? ",

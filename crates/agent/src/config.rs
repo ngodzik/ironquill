@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use universe_core::{Effort, ModelId, Usd};
+use universe_core::{Effort, ExternalTools, ModelId, Usd};
 use universe_tools::Check;
 
 use crate::error::AgentError;
@@ -29,6 +29,7 @@ pub struct AgentConfig {
     pub(crate) allowed_hosts: Vec<String>,
     pub(crate) allowed_programs: Vec<String>,
     pub(crate) summarize_when_cold: Vec<ModelId>,
+    pub(crate) external: Option<Arc<dyn ExternalTools>>,
     pub(crate) audit_log: Option<std::path::PathBuf>,
 }
 
@@ -78,6 +79,14 @@ pub enum Question {
     KeepWarm {
         /// How long the conversation has waited.
         minutes: u64,
+    },
+    /// Whether a tool served by another, one that may change something,
+    /// may run.
+    ExternalTool {
+        /// Its name, `<server>__<tool>`.
+        name: String,
+        /// Its arguments, as JSON.
+        arguments: String,
     },
     /// A file tool reached outside the workspace: whether to add a folder
     /// for the rest of the conversation.
@@ -270,6 +279,14 @@ impl AgentConfig {
         self
     }
 
+    /// Tools served by others, MCP servers' for one: offered to models
+    /// besides universe's own. Those that only read run at once; any other
+    /// waits for the person, as a held command does.
+    pub fn with_external_tools(mut self, tools: Option<Arc<dyn ExternalTools>>) -> Self {
+        self.external = tools;
+        self
+    }
+
     /// The models whose conversation may be started again from its summary
     /// when their cache expired after a pause, the person asked first:
     /// typically the expensive ones. Others go on as they are.
@@ -425,6 +442,7 @@ impl AgentConfigBuilder {
             budget: self.budget,
             context_warning: self.context_warning,
             summarize_when_cold: Vec::new(),
+            external: None,
             effort: self.effort,
             pair: self.pair,
             detect_checks: self.detect_checks,

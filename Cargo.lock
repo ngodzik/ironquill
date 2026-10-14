@@ -6342,6 +6342,7 @@ dependencies = [
  "universe-core",
  "universe-gui",
  "universe-llm",
+ "universe-mcp",
  "universe-tools",
  "universe-tui",
  "universe-ui",
@@ -6414,6 +6415,16 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "universe-core",
+]
+
+[[package]]
+name = "universe-mcp"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "tokio",
  "universe-core",
 ]
 

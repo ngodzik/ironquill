@@ -127,6 +127,11 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
                 ('n', "Stop".to_owned()),
             ],
         ),
+        Question::ExternalTool { .. } => (
+            RED,
+            "Run this tool?",
+            vec![('y', "Run it".to_owned()), ('n', "Refuse".to_owned())],
+        ),
         Question::AddFolder { .. } => (
             YELLOW,
             "Add a folder?",
@@ -199,6 +204,16 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
                     "No request for {minutes} minutes. Each read of the warm sessions costs a \
                      little; letting them cool, the next request writes them to the cache again."
                 ));
+            }
+            Question::ExternalTool { name, arguments } => {
+                ui.label(
+                    RichText::new(format!(
+                        "{} wants {name}, a tool that may change something, with:",
+                        approval.model
+                    ))
+                    .color(DIM),
+                );
+                ui.label(RichText::new(arguments).monospace().color(RED));
             }
             Question::AddFolder { path, folder } => {
                 ui.label(format!(

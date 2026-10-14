@@ -3147,6 +3147,15 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     if leads && let Some(spec) = delegate_spec(&ctx.config.team, model_id) {
         tools.push(spec);
     }
+    // Tools served by others: a reader gets only those that only read.
+    if let Some(external) = &ctx.config.external {
+        tools.extend(
+            external
+                .specs()
+                .into_iter()
+                .filter(|t| role != Role::Reader || external.reads_only(&t.name) == Some(true)),
+        );
+    }
     let window = ctx.model.context_window(model_id).await;
     let identity = identity(model_id, leads, ctx.config);
     let pricing = ctx.model.pricing(model_id).await;
@@ -3269,6 +3278,17 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 });
                 continue;
             }
+            if let Some(external) = ctx.config.external.clone()
+                && let Some(reads_only) = external.reads_only(&call.name)
+            {
+                let content =
+                    external_call(ctx, model_id, external.as_ref(), call, reads_only).await;
+                messages.push(Message::Tool {
+                    call_id: call.id.clone(),
+                    content,
+                });
+                continue;
+            }
             if call.name == COMMAND_TOOL {
                 let content = command(ctx, model_id, &call.arguments).await;
                 messages.push(Message::Tool {
@@ -3322,6 +3342,66 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             mime: p.mime,
         }));
     }
+}
+
+/// Calls a tool served by another: at once when it only reads, else once the
+/// person said yes. What it returns is redacted of the environment's
+/// secrets, as a command's output is.
+async fn external_call<M: ChatModel, D, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    model: &ModelId,
+    external: &dyn universe_core::ExternalTools,
+    call: &universe_core::ToolCall,
+    reads_only: bool,
+) -> String {
+    let line = format!("{} {}", call.name, call.arguments);
+    if !reads_only {
+        let answer = match &ctx.config.approver {
+            Some(approver) => {
+                approver
+                    .ask(Approval {
+                        model: model.clone(),
+                        question: Question::ExternalTool {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    })
+                    .await
+            }
+            None => Answer::No,
+        };
+        if !answer.yes() {
+            audit(ctx, model, &line, "held, refused", None);
+            return "refused: this tool may change something, and the person did not allow it. \
+                    Do not reach the same result another way: say what you wanted to do."
+                .to_owned();
+        }
+    }
+    let outcome = external.call(&call.name, &call.arguments).await;
+    let decision = if reads_only {
+        "ran, it only reads"
+    } else {
+        "ran, approved by the person"
+    };
+    let (status, text) = match outcome {
+        Ok(text) => ("done", text),
+        Err(why) => ("failed", format!("error: {why}")),
+    };
+    audit(ctx, model, &line, decision, Some(status));
+    let (text, _) = universe_tools::redact_secrets(&text);
+    (ctx.observe)(Event::Tool {
+        name: call.name.clone(),
+        path: None,
+        outcome: if status == "done" {
+            Ok(universe_tools::ToolSummary::Ran {
+                label: call.name.clone(),
+                lines: text.lines().count(),
+            })
+        } else {
+            Err(text.clone())
+        },
+    });
+    text
 }
 
 /// How many times images are halved for a provider that refuses them.
@@ -4856,6 +4936,91 @@ mod tests {
         };
         assert!(data.len() <= full / 3);
         assert!(seen.len() >= 3 && seen.len() <= 2 + 3);
+    }
+
+    /// Two tools served by another: one reads, one writes.
+    #[derive(Debug, Default)]
+    struct Tracker {
+        called: Mutex<Vec<String>>,
+    }
+
+    impl universe_core::ExternalTools for Tracker {
+        fn specs(&self) -> Vec<ToolSpec> {
+            ["tracker__get_issue", "tracker__close_issue"]
+                .map(|name| ToolSpec {
+                    name: name.into(),
+                    description: String::new(),
+                    parameters: json!({"type": "object"}),
+                })
+                .to_vec()
+        }
+
+        fn reads_only(&self, name: &str) -> Option<bool> {
+            match name {
+                "tracker__get_issue" => Some(true),
+                "tracker__close_issue" => Some(false),
+                _ => None,
+            }
+        }
+
+        fn call<'a>(&'a self, name: &'a str, _: &'a str) -> universe_core::ExternalCall<'a> {
+            self.called.lock().unwrap().push(name.to_owned());
+            Box::pin(async move { Ok(format!("{name} done")) })
+        }
+
+        fn status(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_external_tool_that_reads_runs_and_one_that_writes_asks() {
+        let (_dir, mut toolbox) = setup();
+        let tracker = Arc::new(Tracker::default());
+        let model = Scripted::new(vec![
+            calls("tracker__get_issue", json!({"id": "ENG-1"})),
+            calls("tracker__close_issue", json!({"id": "ENG-1"})),
+            says("Read it; closing was refused."),
+        ]);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap()
+            .with_external_tools(Some(
+                Arc::clone(&tracker) as Arc<dyn universe_core::ExternalTools>
+            ))
+            .with_approver({
+                let asked = Arc::clone(&asked);
+                Approver::new(move |approval: Approval| {
+                    asked.lock().unwrap().push(approval);
+                    async { Answer::No }
+                })
+            });
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "close it",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(*tracker.called.lock().unwrap(), ["tracker__get_issue"]);
+        assert!(matches!(
+            &asked.lock().unwrap()[0].question,
+            Question::ExternalTool { name, .. } if name == "tracker__close_issue"
+        ));
+        let seen = model.seen.lock().unwrap();
+        assert!(
+            seen[0]
+                .tools
+                .iter()
+                .any(|t| t.name == "tracker__close_issue")
+        );
     }
 
     #[tokio::test]

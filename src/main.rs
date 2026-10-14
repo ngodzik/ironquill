@@ -420,6 +420,13 @@ async fn interface(
         ask_workspace,
         context_warning: defaults.context_warning,
         summarize_when_cold: defaults.summarize_when_cold.clone(),
+        mcp: defaults.mcp.clone(),
+        // Each server starts on a task of its own; its tools are offered
+        // once it answers.
+        external: (!defaults.mcp.is_empty()).then(|| {
+            Arc::new(universe_mcp::Mcp::start(&defaults.mcp))
+                as Arc<dyn universe_core::ExternalTools>
+        }),
         tiers,
         checks,
         rounds: 2,

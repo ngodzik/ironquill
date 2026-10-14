@@ -183,6 +183,10 @@ pub struct Settings {
     /// The models whose conversation may start again from its summary after
     /// a pause, as written in the settings.
     pub summarize_when_cold: Vec<String>,
+    /// The MCP servers, as written in the settings: kept there as written.
+    pub mcp: std::collections::BTreeMap<String, universe_core::McpServer>,
+    /// Their tools, offered to models.
+    pub external: Option<std::sync::Arc<dyn universe_core::ExternalTools>>,
     /// What the provider's models are reached through, such as
     /// "Requesty": shown with them, since the same model may be reached
     /// through an agent too, at another price, with another cache.
@@ -2688,6 +2692,7 @@ impl App {
                             .filter_map(|m| ModelId::new(m).ok())
                             .collect(),
                     )
+                    .with_external_tools(self.settings.external.clone())
                     .with_strict_commands(self.settings.strict_commands);
                 self.input.take();
                 self.chat.transcript.push(Entry::User(text.clone()));
@@ -2873,6 +2878,25 @@ impl App {
                     None => self.error("/usage takes a window such as 1h, 6h or 24h"),
                 },
             },
+            Command::Mcp => {
+                let servers = self
+                    .settings
+                    .external
+                    .as_ref()
+                    .map(|e| e.status())
+                    .unwrap_or_default();
+                self.info(if servers.is_empty() {
+                    "No MCP server: declare one in ~/.universe/config.toml as [mcp.<name>], \
+                     with url (and headers) or command"
+                        .to_owned()
+                } else {
+                    let lines: Vec<String> = servers
+                        .into_iter()
+                        .map(|(name, how)| format!("{name}: {how}"))
+                        .collect();
+                    format!("MCP servers · {}", lines.join(" · "))
+                });
+            }
             Command::Hosts(None) => self.info(if self.settings.allowed_hosts.is_empty() {
                 "No server allowed besides those the project and its tools already use: \
                  GitHub, AWS, your clusters, the package registries, the git remotes"
@@ -3960,7 +3984,8 @@ impl App {
             Question::MoreTurns { .. }
             | Question::KeepWarm { .. }
             | Question::ColdStart { .. }
-            | Question::AddFolder { .. } => (Vec::new(), Vec::new(), Vec::new()),
+            | Question::AddFolder { .. }
+            | Question::ExternalTool { .. } => (Vec::new(), Vec::new(), Vec::new()),
         };
         let answer = match key.code {
             KeyCode::Char('y' | 'Y') => Answer::Yes,
@@ -4014,7 +4039,8 @@ impl App {
                     Question::MoreTurns { .. }
                     | Question::KeepWarm { .. }
                     | Question::ColdStart { .. }
-                    | Question::AddFolder { .. } => None,
+                    | Question::AddFolder { .. }
+                    | Question::ExternalTool { .. } => None,
                 });
             }
             _ => return Some(None),
@@ -4330,6 +4356,7 @@ impl App {
             workspaces: self.settings.workspaces.clone(),
             context_warning: self.settings.context_warning,
             summarize_when_cold: self.settings.summarize_when_cold.clone(),
+            mcp: self.settings.mcp.clone(),
         }
     }
 
@@ -6340,6 +6367,7 @@ mod tests {
                 workspaces: vec![],
                 context_warning: None,
                 summarize_when_cold: vec![],
+                mcp: Default::default(),
             }
         );
     }

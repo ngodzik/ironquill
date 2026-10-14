@@ -43,7 +43,7 @@ universe --gui                     # in a window
 
 Settings live in `~/.universe/config.toml`, and a project's own (linked repositories, environments) in `~/.universe/projects/<folder>.toml`.
 
-With `workspaces = ["~/code/app", ...]` in the settings, a new conversation asks which folder it works in and starts again there (`--here` skips the question). `allowed_programs = [...]` lists a project's own tools, which strict mode then lets run without asking.
+With `workspaces = ["~/code/app", ...]` in the settings, a new conversation asks which folder it works in and starts again there (`--here` skips the question). `allowed_programs = [...]` lists a project's own tools, which strict mode then lets run without asking. MCP servers are declared there too, as `[mcp.<name>]` with a `url` (and `headers`) or a `command`: `/mcp` says how each answered, their tools that only read run at once, the others are asked first.
 
 ## Building
 
