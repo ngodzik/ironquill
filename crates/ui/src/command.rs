@@ -33,6 +33,10 @@ pub(crate) enum Command {
     /// `/task <what>` adds a task tied to this conversation; alone, lists
     /// them.
     Task(Option<String>),
+    /// `/ticket <id or link>` links a ticket to the branch; `/ticket note
+    /// <text>` notes what was verified elsewhere; `/ticket check` checks
+    /// progress; alone, the tickets' pane.
+    Ticket(Option<String>),
     /// `/tasks` lists the project's tasks.
     Tasks,
     /// `/cost` shows what the conversation has cost so far.
@@ -136,6 +140,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "chats" => Ok(Command::Chats),
         "newchat" => Ok(Command::NewChat),
         "task" => Ok(Command::Task(rest_opt)),
+        "ticket" | "tickets" => Ok(Command::Ticket(rest_opt)),
         "tasks" => Ok(Command::Tasks),
         "cost" => Ok(Command::Cost),
         "usage" => Ok(Command::Usage(rest_opt)),
@@ -386,6 +391,8 @@ Type a question or a change and press Enter. Changes are checked before they are
 /hosts               servers allowed besides those already used; /hosts forget
                      (every command is written down in ~/.universe/audit.log)
 /mcp                 the MCP servers of the settings, [mcp.<name>], and how they answered
+/ticket <id or link> link a ticket of a tracker of the settings to the branch, its work
+                     listed (Ctrl-L shows them); /ticket note <text>, /ticket check
 /debug <question>    investigate in a fresh context, with the model marked ◆ for fresh work;
                      only its report joins the conversation (Ctrl-T shows its work)
 /q                   quit

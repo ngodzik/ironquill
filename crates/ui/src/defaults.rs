@@ -151,6 +151,10 @@ pub struct Defaults {
     /// `command` (with `env`). Set in the file only: it may hold tokens.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
+    /// Ticket trackers, `[trackers.<name>]`, each read through an MCP
+    /// server's tools. Set in the file only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trackers: BTreeMap<String, crate::tickets::Tracker>,
 }
 
 impl Defaults {
@@ -269,6 +273,17 @@ mod tests {
                     url: Some("https://mcp.example.com/mcp".into()),
                     headers: BTreeMap::from([("Authorization".into(), "Bearer t".into())]),
                     ..McpServer::default()
+                },
+            )]),
+            trackers: BTreeMap::from([(
+                "issues".into(),
+                crate::tickets::Tracker {
+                    server: "tracker".into(),
+                    issue: "get_issue".into(),
+                    comments: None,
+                    argument: "id".into(),
+                    ids: "[A-Z]+-[0-9]+".into(),
+                    hosts: vec!["issues.example.com".into()],
                 },
             )]),
         };

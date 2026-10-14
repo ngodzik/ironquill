@@ -27,8 +27,10 @@ use crate::tree::FileTree;
 use crate::usage::{Sample, UsageLog};
 
 mod chats;
+mod tickets;
 
 pub use chats::{ChatRow, ChatState, TaskRow};
+pub use tickets::{Shown, TicketView};
 
 /// How opaque a see-through window is unless `opacity` says otherwise:
 /// enough to read on any wallpaper, little enough to see it.
@@ -187,6 +189,8 @@ pub struct Settings {
     pub mcp: std::collections::BTreeMap<String, universe_core::McpServer>,
     /// Their tools, offered to models.
     pub external: Option<std::sync::Arc<dyn universe_core::ExternalTools>>,
+    /// The ticket trackers, as written in the settings.
+    pub trackers: std::collections::BTreeMap<String, crate::tickets::Tracker>,
     /// What the provider's models are reached through, such as
     /// "Requesty": shown with them, since the same model may be reached
     /// through an agent too, at another price, with another cache.
@@ -261,6 +265,32 @@ pub enum Effect {
     ShowCommit(String),
     /// Read the latest conversations of every project, for `/chats`.
     ListEverywhere,
+    /// Read a ticket through its tracker's MCP server, and have a model
+    /// list its work.
+    ReadTicket {
+        /// Which ticket.
+        named: crate::tickets::Named,
+        /// Its tracker.
+        tracker: crate::tickets::Tracker,
+        /// The MCP servers' tools.
+        external: std::sync::Arc<dyn universe_core::ExternalTools>,
+        /// The model that lists the work; the cheapest of `candidates`
+        /// without one.
+        model: Option<ModelId>,
+        /// The models to pick the cheapest from.
+        candidates: Vec<ModelId>,
+    },
+    /// Judge the branch's work against its tickets.
+    CheckProgress {
+        /// The tickets.
+        tickets: Vec<crate::tickets::Ticket>,
+        /// What was verified elsewhere.
+        notes: Vec<String>,
+        /// The judge; the cheapest of `candidates` without one.
+        model: Option<ModelId>,
+        /// The models to pick the cheapest from.
+        candidates: Vec<ModelId>,
+    },
     /// Investigate a question in a fresh context, for `/debug`.
     Investigate {
         /// The question.
@@ -431,6 +461,10 @@ pub enum AgentMessage {
     WalkModel(Option<ModelId>),
     /// The answer to a question asked while walking, or why there is none.
     WalkAnswer(Result<universe_agent::Answered, String>),
+    /// A ticket read, its work listed, or why it could not be.
+    Ticket(Result<crate::tickets::Ticket, String>),
+    /// The branch's work judged against its tickets, or why it could not be.
+    Progress(Result<crate::tickets::Progress, String>),
 }
 
 /// One item in the transcript. Saved with the conversation, so that a
@@ -969,6 +1003,14 @@ pub struct App {
     branch: Option<crate::changes::ChangeSet>,
     /// Whether the tickets' pane shows.
     tickets_open: bool,
+    /// The branch the tickets are linked to, and them, as last kept.
+    tickets_branch: Option<String>,
+    tickets: crate::tickets::Tickets,
+    tickets_kept: Option<crate::tickets::Tickets>,
+    /// What is being done with them, while it is.
+    tickets_busy: Option<String>,
+    /// The pieces of the diff an item or a file is served by, shown.
+    ticket_view: Option<TicketView>,
     /// Whether the machine is kept from idle sleep now.
     kept_awake: bool,
     /// How far a long held command is scrolled, in lines.
@@ -1136,6 +1178,11 @@ impl App {
             usage_open: false,
             branch: None,
             tickets_open: false,
+            tickets_branch: None,
+            tickets: crate::tickets::Tickets::default(),
+            tickets_kept: None,
+            tickets_busy: None,
+            ticket_view: None,
             kept_awake: false,
             approval_scroll: 0,
             workspace_picker: None,
@@ -2895,6 +2942,7 @@ impl App {
                 self.add_task(title);
             }
             Command::Task(None) | Command::Tasks => self.show_tasks(),
+            Command::Ticket(argument) => return self.ticket_command(argument),
             Command::Name(None) => {
                 let name = self.name();
                 self.info(format!("This conversation: {name}"));
@@ -3226,6 +3274,14 @@ impl App {
                     );
                 }
                 self.walk_model = model;
+                false
+            }
+            AgentMessage::Ticket(read) => {
+                self.ticket_read(read);
+                false
+            }
+            AgentMessage::Progress(checked) => {
+                self.progress_checked(checked);
                 false
             }
             AgentMessage::WalkAnswer(answer) => {
@@ -4439,6 +4495,7 @@ impl App {
             context_warning: self.settings.context_warning,
             summarize_when_cold: self.settings.summarize_when_cold.clone(),
             mcp: self.settings.mcp.clone(),
+            trackers: self.settings.trackers.clone(),
         }
     }
 
@@ -5547,6 +5604,76 @@ mod tests {
         );
     }
 
+    fn run(app: &mut App, text: &str) -> Option<Effect> {
+        type_text(app, text);
+        press(app, KeyCode::Enter)
+    }
+
+    #[test]
+    fn a_ticket_is_linked_noted_judged_and_kept_with_its_branch() {
+        #[derive(Debug)]
+        struct Nothing;
+        impl universe_core::ExternalTools for Nothing {
+            fn specs(&self) -> Vec<universe_core::ToolSpec> {
+                Vec::new()
+            }
+            fn reads_only(&self, _: &str) -> Option<bool> {
+                None
+            }
+            fn call<'a>(&'a self, _: &'a str, _: &'a str) -> universe_core::ExternalCall<'a> {
+                Box::pin(async { Err("none".to_owned()) })
+            }
+            fn status(&self) -> Vec<(String, String)> {
+                Vec::new()
+            }
+        }
+        let mut app = ready();
+        app.tickets_loaded(Some("feature".into()), crate::tickets::Tickets::default());
+        // Without a tracker, it says how to declare one.
+        assert!(run(&mut app, "/ticket ENG-1").is_none());
+        assert!(
+            matches!(app.chat.transcript.last(), Some(Entry::Error(t)) if t.contains("[trackers"))
+        );
+        app.settings.trackers.insert(
+            "issues".into(),
+            crate::tickets::Tracker {
+                server: "issues".into(),
+                issue: "get_issue".into(),
+                ids: "[A-Z]+-[0-9]+".into(),
+                argument: "id".into(),
+                ..crate::tickets::Tracker::default()
+            },
+        );
+        app.settings.external = Some(std::sync::Arc::new(Nothing));
+        let Some(Effect::ReadTicket { named, .. }) = run(&mut app, "/ticket ENG-1") else {
+            panic!("the ticket is read");
+        };
+        assert_eq!(named.id, "ENG-1");
+        assert!(app.tickets_open() && app.tickets_busy().is_some());
+        app.on_agent(AgentMessage::Ticket(Ok(crate::tickets::Ticket {
+            tracker: "issues".into(),
+            id: "ENG-1".into(),
+            title: "Upload".into(),
+            text: String::new(),
+            items: vec!["accept files".into()],
+        })));
+        assert_eq!(app.tickets().tickets.len(), 1);
+        run(&mut app, "/ticket note checked on staging");
+        assert_eq!(app.tickets().notes, ["checked on staging"]);
+        let Some((branch, kept)) = app.tickets_to_keep() else {
+            panic!("kept with the branch");
+        };
+        assert_eq!((branch.as_str(), kept.tickets.len()), ("feature", 1));
+        assert!(app.tickets_to_keep().is_none(), "kept once");
+        assert!(matches!(
+            run(&mut app, "/ticket check"),
+            Some(Effect::CheckProgress { .. })
+        ));
+        app.show_ticket_part(Shown::Item(0, 0));
+        app.widen_ticket_view();
+        assert_eq!(app.ticket_view().unwrap().context, 13);
+    }
+
     #[test]
     fn pair_mode_has_opus_plan_and_sonnet_code() {
         let mut app = ready();
@@ -6493,6 +6620,7 @@ mod tests {
                 context_warning: None,
                 summarize_when_cold: vec![],
                 mcp: Default::default(),
+                trackers: Default::default(),
             }
         );
     }

@@ -28,6 +28,7 @@ mod review_view;
 mod service_board;
 mod services_view;
 mod theme;
+mod tickets_pane;
 mod transcript;
 mod universe;
 mod usage;
@@ -151,6 +152,7 @@ where
         transcript_rows: 0,
         relaunch: Arc::clone(&relaunch),
         branch: branch_pane::BranchPane::default(),
+        tickets: tickets_pane::TicketsPane::default(),
     };
 
     let exit = bevy::app::App::new()
@@ -257,6 +259,8 @@ struct Shell<M, D> {
     relaunch: Arc<std::sync::Mutex<Option<Relaunch>>>,
     /// What the branch changed, as its pane shows it.
     branch: branch_pane::BranchPane,
+    /// The branch's tickets, as their pane shows them.
+    tickets: tickets_pane::TicketsPane,
 }
 
 impl<M, D> Shell<M, D>
@@ -618,6 +622,38 @@ where
             });
     }
 
+    // The branch's tickets (Ctrl-L) on the right; an item's or a file's
+    // pieces of the diff on the left.
+    if shell.app.tickets_open() {
+        let fill = if shell.app.map_view() == Some(MapView::Universe) {
+            theme::see(PANEL, 0.62 * opacity)
+        } else {
+            background
+        };
+        let Shell {
+            tickets,
+            app,
+            effects,
+            ..
+        } = &mut *shell;
+        egui::Panel::right("tickets")
+            .resizable(true)
+            .default_size(USAGE_WIDTH)
+            .frame(pane.fill(fill).stroke(Stroke::new(1.0, EDGE)))
+            .show(&mut root, |ui| {
+                ScrollArea::vertical().show(ui, |ui| {
+                    tickets_pane::show(ui, tickets, app, effects);
+                });
+            });
+        if shell.app.ticket_view().is_some() && shell.app.map_view().is_none() {
+            let Shell { tickets, app, .. } = &mut *shell;
+            egui::Panel::left("ticket-pieces")
+                .resizable(true)
+                .default_size(560.0)
+                .frame(pane.fill(background).stroke(Stroke::new(1.0, EDGE)))
+                .show(&mut root, |ui| tickets_pane::pieces(ui, tickets, app));
+        }
+    }
     let now = ctx.input(|i| i.time);
     let view = shell.app.map_view();
     shell.review.update(&project, shell.app.change_set());
