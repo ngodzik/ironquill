@@ -119,15 +119,133 @@ pub fn lines_at(root: &Path, path: &Path, rev: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Where the current branch left the main one: the merge base of `HEAD`
-/// with `main`, `master` or their remote, when that is not `HEAD` itself.
+/// Where the current branch left the main one: the nearest merge base of
+/// `HEAD` with `main`, `master` and their remotes, the one with the fewest
+/// commits to `HEAD`, when that is not `HEAD` itself. A local `main` left
+/// behind would otherwise bring other people's work into the branch's.
 pub fn branch_base(root: &Path) -> Option<String> {
     let head = git(root, &["rev-parse", "HEAD"])?;
-    ["main", "master", "origin/main", "origin/master"]
+    let mut mains: Vec<String> = vec!["main".into(), "master".into()];
+    if let Some(remotes) = git(root, &["remote"]) {
+        for remote in remotes.lines().map(str::trim).filter(|r| !r.is_empty()) {
+            mains.push(format!("{remote}/main"));
+            mains.push(format!("{remote}/master"));
+        }
+    }
+    mains
         .iter()
-        .find_map(|branch| git(root, &["merge-base", "HEAD", branch]))
+        .filter_map(|branch| git(root, &["merge-base", "HEAD", branch]))
         .map(|base| base.trim().to_owned())
+        .filter_map(|base| {
+            let ahead = git(root, &["rev-list", "--count", &format!("{base}..HEAD")])?;
+            Some((ahead.trim().parse::<u64>().ok()?, base))
+        })
+        .min_by_key(|(ahead, _)| *ahead)
+        .map(|(_, base)| base)
         .filter(|base| *base != head.trim())
+}
+
+/// The branch checked out, `None` outside git or on a detached head.
+pub fn current_branch(root: &Path) -> Option<String> {
+    let name = git(root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let name = name.trim();
+    (!name.is_empty() && name != "HEAD").then(|| name.to_owned())
+}
+
+/// A piece of a diff: lines removed and added at one place of one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    /// The file, from the project's root.
+    pub path: String,
+    /// Where its lines were, from 1, in the base; 0 for none.
+    pub old_start: usize,
+    /// Where its lines are, from 1, now; 0 for none.
+    pub new_start: usize,
+    /// The lines removed.
+    pub removed: Vec<String>,
+    /// The lines added.
+    pub added: Vec<String>,
+}
+
+impl Hunk {
+    /// How many lines it changes: those added, else those removed.
+    #[must_use]
+    pub fn lines(&self) -> usize {
+        self.added.len().max(self.removed.len())
+    }
+}
+
+/// The pieces of the diff from `base` to the working tree, without context:
+/// the files not tracked yet as whole-file pieces, the deleted ones too.
+/// `None` outside git.
+pub fn diff_hunks(root: &Path, base: &str) -> Option<Vec<Hunk>> {
+    let diff = git(
+        root,
+        &[
+            "diff",
+            "--relative",
+            "--no-color",
+            "--no-ext-diff",
+            "-U0",
+            base,
+        ],
+    )?;
+    let mut hunks = parse_hunks(&diff);
+    let untracked = git(root, &["ls-files", "--others", "--exclude-standard"])?;
+    for path in untracked.lines().filter(|l| !l.is_empty()) {
+        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+            continue;
+        };
+        hunks.push(Hunk {
+            path: path.to_owned(),
+            old_start: 0,
+            new_start: 1,
+            removed: Vec::new(),
+            added: text.lines().map(str::to_owned).collect(),
+        });
+    }
+    Some(hunks)
+}
+
+/// The pieces of a unified diff written without context.
+fn parse_hunks(diff: &str) -> Vec<Hunk> {
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut old_path = String::new();
+    let mut path = String::new();
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            old_path = rest.strip_prefix("a/").unwrap_or(rest).to_owned();
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            path = if rest == "/dev/null" {
+                old_path.clone()
+            } else {
+                rest.strip_prefix("b/").unwrap_or(rest).to_owned()
+            };
+        } else if let Some(rest) = line.strip_prefix("@@ ") {
+            // @@ -a[,b] +c[,d] @@
+            let mut parts = rest.split_whitespace();
+            let start = |part: Option<&str>| {
+                part.and_then(|p| p[1..].split(',').next()?.parse::<usize>().ok())
+                    .unwrap_or(0)
+            };
+            let old_start = start(parts.next());
+            let new_start = start(parts.next());
+            hunks.push(Hunk {
+                path: path.clone(),
+                old_start,
+                new_start,
+                removed: Vec::new(),
+                added: Vec::new(),
+            });
+        } else if let Some(hunk) = hunks.last_mut() {
+            if let Some(text) = line.strip_prefix('+') {
+                hunk.added.push(text.to_owned());
+            } else if let Some(text) = line.strip_prefix('-') {
+                hunk.removed.push(text.to_owned());
+            }
+        }
+    }
+    hunks
 }
 
 /// How a file differs from a base.
@@ -363,6 +481,67 @@ mod tests {
             "init",
         ]);
         dir
+    }
+
+    #[test]
+    fn a_diff_without_context_is_read_in_pieces() {
+        let diff = "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -2 +2,2 @@ def f():\n-    return 1\n+    x = 2\n+    return x\n@@ -9,0 +11 @@\n+# end\ndiff --git a/old.py b/old.py\n--- a/old.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n";
+        let hunks = parse_hunks(diff);
+        assert_eq!(hunks.len(), 3);
+        assert_eq!(
+            (
+                hunks[0].path.as_str(),
+                hunks[0].old_start,
+                hunks[0].new_start
+            ),
+            ("src/a.py", 2, 2)
+        );
+        assert_eq!(hunks[0].added, ["    x = 2", "    return x"]);
+        assert_eq!(hunks[0].lines(), 2);
+        assert_eq!((hunks[1].new_start, hunks[1].added.len()), (11, 1));
+        assert_eq!((hunks[2].path.as_str(), hunks[2].lines()), ("old.py", 2));
+    }
+
+    #[test]
+    fn the_base_is_the_nearest_of_main_and_its_remotes() {
+        let dir = repo();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let commit = |message: &str| {
+            std::fs::write(dir.path().join("b.py"), message).unwrap();
+            run(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qam",
+                message,
+            ]);
+        };
+        run(&["branch", "-M", "main"]);
+        // Others' work, fetched: origin/main is ahead of the local main.
+        run(&["switch", "-qc", "upstream"]);
+        commit("theirs");
+        let theirs = git(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        run(&["remote", "add", "origin", "/nowhere"]);
+        run(&["update-ref", "refs/remotes/origin/main", theirs.trim()]);
+        // The branch starts from origin/main.
+        run(&["switch", "-qc", "feature"]);
+        commit("mine");
+        assert_eq!(branch_base(dir.path()).as_deref(), Some(theirs.trim()));
     }
 
     #[test]

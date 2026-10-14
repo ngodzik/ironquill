@@ -201,7 +201,7 @@ fn read(root: &Path, base: &str, files: &[(String, Change)]) -> Read {
 }
 
 /// A delta's colour and its sign.
-fn delta_look(delta: Delta) -> (Color32, &'static str) {
+pub(crate) fn delta_look(delta: Delta) -> (Color32, &'static str) {
     match delta {
         Delta::Added => (GREEN, "+"),
         Delta::Removed => (RED, "−"),
@@ -210,7 +210,7 @@ fn delta_look(delta: Delta) -> (Color32, &'static str) {
 }
 
 /// A small word in a pill of its colour: NEW, CHANGED, REMOVED.
-fn badge(ui: &mut Ui, delta: Delta) {
+pub(crate) fn badge(ui: &mut Ui, delta: Delta) {
     let (colour, _) = delta_look(delta);
     let word = match delta {
         Delta::Added => "NEW",
@@ -237,7 +237,7 @@ fn section(ui: &mut Ui, title: &str, count: usize) {
 }
 
 /// A step of a migration or a model: its sign, its table, what it does.
-fn schema_line(ui: &mut Ui, change: &SchemaChange) {
+pub(crate) fn schema_line(ui: &mut Ui, change: &SchemaChange) {
     let (colour, sign) = delta_look(change.delta);
     ui.horizontal(|ui| {
         ui.add_space(14.0);
@@ -250,7 +250,7 @@ fn schema_line(ui: &mut Ui, change: &SchemaChange) {
 }
 
 /// A path as a link: a click opens the file, folded to its changes.
-fn file_link(ui: &mut Ui, path: &str, size: f32) -> bool {
+pub(crate) fn file_link(ui: &mut Ui, path: &str, size: f32) -> bool {
     let (folder, name) = path.rsplit_once('/').unwrap_or(("", path));
     let mut job = egui::text::LayoutJob::default();
     if !folder.is_empty() {

@@ -152,6 +152,9 @@ pub(crate) struct Universe {
     /// How much of the window's width the panels cover on the right: the
     /// view moves so that the universe is centred in what is left.
     pub(crate) covered: f32,
+    /// For each node a file the branch changed since it left the main
+    /// one: the colour it pulses in, how strongly, and its phase.
+    pulses: Vec<Option<(LinearRgba, f32, f32)>>,
     /// Whether the window shows the deployments rather than the code: the
     /// stars rest, and the camera is the fleet's.
     pub(crate) deployments: bool,
@@ -195,6 +198,7 @@ impl Universe {
             on_screen: Vec::new(),
             covered: 0.0,
             deployments: false,
+            pulses: Vec::new(),
         }
     }
 
@@ -746,6 +750,32 @@ fn size(node: &universe_codemap::Node) -> f32 {
     }
 }
 
+/// How bright a branch's file pulses at most, above its rest.
+const PULSE: f32 = 7.0;
+
+/// How a file the branch changed pulses: green when new, amber when changed,
+/// cyan when renamed, stronger with more lines changed (on a log scale),
+/// with a phase of its own; nothing for a deleted file, which has no star.
+fn pulse(
+    change: &universe_tools::Change,
+    lines: usize,
+    path: &str,
+) -> Option<(LinearRgba, f32, f32)> {
+    let hue = match change {
+        universe_tools::Change::Added => LinearRgba::rgb(0.3, 1.0, 0.45),
+        universe_tools::Change::Modified => LinearRgba::rgb(1.0, 0.7, 0.15),
+        universe_tools::Change::Renamed { .. } => LinearRgba::rgb(0.2, 0.9, 1.0),
+        universe_tools::Change::Deleted => return None,
+    };
+    let strength = ((1.0 + lines as f32).ln() / (1.0 + 500.0_f32).ln()).clamp(0.2, 1.0);
+    // FNV-1a over the path: the same phase from one frame to the next.
+    let hash = path.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let phase = (hash % 6283) as f32 / 1000.0;
+    Some((hue, strength, phase))
+}
+
 /// Builds the map and the stars the first time the universe shows, and
 /// shows or hides the scene with it.
 pub(crate) fn show_or_hide(
@@ -789,8 +819,27 @@ pub(crate) fn show_or_hide(
     if !shown || universe.map.is_some() {
         return;
     }
-    // The files a branch changed come first: they show, whatever fits.
-    let map = universe_codemap::map_with(&universe.root, MAX_FILES, &universe.changed_paths);
+    // The files the branch changed since it left the main one, and those
+    // of a review, come first: they show, whatever fits.
+    let branch: Vec<universe_tools::ChangedFile> = universe_tools::branch_base(&universe.root)
+        .and_then(|base| universe_tools::changed_files(&universe.root, &base))
+        .unwrap_or_default();
+    let mut forced = universe.changed_paths.clone();
+    forced.extend(
+        branch
+            .iter()
+            .filter(|f| f.change != universe_tools::Change::Deleted)
+            .map(|f| f.path.clone()),
+    );
+    let map = universe_codemap::map_with(&universe.root, MAX_FILES, &forced);
+    universe.pulses = map
+        .nodes
+        .iter()
+        .map(|node| {
+            let file = branch.iter().find(|f| f.path == node.path)?;
+            pulse(&file.change, file.added + file.removed, &file.path)
+        })
+        .collect();
     let layout = Layout::new(&map);
     let stars = map
         .nodes
@@ -933,12 +982,14 @@ pub(crate) fn animate(
         .map(|node| universe.lit(node))
         .collect();
     let recolour = std::mem::take(&mut universe.recolour);
+    let now = time.elapsed_secs_wrapped();
     let Universe {
         map,
         layout,
         stars: entities,
         flash,
         grouping,
+        pulses,
         ..
     } = &mut *universe;
     let (Some(map), Some(layout)) = (map.as_ref(), layout.as_mut()) else {
@@ -976,6 +1027,17 @@ pub(crate) fn animate(
             }
             let swell = 1.0 + (*glow / EDIT_FLASH) * 1.6;
             transform.scale = Vec3::splat(scale * swell);
+        } else if let Some(Some((hue, strength, phase))) = pulses.get(node)
+            && lit[node]
+        {
+            // A file of the branch breathes in its colour, each at its own
+            // pace, so that they do not beat together.
+            let breath = 0.5 + 0.5 * (now * 2.2 + phase).sin();
+            if let Some(mut material) = materials.get_mut(&material.0) {
+                material.emissive =
+                    hdr(colour, rest, 1.0) + hdr(*hue, PULSE * strength * breath, 0.0);
+            }
+            transform.scale = Vec3::splat(scale * (1.0 + 0.35 * strength * breath));
         }
     }
 
@@ -1165,6 +1227,33 @@ mod tests {
                 lines: 10,
             }),
         }
+    }
+
+    #[test]
+    fn a_branchs_files_pulse_by_how_they_changed_and_how_much() {
+        use universe_tools::Change;
+        let (new, small, _) = pulse(&Change::Added, 3, "a.rs").unwrap();
+        let (changed, big, _) = pulse(&Change::Modified, 900, "b.rs").unwrap();
+        let (renamed, ..) = pulse(
+            &Change::Renamed {
+                from: "c.rs".into(),
+            },
+            1,
+            "d.rs",
+        )
+        .unwrap();
+        assert!(new.green > new.red && changed.red > changed.blue && renamed.blue > renamed.red);
+        assert!(small < big && (big - 1.0).abs() < f32::EPSILON);
+        assert!(pulse(&Change::Deleted, 10, "e.rs").is_none());
+        // Each its own phase, the same each time.
+        assert_ne!(
+            pulse(&Change::Added, 1, "x.rs").unwrap().2,
+            pulse(&Change::Added, 1, "y.rs").unwrap().2
+        );
+        assert_eq!(
+            pulse(&Change::Added, 1, "x.rs"),
+            pulse(&Change::Added, 1, "x.rs")
+        );
     }
 
     #[test]

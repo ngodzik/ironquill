@@ -57,9 +57,53 @@ pub(crate) struct DatabaseView {
     zoom: f32,
     hovered: Option<usize>,
     chosen: Option<usize>,
+    /// The tables shown alone, a branch's and those their keys link; all
+    /// when `None`.
+    focus: Option<Vec<String>>,
 }
 
 impl DatabaseView {
+    /// Shows only `tables` and those their foreign keys link, laid out on
+    /// their own.
+    pub(crate) fn focus(&mut self, tables: Vec<String>) {
+        self.focus = Some(tables);
+        self.per_row = 0;
+        self.pan = Vec2::ZERO;
+        self.zoom = 1.0;
+        self.chosen = None;
+    }
+
+    /// The schema as shown: all of it, or the tables focused on and those
+    /// their keys link, either way.
+    fn shown(&self) -> Option<Schema> {
+        let schema = self.schema.clone()?;
+        let Some(focus) = &self.focus else {
+            return Some(schema);
+        };
+        let keys = schema.foreign_keys();
+        let named: HashSet<usize> = schema
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| focus.contains(&t.name))
+            .map(|(i, _)| i)
+            .collect();
+        let linked: HashSet<usize> = keys
+            .iter()
+            .filter(|k| named.contains(&k.from) || named.contains(&k.to))
+            .flat_map(|k| [k.from, k.to])
+            .chain(named.iter().copied())
+            .collect();
+        Some(Schema {
+            tables: schema
+                .tables
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| linked.contains(i))
+                .map(|(_, t)| t)
+                .collect(),
+        })
+    }
     /// Reads the models of the project the plan read, on a thread, once
     /// per reading of the project.
     pub(crate) fn update(&mut self, plan: &Plan) {
@@ -332,7 +376,7 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, review: &ReviewView, ap
         TEXT,
     );
 
-    let Some(schema) = view.schema.clone() else {
+    let Some(schema) = view.shown() else {
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
@@ -375,6 +419,20 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, review: &ReviewView, ap
         FontId::proportional(13.0),
         DIM,
     );
+    // Showing only a branch's tables: the way back to all of them.
+    if view.focus.is_some() {
+        let area = Rect::from_min_size(corner + vec2(0.0, 56.0), vec2(360.0, 24.0));
+        let mut all = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+            all = ui
+                .button(RichText::new("Only the branch's tables · show all").size(12.5))
+                .clicked();
+        });
+        if all {
+            view.focus = None;
+            view.per_row = 0;
+        }
+    }
 
     // The changes of the branch looked at, and what the search keeps.
     let touched = changed(review);

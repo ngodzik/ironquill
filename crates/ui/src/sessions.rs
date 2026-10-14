@@ -187,6 +187,48 @@ impl Store {
     }
 }
 
+impl Store {
+    /// The tickets linked to `branch`: none yet, or a file that cannot be
+    /// read, is none.
+    #[must_use]
+    pub fn tickets(&self, branch: &str) -> crate::tickets::Tickets {
+        fs::read(self.dir.join(tickets_file(branch)))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Keeps the tickets linked to `branch`, for every conversation on it.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be written.
+    pub fn save_tickets(&self, branch: &str, tickets: &crate::tickets::Tickets) -> io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let json = serde_json::to_vec_pretty(tickets).map_err(io::Error::other)?;
+        let path = self.dir.join(tickets_file(branch));
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(tmp, path)
+    }
+}
+
+/// The file of a branch's tickets: not a `.json`, so that the list of
+/// conversations does not read it as one.
+fn tickets_file(branch: &str) -> String {
+    let safe: String = branch
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("tickets-{safe}.state")
+}
+
 /// The project's state beside its conversations: not a `.json`, so that
 /// the list of conversations does not try to read it as one.
 const PROJECT_STATE: &str = "project.state";
