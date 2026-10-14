@@ -747,6 +747,9 @@ where
                     });
                 }
             }
+            Effect::ListEverywhere => {
+                app.set_elsewhere(crate::sessions::latest_everywhere(30));
+            }
             Effect::ListSessions => {
                 app.show_picker(store.map(Store::list).unwrap_or_default());
             }

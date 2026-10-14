@@ -255,6 +255,8 @@ pub enum Effect {
     Copy(String),
     /// Show what a commit did, as a reply cited it.
     ShowCommit(String),
+    /// Read the latest conversations of every project, for `/chats`.
+    ListEverywhere,
     /// Fetch a pull request's review comments, for /address.
     Address(String),
     /// Apply these patches with git, all or none: their numbers, and them.
@@ -1034,6 +1036,8 @@ pub struct App {
     closed: Vec<ChatId>,
     /// The list of open conversations, on the row selected.
     chats_open: Option<usize>,
+    /// The latest conversations of every project, for `/chats`.
+    elsewhere: Vec<crate::sessions::Summary>,
     /// The project's tasks.
     tasks: Vec<crate::sessions::Task>,
     /// The list of tasks, on the row selected.
@@ -1157,6 +1161,7 @@ impl App {
             next_chat: 1,
             closed: Vec::new(),
             chats_open: None,
+            elsewhere: Vec::new(),
             tasks: Vec::new(),
             tasks_open: None,
             project_kept: None,
@@ -2828,7 +2833,10 @@ impl App {
                 self.chat.cost_complete = true;
                 return Some(Effect::Reset);
             }
-            Command::Chats => self.show_chats(),
+            Command::Chats => {
+                self.show_chats();
+                return Some(Effect::ListEverywhere);
+            }
             Command::NewChat => {
                 self.open_chat();
             }
@@ -6126,6 +6134,7 @@ mod tests {
             updated: 0,
             requests: 1,
             cost: Usd(0.0),
+            project: PathBuf::from("/p"),
         };
         app.show_picker(vec![item("a"), item("b")]);
         press(&mut app, KeyCode::Down);

@@ -347,6 +347,33 @@ fn chats(ctx: &Context, app: &App) {
                     shown.scroll_to_me(None);
                 }
             }
+            // The latest of every project: another project's starts the
+            // program again there.
+            let open = app.chat_rows().len();
+            if !app.elsewhere().is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Latest, in every project").small().color(DIM));
+            }
+            let now = sessions::now();
+            for (k, saved) in app.elsewhere().iter().enumerate() {
+                let i = open + k;
+                let project = saved
+                    .project
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let shown = row(ui, i == selected, |ui| {
+                    ui.label(RichText::new(&project).color(ACCENT));
+                    ui.label(RichText::new(&saved.name).color(TEXT));
+                    ui.label(
+                        RichText::new(sessions::ago(saved.updated, now))
+                            .small()
+                            .color(DIM),
+                    );
+                });
+                if i == selected {
+                    shown.scroll_to_me(None);
+                }
+            }
         });
         hint(
             ui,

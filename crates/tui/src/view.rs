@@ -71,6 +71,18 @@ pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
         render_compact(frame, app);
     }
     if let Some(selected) = app.chats_open() {
+        let now = sessions::now();
+        let elsewhere = app.elsewhere().iter().map(|saved| {
+            let project = saved
+                .project
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            format!(
+                "  {project} › {} · {}",
+                saved.name,
+                sessions::ago(saved.updated, now)
+            )
+        });
         let rows = app
             .chat_rows()
             .into_iter()
@@ -87,10 +99,11 @@ pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
                     plural(chat.requests, "request", "requests")
                 )
             })
+            .chain(elsewhere)
             .collect();
         render_list(
             frame,
-            " Conversations ",
+            " Conversations, then the latest of every project ",
             rows,
             selected,
             " ↑↓: move · Enter: show · n: new · x: close one not shown · Esc: close ",
