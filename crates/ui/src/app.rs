@@ -2700,6 +2700,24 @@ impl App {
         self.focus = focus;
     }
 
+    /// A click on `pane`: it takes the focus, if it is on screen.
+    pub fn click_pane(&mut self, pane: Focus) {
+        if self.visible_panes().contains(&pane) {
+            self.focus_on(pane);
+        }
+    }
+
+    /// A click on the Docker pane's container `index`: it is chosen, and
+    /// the pane takes the focus.
+    pub fn click_container(&mut self, index: usize) {
+        self.click_pane(Focus::Docker);
+        if let Some(docker) = &mut self.docker
+            && index < docker.containers.len()
+        {
+            docker.selected = index;
+        }
+    }
+
     /// A click on the tree's entry `index`: it is chosen, a folder opens or
     /// closes, a file opens.
     pub fn click_tree(&mut self, index: usize) {
@@ -6515,6 +6533,32 @@ mod tests {
         assert_eq!(app.focus(), Focus::Docker);
         app.on_key(ctrl_k);
         assert!(app.docker().is_none());
+        assert_eq!(app.focus(), Focus::Chat);
+    }
+
+    #[test]
+    fn a_click_chooses_a_container_and_focuses_only_a_pane_on_screen() {
+        let mut app = ready();
+        let container = |name: &str| Container {
+            id: name.into(),
+            name: name.into(),
+            image: "postgres".into(),
+            status: "Up 2 hours".into(),
+            ports: String::new(),
+        };
+        // No pane, no focus: a click where one was drawn last frame.
+        app.click_pane(Focus::Docker);
+        assert_eq!(app.focus(), Focus::Chat);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        app.on_docker(Ok(vec![container("db"), container("cache")]));
+        app.click_container(1);
+        assert_eq!(app.focus(), Focus::Docker);
+        assert_eq!(app.docker().unwrap().selected, 1);
+        // Past the end, the choice stays.
+        app.click_container(5);
+        assert_eq!(app.docker().unwrap().selected, 1);
+        app.click_pane(Focus::Chat);
         assert_eq!(app.focus(), Focus::Chat);
     }
 

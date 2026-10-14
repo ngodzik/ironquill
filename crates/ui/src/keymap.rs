@@ -154,7 +154,7 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-B", "show or hide the file tree"),
             (
                 "Ctrl-Z",
-                "conversation full screen, and back to the panes as they were",
+                "the conversation alone, without the files or Docker, and back to the panes as they were",
             ),
             (
                 "Ctrl-T",

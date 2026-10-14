@@ -43,7 +43,8 @@ pub(crate) fn show(ui: &mut Ui, app: &App, effects: &mut Vec<Effect>) {
     }
 }
 
-fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<Effect>) {
+/// One entry of the transcript, as the conversation shows it.
+pub(crate) fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<Effect>) {
     match entry {
         Entry::Welcome => welcome(ui, app),
         Entry::Info(text) => wrapped(ui, RichText::new(text).color(DIM)),
@@ -330,7 +331,7 @@ fn indented(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     });
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
