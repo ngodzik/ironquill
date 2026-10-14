@@ -12,6 +12,7 @@ use crate::error::AgentError;
 use crate::event::{Event, Purpose};
 
 mod compact;
+mod investigate;
 
 pub use compact::{Compaction, Subject};
 
@@ -291,6 +292,9 @@ struct Ctx<'a, M, D, O> {
     /// The last request sent to a provider's model for the conversation:
     /// what a tick sends again to keep its cache warm.
     last_request: Option<ChatRequest>,
+    /// The conversation as an investigator may look at it again, during
+    /// `/debug`.
+    history: Option<investigate::History>,
 }
 
 enum Attempt {
@@ -458,6 +462,7 @@ impl Session {
             last_call: None,
             last_context: None,
             last_request: None,
+            history: None,
         };
         // A request keeps its own session warm; the other one is ticked
         // meanwhile, and the ticks count with the request.
@@ -1562,6 +1567,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         last_call: None,
         last_context: None,
         last_request: None,
+        history: None,
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -3147,6 +3153,10 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     if leads && let Some(spec) = delegate_spec(&ctx.config.team, model_id) {
         tools.push(spec);
     }
+    // An investigator may look at the conversation again.
+    if ctx.history.is_some() {
+        tools.extend(investigate::History::specs());
+    }
     // Tools served by others: a reader gets only those that only read.
     if let Some(external) = &ctx.config.external {
         tools.extend(
@@ -3275,6 +3285,13 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 messages.push(Message::Tool {
                     call_id: call.id.clone(),
                     content: report,
+                });
+                continue;
+            }
+            if let Some(answer) = ctx.history.as_mut().and_then(|h| h.answer(call)) {
+                messages.push(Message::Tool {
+                    call_id: call.id.clone(),
+                    content: answer,
                 });
                 continue;
             }
@@ -5021,6 +5038,74 @@ mod tests {
                 .iter()
                 .any(|t| t.name == "tracker__close_issue")
         );
+    }
+
+    #[tokio::test]
+    async fn debug_investigates_in_a_fresh_context_and_only_its_report_comes_back() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("The parser drops the last line."),
+            // The brief, as one more turn of the conversation.
+            says("The person reports that the parser drops the last line of a file."),
+            // The investigator looks at the first exchange, then reports.
+            calls("read_exchange", json!({"number": 1})),
+            says("src/parser.rs:12 stops one line early: `..len - 1`."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let secret_detail = "only in the first exchange";
+        session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                &format!("why is the last line lost? {secret_detail}"),
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let before = session.messages.len();
+        let mut events = Vec::new();
+        session
+            .investigate(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                &ModelId::new("cheap").unwrap(),
+                "where is the bug?",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+        let seen = model.seen.lock().unwrap();
+        // The brief was asked with the conversation's own prefix and tools.
+        assert!(seen[1].messages.len() > 2 && !seen[1].tools.is_empty());
+        // The investigator starts from the brief and the list, not the
+        // conversation; it read the first exchange again when it asked.
+        let start = &seen[2].messages;
+        assert_eq!(start.len(), 2);
+        assert!(
+            matches!(&start[1], Message::User(t) if t.contains("1. User: why is the last line lost"))
+        );
+        assert!(seen[2].tools.iter().any(|t| t.name == "read_exchange"));
+        assert!(matches!(
+            seen[3].messages.last(),
+            Some(Message::Tool { content, .. }) if content.contains(secret_detail)
+        ));
+        // Only the question and the report join the conversation.
+        assert_eq!(session.messages.len(), before + 2);
+        assert!(matches!(
+            session.messages.last(),
+            Some(Message::Assistant { content: Some(t), .. })
+                if t.contains("src/parser.rs:12") && t.contains("1 look at the conversation")
+        ));
+        assert!(events.iter().any(|e| matches!(e, Event::Delegating { .. })));
     }
 
     #[tokio::test]

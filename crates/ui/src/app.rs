@@ -261,6 +261,15 @@ pub enum Effect {
     ShowCommit(String),
     /// Read the latest conversations of every project, for `/chats`.
     ListEverywhere,
+    /// Investigate a question in a fresh context, for `/debug`.
+    Investigate {
+        /// The question.
+        question: String,
+        /// How the conversation works: its model writes the brief.
+        config: AgentConfig,
+        /// The model that investigates.
+        investigator: ModelId,
+    },
     /// Fetch a pull request's review comments, for /address.
     Address(String),
     /// Apply these patches with git, all or none: their numbers, and them.
@@ -2706,6 +2715,7 @@ impl App {
                     self.focus = Focus::Chat;
                 }
                 self.chat.running_since = Some(Instant::now());
+                self.chat.member = None;
                 self.chat.working_model = tiers.first().cloned();
                 self.chat.scroll_back.set(0);
                 // A request starts the hour of ticks again.
@@ -2878,6 +2888,28 @@ impl App {
                     None => self.error("/usage takes a window such as 1h, 6h or 24h"),
                 },
             },
+            Command::Debug(None) => {
+                self.error("Ask a question: /debug <what to find out>");
+            }
+            Command::Debug(Some(question)) => {
+                let Some(investigator) = self.fresh_model().filter(|m| m.delegate().is_none())
+                else {
+                    self.error(
+                        "An agent cannot investigate a single question: mark a model for fresh \
+                         work with Ctrl-F in the model picker (Ctrl-E)",
+                    );
+                    return None;
+                };
+                let tiers = self.settings.tiers.clone();
+                return match self.submit_to(format!("/debug {question}"), tiers) {
+                    Some(Effect::Send { text, config }) => Some(Effect::Investigate {
+                        question: text.trim_start_matches("/debug ").to_owned(),
+                        config,
+                        investigator,
+                    }),
+                    other => other,
+                };
+            }
             Command::Mcp => {
                 let servers = self
                     .settings
@@ -3252,6 +3284,9 @@ impl App {
                 false
             }
             AgentMessage::Done(Ok(outcome)) => {
+                // Whoever worked is done: the next request is the
+                // conversation's own.
+                self.chat.member = None;
                 self.learn_all_commits();
                 self.chat.idle_since = Instant::now();
                 // The request read its session: the next tick is a full
@@ -3288,6 +3323,7 @@ impl App {
                 true
             }
             AgentMessage::Done(Err(error)) => {
+                self.chat.member = None;
                 self.chat.running_since = None;
                 self.chat.requests += 1;
                 self.error(error);
@@ -4834,6 +4870,12 @@ impl App {
                     effort,
                 }
             }
+            Event::Investigated { text } => {
+                // The investigator is done: the report is the conversation's.
+                self.chat.member = None;
+                self.chat.working_model = None;
+                Entry::Said(text)
+            }
             Event::ContextFilling { used, window } => Entry::Info(format!(
                 "The conversation fills {}% of the model's context (about {used} of {window} \
                  tokens): /compact would make it lighter",
@@ -5420,6 +5462,43 @@ mod tests {
         press(&mut app, KeyCode::Up);
         app.on_key(ctrl_f);
         assert_eq!(app.defaults().fresh_model, None);
+    }
+
+    #[test]
+    fn debug_goes_to_the_fresh_model_and_the_next_request_is_the_conversations() {
+        let mut app = ready();
+        app.settings.fresh_model = Some(ModelId::new("tiny").unwrap());
+        type_text(&mut app, "/debug why does the parser drop a line?");
+        let Some(Effect::Investigate {
+            question,
+            investigator,
+            ..
+        }) = press(&mut app, KeyCode::Enter)
+        else {
+            panic!("an investigation");
+        };
+        assert_eq!(question, "why does the parser drop a line?");
+        assert_eq!(investigator.as_str(), "tiny");
+        app.on_agent(AgentMessage::Event(Event::Delegating {
+            from: ModelId::new("cheap").unwrap(),
+            to: investigator,
+            task: question,
+        }));
+        app.on_agent(AgentMessage::Event(Event::Investigated {
+            text: "src/parser.rs:12".into(),
+        }));
+        assert!(app.chat.member.is_none());
+        assert!(
+            matches!(app.chat.transcript.last(), Some(Entry::Said(t)) if t == "src/parser.rs:12")
+        );
+        // An agent cannot investigate: without a model marked, it is said.
+        let mut app = ready();
+        app.settings.tiers = vec![ModelId::new("claude-code/opus").unwrap()];
+        type_text(&mut app, "/debug anything");
+        assert!(press(&mut app, KeyCode::Enter).is_none());
+        assert!(
+            matches!(app.chat.transcript.last(), Some(Entry::Error(t)) if t.contains("Ctrl-F"))
+        );
     }
 
     #[test]

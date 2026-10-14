@@ -405,6 +405,7 @@ impl<'a, M, D, O> Ctx<'a, M, D, O> {
             last_call: None,
             last_context: None,
             last_request: None,
+            history: None,
         }
     }
 }

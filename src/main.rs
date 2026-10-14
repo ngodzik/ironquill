@@ -898,6 +898,7 @@ fn show(event: Event) {
             "⊘ refused, nobody to approve it: {command} ({})",
             reasons.join("; ")
         ),
+        Event::Investigated { text } => println!("{text}"),
         Event::ContextFilling { used, window } => {
             eprintln!(
                 "⚠ the conversation fills most of the context: about {used} of {window} tokens"

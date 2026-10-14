@@ -221,6 +221,12 @@ pub enum Event {
         /// And after.
         after: TokenCount,
     },
+    /// An investigation of `/debug` ended: its report, which joins the
+    /// conversation; whoever worked on it is done.
+    Investigated {
+        /// The report.
+        text: String,
+    },
     /// The conversation fills most of the model's context: `/compact`
     /// would help. Told once a request.
     ContextFilling {
