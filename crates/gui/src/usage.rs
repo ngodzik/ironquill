@@ -24,7 +24,7 @@ const REVEAL_SECONDS: f32 = 0.9;
 /// The windows Ctrl-P goes through, as the state does.
 const WINDOWS: [u64; 3] = [3600, 6 * 3600, 24 * 3600];
 
-/// Where cache rebuilds stand out: the warm orange of the terminal's marks.
+/// Where cache rebuilds stand out: the warm orange of the interface's marks.
 const REBUILD: Color32 = Color32::from_rgb(230, 126, 34);
 
 /// Each role's context line, in the order of `ROLES`: the chat's neutral

@@ -1,6 +1,6 @@
 //! Mermaid diagrams drawn as PNG images by a program of the machine
 //! (mermaid-cli, mmdr, or one the settings name), each once, kept in a
-//! cache: the terminal and the window show the same files.
+//! cache, so that a diagram is drawn once for every time it shows.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};

@@ -1,4 +1,4 @@
-//! The window's look: the terminal's colours, on a deep background, with
+//! The window's look: the interface's colours, on a deep background, with
 //! room to breathe.
 
 use bevy_egui::egui::{
@@ -18,7 +18,7 @@ pub(crate) const EDGE: Color32 = Color32::from_rgb(38, 44, 58);
 pub(crate) const TEXT: Color32 = Color32::from_rgb(214, 219, 230);
 /// What is said in passing.
 pub(crate) const DIM: Color32 = Color32::from_rgb(112, 120, 138);
-/// The model in use and what has the focus, as in the terminal.
+/// The model in use and what has the focus.
 pub(crate) const ACCENT: Color32 = Color32::from_rgb(215, 119, 87);
 /// Code in replies.
 pub(crate) const CODE: Color32 = Color32::from_rgb(229, 192, 123);

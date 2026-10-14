@@ -1,17 +1,26 @@
 //! The conversation, drawn from the state's transcript: what the person
 //! wrote, what the models answered and did, and what each request cost.
 
+use std::ops::Range;
+use std::sync::Arc;
+
 use bevy_egui::egui::{
-    self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke,
+    self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke,
     TextFormat, Ui, text::LayoutJob,
 };
 use universe_tools::{DiffLine, ToolSummary};
 use universe_ui::markdown::{self as md, Block, Marker};
+use universe_ui::references::{self, Reference};
 use universe_ui::{App, Effect, Entry, step_title};
 
 use crate::theme::{
     ACCENT, BODY_SIZE, CODE, CYAN, DIM, EDGE, GREEN, LINK, MAGENTA, RED, TEXT, YELLOW,
 };
+
+/// Where a click on a cited file or commit is left, in egui's memory, for
+/// the window to open once the drawing is done: the transcript only reads
+/// the state.
+pub(crate) const CITED: &str = "cited";
 
 /// How many lines of a failed check's output show.
 const EXCERPT_LINES: usize = 12;
@@ -43,7 +52,8 @@ pub(crate) fn show(ui: &mut Ui, app: &App, effects: &mut Vec<Effect>) {
     }
 }
 
-fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<Effect>) {
+/// One entry of the transcript, as the conversation shows it.
+pub(crate) fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<Effect>) {
     match entry {
         Entry::Welcome => welcome(ui, app),
         Entry::Info(text) => wrapped(ui, RichText::new(text).color(DIM)),
@@ -76,7 +86,7 @@ fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<Effect>) {
                     left: 20,
                     ..Margin::ZERO
                 })
-                .show(ui, |ui| markdown(ui, text, effects));
+                .show(ui, |ui| markdown(ui, app, text, effects));
         }
         Entry::Command {
             command,
@@ -225,9 +235,12 @@ fn entry_ui(ui: &mut Ui, app: &App, entry: &Entry, effects: &mut Vec<Effect>) {
             });
         }
         Entry::Image(path) => {
-            ui.label(
-                RichText::new(format!("{path} (pictures come to the window next)")).color(DIM),
-            );
+            ui.label(RichText::new(path).small().color(DIM));
+            let pictures: Option<crate::diagrams::Diagrams> =
+                ui.data(|d| d.get_temp(egui::Id::new("diagrams")));
+            if let Some(pictures) = pictures {
+                pictures.picture(ui, &app.root().join(path));
+            }
         }
     }
 }
@@ -330,7 +343,7 @@ fn indented(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     });
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -436,11 +449,11 @@ fn diff_block(ui: &mut Ui, diff: &[DiffLine]) {
 /// A reply's Markdown, as `universe_ui::markdown` reads it: headings by
 /// level, lists nested, numbered or ticked, quotes behind a bar with a copy
 /// button, rules, tables, and fenced blocks with a copy button.
-fn markdown(ui: &mut Ui, text: &str, effects: &mut Vec<Effect>) {
-    blocks(ui, &md::parse(text), effects);
+fn markdown(ui: &mut Ui, app: &App, text: &str, effects: &mut Vec<Effect>) {
+    blocks(ui, app, &md::parse(text), effects);
 }
 
-fn blocks(ui: &mut Ui, list: &[Block], effects: &mut Vec<Effect>) {
+fn blocks(ui: &mut Ui, app: &App, list: &[Block], effects: &mut Vec<Effect>) {
     for block in list {
         match block {
             Block::Blank => ui.add_space(4.0),
@@ -461,7 +474,7 @@ fn blocks(ui: &mut Ui, list: &[Block], effects: &mut Vec<Effect>) {
                     ui.visuals().faint_bg_color,
                 );
                 job.wrap.max_width = ui.available_width();
-                ui.label(job);
+                citing(ui, app, job);
             }
             Block::Paragraph(lines) => {
                 let mut job = LayoutJob::default();
@@ -472,7 +485,7 @@ fn blocks(ui: &mut Ui, list: &[Block], effects: &mut Vec<Effect>) {
                     runs(&mut job, line, BODY_SIZE, TEXT, ui.visuals().faint_bg_color);
                 }
                 job.wrap.max_width = ui.available_width();
-                ui.label(job);
+                citing(ui, app, job);
             }
             Block::Item {
                 depth,
@@ -502,7 +515,7 @@ fn blocks(ui: &mut Ui, list: &[Block], effects: &mut Vec<Effect>) {
                         ui.visuals().faint_bg_color,
                     );
                     job.wrap.max_width = ui.available_width();
-                    ui.label(job);
+                    citing(ui, app, job);
                 });
             }
             Block::Rule => {
@@ -510,7 +523,7 @@ fn blocks(ui: &mut Ui, list: &[Block], effects: &mut Vec<Effect>) {
                 ui.separator();
                 ui.add_space(4.0);
             }
-            Block::Quote { text, blocks } => quote(ui, text, blocks, effects),
+            Block::Quote { text, blocks } => quote(ui, app, text, blocks, effects),
             Block::Code { language, text } => code_block(ui, language, text, effects),
             Block::Image { alt, path } => {
                 ui.label(RichText::new(format!("![{alt}]({path})")).color(DIM));
@@ -519,13 +532,19 @@ fn blocks(ui: &mut Ui, list: &[Block], effects: &mut Vec<Effect>) {
                 header,
                 aligns,
                 rows,
-            } => table(ui, header, aligns, rows),
+            } => table(ui, app, header, aligns, rows),
         }
     }
 }
 
 /// A table on a card, its header bold, its columns aligned as written.
-fn table(ui: &mut Ui, header: &[Vec<md::Span>], aligns: &[md::Align], rows: &[Vec<Vec<md::Span>>]) {
+fn table(
+    ui: &mut Ui,
+    app: &App,
+    header: &[Vec<md::Span>],
+    aligns: &[md::Align],
+    rows: &[Vec<Vec<md::Span>>],
+) {
     Frame::new()
         .fill(ui.visuals().faint_bg_color)
         .stroke(Stroke::new(1.0, EDGE))
@@ -553,9 +572,8 @@ fn table(ui: &mut Ui, header: &[Vec<md::Span>], aligns: &[md::Align], rows: &[Ve
                             };
                             // A cell keeps to one line: the grid gives each
                             // column the room its widest cell needs.
-                            ui.with_layout(Layout::top_down(align), |ui| {
-                                ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend))
-                            });
+                            job.wrap.max_width = f32::INFINITY;
+                            ui.with_layout(Layout::top_down(align), |ui| citing(ui, app, job));
                         }
                         ui.end_row();
                     };
@@ -570,7 +588,7 @@ fn table(ui: &mut Ui, header: &[Vec<md::Span>], aligns: &[md::Align], rows: &[Ve
 /// A quote set apart by a bar on its left, its markers gone and its
 /// text drawn as Markdown again, with a button that copies it as written
 /// without them: a quoted draft is often what is wanted.
-fn quote(ui: &mut Ui, text: &str, inner: &[Block], effects: &mut Vec<Effect>) {
+fn quote(ui: &mut Ui, app: &App, text: &str, inner: &[Block], effects: &mut Vec<Effect>) {
     let shown = Frame::new()
         .inner_margin(Margin {
             left: 12,
@@ -585,7 +603,7 @@ fn quote(ui: &mut Ui, text: &str, inner: &[Block], effects: &mut Vec<Effect>) {
                     effects.push(Effect::Copy(text.to_owned()));
                 }
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                    blocks(ui, inner, effects);
+                    blocks(ui, app, inner, effects);
                 });
             });
         });
@@ -629,6 +647,85 @@ fn runs(job: &mut LayoutJob, spans: &[md::Span], size: f32, colour: Color32, bac
         }
         job.append(&span.text, 0.0, format);
     }
+}
+
+/// `job` as a label, the files and commits it cites that exist drawn as
+/// links: a click on one is left under [`CITED`] for the window to open.
+fn citing(ui: &mut Ui, app: &App, mut job: LayoutJob) {
+    let cited: Vec<(Range<usize>, Reference)> = references::candidates(&job.text)
+        .into_iter()
+        .filter(|(_, _, reference)| app.reference_exists(reference))
+        .map(|(start, end, reference)| (start..end, reference))
+        .collect();
+    if cited.is_empty() {
+        ui.label(job);
+        return;
+    }
+    for (range, _) in &cited {
+        link(&mut job, range);
+    }
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let response = ui.add(egui::Label::new(Arc::clone(&galley)).sense(Sense::click()));
+    // The reference under the pointer, by the character it is over.
+    let under = |at: egui::Pos2| {
+        let index = galley
+            .cursor_from_pos(at - response.rect.left_top())
+            .index
+            .0;
+        let byte = galley
+            .job
+            .text
+            .char_indices()
+            .nth(index)
+            .map_or(galley.job.text.len(), |(byte, _)| byte);
+        cited
+            .iter()
+            .find(|(range, _)| range.contains(&byte))
+            .map(|(_, reference)| reference)
+    };
+    if let Some(reference) = response.hover_pos().and_then(under) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        if response.clicked() {
+            let reference = Some(reference.clone());
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(egui::Id::new(CITED), reference));
+        }
+    }
+}
+
+/// The bytes of `range` in `job` drawn as a link: the sections split at its
+/// edges, those inside it coloured and underlined.
+fn link(job: &mut LayoutJob, range: &Range<usize>) {
+    let mut sections = Vec::with_capacity(job.sections.len() + 2);
+    for section in job.sections.drain(..) {
+        let (start, end) = (
+            usize::from(section.byte_range.start),
+            usize::from(section.byte_range.end),
+        );
+        let cuts = [
+            start,
+            range.start.clamp(start, end),
+            range.end.clamp(start, end),
+            end,
+        ];
+        for pair in cuts.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            if from >= to {
+                continue;
+            }
+            let mut part = section.clone();
+            part.byte_range = from.into()..to.into();
+            if from != start {
+                part.leading_space = 0.0;
+            }
+            if from >= range.start && to <= range.end {
+                part.format.color = CYAN;
+                part.format.underline = Stroke::new(1.0, CYAN);
+            }
+            sections.push(part);
+        }
+    }
+    job.sections = sections;
 }
 
 /// A fenced block on its own card, its language above it and a copy button
@@ -700,5 +797,38 @@ mod tests {
     fn an_unclosed_marker_stays_as_written() {
         assert_eq!(pieces("a `b"), ["a `b"]);
         assert_eq!(pieces("2 ** 3"), ["2 ** 3"]);
+    }
+
+    #[test]
+    fn a_link_splits_the_sections_it_crosses_and_keeps_the_rest() {
+        let mut job = LayoutJob::default();
+        // Formats apart, or appending would merge them into one section.
+        let code = TextFormat {
+            font_id: FontId::monospace(BODY_SIZE),
+            ..plain()
+        };
+        job.append("see ", 0.0, plain());
+        job.append("src/a.rs:3", 0.0, code);
+        job.append(" now", 0.0, plain());
+        // From inside the first section to inside the second.
+        link(&mut job, &(2..8));
+        let parts: Vec<(&str, bool)> = job
+            .sections
+            .iter()
+            .map(|s| {
+                let range = usize::from(s.byte_range.start)..usize::from(s.byte_range.end);
+                (&job.text[range], s.format.color == CYAN)
+            })
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                ("se", false),
+                ("e ", true),
+                ("src/", true),
+                ("a.rs:3", false),
+                (" now", false)
+            ]
+        );
     }
 }

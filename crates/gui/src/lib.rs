@@ -1,8 +1,7 @@
 //! The universe window: the interface's state drawn on the GPU.
 //!
 //! The state, the keys and what each does live in `universe-ui`, and the
-//! effects are carried out by its `Host`, as in the terminal. This crate
-//! only:
+//! effects are carried out by its `Host`. This crate only:
 //! - reads the window's keys and hands them to the state (`keys`);
 //! - drives the `Host` once a frame, without ever waiting on it;
 //! - draws the state with egui on Bevy (`transcript`, `windows`, `usage`).
@@ -20,6 +19,7 @@ mod backdrop;
 mod branch_pane;
 mod database_view;
 mod diagrams;
+mod docker_pane;
 mod error;
 mod fleet_view;
 mod infra;
@@ -28,6 +28,7 @@ mod plan;
 mod review_view;
 mod service_board;
 mod services_view;
+mod sub_agent_pane;
 mod theme;
 mod tickets_pane;
 mod transcript;
@@ -62,6 +63,7 @@ use universe_ui::backdrop::Motion;
 use universe_ui::editor::{EditorMode, ScreenRow};
 use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
 use universe_ui::keymap::{Focus, Mode, Pending};
+use universe_ui::references::Reference;
 use universe_ui::workspaces::Relaunch;
 use universe_ui::{App, Effect, Host, MapView, Settings, Start, Waiting, clipboard};
 
@@ -97,7 +99,7 @@ const BLINK: Duration = Duration::from_millis(530);
 /// second, enough for a slow pattern.
 const BACKDROP_WAIT: Duration = Duration::from_millis(80);
 
-/// The frames of the spinner, as in the terminal.
+/// The frames of the spinner.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The width of the usage pane, in points.
@@ -151,6 +153,7 @@ where
         keys: Vec::new(),
         usage: UsageView::default(),
         scroll_seen: 0,
+        sub_seen: 0,
         wheel_rest: 0.0,
         transcript_rows: 0,
         relaunch: Arc::clone(&relaunch),
@@ -256,6 +259,8 @@ struct Shell<M, D> {
     /// The conversation's scroll as the state last had it, in lines: a key
     /// that scrolls changes it, and the view follows by the difference.
     scroll_seen: usize,
+    /// The same for the sub-agent pane.
+    sub_seen: usize,
     /// How many lines the conversation scrolls through, as last drawn.
     transcript_rows: usize,
     /// What the wheel or the touchpad moved short of a whole line, kept for
@@ -615,6 +620,33 @@ where
             activity(ui, &shell.app);
             input(ui, &shell.app);
         });
+    // The containers (Ctrl-K) along the bottom, above the message box; not
+    // over the codebase's views, nor while the conversation has the window
+    // to itself (Ctrl-Z).
+    let zoomed = shell.app.is_zoomed();
+    let containers = shell.app.docker().map(|d| d.containers.len());
+    if let Some(containers) = containers
+        && shell.app.map_view().is_none()
+        && !zoomed
+    {
+        let height = docker_pane::height(&root, containers, root.available_height());
+        let Shell { app, keys, .. } = &mut *shell;
+        let clicked = egui::Panel::bottom("docker")
+            .resizable(true)
+            .default_size(height)
+            .frame(
+                pane.fill(background)
+                    .inner_margin(Margin::symmetric(14, 8))
+                    .stroke(Stroke::new(1.0, EDGE)),
+            )
+            .show(&mut root, |ui| docker_pane::show(ui, app, keys))
+            .inner;
+        match clicked {
+            Some(docker_pane::Clicked::Container(i)) => shell.app.click_container(i),
+            Some(docker_pane::Clicked::Pane) => shell.app.click_pane(Focus::Docker),
+            None => {}
+        }
+    }
 
     match shell.app.usage_pane() {
         Some((log, window)) => {
@@ -791,7 +823,7 @@ where
                     &mut shell.app,
                 ),
             });
-    } else if shell.app.tree().is_some() {
+    } else if shell.app.tree().is_some() && !zoomed {
         egui::Panel::left("tree")
             .default_size(280.0)
             .frame(pane)
@@ -800,7 +832,7 @@ where
             });
     }
     if view.is_some() {
-    } else if shell.app.file().is_some() {
+    } else if shell.app.file().is_some() && !zoomed {
         chat_beside(&mut root, &ctx, shell, pane);
         egui::CentralPanel::default()
             .frame(pane.fill(background))
@@ -815,6 +847,14 @@ where
 
     if universe.deployments != fleet.active {
         universe.deployments = fleet.active;
+    }
+    // A file or commit a reply cites, clicked while drawing.
+    let cited = ctx.data_mut(|d| d.remove_temp::<Option<Reference>>(Id::new(transcript::CITED)));
+    if let Some(reference) = cited.flatten() {
+        if let Some(effect) = shell.app.open_cited(reference) {
+            shell.effects.push(effect);
+        }
+        ctx.request_repaint();
     }
     windows::show(&ctx, &shell.app, &mut shell.keys);
     if !shell.effects.is_empty() || !shell.keys.is_empty() {
@@ -1386,9 +1426,34 @@ pub(crate) fn shadowed(
     painter.text(at, anchor, text, font, colour);
 }
 
-/// The conversation, following new output unless a key scrolled it back.
+/// The conversation, following new output unless a key scrolled it back;
+/// under it, the work of a task handed over, while shown.
 fn conversation<M, D>(ui: &mut Ui, shell: &mut Shell<M, D>) {
     backdrop::paint(ui, &shell.app);
+    // A task handed to a model of the team (Ctrl-T) takes most of the room:
+    // the conversation keeps a third.
+    if shell.app.sub_agent().is_some() && ui.available_height() >= 240.0 {
+        let height = ui.available_height() * 2.0 / 3.0;
+        let Shell {
+            app,
+            sub_seen,
+            effects,
+            ..
+        } = &mut *shell;
+        let clicked = egui::Panel::bottom("sub-agent")
+            .resizable(true)
+            .default_size(height)
+            .show_separator_line(false)
+            .frame(Frame::NONE.inner_margin(Margin {
+                top: 8,
+                ..Margin::ZERO
+            }))
+            .show(ui, |ui| sub_agent_pane::show(ui, app, sub_seen, effects))
+            .inner;
+        if clicked {
+            shell.app.click_pane(Focus::SubAgent);
+        }
+    }
     let row = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
     let back = shell.app.scroll_back();
     let delta = back as f32 - shell.scroll_seen as f32;
@@ -2014,8 +2079,7 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             ui.add(egui::Label::new(job).selectable(false).extend());
         });
         let rect = shown.response.rect;
-        // The change's mark, between the number and the text, as in the
-        // terminal.
+        // The change's mark, between the number and the text.
         let sign = match mark {
             universe_tools::LineMark::Added => Some(theme::GREEN),
             universe_tools::LineMark::Changed => Some(theme::LINK),

@@ -83,18 +83,12 @@ struct Cli {
     #[arg(short = 'r', long, num_args = 0..=1, value_name = "ID")]
     resume: Option<Option<String>>,
 
-    /// Open the window instead of the terminal interface: the same
-    /// conversation, keys and commands, drawn on the GPU.
-    #[arg(long)]
-    gui: bool,
-
     /// Work in the current folder without asking which of `workspaces` a
     /// new conversation works in.
     #[arg(long)]
     here: bool,
 
-    /// Without a subcommand, universe opens its terminal interface, or its
-    /// window with --gui.
+    /// Without a subcommand, universe opens its window.
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -169,8 +163,7 @@ async fn main() -> Result<()> {
     let provider = provider.with_cache_ttl(cache_ttl);
 
     let Some(command) = cli.command else {
-        // No log subscriber here: anything written to the terminal while the
-        // interface owns it would tear the screen.
+        // No log subscriber here: the window says what goes wrong itself.
         let start = if cli.continue_last {
             universe_ui::Start::Continue
         } else if let Some(resume) = cli.resume {
@@ -189,13 +182,8 @@ async fn main() -> Result<()> {
             budget: Pick::new(cli.budget, typed("budget")),
             effort: Pick::new(cli.effort, typed("effort")),
         };
-        let screen = if cli.gui {
-            Screen::Window
-        } else {
-            Screen::Terminal
-        };
         let ask = !cli.here && matches!(start, universe_ui::Start::New);
-        let relaunch = interface(provider, keyed, choices, start, screen, ask).await?;
+        let relaunch = interface(provider, keyed, choices, start, ask).await?;
         return match relaunch {
             Some(relaunch) => Err(relaunch_in(&relaunch)),
             None => Ok(()),
@@ -295,19 +283,11 @@ impl<T> Pick<T> {
     }
 }
 
-/// Where the interface is drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Screen {
-    Terminal,
-    Window,
-}
-
 async fn interface(
     provider: OpenAiCompatible,
     keyed: bool,
     choices: Choices,
     start: universe_ui::Start,
-    screen: Screen,
     ask_workspace: bool,
 ) -> Result<Option<universe_ui::workspaces::Relaunch>> {
     let workspace = Workspace::new(".")?;
@@ -464,7 +444,6 @@ async fn interface(
         opacity: defaults.opacity,
         text_size: defaults.text_size,
         chat_width: defaults.chat_width,
-        images: defaults.images.unwrap_or_default(),
         mermaid: defaults.mermaid.clone(),
         cache_ttl: defaults.cache_ttl.unwrap_or_default(),
         backdrop: universe_ui::backdrop::Backdrop {
@@ -483,33 +462,19 @@ async fn interface(
         claude: claude.unwrap_or_else(|| ClaudeCode::new("claude")),
         codex: codex.unwrap_or_else(|| Codex::new("codex")),
     };
-    Ok(match screen {
-        Screen::Terminal => {
-            universe_tui::run(
-                Arc::new(provider),
-                Arc::new(agents),
-                workspace,
-                settings,
-                start,
-            )
-            .await?
-        }
-        Screen::Window => {
-            // The window needs the main thread, which this task runs on:
-            // the runtime's other threads carry its work meanwhile.
-            let runtime = tokio::runtime::Handle::current();
-            tokio::task::block_in_place(|| {
-                universe_gui::run(
-                    runtime,
-                    Arc::new(provider),
-                    Arc::new(agents),
-                    workspace,
-                    settings,
-                    start,
-                )
-            })?
-        }
-    })
+    // The window needs the main thread, which this task runs on: the
+    // runtime's other threads carry its work meanwhile.
+    let runtime = tokio::runtime::Handle::current();
+    Ok(tokio::task::block_in_place(|| {
+        universe_gui::run(
+            runtime,
+            Arc::new(provider),
+            Arc::new(agents),
+            workspace,
+            settings,
+            start,
+        )
+    })?)
 }
 
 /// The arguments the program was started with, for a relaunch in another
@@ -958,15 +923,16 @@ mod tests {
 
     #[test]
     fn a_relaunch_keeps_the_options_and_drops_what_chose_the_conversation() {
-        let given = ["--gui", "-r", "abc", "--model", "m", "-c"].map(std::ffi::OsString::from);
+        let given =
+            ["--effort", "low", "-r", "abc", "--model", "m", "-c"].map(std::ffi::OsString::from);
         assert_eq!(
             relaunch_args(given.into_iter(), None),
-            ["--gui", "--model", "m", "--here"]
+            ["--effort", "low", "--model", "m", "--here"]
         );
-        let given = ["--resume", "--gui"].map(std::ffi::OsString::from);
+        let given = ["--resume", "--budget", "1"].map(std::ffi::OsString::from);
         assert_eq!(
             relaunch_args(given.into_iter(), Some("1791-ab")),
-            ["--gui", "--here", "-r", "1791-ab"]
+            ["--budget", "1", "--here", "-r", "1791-ab"]
         );
     }
 }
