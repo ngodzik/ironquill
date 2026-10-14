@@ -3,7 +3,7 @@
 //! [`App`] holds everything on screen and decides what each key, click and
 //! message from the agent does. It performs no I/O: it returns an [`Effect`]
 //! for the loop that drives it to carry out, which is what makes it testable
-//! without a screen, and lets a terminal and a window drive the same state.
+//! without a screen.
 //! A view reads it and draws; [`keymap`] turns keys into actions.
 
 #![deny(unsafe_code)]

@@ -26,15 +26,14 @@ Separation of concerns is **enforced by the crate dependency graph**, not by con
           ↑               ↑
           |         crates/agent  (core + tools, never llm)
           |               ↑
-          |         crates/ui     (core + tools + agent, never llm, never a terminal or window library)
-          |           ↑         ↑
-          |   crates/tui       crates/gui   (each: core + tools + agent + ui, never llm, never the other;
-          |                         ↑        gui also: codemap)
-          |                    crates/codemap  (no internal dependencies, no rendering)
-          |           ↑         ↑
-          |   crates/mcp  (core)
-          |       ↑
+          |         crates/ui     (core + tools + agent, never llm, never a window library)
+          |               ↑
+          |         crates/gui    (core + tools + agent + ui + codemap, never llm)
+          |               ↑
           universe  (bin, depends on all)
+
+      crates/codemap  (no internal dependencies, no rendering)
+      crates/mcp      (core)
 ```
 
 | Crate             | Single responsibility                                                      |
@@ -44,13 +43,12 @@ Separation of concerns is **enforced by the crate dependency graph**, not by con
 | `universe-tools` | Deterministic tools: sandboxed workspace, file edits, checks, git          |
 | `universe-agent` | The loop: edit, check, retry, escalate. Generic over `ChatModel`           |
 | `universe-ui`    | The interface's state: modes, keys, commands, the editor. Draws nothing    |
-| `universe-tui`   | Draws `universe-ui`'s state in the terminal and runs its loop. Generic over `ChatModel` |
-| `universe-gui`   | Draws `universe-ui`'s state in a window, with egui on Bevy (`--gui`). Generic over `ChatModel` |
+| `universe-gui`   | Draws `universe-ui`'s state in a window, with egui on Bevy, and runs its loop. Generic over `ChatModel` |
 | `universe-codemap` | The codebase as a graph (folders, files, imports read by patterns, Python packages, TypeScript aliases and Dart packages resolved, routes read from FastAPI's decorators when there is no spec and calls from the paths clients write, a front end's calls to its back end through an OpenAPI spec), its design one level at a time (parts, packages found by their manifests, what uses what, layers, loops), its files grouped by module, language, layer or role, its services (those of its Compose files and the folders that serve an API or MCP tools) and who reaches whom, through an OpenAPI spec, over MCP or by a URL naming a service, each link with where it was read, the tables its SQLAlchemy and SQLModel models define (columns, keys, indexes, foreign keys), a branch's changes read for review (routes from the OpenAPI specs before and after, Alembic migrations, models' tables, files by area), where the project runs as its deployment and infrastructure say (per-project local settings linking repositories, Helm charts, Kustomize trees and Flux objects, also declared in Terraform, Terragrunt units, AWS, Google Cloud and DigitalOcean with every setting's layers, each environment rendered by `kustomize` and `helm` with origins kept and secrets hidden, Terraform read with modules at their pinned ref, cloud identifiers matched to the blocks that configure them, an architecture model, every environment assembled at once (each release's images, its objects with what they say of themselves and how they act on each other, its settings told by the kind of layer that set them), a cache keyed by the repositories' state, and linked repositories fast-forwarded where nothing can be lost), and a force-directed layout that gathers groups into galaxies. Draws nothing |
 | `universe-mcp`   | A client of the Model Context Protocol: the servers the settings declare, over stdio or streamable HTTP, their tools offered to models through core's `ExternalTools` |
 | `universe`       | CLI entry point                                                            |
 
-In `universe-ui`, keys become actions only in `keymap.rs`, and `App` turns actions into state changes and returns an `Effect` for the loop instead of doing I/O. It reads keys, clicks and areas in its own types (`input.rs`) and colours as RGB (`style.rs`), never a terminal's or a window's: a backend translates its events into them. Effects are carried out by `universe-ui`'s `Host`, the same for every backend, never by a backend itself. `universe-tui`'s `view.rs` draws the state without changing anything, and so does `universe-gui`, which drives the `Host` once a frame without ever waiting on it. The window sleeps between keys: nothing in it may ask egui to repaint unless something moves, since bevy_egui takes any request, even one for later, as one for now. A new key binding touches `keymap.rs` only; a new `:` command touches `command.rs` and `App::run_command`.
+In `universe-ui`, keys become actions only in `keymap.rs`, and `App` turns actions into state changes and returns an `Effect` for the loop instead of doing I/O. It reads keys, clicks and areas in its own types (`input.rs`) and colours as RGB (`style.rs`), never the window's: `universe-gui` translates its events into them, so that the state is tested without a window. Effects are carried out by `universe-ui`'s `Host`, never by the window itself. `universe-gui` draws the state without changing anything, and drives the `Host` once a frame without ever waiting on it. The window sleeps between keys: nothing in it may ask egui to repaint unless something moves, since bevy_egui takes any request, even one for later, as one for now. A new key binding touches `keymap.rs` only; a new `:` command touches `command.rs` and `App::run_command`.
 
 `universe-agent` does not depend on `universe-llm`: it is generic over `ChatModel`, which is what lets its tests run against a scripted model with no network. Tools served by others reach it the same way, as core's `ExternalTools`, which `universe-mcp` implements: those that only read run at once, any other waits for the person.
 
@@ -58,7 +56,7 @@ A `Delegate` (Claude Code, Codex) is an agent rather than a model: it gets a who
 
 A model edits files through `Toolbox` and runs commands through the agent's `run_command`, where `universe_tools::assess` holds what cannot be undone, leaves the machine or cannot be read, for the person to approve; a command held only because it cannot be read is first read by the cheapest priced model. Writing where code runs later (hooks, CI workflows, shell start-up files, tools' settings) is held, and every command is written to `~/.universe/audit.log`. A command that would show a secret is refused outright; secrets reach a command only when a program reads its own or the person allowed one it names, and output is redacted of them. Checks are run by the agent, so a model can neither skip nor fake them; they judge a pair and `universe do`, not a request in the conversation.
 
-A new crate (workflows, context, TUI) is added when its first real code lands, not before, and this graph is updated in the same commit.
+A new crate (workflows, context) is added when its first real code lands, not before, and this graph is updated in the same commit.
 
 ## Idiomatic Rust patterns
 

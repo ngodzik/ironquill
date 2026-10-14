@@ -23,10 +23,10 @@ Deterministic tools before models: compilers, tests, linters, language servers a
 
 All of it experimental, all of it likely to change.
 
-- **A conversation with a model**, in the terminal or in a window (`--gui`), its changes shown as diffs. Any OpenAI compatible endpoint works, Requesty by default; Claude Code and Codex can work as sub-agents.
+- **A conversation with a model**, in a window, its changes shown as diffs. Any OpenAI compatible endpoint works, Requesty by default; Claude Code and Codex can work as sub-agents.
 - **A safety net for commands**: what cannot be undone, leaves the machine or cannot be read waits for your approval, secrets are never shown to a model, and every command is logged. A net, not a sandbox.
 - **Costs and context in view**, per request and per conversation, with a budget per request.
-- **Views of the codebase** in the window (Ctrl-N), read from the code with no model: its design in layers, its API, its services, its database tables, and its files as a universe of stars.
+- **Views of the codebase** (Ctrl-N), read from the code with no model: its design in layers, its API, its services, its database tables, and its files as a universe of stars.
 - **Where it runs**: the deployment read from Compose, Helm, Kustomize, Flux and Terraform, each environment rendered by `kustomize` and `helm`, every environment shown at once as galaxies, and each service laid out flat with its objects and its values layer by layer. Secrets are never read or shown.
 - **Fresh contexts**: `/debug <question>` has an investigator, the model marked ◆ in the picker (Ctrl-F) or the conversation's, look into a question from a brief and the list of exchanges; only its report comes back, so a long conversation does not pay for the investigation.
 - **The branch and its tickets**: Ctrl-R shows what the branch changed since it left the main one, each route a click away from all of it compared before and after. `/ticket <id or link>` links a ticket of any tracker whose MCP server can read it; a model lists its work, and "Check progress" judges the branch's diff against each item, the rest counted: each item's share of the changed lines, every file with the items it serves (Ctrl-L).
@@ -39,8 +39,7 @@ All of it experimental, all of it likely to change.
 ```bash
 export REQUESTY_API_KEY=...         # without one, only Claude Code and Codex answer
 cd your-project
-universe                           # in the terminal
-universe --gui                     # in a window
+universe                           # opens the window
 ```
 
 Settings live in `~/.universe/config.toml`, and a project's own (linked repositories, environments) in `~/.universe/projects/<folder>.toml`.

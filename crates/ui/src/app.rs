@@ -101,7 +101,7 @@ pub struct DockerPane {
 }
 
 /// Lines moved by a half page scroll. Fixed rather than measured, so that the
-/// state does not depend on the size of the terminal.
+/// state does not depend on the size of the window.
 const HALF_PAGE: usize = 10;
 
 /// What the agent is set up to do. Every field can be changed from inside the
@@ -2106,10 +2106,7 @@ impl App {
                     None => self.settings.see_through = false,
                 }
                 self.notice = Some(match next {
-                    Some(step) => format!(
-                        "Window at {:.0}% (in the terminal, its own settings do this)",
-                        step * 100.0
-                    ),
+                    Some(step) => format!("Window at {:.0}%", step * 100.0),
                     None => "Opaque window".to_owned(),
                 });
             }
@@ -4759,8 +4756,7 @@ impl App {
         let notice = match view {
             Some(MapView::Plan) => {
                 "The plan: what uses what, foundations at the bottom. Click a part to see its \
-                 files, double-click to open it; Ctrl-N again for the services (in the terminal, it \
-                 shows only in the window)"
+                 files, double-click to open it; Ctrl-N again for the services"
             }
             Some(MapView::Api) => {
                 "The API: each route of the OpenAPI specs, what serves it and what calls it. \

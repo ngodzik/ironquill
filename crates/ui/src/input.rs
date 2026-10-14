@@ -1,9 +1,8 @@
 //! Keys, clicks and screen areas as the interface's state reads them.
 //!
-//! The state never sees a backend's own types: the terminal loop translates
-//! Crossterm's events into these, and a graphical window will translate its
-//! own. The names follow Crossterm's so that the code reading them reads as
-//! it did.
+//! The state never sees the window's own types: the window translates its
+//! events into these, so that the state is tested without one. The names
+//! follow Crossterm's, which the state was first written against.
 
 use std::ops::BitOr;
 

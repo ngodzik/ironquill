@@ -1,8 +1,9 @@
 //! Keys as the window reports them, turned into the state's own.
 //!
-//! The state reads every key itself, as in the terminal: no egui widget
-//! takes the keyboard, so that the modes, the leader and the window prefix
-//! work the same in both.
+//! The state reads every key itself: no egui widget takes the keyboard, so
+//! that the modes, the leader and the window prefix work as the keymap
+//! says. Keys come to it as a terminal would report them, which is what the
+//! keymap was written against.
 
 use bevy::input::keyboard::Key;
 use universe_ui::input::{KeyCode, KeyEvent, KeyModifiers};
@@ -13,8 +14,7 @@ pub(crate) enum Pressed {
     /// A key for the state.
     Key(KeyEvent),
     /// Paste the clipboard: Ctrl-V, Ctrl-Shift-V, Cmd-V or Shift-Insert, as
-    /// in most applications. The terminal pastes by itself; a window must
-    /// ask.
+    /// in most applications: a window must ask for the clipboard.
     Paste,
     /// The text a step larger (1), smaller (-1) or as at first (0): Cmd +,
     /// Cmd − and Cmd 0 on macOS, Ctrl elsewhere.
@@ -60,7 +60,7 @@ pub(crate) fn copies(modifiers: bevy_egui::egui::Modifiers) -> bool {
 }
 
 /// What pressing `key` with `held` asks for, or `None` for a key alone that
-/// means nothing, such as Shift: the terminal never reports those either.
+/// means nothing, such as Shift: a terminal never reports those either.
 pub(crate) fn translate(key: &Key, held: Held) -> Option<Pressed> {
     let code = match key {
         Key::Character(text) => {
@@ -87,7 +87,7 @@ pub(crate) fn translate(key: &Key, held: Held) -> Option<Pressed> {
                 return None;
             }
             // With Control held, the state reads the letter as typed without
-            // Shift, as the terminal reports Ctrl-O.
+            // Shift, as a terminal reports Ctrl-O.
             if held.control {
                 KeyCode::Char(c.to_ascii_lowercase())
             } else {
@@ -122,7 +122,7 @@ pub(crate) fn translate(key: &Key, held: Held) -> Option<Pressed> {
         | Key::FnLock => return None,
         _ => KeyCode::Other,
     };
-    // Shift is in the character already; the terminal does not report it
+    // Shift is in the character already; a terminal does not report it
     // beside one either.
     let held = match code {
         KeyCode::Char(_) => Held {

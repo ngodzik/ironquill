@@ -44,7 +44,7 @@ allow = [
     "CDLA-Permissive-2.0",
     "Unicode-3.0",
     "Unlicense",
-    # foldhash, through ratatui's hash maps. Permissive and OSI approved.
+    # foldhash, through Bevy's hash maps. Permissive and OSI approved.
     "Zlib",
     # arrayref, through the drawing of the window's title bar on Wayland.
     # Permissive and OSI approved, as BSD-3-Clause is.

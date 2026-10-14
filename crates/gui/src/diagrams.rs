@@ -1,6 +1,6 @@
 //! Mermaid diagrams in the window: each drawn once on a thread, by the
-//! renderer the terminal uses, into the same cache; the PNG decoded and
-//! shown as a texture. Its code shows while it draws, and stays if it fails.
+//! interface's renderer, into its cache; the PNG decoded and shown as a
+//! texture. Its code shows while it draws, and stays if it fails.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

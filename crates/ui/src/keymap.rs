@@ -164,28 +164,25 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-O", "show or hide the usage pane (/usage)"),
             (
                 "Ctrl-R",
-                "show or hide what the branch changed: routes, migrations, models (--gui only)",
+                "show or hide what the branch changed: routes, migrations, models",
             ),
             (
                 "Ctrl-L",
                 "show or hide the branch's tickets and how far the work is (/ticket)",
             ),
             ("Ctrl-P", "the usage pane's window: 1h, 6h, 24h"),
-            (
-                "Ctrl-M",
-                "the window see-through, as a terminal can be, or opaque (--gui only)",
-            ),
+            ("Ctrl-M", "the window see-through, 80%, 60%, 40%, or opaque"),
             (
                 "Ctrl-N",
-                "the codebase's plan, its API, its universe of files, then back (--gui only)",
+                "the codebase's plan, its API, its universe of files, then back",
             ),
             (
                 "Ctrl-F",
-                "search the plan, the API and the universe: Enter keeps the search, Esc clears it (--gui only)",
+                "search the plan, the API and the universe: Enter keeps the search, Esc clears it",
             ),
             (
                 "Ctrl-X",
-                "the pattern behind the panels: stars, waves, grid, rain, then none (/background, --gui only)",
+                "the pattern behind the panels: stars, waves, grid, rain, then none (/background)",
             ),
             ("Ctrl-S", "this list"),
             ("Ctrl-C", "stop the request; twice to quit"),
@@ -315,8 +312,6 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         // L for the tickets the branch is linked to.
         KeyCode::Char('l') if ctrl => return Some(Action::ToggleTickets),
         KeyCode::Char('p') if ctrl => return Some(Action::NextUsageWindow),
-        // Only the window tells Ctrl-M from Enter: a terminal sends both
-        // the same, which is fine, as only the window can be see-through.
         KeyCode::Char('m') if ctrl => return Some(Action::ToggleSeeThrough),
         KeyCode::Char('n') if ctrl => return Some(Action::NextMap),
         // F for find, as in most applications.

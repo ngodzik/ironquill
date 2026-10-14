@@ -1,8 +1,7 @@
 //! The universe window: the interface's state drawn on the GPU.
 //!
 //! The state, the keys and what each does live in `universe-ui`, and the
-//! effects are carried out by its `Host`, as in the terminal. This crate
-//! only:
+//! effects are carried out by its `Host`. This crate only:
 //! - reads the window's keys and hands them to the state (`keys`);
 //! - drives the `Host` once a frame, without ever waiting on it;
 //! - draws the state with egui on Bevy (`transcript`, `windows`, `usage`).
@@ -97,7 +96,7 @@ const BLINK: Duration = Duration::from_millis(530);
 /// second, enough for a slow pattern.
 const BACKDROP_WAIT: Duration = Duration::from_millis(80);
 
-/// The frames of the spinner, as in the terminal.
+/// The frames of the spinner.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The width of the usage pane, in points.
@@ -2014,8 +2013,7 @@ fn file(ui: &mut Ui, app: &mut App, rest: &mut f32, keys: &mut Vec<KeyEvent>) {
             ui.add(egui::Label::new(job).selectable(false).extend());
         });
         let rect = shown.response.rect;
-        // The change's mark, between the number and the text, as in the
-        // terminal.
+        // The change's mark, between the number and the text.
         let sign = match mark {
             universe_tools::LineMark::Added => Some(theme::GREEN),
             universe_tools::LineMark::Changed => Some(theme::LINK),

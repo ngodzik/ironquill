@@ -8,8 +8,8 @@ use syntect::highlighting::{
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
-/// A dark theme that reads well on most terminal backgrounds. Only its
-/// foreground colours are used: the terminal keeps its own background.
+/// A dark theme that reads well on the window's dark background. Only its
+/// foreground colours are used: the window keeps its own background.
 const THEME: &str = "base16-ocean.dark";
 
 /// Beyond this a file is shown plain: a generated file that long is not

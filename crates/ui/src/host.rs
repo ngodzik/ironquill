@@ -1,6 +1,7 @@
 //! What the state asks for and only a loop can do: sending to the agent,
-//! saving, compacting, asking docker. The terminal and a window drive the
-//! same [`Host`], so that neither carries out an effect its own way.
+//! saving, compacting, asking docker. The window drives the [`Host`] rather
+//! than carrying out an effect its own way, so that effects are tested
+//! without it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
