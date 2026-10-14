@@ -37,7 +37,14 @@ pub use tickets::{Shown, TicketView};
 pub const DEFAULT_OPACITY: f32 = 0.78;
 
 /// Below this, text on a busy wallpaper is lost.
+/// The window's text sizes, a step apart: a size egui has not drawn yet
+/// rebuilds its font atlas, so there are few.
+const TEXT_SIZES: [f32; 9] = [0.75, 0.85, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8, 2.0];
+
 const MIN_OPACITY: f32 = 0.2;
+
+/// The opacities Ctrl-M goes through, after opaque.
+const OPACITY_STEPS: [f32; 3] = [0.8, 0.6, 0.4];
 
 /// Lines moved by one turn of the mouse wheel.
 const WHEEL_LINES: i32 = 3;
@@ -161,6 +168,8 @@ pub struct Settings {
     /// How opaque the window is while see-through, as configured; `None`
     /// takes [`DEFAULT_OPACITY`].
     pub opacity: Option<f32>,
+    /// How large the window's text is; `None` is 1.
+    pub text_size: Option<f32>,
     /// How wide the window's conversation is beside a file or the
     /// codebase, as last dragged; `None` leaves it to the window.
     pub chat_width: Option<f32>,
@@ -1776,6 +1785,11 @@ impl App {
         self.chat.running_since.is_some()
     }
 
+    /// Quits, as the window's close button asks.
+    pub fn quit(&mut self) {
+        self.quit = true;
+    }
+
     /// Whether the person asked to quit.
     pub fn should_quit(&self) -> bool {
         self.quit
@@ -2076,16 +2090,28 @@ impl App {
                     None => "No background".to_owned(),
                 });
             }
+            // Ctrl-M: opaque, 80%, 60%, 40%, and opaque again; kept for
+            // the next session.
             Action::ToggleSeeThrough => {
-                self.settings.see_through = !self.settings.see_through;
-                self.notice = Some(
-                    if self.settings.see_through {
-                        "See-through window (in the terminal, its own settings do this)"
-                    } else {
-                        "Opaque window"
+                let now = self.opacity();
+                let next = OPACITY_STEPS
+                    .iter()
+                    .copied()
+                    .find(|step| *step < now - 0.01);
+                match next {
+                    Some(step) => {
+                        self.settings.see_through = true;
+                        self.settings.opacity = Some(step);
                     }
-                    .to_owned(),
-                );
+                    None => self.settings.see_through = false,
+                }
+                self.notice = Some(match next {
+                    Some(step) => format!(
+                        "Window at {:.0}% (in the terminal, its own settings do this)",
+                        step * 100.0
+                    ),
+                    None => "Opaque window".to_owned(),
+                });
             }
             Action::NextUsageWindow => {
                 self.usage_window = match self.usage_window {
@@ -2709,6 +2735,10 @@ impl App {
         // Walking, a message is a question about the code, not a request.
         if self.walking() && !text.is_empty() {
             return self.ask_walk(text);
+        }
+        // Sent from a view: back to the conversation, to see the answer.
+        if self.map.is_some() && !text.is_empty() {
+            self.map = None;
         }
         let tiers = self.settings.tiers.clone();
         self.submit_to(text, tiers)
@@ -4481,6 +4511,7 @@ impl App {
             see_through: self.settings.see_through,
             // Set in the file only: kept as written there.
             opacity: self.settings.opacity,
+            text_size: self.settings.text_size,
             chat_width: self.settings.chat_width,
             images: (self.settings.images != Images::Auto).then_some(self.settings.images),
             mermaid: self.settings.mermaid.clone(),
@@ -4718,6 +4749,12 @@ impl App {
     /// Shows the codebase as `view`, or the panes again with `None`: what
     /// Ctrl-N steps through, and what the window's own buttons pick.
     pub fn show_map(&mut self, view: Option<MapView>) {
+        // A view takes the whole window: the panes on the right close.
+        if view.is_some() {
+            self.usage_open = false;
+            self.branch = None;
+            self.tickets_open = false;
+        }
         self.map = view;
         let notice = match view {
             Some(MapView::Plan) => {
@@ -4766,6 +4803,28 @@ impl App {
     /// The pattern behind the window's panels, and whether it moves.
     pub fn backdrop(&self) -> crate::backdrop::Backdrop {
         self.settings.backdrop
+    }
+
+    /// How large the window's text is: 1 at first.
+    pub fn text_size(&self) -> f32 {
+        self.settings.text_size.unwrap_or(1.0)
+    }
+
+    /// Makes the window's text a step larger (`1`), smaller (`-1`), or as
+    /// it was at first (`0`); kept for the next session.
+    pub fn step_text_size(&mut self, step: i32) {
+        let now = self.text_size();
+        let at = TEXT_SIZES
+            .iter()
+            .position(|s| (*s - now).abs() < 0.01)
+            .unwrap_or(TEXT_SIZES.iter().position(|s| *s >= now).unwrap_or(2));
+        let next = match step {
+            0 => 1.0,
+            s if s > 0 => TEXT_SIZES[(at + 1).min(TEXT_SIZES.len() - 1)],
+            _ => TEXT_SIZES[at.saturating_sub(1)],
+        };
+        self.settings.text_size = ((next - 1.0f32).abs() > 0.01).then_some(next);
+        self.notice = Some(format!("Text at {:.0}%", next * 100.0));
     }
 
     /// How opaque the window's background is now: 1 unless see-through.
@@ -5472,18 +5531,21 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_m_makes_the_window_see_through_and_keeps_it() {
+    fn ctrl_m_goes_through_the_opacities_and_keeps_them() {
         let mut app = ready();
-        assert!((app.opacity() - 1.0).abs() < f32::EPSILON);
-        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL));
-        assert!((app.opacity() - DEFAULT_OPACITY).abs() < f32::EPSILON);
+        let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            app.on_key(ctrl_m);
+            seen.push((app.opacity() * 100.0).round() as u32);
+        }
+        assert_eq!(seen, [80, 60, 40, 100]);
+        app.on_key(ctrl_m);
         assert!(app.defaults().see_through);
+        assert_eq!(app.defaults().opacity, Some(0.8));
         // An opacity from the file is held to what stays readable.
         app.settings.opacity = Some(0.05);
         assert!((app.opacity() - MIN_OPACITY).abs() < f32::EPSILON);
-        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL));
-        assert!((app.opacity() - 1.0).abs() < f32::EPSILON);
-        assert!(!app.defaults().see_through);
     }
 
     #[test]
@@ -6610,6 +6672,7 @@ mod tests {
                 keep_awake: None,
                 see_through: false,
                 opacity: None,
+                text_size: None,
                 chat_width: None,
                 images: None,
                 mermaid: None,

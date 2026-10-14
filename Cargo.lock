@@ -6393,6 +6393,7 @@ dependencies = [
  "bevy",
  "bevy_egui",
  "egui_plot",
+ "image",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",

@@ -110,6 +110,10 @@ pub struct Defaults {
     /// the file only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
+    /// How large the window's text is, as Cmd + and Cmd − left it; unsaid,
+    /// 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_size: Option<f32>,
     /// How wide the window's conversation is beside a file or the
     /// codebase, in points, as last dragged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -258,6 +262,7 @@ mod tests {
             keep_awake: None,
             see_through: true,
             opacity: Some(0.7),
+            text_size: Some(1.25),
             chat_width: Some(420.0),
             images: Some(Images::Off),
             mermaid: Some(vec!["mmdr".into(), "-i".into(), "{input}".into()]),

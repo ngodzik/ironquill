@@ -501,7 +501,11 @@ pub(crate) fn show(ui: &mut Ui, view: &mut DatabaseView, review: &ReviewView, ap
             view.pan += from_centre - from_centre * (view.zoom / before);
         }
     }
-    let scale = fit * view.zoom.max(0.1);
+    // egui draws each text size from an atlas it rebuilds whole when full,
+    // drawing that frame empty: a flash. Where text shows, the whole view
+    // zooms by steps, cards with their text; below, only titles show, at
+    // one size, and it zooms smoothly.
+    let scale = stepped(fit * view.zoom.max(0.1));
     let centre = room.center() + view.pan;
     let screen = |r: Rect| {
         Rect::from_min_max(
@@ -911,9 +915,35 @@ fn details(
     }
 }
 
+/// The scales the view is drawn at where its rows show.
+const SCALES: [f32; 21] = [
+    0.45, 0.5, 0.56, 0.63, 0.71, 0.8, 0.9, 1.0, 1.12, 1.25, 1.4, 1.6, 1.8, 2.0, 2.25, 2.5, 2.8,
+    3.2, 3.6, 4.0, 4.5,
+];
+
+/// `scale` on the nearest step where rows show, as it is below.
+fn stepped(scale: f32) -> f32 {
+    if scale < SCALES[0] {
+        return scale;
+    }
+    SCALES
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - scale).abs().total_cmp(&(b - scale).abs()))
+        .unwrap_or(scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_view_zooms_by_steps_where_its_text_shows() {
+        assert!((stepped(1.03) - 1.0).abs() < f32::EPSILON);
+        assert!((stepped(1.2) - 1.25).abs() < f32::EPSILON);
+        // Below, only titles show at one size: smooth.
+        assert!((stepped(0.3) - 0.3).abs() < f32::EPSILON);
+    }
 
     fn schema(text: &str) -> Schema {
         universe_codemap::schema(&[("models.py".to_owned(), text.to_owned())])

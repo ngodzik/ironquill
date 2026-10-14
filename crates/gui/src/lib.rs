@@ -19,6 +19,7 @@ mod arch_view;
 mod backdrop;
 mod branch_pane;
 mod database_view;
+mod diagrams;
 mod error;
 mod fleet_view;
 mod infra;
@@ -50,8 +51,8 @@ use bevy_egui::egui::{
     UiBuilder,
 };
 use bevy_egui::{
-    EguiContexts, EguiGlobalSettings, EguiInput, EguiInputSet, EguiPlugin, EguiPreUpdateSet,
-    EguiPrimaryContextPass, PrimaryEguiContext,
+    EguiContexts, EguiGlobalSettings, EguiInput, EguiInputSet, EguiOutput, EguiPlugin,
+    EguiPostUpdateSet, EguiPreUpdateSet, EguiPrimaryContextPass, PrimaryEguiContext,
 };
 use tokio::runtime::Handle;
 use universe_codemap::NodeKind;
@@ -125,9 +126,11 @@ where
 {
     // The host's timers belong to the runtime.
     let _context = runtime.enter();
+    let settings_mermaid = settings.mermaid.clone();
     let mut app = App::new(settings, workspace.root().to_owned());
     let mut host = Host::new(model, delegate, workspace);
     runtime.block_on(host.start(&mut app, start));
+    let diagrams = diagrams::Diagrams::new(settings_mermaid.as_deref());
     let title = format!("{} · universe", app.name());
     // Where the program starts again, as the state said when it quit: read
     // once the window is gone.
@@ -151,6 +154,7 @@ where
         wheel_rest: 0.0,
         transcript_rows: 0,
         relaunch: Arc::clone(&relaunch),
+        diagrams,
         branch: branch_pane::BranchPane::default(),
         tickets: tickets_pane::TicketsPane::default(),
     };
@@ -166,15 +170,12 @@ where
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title,
-                        resolution: (1400, 900).into(),
-                        // Made see-through from the start: a window cannot
-                        // become so later. Opaque, its panels hide it all.
-                        transparent: true,
-                        composite_alpha_mode: COMPOSITE_ALPHA,
-                        ..default()
-                    }),
+                    primary_window: Some(main_window(title)),
+                    // The window the system takes away, as an unplugged
+                    // screen does, is opened again rather than quit; the
+                    // close button and Ctrl-C still quit, below.
+                    exit_condition: bevy::window::ExitCondition::DontExit,
+                    close_when_requested: false,
                     ..default()
                 })
                 .set(bevy::log::LogPlugin {
@@ -217,6 +218,11 @@ where
                 .chain(),
         )
         .add_systems(EguiPrimaryContextPass, draw::<M, D>)
+        .add_systems(Last, close_or_reopen::<M, D>)
+        .add_systems(
+            PostUpdate,
+            copy_selection::<M, D>.after(EguiPostUpdateSet::ProcessOutput),
+        )
         .run();
     match exit {
         AppExit::Success => Ok(relaunch.lock().ok().and_then(|mut r| r.take())),
@@ -257,6 +263,8 @@ struct Shell<M, D> {
     wheel_rest: f32,
     /// Where the program starts again once the window is gone.
     relaunch: Arc<std::sync::Mutex<Option<Relaunch>>>,
+    /// The Mermaid diagrams of the conversation, drawn on threads.
+    diagrams: diagrams::Diagrams,
     /// What the branch changed, as its pane shows it.
     branch: branch_pane::BranchPane,
     /// The branch's tickets, as their pane shows them.
@@ -436,6 +444,7 @@ fn read_keys<M, D>(
                 Ok(text) => shell.app.on_paste(&text),
                 Err(e) => shell.app.report_error(e),
             },
+            Some(Pressed::TextSize(step)) => shell.app.step_text_size(step),
             None => {}
         }
     }
@@ -528,6 +537,8 @@ fn draw<M, D>(
     mut universe: ResMut<Universe>,
     mut fleet: ResMut<fleet_view::FleetView>,
     mut styled: Local<bool>,
+    mut followed: Local<f32>,
+    window: Query<Entity, With<PrimaryWindow>>,
 ) -> Result
 where
     M: ChatModel + 'static,
@@ -537,9 +548,18 @@ where
     if !*styled {
         ctx.set_theme(egui::Theme::Dark);
         theme::apply(&ctx);
+        // The state keeps the text's size: egui's own keys would change it
+        // behind its back.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         *styled = true;
     }
+    let size = shell.app.text_size();
+    if (ctx.zoom_factor() - size).abs() > 0.001 {
+        ctx.set_zoom_factor(size);
+    }
     let shell = &mut *shell;
+    // The conversation's diagrams, for the Markdown that draws them.
+    ctx.data_mut(|d| d.insert_temp(Id::new("diagrams"), shell.diagrams.clone()));
     let mut root = Ui::new(
         ctx.clone(),
         Id::new("universe"),
@@ -549,10 +569,34 @@ where
     );
     // Ctrl-M fades the background in or out rather than switching it.
     let opacity = ctx.animate_value_with_time(Id::new("opacity"), shell.app.opacity(), 0.25);
+    if (*followed - opacity).abs() > 0.001 {
+        theme::follow(&ctx, opacity);
+        *followed = opacity;
+    }
     let panel = theme::see(PANEL, opacity);
     let background = theme::see(theme::BACKGROUND, opacity);
     let pane = Frame::new().fill(panel).inner_margin(Margin::same(14));
 
+    // On macOS the content goes under the title bar: a band of its height
+    // keeps the system's buttons and title on something opaque, except in
+    // full screen, which winit reports however it was entered.
+    if cfg!(target_os = "macos") {
+        let full = window.single().ok().is_some_and(|entity| {
+            bevy::winit::WINIT_WINDOWS.with_borrow(|windows| {
+                windows
+                    .get_window(entity)
+                    .is_some_and(|w| w.fullscreen().is_some())
+            })
+        });
+        if !full {
+            egui::Panel::top("title-bar")
+                .exact_size(TITLE_BAR / ctx.zoom_factor())
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(Frame::new().fill(theme::BACKGROUND))
+                .show(&mut root, |_| {});
+        }
+    }
     egui::Panel::bottom("status")
         .frame(
             Frame::new()
@@ -579,7 +623,15 @@ where
             egui::Panel::right("usage")
                 .resizable(false)
                 .exact_size(USAGE_WIDTH * open)
-                .frame(pane.fill(background).stroke(Stroke::new(1.0, EDGE)))
+                .frame(
+                    pane.fill(if shell.app.map_view() == Some(MapView::Universe) {
+                        // Over the universe, it lets the stars show through.
+                        theme::see(PANEL, 0.62 * opacity)
+                    } else {
+                        background
+                    })
+                    .stroke(Stroke::new(1.0, EDGE)),
+                )
                 .show(&mut root, |ui| {
                     ScrollArea::vertical().show(ui, |ui| {
                         usage::show(ui, &mut shell.usage, log, window);
@@ -679,16 +731,11 @@ where
     }
     shell.plan.light_up(shell.app.transcript(), now);
     if let Some(view) = view {
-        // The conversation beside the codebase, translucent so that what
-        // is drawn behind shows through; the codebase takes the rest.
-        let chat = chat_beside(
-            &mut root,
-            &ctx,
-            shell,
-            pane.fill(theme::see(PANEL, 0.62 * opacity)),
-        );
+        // The codebase takes the whole window, which a small screen needs;
+        // ✕ Chat in the views' switch, or a message sent, comes back.
         let window = ctx.content_rect().width().max(1.0);
-        universe.covered = (window - chat.response.rect.left()).max(0.0) / window;
+        let free = root.available_rect_before_wrap();
+        universe.covered = (ctx.content_rect().right() - free.right()).max(0.0) / window;
         fleet.covered = universe.covered;
         egui::CentralPanel::default()
             .frame(match view {
@@ -770,27 +817,80 @@ where
         universe.deployments = fleet.active;
     }
     windows::show(&ctx, &shell.app, &mut shell.keys);
-    // bevy_egui is built without its clipboard: what egui copies, such as
-    // a selection on Cmd-C, goes to the system's from here.
-    let copied: Vec<String> = ctx.output(|o| {
-        o.commands
-            .iter()
-            .filter_map(|c| match c {
-                egui::OutputCommand::CopyText(text) => Some(text.clone()),
-                _ => None,
-            })
-            .collect()
-    });
-    for text in copied {
-        if let Err(e) = clipboard::copy(&text) {
-            shell.app.report_error(e);
-        }
-    }
     if !shell.effects.is_empty() || !shell.keys.is_empty() {
         ctx.request_repaint();
     }
     Ok(())
 }
+
+/// The window, as first opened and as opened again.
+fn main_window(title: String) -> Window {
+    Window {
+        title,
+        resolution: (1400, 900).into(),
+        // Made see-through from the start: a window cannot become so
+        // later. Opaque, its panels hide it all.
+        transparent: true,
+        composite_alpha_mode: COMPOSITE_ALPHA,
+        // A see-through window leaves its title bar see-through too: on
+        // macOS the content goes under it, and a band of the bar's height
+        // is drawn opaque there.
+        fullsize_content_view: cfg!(target_os = "macos"),
+        titlebar_transparent: cfg!(target_os = "macos"),
+        ..default()
+    }
+}
+
+/// Quits when the window's close button asks; opens the window again when
+/// the system took it away unasked, as unplugging a screen does. Each step
+/// is logged.
+fn close_or_reopen<M, D>(
+    mut commands: Commands,
+    mut requested: MessageReader<bevy::window::WindowCloseRequested>,
+    mut closed: MessageReader<bevy::window::WindowClosed>,
+    mut destroyed: MessageReader<bevy::window::WindowDestroyed>,
+    windows: Query<(), With<PrimaryWindow>>,
+    mut shell: NonSendMut<Shell<M, D>>,
+) where
+    M: ChatModel + 'static,
+    D: Delegate + 'static,
+{
+    if requested.read().next().is_some() {
+        warn!("the window's close button was pressed: quitting");
+        shell.app.quit();
+    }
+    let gone = closed.read().count() + destroyed.read().count() > 0;
+    if gone && !shell.app.should_quit() && windows.is_empty() {
+        warn!("the system took the window away unasked: opening it again");
+        let title = format!("{} · universe", shell.app.name());
+        commands.spawn((main_window(title), PrimaryWindow));
+    }
+}
+
+/// What egui copied, a selection on Cmd-C (Ctrl-Shift-C elsewhere) or a
+/// copy button, to the system's clipboard: bevy_egui is built without its
+/// own. egui copies a label's selection only at the end of its pass, so it
+/// is read once the output is processed, never while drawing.
+fn copy_selection<M, D>(
+    outputs: Query<&EguiOutput, Changed<EguiOutput>>,
+    mut shell: NonSendMut<Shell<M, D>>,
+) where
+    M: ChatModel + 'static,
+    D: Delegate + 'static,
+{
+    for output in &outputs {
+        for command in &output.platform_output.commands {
+            if let egui::OutputCommand::CopyText(text) = command
+                && let Err(e) = clipboard::copy(text)
+            {
+                shell.app.report_error(e);
+            }
+        }
+    }
+}
+
+/// The height of macOS's title bar, in points.
+const TITLE_BAR: f32 = 28.0;
 
 /// The conversation's width beside a file or the codebase, until dragged.
 const CHAT_WIDTH: f32 = 440.0;
@@ -1359,7 +1459,7 @@ fn input(ui: &mut Ui, app: &App) {
     };
     let focused = app.mode() != Mode::Normal;
     Frame::new()
-        .fill(RAISED)
+        .fill(ui.visuals().faint_bg_color)
         .stroke(Stroke::new(
             1.0,
             if focused {
