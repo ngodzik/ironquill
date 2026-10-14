@@ -174,6 +174,12 @@ pub struct Settings {
     /// Whether to ask which of them a new conversation works in: not when
     /// started with `--here`, as a relaunch is.
     pub ask_workspace: bool,
+    /// The share of the model's context, in percent, past which `/compact`
+    /// is suggested, as written in the settings; 80 when unsaid.
+    pub context_warning: Option<u8>,
+    /// The models whose conversation may start again from its summary after
+    /// a pause, as written in the settings.
+    pub summarize_when_cold: Vec<String>,
     /// What the provider's models are reached through, such as
     /// "Requesty": shown with them, since the same model may be reached
     /// through an agent too, at another price, with another cache.
@@ -2649,7 +2655,12 @@ impl App {
         }
         builder = builder
             .effort(Some(self.settings.effort))
-            .detect_checks(self.settings.detect_checks);
+            .detect_checks(self.settings.detect_checks)
+            .context_warning(
+                self.settings
+                    .context_warning
+                    .unwrap_or(universe_agent::CONTEXT_WARNING),
+            );
         let allowed = self.settings.allowed_secrets.clone();
         if let Some(pair) = pair {
             builder = builder.pair(pair);
@@ -2660,6 +2671,13 @@ impl App {
                     .with_allowed_secrets(allowed)
                     .with_allowed_hosts(self.settings.allowed_hosts.clone())
                     .with_allowed_programs(self.settings.allowed_programs.clone())
+                    .with_summarize_when_cold(
+                        self.settings
+                            .summarize_when_cold
+                            .iter()
+                            .filter_map(|m| ModelId::new(m).ok())
+                            .collect(),
+                    )
                     .with_strict_commands(self.settings.strict_commands);
                 self.input.take();
                 self.chat.transcript.push(Entry::User(text.clone()));
@@ -4266,6 +4284,8 @@ impl App {
                 .then_some(self.settings.backdrop.motion),
             // Set in the file only: kept as written there.
             workspaces: self.settings.workspaces.clone(),
+            context_warning: self.settings.context_warning,
+            summarize_when_cold: self.settings.summarize_when_cold.clone(),
         }
     }
 
@@ -4743,17 +4763,10 @@ impl App {
                     effort,
                 }
             }
-            Event::Compacted {
-                dropped,
-                before,
-                after,
-            } => Entry::Info(format!(
-                "Context compacted: {} dropped, about {before} → {after} tokens. /context shows what is left",
-                if dropped == 1 {
-                    "1 old tool result".to_owned()
-                } else {
-                    format!("{dropped} old tool results")
-                }
+            Event::ContextFilling { used, window } => Entry::Info(format!(
+                "The conversation fills {}% of the model's context (about {used} of {window} \
+                 tokens): /compact would make it lighter",
+                (used.0 * 100).checked_div(window.0).unwrap_or(0)
             )),
             Event::OverBudget { spent, budget } => {
                 self.chat.member = None;
@@ -6258,6 +6271,8 @@ mod tests {
                 background: None,
                 background_motion: None,
                 workspaces: vec![],
+                context_warning: None,
+                summarize_when_cold: vec![],
             }
         );
     }

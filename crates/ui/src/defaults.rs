@@ -129,6 +129,15 @@ pub struct Defaults {
     /// the start, the first chosen. Set in the file only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<String>,
+    /// The share of the model's context, in percent, past which `/compact`
+    /// is suggested; 80 when unsaid, 100 never. Set in the file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_warning: Option<u8>,
+    /// The models whose conversation may start again from its summary when
+    /// their cache expired after a pause, the person asked first: typically
+    /// the expensive ones. Set in the file only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summarize_when_cold: Vec<String>,
 }
 
 impl Defaults {
@@ -232,6 +241,8 @@ mod tests {
             background: Some(Pattern::Rain),
             background_motion: Some(Motion::Slow),
             workspaces: vec!["~/code/shop".into()],
+            context_warning: Some(90),
+            summarize_when_cold: vec!["b/strong".into()],
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));

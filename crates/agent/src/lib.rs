@@ -20,7 +20,8 @@ mod run;
 
 pub use ask::{Answered, ask, ask_cheapest, cheapest};
 pub use config::{
-    AgentConfig, AgentConfigBuilder, Answer, Approval, Approver, COMPACT_AT, Member, Pair, Question,
+    AgentConfig, AgentConfigBuilder, Answer, Approval, Approver, CONTEXT_WARNING, Member, Pair,
+    Question,
 };
 pub use error::AgentError;
 pub use event::{Event, Purpose};

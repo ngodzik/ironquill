@@ -418,6 +418,8 @@ async fn interface(
     let settings = universe_ui::Settings {
         workspaces: defaults.workspaces.clone(),
         ask_workspace,
+        context_warning: defaults.context_warning,
+        summarize_when_cold: defaults.summarize_when_cold.clone(),
         tiers,
         checks,
         rounds: 2,
@@ -884,13 +886,9 @@ fn show(event: Event) {
             "⊘ refused, nobody to approve it: {command} ({})",
             reasons.join("; ")
         ),
-        Event::Compacted {
-            dropped,
-            before,
-            after,
-        } => {
+        Event::ContextFilling { used, window } => {
             eprintln!(
-                "⇣ compacted: {dropped} old tool results dropped, about {before} → {after} tokens"
+                "⚠ the conversation fills most of the context: about {used} of {window} tokens"
             );
         }
         Event::OverBudget { spent, budget } => {

@@ -282,6 +282,8 @@ struct Ctx<'a, M, D, O> {
     allowed_hosts: Vec<String>,
     /// The programs the person allowed besides the known ones.
     allowed_programs: Vec<String>,
+    /// Whether the person was told this request that the context fills.
+    context_warned: bool,
     /// The settings of the last call to an agent, and its context's size:
     /// what its session is kept with.
     last_call: Option<Call>,
@@ -452,6 +454,7 @@ impl Session {
             allowed_secrets: config.allowed_secrets.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
             allowed_programs: config.allowed_programs.clone(),
+            context_warned: false,
             last_call: None,
             last_context: None,
             last_request: None,
@@ -555,7 +558,14 @@ impl Session {
         let Some(first) = ctx.config.tiers.first().cloned() else {
             return Ok(());
         };
-        if ctx.config.pair.is_some() || first.delegate().is_some() || self.last_used == 0 {
+        // Only for the models the person listed, typically the expensive
+        // ones, and only with someone to ask.
+        if ctx.config.pair.is_some()
+            || first.delegate().is_some()
+            || self.last_used == 0
+            || !ctx.config.summarize_when_cold.contains(&first)
+            || ctx.config.approver.is_none()
+        {
             return Ok(());
         }
         let idle = now_secs().saturating_sub(self.last_used);
@@ -646,7 +656,7 @@ impl Session {
     }
 
     /// Asks the person what to do with a conversation whose cache expired;
-    /// without anybody to ask, it starts again from its summary.
+    /// without anybody to ask, it goes on as it is.
     async fn ask_cold_start<M, D, O>(
         ctx: &Ctx<'_, M, D, O>,
         model: &ModelId,
@@ -654,7 +664,7 @@ impl Session {
         tokens: Option<u64>,
     ) -> Answer {
         let Some(approver) = &ctx.config.approver else {
-            return Answer::Yes;
+            return Answer::No;
         };
         approver
             .ask(Approval {
@@ -733,14 +743,20 @@ impl Session {
         // picked, and is told what was said without it meanwhile.
         let agent = first.delegate().map(|(agent, _)| agent);
         if let Some(agent) = agent {
-            // A cold session starts afresh and is told the conversation,
-            // unless the person would rather go on with it as it is.
+            // A cold session goes on as it is, unless the model is one the
+            // person listed to start afresh, told the conversation, and
+            // they say so.
             let mut thread = self.warm(agent).map(|t| (t.session.clone(), t.seen));
             if thread.is_none()
                 && let Some(cold) = self.agents.get(&agent).cloned()
             {
                 let idle = now_secs().saturating_sub(cold.used);
-                match Self::ask_cold_start(ctx, first, idle, cold.context).await {
+                let answer = if ctx.config.summarize_when_cold.contains(first) {
+                    Self::ask_cold_start(ctx, first, idle, cold.context).await
+                } else {
+                    Answer::No
+                };
+                match answer {
                     Answer::Stop => return Err(AgentError::NotSent),
                     Answer::No => thread = Some((cold.session, cold.seen)),
                     Answer::Yes | Answer::Always => {}
@@ -1542,6 +1558,7 @@ pub async fn run<M: ChatModel, D: Delegate>(
         allowed_secrets: config.allowed_secrets.clone(),
         allowed_hosts: config.allowed_hosts.clone(),
         allowed_programs: config.allowed_programs.clone(),
+        context_warned: false,
         last_call: None,
         last_context: None,
         last_request: None,
@@ -1955,10 +1972,6 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
     }
     Ok(reply)
 }
-
-/// Tool results a compaction keeps at most: the latest ones are what the
-/// model is working on. It keeps fewer when that is not enough.
-const KEEP_RESULTS: usize = 4;
 
 /// Output tokens counted for a call before it is made: a reply that edits
 /// code is rarely longer.
@@ -3137,7 +3150,9 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     let window = ctx.model.context_window(model_id).await;
     let identity = identity(model_id, leads, ctx.config);
     let pricing = ctx.model.pricing(model_id).await;
-    let compact_at = window.map_or(ctx.config.compact_at, |w| ctx.config.compact_at.min(w / 2));
+    let warn_at = window
+        .filter(|_| ctx.config.context_warning < 100)
+        .map(|w| w * u64::from(ctx.config.context_warning) / 100);
     let mut left = ctx.config.max_turns;
     // Whether its last reply was empty: it is asked once to go on.
     let mut silent = false;
@@ -3151,30 +3166,18 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             }
         }
         left -= 1;
-        let before = crate::context::approx_tokens(messages);
-        if before > compact_at {
-            // Down to half the threshold, so that the next calls only add
-            // to it: each compaction makes the provider's cache start over.
-            let mut compacted = messages.clone();
-            let mut dropped = 0;
-            for keep in (1..=KEEP_RESULTS).rev() {
-                dropped += crate::context::compact(&mut compacted, keep);
-                if crate::context::approx_tokens(&compacted) <= compact_at / 2 {
-                    break;
-                }
-            }
-            // Only when it is worth it: a fifth less at least. A conversation
-            // long with words rather than tool results gains little, and
-            // would lose its cache on every call.
-            let after = crate::context::approx_tokens(&compacted);
-            if dropped > 0 && after * 5 <= before * 4 {
-                *messages = compacted;
-                (ctx.observe)(Event::Compacted {
-                    dropped,
-                    before: TokenCount(before),
-                    after: TokenCount(after),
-                });
-            }
+        // Nothing is dropped by itself: past a share of the context, the
+        // person is told once that `/compact` would help.
+        let used = crate::context::approx_tokens(messages);
+        if let (Some(warn_at), Some(window)) = (warn_at, window)
+            && used >= warn_at
+            && !ctx.context_warned
+        {
+            ctx.context_warned = true;
+            (ctx.observe)(Event::ContextFilling {
+                used: TokenCount(used),
+                window: TokenCount(window),
+            });
         }
         let mut sent = messages.clone();
         if let Some(Message::System(prompt)) = sent.first_mut() {
@@ -3884,6 +3887,7 @@ mod tests {
         answers: Mutex<VecDeque<ChatResponse>>,
         seen: Mutex<Vec<ChatRequest>>,
         pricing: Option<Pricing>,
+        window: Option<u64>,
     }
 
     impl Scripted {
@@ -3892,6 +3896,14 @@ mod tests {
                 answers: Mutex::new(answers.into()),
                 seen: Mutex::new(Vec::new()),
                 pricing: None,
+                window: None,
+            }
+        }
+
+        fn windowed(self, tokens: u64) -> Self {
+            Self {
+                window: Some(tokens),
+                ..self
             }
         }
 
@@ -3918,6 +3930,10 @@ mod tests {
 
         async fn pricing(&self, _: &ModelId) -> Option<Pricing> {
             self.pricing
+        }
+
+        async fn context_window(&self, _: &ModelId) -> Option<u64> {
+            self.window
         }
     }
 
@@ -4051,60 +4067,6 @@ mod tests {
         assert!(approves("OK"));
         assert!(approves(" `ok`.\n"));
         assert!(!approves("OK, but README.md is missing the route."));
-    }
-
-    #[tokio::test]
-    async fn a_long_conversation_is_compacted_once_past_the_threshold() {
-        let (dir, mut toolbox) = setup();
-        for name in ["a", "b", "c", "d", "e", "f"] {
-            std::fs::write(dir.path().join(format!("{name}.txt")), "word ".repeat(500)).unwrap();
-        }
-        let mut answers: Vec<ChatResponse> = ["a", "b", "c", "d", "e", "f"]
-            .iter()
-            .map(|n| calls("read_file", json!({"path": format!("{n}.txt")})))
-            .collect();
-        answers.push(says("Read them all."));
-        let model = Scripted::new(answers);
-        let config = AgentConfig::builder()
-            .tier(ModelId::new("cheap").unwrap())
-            .compact_at(2_500)
-            .build()
-            .unwrap();
-        let mut session = Session::new();
-        let mut events = Vec::new();
-        session
-            .send(
-                &model,
-                &NoDelegate,
-                &mut toolbox,
-                &config,
-                "read all",
-                "",
-                |e| {
-                    events.push(e);
-                },
-            )
-            .await
-            .unwrap();
-
-        let compactions: Vec<&Event> = events
-            .iter()
-            .filter(|e| matches!(e, Event::Compacted { .. }))
-            .collect();
-        assert_eq!(compactions.len(), 1, "once, all at once: {compactions:?}");
-        let seen = model.seen.lock().unwrap();
-        let last = &seen.last().unwrap().messages;
-        assert!(crate::context::tests::valid(last));
-        let dropped = last
-            .iter()
-            .filter(|m| matches!(m, Message::Tool { content, .. } if content.starts_with("[Earlier result")))
-            .count();
-        assert!(dropped >= 1);
-        // The latest results are kept whole.
-        assert!(matches!(
-            &last[last.len() - 1],
-            Message::Tool { content, .. } if content.starts_with("word")
-        ));
     }
 
     #[tokio::test]
@@ -4560,7 +4522,9 @@ mod tests {
             .tier(ModelId::new("claude-code/opus").unwrap())
             .member(Member::new(ModelId::new("cheap").unwrap(), ""))
             .build()
-            .unwrap();
+            .unwrap()
+            .with_summarize_when_cold(vec![ModelId::new("claude-code/opus").unwrap()])
+            .with_approver(Approver::new(|_| async { Answer::Yes }));
         let long = format!("make done.txt {}", "with care ".repeat(3_000));
         let mut session = Session::new();
         let first = session
@@ -4751,6 +4715,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_conversation_filling_the_context_says_so_once_and_drops_nothing() {
+        let (dir, mut toolbox) = setup();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(format!("{name}.txt")), "word ".repeat(500)).unwrap();
+        }
+        let mut answers: Vec<ChatResponse> = ["a", "b", "c"]
+            .iter()
+            .map(|n| calls("read_file", json!({"path": format!("{n}.txt")})))
+            .collect();
+        answers.push(says("Read them all."));
+        let model = Scripted::new(answers).windowed(1_000);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        let mut events = Vec::new();
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "read all",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+        let warnings = events
+            .iter()
+            .filter(|e| matches!(e, Event::ContextFilling { .. }))
+            .count();
+        assert_eq!(warnings, 1);
+        // Every result is sent whole, the oldest included.
+        let seen = model.seen.lock().unwrap();
+        let last = &seen.last().unwrap().messages;
+        let whole = last
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { content, .. } if content.starts_with("word")))
+            .count();
+        assert_eq!(whole, 3);
+    }
+
+    #[tokio::test]
     async fn a_file_outside_the_workspace_adds_a_folder_once_the_person_says_yes() {
         let (_dir, mut toolbox) = setup();
         let other = tempfile::tempdir().unwrap();
@@ -4924,7 +4932,9 @@ mod tests {
         let config = AgentConfig::builder()
             .tier(ModelId::new("cheap").unwrap())
             .build()
-            .unwrap();
+            .unwrap()
+            .with_summarize_when_cold(vec![ModelId::new("cheap").unwrap()])
+            .with_approver(Approver::new(|_| async { Answer::Yes }));
         let mut session = Session::new();
         let long = "the parser ".repeat(3_000);
         for i in 1..=3 {
@@ -5875,6 +5885,7 @@ mod tests {
             .tier(ModelId::new("claude-code/opus").unwrap())
             .build()
             .unwrap()
+            .with_summarize_when_cold(vec![ModelId::new("claude-code/opus").unwrap()])
             .with_approver(Approver::new(move |approval: Approval| {
                 assert!(matches!(approval.question, Question::ColdStart { .. }));
                 async move { answer }
