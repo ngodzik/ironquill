@@ -123,6 +123,10 @@ pub enum Action {
     CopySelected,
     /// Show or hide the usage pane.
     ToggleUsage,
+    /// Show or hide what the branch changed since it left the main one.
+    ToggleBranch,
+    /// Show or hide the tickets linked to the branch.
+    ToggleTickets,
     /// The usage pane's next window: an hour, six, a day.
     NextUsageWindow,
     /// Let what is behind the window show through, or make it opaque again.
@@ -158,6 +162,14 @@ pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ),
             ("Ctrl-K", "show or hide the Docker containers"),
             ("Ctrl-O", "show or hide the usage pane (/usage)"),
+            (
+                "Ctrl-R",
+                "show or hide what the branch changed: routes, migrations, models (--gui only)",
+            ),
+            (
+                "Ctrl-L",
+                "show or hide the branch's tickets and how far the work is (/ticket)",
+            ),
             ("Ctrl-P", "the usage pane's window: 1h, 6h, 24h"),
             (
                 "Ctrl-M",
@@ -298,6 +310,10 @@ pub fn action(mode: Mode, focus: Focus, pending: Option<Pending>, key: KeyEvent)
         KeyCode::Char('k') if ctrl => return Some(Action::ToggleDocker),
         // O for overview of what was used; P for its period.
         KeyCode::Char('o') if ctrl => return Some(Action::ToggleUsage),
+        // R for review: what the branch changed.
+        KeyCode::Char('r') if ctrl => return Some(Action::ToggleBranch),
+        // L for the tickets the branch is linked to.
+        KeyCode::Char('l') if ctrl => return Some(Action::ToggleTickets),
         KeyCode::Char('p') if ctrl => return Some(Action::NextUsageWindow),
         // Only the window tells Ctrl-M from Enter: a terminal sends both
         // the same, which is fine, as only the window can be see-through.

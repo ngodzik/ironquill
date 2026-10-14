@@ -38,6 +38,10 @@ pub struct RouteChange {
     pub delta: Delta,
     /// What differs, one line each: `query parameter uri (string[]) added`.
     pub details: Vec<String>,
+    /// The whole operation before, when it was there.
+    pub before: Option<Operation>,
+    /// The whole operation after, when it is there.
+    pub after: Option<Operation>,
 }
 
 /// A change to the database: a migration's step, or a model's.
@@ -254,7 +258,8 @@ pub fn route_changes(before: &[Operation], after: &[Operation]) -> Vec<RouteChan
     let new: BTreeMap<(String, String), &Operation> = after.iter().map(|o| (key(o), o)).collect();
     let mut changes = Vec::new();
     for ((path, method), operation) in &new {
-        let delta = match old.get(&(path.clone(), method.clone())) {
+        let was = old.get(&(path.clone(), method.clone())).copied();
+        let delta = match was {
             None => Some((Delta::Added, describe(operation))),
             Some(was) => {
                 let details = differences(was, operation);
@@ -267,6 +272,8 @@ pub fn route_changes(before: &[Operation], after: &[Operation]) -> Vec<RouteChan
                 path: path.clone(),
                 delta,
                 details,
+                before: was.cloned(),
+                after: Some((*operation).clone()),
             });
         }
     }
@@ -277,10 +284,134 @@ pub fn route_changes(before: &[Operation], after: &[Operation]) -> Vec<RouteChan
                 path: path.clone(),
                 delta: Delta::Removed,
                 details: describe(operation),
+                before: Some((*operation).clone()),
+                after: None,
             });
         }
     }
     changes
+}
+
+/// One line of a route compared before and after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationLine {
+    /// The same in both.
+    Same {
+        /// What it is about: `summary`, `query uri`, `200`.
+        key: String,
+        /// Its value.
+        value: String,
+    },
+    /// Only after.
+    Added {
+        /// What it is about.
+        key: String,
+        /// Its value.
+        value: String,
+    },
+    /// Only before.
+    Removed {
+        /// What it is about.
+        key: String,
+        /// Its value.
+        value: String,
+    },
+    /// In both, and it differs.
+    Changed {
+        /// What it is about.
+        key: String,
+        /// Its value before.
+        before: String,
+        /// Its value after.
+        after: String,
+    },
+}
+
+/// What a route is, line by line: its summary, its description, each
+/// parameter, its body, each answer with its example.
+fn operation_lines(operation: &Operation) -> Vec<(String, String)> {
+    let mut lines = Vec::new();
+    if !operation.summary.is_empty() {
+        lines.push(("summary".to_owned(), operation.summary.clone()));
+    }
+    if !operation.description.is_empty() && operation.description != operation.summary {
+        lines.push(("description".to_owned(), operation.description.clone()));
+    }
+    for p in &operation.parameters {
+        let mut value = p.kind.clone();
+        if p.required {
+            value.push_str(", required");
+        }
+        if let Some(example) = &p.example {
+            value.push_str(&format!(", e.g. {example}"));
+        }
+        if !p.description.is_empty() {
+            value.push_str(&format!(": {}", p.description));
+        }
+        lines.push((format!("{} {}", p.location, p.name), value));
+    }
+    if let Some(body) = &operation.body {
+        let mut value = body.media.clone();
+        if let Some(schema) = &body.schema {
+            value.push_str(&format!(" {schema}"));
+        }
+        if body.required {
+            value.push_str(", required");
+        }
+        lines.push(("body".to_owned(), value));
+        if let Some(example) = &body.example {
+            lines.push(("body example".to_owned(), example.clone()));
+        }
+    }
+    for r in &operation.responses {
+        let mut value = r.description.clone();
+        if let Some(schema) = &r.schema {
+            value.push_str(&format!(" ({schema})"));
+        }
+        lines.push((format!("answer {}", r.status), value));
+        if let Some(example) = &r.example {
+            lines.push((format!("answer {} example", r.status), example.clone()));
+        }
+    }
+    lines
+}
+
+/// A route compared line by line, before and after: what stayed, what was
+/// added or removed, and what changed, as `before → after`.
+#[must_use]
+pub fn compare_operations(
+    before: Option<&Operation>,
+    after: Option<&Operation>,
+) -> Vec<OperationLine> {
+    let old = before.map(operation_lines).unwrap_or_default();
+    let new = after.map(operation_lines).unwrap_or_default();
+    let mut out = Vec::new();
+    for (key, value) in &new {
+        out.push(match old.iter().find(|(k, _)| k == key) {
+            None => OperationLine::Added {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Some((_, was)) if was == value => OperationLine::Same {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Some((_, was)) => OperationLine::Changed {
+                key: key.clone(),
+                before: was.clone(),
+                after: value.clone(),
+            },
+        });
+    }
+    for (key, value) in &old {
+        if !new.iter().any(|(k, _)| k == key) {
+            out.push(OperationLine::Removed {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// A new or removed route, in a line or two.
@@ -677,6 +808,71 @@ pub fn model_changes(before: &str, after: &str) -> Vec<SchemaChange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_route_compared_says_what_stayed_was_added_removed_or_changed() {
+        let operation = |summary: &str, parameters: Vec<Parameter>| Operation {
+            id: "list".into(),
+            method: "GET".into(),
+            path: "/assets".into(),
+            summary: summary.into(),
+            description: String::new(),
+            parameters,
+            body: None,
+            responses: Vec::new(),
+            secured: false,
+            server: None,
+            tags: Vec::new(),
+            deprecated: false,
+            spec: 0,
+            from_code: false,
+            handler: None,
+            callers: Vec::new(),
+        };
+        let parameter = |name: &str, kind: &str| Parameter {
+            name: name.into(),
+            location: "query".into(),
+            required: false,
+            kind: kind.into(),
+            description: String::new(),
+            example: None,
+        };
+        let before = operation(
+            "List assets",
+            vec![parameter("limit", "integer"), parameter("tag", "string")],
+        );
+        let after = operation(
+            "List the assets",
+            vec![parameter("limit", "integer"), parameter("uri", "string[]")],
+        );
+        assert_eq!(
+            compare_operations(Some(&before), Some(&after)),
+            [
+                OperationLine::Changed {
+                    key: "summary".into(),
+                    before: "List assets".into(),
+                    after: "List the assets".into()
+                },
+                OperationLine::Same {
+                    key: "query limit".into(),
+                    value: "integer".into()
+                },
+                OperationLine::Added {
+                    key: "query uri".into(),
+                    value: "string[]".into()
+                },
+                OperationLine::Removed {
+                    key: "query tag".into(),
+                    value: "string".into()
+                },
+            ]
+        );
+        assert!(
+            compare_operations(None, Some(&after))
+                .iter()
+                .all(|l| matches!(l, OperationLine::Added { .. }))
+        );
+    }
 
     fn spec(parameters: &str) -> String {
         format!(

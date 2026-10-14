@@ -119,14 +119,29 @@ pub fn lines_at(root: &Path, path: &Path, rev: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Where the current branch left the main one: the merge base of `HEAD`
-/// with `main`, `master` or their remote, when that is not `HEAD` itself.
+/// Where the current branch left the main one: the nearest merge base of
+/// `HEAD` with `main`, `master` and their remotes, the one with the fewest
+/// commits to `HEAD`, when that is not `HEAD` itself. A local `main` left
+/// behind would otherwise bring other people's work into the branch's.
 pub fn branch_base(root: &Path) -> Option<String> {
     let head = git(root, &["rev-parse", "HEAD"])?;
-    ["main", "master", "origin/main", "origin/master"]
+    let mut mains: Vec<String> = vec!["main".into(), "master".into()];
+    if let Some(remotes) = git(root, &["remote"]) {
+        for remote in remotes.lines().map(str::trim).filter(|r| !r.is_empty()) {
+            mains.push(format!("{remote}/main"));
+            mains.push(format!("{remote}/master"));
+        }
+    }
+    mains
         .iter()
-        .find_map(|branch| git(root, &["merge-base", "HEAD", branch]))
+        .filter_map(|branch| git(root, &["merge-base", "HEAD", branch]))
         .map(|base| base.trim().to_owned())
+        .filter_map(|base| {
+            let ahead = git(root, &["rev-list", "--count", &format!("{base}..HEAD")])?;
+            Some((ahead.trim().parse::<u64>().ok()?, base))
+        })
+        .min_by_key(|(ahead, _)| *ahead)
+        .map(|(_, base)| base)
         .filter(|base| *base != head.trim())
 }
 
@@ -363,6 +378,48 @@ mod tests {
             "init",
         ]);
         dir
+    }
+
+    #[test]
+    fn the_base_is_the_nearest_of_main_and_its_remotes() {
+        let dir = repo();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let commit = |message: &str| {
+            std::fs::write(dir.path().join("b.py"), message).unwrap();
+            run(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qam",
+                message,
+            ]);
+        };
+        run(&["branch", "-M", "main"]);
+        // Others' work, fetched: origin/main is ahead of the local main.
+        run(&["switch", "-qc", "upstream"]);
+        commit("theirs");
+        let theirs = git(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        run(&["remote", "add", "origin", "/nowhere"]);
+        run(&["update-ref", "refs/remotes/origin/main", theirs.trim()]);
+        // The branch starts from origin/main.
+        run(&["switch", "-qc", "feature"]);
+        commit("mine");
+        assert_eq!(branch_base(dir.path()).as_deref(), Some(theirs.trim()));
     }
 
     #[test]

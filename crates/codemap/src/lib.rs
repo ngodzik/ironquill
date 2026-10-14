@@ -49,8 +49,8 @@ pub use map::{CodeMap, Edge, EdgeKind, Language, Node, NodeKind, map, map_with};
 pub use render::{Object, Rendered, render};
 pub use repos::{Place, Repo, Repos};
 pub use review::{
-    Area, Delta, Migration, Review, Revised, RouteChange, SchemaChange, migration, model_changes,
-    review, route_changes,
+    Area, Delta, Migration, OperationLine, Review, Revised, RouteChange, SchemaChange,
+    compare_operations, migration, model_changes, review, route_changes,
 };
 pub use schema::{Column, ForeignKey, Index, Reference, Schema, Table, schema};
 pub use services::{Evidence, Service, ServiceLink, Services, Tool, ToolKind, Via};

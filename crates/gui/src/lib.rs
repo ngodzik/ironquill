@@ -17,6 +17,7 @@ mod activity;
 mod api_view;
 mod arch_view;
 mod backdrop;
+mod branch_pane;
 mod database_view;
 mod error;
 mod fleet_view;
@@ -149,6 +150,7 @@ where
         wheel_rest: 0.0,
         transcript_rows: 0,
         relaunch: Arc::clone(&relaunch),
+        branch: branch_pane::BranchPane::default(),
     };
 
     let exit = bevy::app::App::new()
@@ -253,6 +255,8 @@ struct Shell<M, D> {
     wheel_rest: f32,
     /// Where the program starts again once the window is gone.
     relaunch: Arc<std::sync::Mutex<Option<Relaunch>>>,
+    /// What the branch changed, as its pane shows it.
+    branch: branch_pane::BranchPane,
 }
 
 impl<M, D> Shell<M, D>
@@ -583,10 +587,39 @@ where
             shell.usage.closed();
         }
     }
+    // What the branch changed (Ctrl-R), on the right, read on a thread.
+    let project = shell.app.root().to_owned();
+    shell
+        .branch
+        .review
+        .update(&project, shell.app.branch_pane());
+    if shell.app.branch_pane().is_some() {
+        let fill = if shell.app.map_view() == Some(MapView::Universe) {
+            theme::see(PANEL, 0.62 * opacity)
+        } else {
+            background
+        };
+        let Shell {
+            branch,
+            plan,
+            database,
+            app,
+            effects,
+            ..
+        } = &mut *shell;
+        egui::Panel::right("branch")
+            .resizable(true)
+            .default_size(USAGE_WIDTH)
+            .frame(pane.fill(fill).stroke(Stroke::new(1.0, EDGE)))
+            .show(&mut root, |ui| {
+                ScrollArea::vertical().show(ui, |ui| {
+                    branch_pane::show(ui, branch, plan.map(), database, app, effects);
+                });
+            });
+    }
 
     let now = ctx.input(|i| i.time);
     let view = shell.app.map_view();
-    let project = shell.app.root().to_owned();
     shell.review.update(&project, shell.app.change_set());
     shell.plan.showing(
         matches!(
@@ -597,8 +630,10 @@ where
                     | MapView::Api
                     | MapView::Review
                     | MapView::Database
-            ) // The deployments need the services to render environments.
-        ) || (view == Some(MapView::Universe) && fleet.active),
+            ) // The deployments need the services to render environments; the
+              // branch's pane, what serves and calls its routes.
+        ) || (view == Some(MapView::Universe) && fleet.active)
+            || shell.app.branch_pane().is_some(),
         now,
         shell.app.transcript(),
     );

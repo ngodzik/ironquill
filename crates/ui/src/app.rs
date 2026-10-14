@@ -964,6 +964,11 @@ pub struct App {
     usage_window: u64,
     /// Whether the usage pane shows.
     usage_open: bool,
+    /// What the branch changed since it left the main one, while its pane
+    /// shows.
+    branch: Option<crate::changes::ChangeSet>,
+    /// Whether the tickets' pane shows.
+    tickets_open: bool,
     /// Whether the machine is kept from idle sleep now.
     kept_awake: bool,
     /// How far a long held command is scrolled, in lines.
@@ -1129,6 +1134,8 @@ impl App {
             history: History::default(),
             usage_window,
             usage_open: false,
+            branch: None,
+            tickets_open: false,
             kept_awake: false,
             approval_scroll: 0,
             workspace_picker: None,
@@ -1966,7 +1973,36 @@ impl App {
                     return Some(Effect::Copy(text));
                 }
             }
-            Action::ToggleUsage => self.usage_open = !self.usage_open,
+            Action::ToggleUsage => {
+                self.usage_open = !self.usage_open;
+                if self.usage_open {
+                    self.branch = None;
+                    self.tickets_open = false;
+                }
+            }
+            Action::ToggleBranch => {
+                if self.branch.take().is_none() {
+                    match crate::changes::ChangeSet::read(
+                        &self.root,
+                        crate::changes::Lens::Work,
+                        None,
+                    ) {
+                        Ok(changes) => {
+                            self.branch = Some(changes);
+                            self.usage_open = false;
+                            self.tickets_open = false;
+                        }
+                        Err(why) => self.notice = Some(why),
+                    }
+                }
+            }
+            Action::ToggleTickets => {
+                self.tickets_open = !self.tickets_open;
+                if self.tickets_open {
+                    self.usage_open = false;
+                    self.branch = None;
+                }
+            }
             Action::Search => self.start_search(),
             Action::NextMap => {
                 // Looking at a branch, its review comes first.
@@ -4096,6 +4132,16 @@ impl App {
             .fresh_model
             .clone()
             .or_else(|| self.current_model().cloned())
+    }
+
+    /// What the branch changed, while its pane shows (Ctrl-R).
+    pub fn branch_pane(&self) -> Option<&crate::changes::ChangeSet> {
+        self.branch.as_ref()
+    }
+
+    /// Whether the tickets' pane shows (Ctrl-L).
+    pub fn tickets_open(&self) -> bool {
+        self.tickets_open
     }
 
     /// The usage samples, and the pane's window while it shows.
