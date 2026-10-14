@@ -418,6 +418,15 @@ async fn interface(
     let settings = universe_ui::Settings {
         workspaces: defaults.workspaces.clone(),
         ask_workspace,
+        context_warning: defaults.context_warning,
+        summarize_when_cold: defaults.summarize_when_cold.clone(),
+        mcp: defaults.mcp.clone(),
+        // Each server starts on a task of its own; its tools are offered
+        // once it answers.
+        external: (!defaults.mcp.is_empty()).then(|| {
+            Arc::new(universe_mcp::Mcp::start(&defaults.mcp))
+                as Arc<dyn universe_core::ExternalTools>
+        }),
         tiers,
         checks,
         rounds: 2,
@@ -433,6 +442,11 @@ async fn interface(
             choices.effort.or_kept(kept).unwrap_or_default()
         },
         planner: defaults.planner.as_deref().map(ModelId::new).transpose()?,
+        fresh_model: defaults
+            .fresh_model
+            .as_deref()
+            .map(ModelId::new)
+            .transpose()?,
         usage_window: defaults
             .usage_window
             .as_deref()
@@ -884,13 +898,10 @@ fn show(event: Event) {
             "⊘ refused, nobody to approve it: {command} ({})",
             reasons.join("; ")
         ),
-        Event::Compacted {
-            dropped,
-            before,
-            after,
-        } => {
+        Event::Investigated { text } => println!("{text}"),
+        Event::ContextFilling { used, window } => {
             eprintln!(
-                "⇣ compacted: {dropped} old tool results dropped, about {before} → {after} tokens"
+                "⚠ the conversation fills most of the context: about {used} of {window} tokens"
             );
         }
         Event::OverBudget { spent, budget } => {

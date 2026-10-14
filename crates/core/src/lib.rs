@@ -8,10 +8,12 @@
 #![warn(missing_docs)]
 
 mod error;
+mod external;
 mod traits;
 mod types;
 
 pub use error::CoreError;
+pub use external::{ExternalCall, ExternalTools, McpServer};
 pub use traits::{ChatModel, Delegate};
 pub use types::{
     Agent, CacheTtl, CacheUse, ChatRequest, ChatResponse, ContextUse, DelegateEvent, DelegateReply,

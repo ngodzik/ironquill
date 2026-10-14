@@ -47,6 +47,17 @@ pub(crate) fn show(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
 
 /// A window centred a third of the way down, its edge in `colour`.
 fn window(ctx: &Context, title: &str, colour: Color32, add: impl FnOnce(&mut Ui)) {
+    sized_window(ctx, title, colour, 520.0..=760.0, add);
+}
+
+/// A window as wide as `widths` allows.
+fn sized_window(
+    ctx: &Context,
+    title: &str,
+    colour: Color32,
+    widths: std::ops::RangeInclusive<f32>,
+    add: impl FnOnce(&mut Ui),
+) {
     egui::Window::new(RichText::new(title).color(colour).strong())
         .id(egui::Id::new(("window", title)))
         .anchor(
@@ -55,8 +66,8 @@ fn window(ctx: &Context, title: &str, colour: Color32, add: impl FnOnce(&mut Ui)
         )
         .collapsible(false)
         .resizable(false)
-        .min_width(520.0)
-        .max_width(760.0)
+        .min_width(*widths.start())
+        .max_width(*widths.end())
         .frame(
             Frame::window(&ctx.global_style())
                 .stroke(Stroke::new(1.5, colour))
@@ -115,6 +126,11 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
                 ('y', "Another half hour".to_owned()),
                 ('n', "Stop".to_owned()),
             ],
+        ),
+        Question::ExternalTool { .. } => (
+            RED,
+            "Run this tool?",
+            vec![('y', "Run it".to_owned()), ('n', "Refuse".to_owned())],
         ),
         Question::AddFolder { .. } => (
             YELLOW,
@@ -188,6 +204,16 @@ fn approval(ctx: &Context, app: &App, keys: &mut Vec<KeyEvent>) {
                     "No request for {minutes} minutes. Each read of the warm sessions costs a \
                      little; letting them cool, the next request writes them to the cache again."
                 ));
+            }
+            Question::ExternalTool { name, arguments } => {
+                ui.label(
+                    RichText::new(format!(
+                        "{} wants {name}, a tool that may change something, with:",
+                        approval.model
+                    ))
+                    .color(DIM),
+                );
+                ui.label(RichText::new(arguments).monospace().color(RED));
             }
             Question::AddFolder { path, folder } => {
                 ui.label(format!(
@@ -336,6 +362,33 @@ fn chats(ctx: &Context, app: &App) {
                     shown.scroll_to_me(None);
                 }
             }
+            // The latest of every project: another project's starts the
+            // program again there.
+            let open = app.chat_rows().len();
+            if !app.elsewhere().is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Latest, in every project").small().color(DIM));
+            }
+            let now = sessions::now();
+            for (k, saved) in app.elsewhere().iter().enumerate() {
+                let i = open + k;
+                let project = saved
+                    .project
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let shown = row(ui, i == selected, |ui| {
+                    ui.label(RichText::new(&project).color(ACCENT));
+                    ui.label(RichText::new(&saved.name).color(TEXT));
+                    ui.label(
+                        RichText::new(sessions::ago(saved.updated, now))
+                            .small()
+                            .color(DIM),
+                    );
+                });
+                if i == selected {
+                    shown.scroll_to_me(None);
+                }
+            }
         });
         hint(
             ui,
@@ -463,7 +516,10 @@ fn model_picker(ctx: &Context, app: &App) {
     };
     let rows = app.model_rows();
     let current = app.current_model();
-    window(ctx, "Model", ACCENT, |ui| {
+    // Most of the screen wide: each model's price, context and scores
+    // show beside its name.
+    let wide = (ctx.content_rect().width() * 0.85).max(520.0);
+    sized_window(ctx, "Model", ACCENT, wide..=wide, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("search").color(DIM));
             ui.label(RichText::new(format!("{}▏", picker.filter)).color(TEXT));
@@ -497,8 +553,11 @@ fn model_picker(ctx: &Context, app: &App) {
                         " "
                     };
                     let team = if model.in_team { "✓" } else { " " };
-                    let name =
-                        RichText::new(format!("{mark} {team} {}", app.model_label(&model.model)));
+                    let fresh = if model.fresh { "◆" } else { " " };
+                    let name = RichText::new(format!(
+                        "{mark} {team}{fresh} {}",
+                        app.model_label(&model.model)
+                    ));
                     ui.label(if model.offered {
                         name.color(TEXT)
                     } else {
@@ -518,7 +577,7 @@ fn model_picker(ctx: &Context, app: &App) {
         });
         hint(
             ui,
-            "type to search · Enter to choose · Space for the team · ← → effort · Tab pair mode · Esc to close",
+            "type to search · Enter to choose · Space for the team · Ctrl-F for fresh work ◆ · ← → effort · Tab pair mode · Esc to close",
         );
     });
 }

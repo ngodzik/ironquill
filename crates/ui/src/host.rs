@@ -455,25 +455,7 @@ where
             .or_insert_with(|| Slot::new(shown, workspace, main_tx));
         match effect {
             Effect::Send { text, config } => {
-                // Read again each time: an edit counts from the next request.
-                // A held command is put to the person in a window; the agent
-                // waits for the answer.
-                let asks = tx.clone();
-                let approver = Approver::new(move |approval| {
-                    let asks = asks.clone();
-                    async move {
-                        let (answer, answered) = oneshot::channel();
-                        if asks.send(AgentMessage::Approve(approval, answer)).is_err() {
-                            return Answer::No;
-                        }
-                        answered.await.unwrap_or(Answer::No)
-                    }
-                });
-                let config = config
-                    .with_instructions(Defaults::instructions())
-                    .with_audit_log(Defaults::audit_log_path())
-                    .with_project_rules(universe_tools::project_instructions(app.root()))
-                    .with_approver(approver);
+                let config = asking(config, app.root(), tx);
                 *task = Some(spawn_agent(
                     Arc::clone(model),
                     Arc::clone(delegate),
@@ -482,6 +464,38 @@ where
                     text,
                     tx.clone(),
                 ));
+            }
+            Effect::Investigate {
+                question,
+                config,
+                investigator,
+            } => {
+                let config = asking(config, app.root(), tx);
+                let (model, delegate, conversation, tx) = (
+                    Arc::clone(model),
+                    Arc::clone(delegate),
+                    Arc::clone(conversation),
+                    tx.clone(),
+                );
+                *task = Some(tokio::spawn(async move {
+                    let mut guard = conversation.lock().await;
+                    let Conversation { session, toolbox } = &mut *guard;
+                    let events = tx.clone();
+                    let result = session
+                        .investigate(
+                            &*model,
+                            &*delegate,
+                            toolbox,
+                            &config,
+                            &investigator,
+                            &question,
+                            |e| {
+                                let _ = events.send(AgentMessage::Event(e));
+                            },
+                        )
+                        .await;
+                    let _ = tx.send(AgentMessage::Done(result.map_err(|e| error_chain(&e))));
+                }));
             }
             Effect::Reset => {
                 if let Some(handle) = task.take() {
@@ -747,6 +761,9 @@ where
                     });
                 }
             }
+            Effect::ListEverywhere => {
+                app.set_elsewhere(crate::sessions::latest_everywhere(30));
+            }
             Effect::ListSessions => {
                 app.show_picker(store.map(Store::list).unwrap_or_default());
             }
@@ -897,6 +914,32 @@ fn spawn_ticks<M: ChatModel + 'static, D: Delegate + 'static>(
         }
         let _ = tx.send(AgentMessage::Ticked(last));
     });
+}
+
+/// `config` with what a request reads again each time, an edit counting
+/// from the next one, and the person to ask: a held command is put to them
+/// in a window, and the agent waits for the answer.
+fn asking(
+    config: AgentConfig,
+    root: &std::path::Path,
+    tx: &mpsc::UnboundedSender<AgentMessage>,
+) -> AgentConfig {
+    let asks = tx.clone();
+    let approver = Approver::new(move |approval| {
+        let asks = asks.clone();
+        async move {
+            let (answer, answered) = oneshot::channel();
+            if asks.send(AgentMessage::Approve(approval, answer)).is_err() {
+                return Answer::No;
+            }
+            answered.await.unwrap_or(Answer::No)
+        }
+    });
+    config
+        .with_instructions(Defaults::instructions())
+        .with_audit_log(Defaults::audit_log_path())
+        .with_project_rules(universe_tools::project_instructions(root))
+        .with_approver(approver)
 }
 
 fn spawn_agent<M, D>(

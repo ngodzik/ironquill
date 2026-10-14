@@ -8,6 +8,7 @@ members = [
     "crates/ui",
     "crates/tui",
     "crates/gui",
+    "crates/mcp",
     ".",
 ]
 resolver = "3"
@@ -30,6 +31,7 @@ universe-agent = { path = "crates/agent", version = "0.1.0" }
 universe-ui    = { path = "crates/ui", version = "0.1.0" }
 universe-tui   = { path = "crates/tui", version = "0.1.0" }
 universe-gui   = { path = "crates/gui", version = "0.1.0" }
+universe-mcp   = { path = "crates/mcp", version = "0.1.0" }
 
 thiserror  = "2.0.21"
 anyhow     = "1.0.104"
@@ -76,6 +78,10 @@ bevy       = { version = "0.19.1", default-features = false, features = [
 bevy_egui  = { version = "0.42.0", default-features = false, features = ["render", "default_fonts"] }
 egui_plot  = "0.37.0"
 syntect    = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+# Images a model is shown: read to know their size, halved when a provider
+# refuses them as too large. The version Bevy already brings.
+image      = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+base64     = "0.22.1"
 
 [package]
 name    = "universe"
@@ -97,6 +103,7 @@ universe-agent.workspace    = true
 universe-ui.workspace       = true
 universe-tui.workspace      = true
 universe-gui.workspace      = true
+universe-mcp.workspace      = true
 anyhow.workspace             = true
 clap.workspace               = true
 serde.workspace              = true

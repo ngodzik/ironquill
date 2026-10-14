@@ -189,6 +189,21 @@ impl App {
         rows
     }
 
+    /// Takes the latest conversations of every project, those open here
+    /// left out: they show above.
+    pub fn set_elsewhere(&mut self, latest: Vec<sessions::Summary>) {
+        self.elsewhere = latest
+            .into_iter()
+            .filter(|s| self.open_with_id(&s.id).is_none())
+            .collect();
+    }
+
+    /// The latest conversations of every project not open here, below the
+    /// open ones in `/chats`.
+    pub fn elsewhere(&self) -> &[sessions::Summary] {
+        &self.elsewhere
+    }
+
     /// The `/chats` list's selected row, while it is open.
     pub fn chats_open(&self) -> Option<usize> {
         self.chats_open
@@ -228,15 +243,38 @@ impl App {
     pub(super) fn chats_key(&mut self, key: KeyEvent) -> Option<Option<Effect>> {
         let selected = self.chats_open?;
         let rows = self.chat_rows();
-        let last = rows.len().saturating_sub(1);
+        let last = (rows.len() + self.elsewhere.len()).saturating_sub(1);
         match key.code {
             KeyCode::Up => self.chats_open = Some(selected.saturating_sub(1)),
             KeyCode::Down => self.chats_open = Some((selected + 1).min(last)),
             KeyCode::Enter => {
+                self.chats_open = None;
                 if let Some(row) = rows.get(selected) {
                     self.show_chat(row.id);
+                } else if let Some(saved) = self.elsewhere.get(selected - rows.len()).cloned() {
+                    // Here, it is resumed; in another project, everything is
+                    // saved and the program starts again there, on it.
+                    let here = self
+                        .root
+                        .canonicalize()
+                        .unwrap_or_else(|_| self.root.clone());
+                    let there = saved
+                        .project
+                        .canonicalize()
+                        .unwrap_or_else(|_| saved.project.clone());
+                    if here == there {
+                        return Some(self.resume_or_show(saved.id));
+                    }
+                    // A request running would be cut short, unsaved.
+                    if rows.iter().any(|r| r.state == ChatState::Running) {
+                        self.notice = Some(
+                            "A request runs: stop it or let it end before leaving the project"
+                                .to_owned(),
+                        );
+                        return Some(None);
+                    }
+                    self.relaunch_in(saved.project, Some(saved.id));
                 }
-                self.chats_open = None;
             }
             KeyCode::Char('n') => {
                 self.open_chat();
@@ -424,6 +462,37 @@ mod tests {
             context: None,
             changed: vec![],
         }))
+    }
+
+    #[test]
+    fn a_conversation_of_another_project_starts_the_program_again_there() {
+        let mut app = ready();
+        let other = tempfile::tempdir().unwrap();
+        let saved = |id: &str, project: &std::path::Path| crate::sessions::Summary {
+            id: id.into(),
+            name: format!("about {id}"),
+            updated: 1,
+            requests: 2,
+            cost: universe_core::Usd(0.0),
+            project: project.to_owned(),
+        };
+        assert!(matches!(
+            run(&mut app, "/chats"),
+            Some(Effect::ListEverywhere)
+        ));
+        app.set_elsewhere(vec![
+            saved("here-1", &std::env::temp_dir()),
+            saved("there-1", other.path()),
+        ]);
+        assert_eq!(app.elsewhere().len(), 2);
+        // The open one, then here-1, then there-1.
+        app.on_key(KeyCode::Down.into());
+        app.on_key(KeyCode::Down.into());
+        app.on_key(KeyCode::Enter.into());
+        let relaunch = app.take_relaunch().unwrap();
+        assert_eq!(relaunch.dir, other.path());
+        assert_eq!(relaunch.conversation.as_deref(), Some("there-1"));
+        assert!(app.should_quit());
     }
 
     #[test]

@@ -28,6 +28,7 @@ All of it experimental, all of it likely to change.
 - **Costs and context in view**, per request and per conversation, with a budget per request.
 - **Views of the codebase** in the window (Ctrl-N), read from the code with no model: its design in layers, its API, its services, its database tables, and its files as a universe of stars.
 - **Where it runs**: the deployment read from Compose, Helm, Kustomize, Flux and Terraform, each environment rendered by `kustomize` and `helm`, every environment shown at once as galaxies, and each service laid out flat with its objects and its values layer by layer. Secrets are never read or shown.
+- **Fresh contexts**: `/debug <question>` has an investigator, the model marked ◆ in the picker (Ctrl-F) or the conversation's, look into a question from a brief and the list of exchanges; only its report comes back, so a long conversation does not pay for the investigation.
 - **Reviewing and walking a branch**: `/review` shows what a branch changed, `/walk` what is not committed yet, with questions about it sent to the cheapest model.
 
 `/help` lists the commands and Ctrl-S every shortcut. They follow the code; this page does not always.
@@ -43,7 +44,7 @@ universe --gui                     # in a window
 
 Settings live in `~/.universe/config.toml`, and a project's own (linked repositories, environments) in `~/.universe/projects/<folder>.toml`.
 
-With `workspaces = ["~/code/app", ...]` in the settings, a new conversation asks which folder it works in and starts again there (`--here` skips the question). `allowed_programs = [...]` lists a project's own tools, which strict mode then lets run without asking.
+With `workspaces = ["~/code/app", ...]` in the settings, a new conversation asks which folder it works in and starts again there (`--here` skips the question). `allowed_programs = [...]` lists a project's own tools, which strict mode then lets run without asking. MCP servers are declared there too, as `[mcp.<name>]` with a `url` (and `headers`) or a `command`: `/mcp` says how each answered, their tools that only read run at once, the others are asked first.
 
 ## Building
 

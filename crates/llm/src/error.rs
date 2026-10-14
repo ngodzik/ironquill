@@ -57,6 +57,22 @@ pub enum LlmError {
         url: String,
     },
 
+    /// The provider held the request without answering. Replies are not
+    /// streamed, so nothing says whether it is still working: the call
+    /// stops, and is not sent again by itself since it may have been billed.
+    #[error(
+        "{url} gave no answer in {minutes} minutes: the request may have been billed; send it again"
+    )]
+    TimedOut {
+        /// The endpoint that was called.
+        url: String,
+        /// How long it was waited for.
+        minutes: u64,
+        /// The underlying failure.
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// The provider does not list the requested model.
     #[error("model {0} is not listed by the provider")]
     UnknownModel(String),

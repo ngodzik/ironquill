@@ -47,6 +47,11 @@ pub(crate) enum Command {
     /// `/hosts` lists the servers allowed besides the known ones; `/hosts
     /// forget <host>` takes one back.
     Hosts(Option<String>),
+    /// `/mcp` lists the MCP servers of the settings and how they answered.
+    Mcp,
+    /// `/debug <question>`: the question investigated in a fresh context,
+    /// only the report coming back.
+    Debug(Option<String>),
     /// `/claude <task>` hands one task to Claude Code, `/codex <task>` to Codex.
     Delegate(Agent, Option<String>),
     /// `/context` opens the conversation's context in the editor.
@@ -137,6 +142,8 @@ pub(crate) fn parse(line: &str) -> Result<Command, String> {
         "secrets" => Ok(Command::Secrets(rest_opt)),
         "strict" => Ok(Command::Strict(rest_opt)),
         "hosts" => Ok(Command::Hosts(rest_opt)),
+        "mcp" => Ok(Command::Mcp),
+        "debug" => Ok(Command::Debug(rest_opt)),
         "claude" | "cc" => Ok(Command::Delegate(Agent::ClaudeCode, rest_opt)),
         "codex" | "cx" => Ok(Command::Delegate(Agent::Codex, rest_opt)),
         "budget" => Ok(Command::Budget(rest_opt)),
@@ -378,6 +385,9 @@ Type a question or a change and press Enter. Changes are checked before they are
 /strict [on|off]     whether a program universe does not know asks first (on)
 /hosts               servers allowed besides those already used; /hosts forget
                      (every command is written down in ~/.universe/audit.log)
+/mcp                 the MCP servers of the settings, [mcp.<name>], and how they answered
+/debug <question>    investigate in a fresh context, with the model marked ◆ for fresh work;
+                     only its report joins the conversation (Ctrl-T shows its work)
 /q                   quit
 Files: Ctrl-B, or Esc then ,n, shows the file tree. Arrows move, → or Enter opens,
   ← closes a folder, q hides the pane. Files the agent changed are marked ●.

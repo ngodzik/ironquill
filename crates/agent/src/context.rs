@@ -48,7 +48,9 @@ pub(crate) fn to_text(messages: &[Message]) -> String {
                     block(&mut out, &title, result.unwrap_or(""));
                 }
             }
-            Message::Tool { .. } => {}
+            // An image cannot be edited as text: an edited context leaves
+            // it out.
+            Message::Tool { .. } | Message::Image { .. } => {}
         }
     }
     out
@@ -203,6 +205,9 @@ pub(crate) fn sanitize(messages: Vec<Message>) -> Vec<Message> {
     out
 }
 
+/// What an image weighs in characters, about: 1,500 tokens.
+const IMAGE_CHARS: usize = 6_000;
+
 /// A rough size in tokens, four characters each, enough to see what an edit
 /// saves.
 pub(crate) fn approx_tokens(messages: &[Message]) -> u64 {
@@ -221,56 +226,11 @@ pub(crate) fn approx_tokens(messages: &[Message]) -> u64 {
                         .sum::<usize>()
             }
             Message::Tool { content, .. } => content.len(),
+            // What providers bill an image of a usual size, about.
+            Message::Image { .. } => IMAGE_CHARS,
         })
         .sum();
     (chars / 4) as u64
-}
-
-/// Results of earlier tool calls longer than this are dropped by a
-/// compaction; shorter ones cost little and say a lot.
-const COMPACT_LONGER_THAN: usize = 400;
-
-/// Replaces the content of every long tool result but the last `keep` with
-/// a line saying what it was, so that a long task stops resending files it
-/// read long ago. The model can call the tool again. Messages stay where
-/// they are, so the conversation stays valid. Returns how many results were
-/// dropped.
-pub(crate) fn compact(messages: &mut [Message], keep: usize) -> usize {
-    let calls: std::collections::HashMap<String, (String, String)> = messages
-        .iter()
-        .flat_map(|m| match m {
-            Message::Assistant { tool_calls, .. } => tool_calls.as_slice(),
-            _ => &[],
-        })
-        .map(|c| (c.id.clone(), (c.name.clone(), c.arguments.clone())))
-        .collect();
-    let results: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| matches!(m, Message::Tool { .. }))
-        .map(|(i, _)| i)
-        .collect();
-    let old = results.len().saturating_sub(keep);
-    let mut dropped = 0;
-    for &i in &results[..old] {
-        let Message::Tool { call_id, content } = &mut messages[i] else {
-            continue;
-        };
-        if content.len() <= COMPACT_LONGER_THAN {
-            continue;
-        }
-        let (name, arguments) = calls
-            .get(call_id)
-            .cloned()
-            .unwrap_or_else(|| ("a tool".into(), String::new()));
-        *content = format!(
-            "[Earlier result of {name} {arguments}, {} lines, dropped to save space. Call the \
-             tool again if you need it.]",
-            content.lines().count()
-        );
-        dropped += 1;
-    }
-    dropped
 }
 
 #[cfg(test)]
@@ -445,52 +405,6 @@ pub(crate) mod tests {
             back,
             [Message::user("hi"), Message::user("note: keep it short")]
         );
-    }
-
-    #[test]
-    fn compaction_drops_old_long_results_and_keeps_the_conversation_valid() {
-        let read = |id: &str, path: &str| Message::Assistant {
-            content: None,
-            tool_calls: vec![ToolCall {
-                id: id.into(),
-                name: "read_file".into(),
-                arguments: format!("{{\"path\":\"{path}\"}}"),
-            }],
-        };
-        let result = |id: &str, text: String| Message::Tool {
-            call_id: id.into(),
-            content: text,
-        };
-        let long = "line\n".repeat(200);
-        let mut messages = vec![
-            Message::system("rules"),
-            Message::user("fix it"),
-            read("1", "a.py"),
-            result("1", long.clone()),
-            read("2", "b.py"),
-            result("2", "short".into()),
-            read("3", "c.py"),
-            result("3", long.clone()),
-        ];
-        let before = approx_tokens(&messages);
-
-        assert_eq!(compact(&mut messages, 1), 1);
-        assert!(valid(&messages));
-        assert_eq!(
-            messages[3],
-            Message::Tool {
-                call_id: "1".into(),
-                content: "[Earlier result of read_file {\"path\":\"a.py\"}, 200 lines, dropped \
-                          to save space. Call the tool again if you need it.]"
-                    .into(),
-            }
-        );
-        // Short results and the latest one stay.
-        assert_eq!(messages[5], result("2", "short".into()));
-        assert_eq!(messages[7], result("3", long));
-        assert!(approx_tokens(&messages) < before);
-        // Nothing left to drop the second time.
-        assert_eq!(compact(&mut messages, 1), 0);
     }
 
     #[test]

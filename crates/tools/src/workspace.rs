@@ -147,6 +147,11 @@ impl Workspace {
         Ok(joined)
     }
 
+    /// The path relative to the root, owned, for messages.
+    pub(crate) fn shown(&self, path: &Path) -> PathBuf {
+        self.display(path).to_owned()
+    }
+
     /// The path relative to the root, for messages.
     pub(crate) fn display<'a>(&self, path: &'a Path) -> &'a Path {
         path.strip_prefix(&self.root).unwrap_or(path)

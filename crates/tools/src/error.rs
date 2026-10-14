@@ -20,6 +20,15 @@ pub enum ToolError {
         root: PathBuf,
     },
 
+    /// A file `view_image` cannot show.
+    #[error("{path} cannot be shown: {reason}")]
+    NotAnImage {
+        /// The file.
+        path: PathBuf,
+        /// Why.
+        reason: String,
+    },
+
     /// The path is inside `.git`: a hook or the repository's configuration
     /// runs code later, and is not the model's to write.
     #[error("{0} is inside .git, which models may not write")]

@@ -221,14 +221,19 @@ pub enum Event {
         /// And after.
         after: TokenCount,
     },
-    /// Old tool results were dropped from the conversation to resend less.
-    Compacted {
-        /// Results dropped.
-        dropped: usize,
-        /// About how many tokens the conversation held before.
-        before: TokenCount,
-        /// And after.
-        after: TokenCount,
+    /// An investigation of `/debug` ended: its report, which joins the
+    /// conversation; whoever worked on it is done.
+    Investigated {
+        /// The report.
+        text: String,
+    },
+    /// The conversation fills most of the model's context: `/compact`
+    /// would help. Told once a request.
+    ContextFilling {
+        /// About how many tokens it holds.
+        used: TokenCount,
+        /// The model's context.
+        window: TokenCount,
     },
     /// The request spent its budget: the work stops here.
     OverBudget {

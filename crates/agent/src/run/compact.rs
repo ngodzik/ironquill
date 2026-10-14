@@ -401,9 +401,11 @@ impl<'a, M, D, O> Ctx<'a, M, D, O> {
             allowed_secrets: Vec::new(),
             allowed_hosts: Vec::new(),
             allowed_programs: Vec::new(),
+            context_warned: false,
             last_call: None,
             last_context: None,
             last_request: None,
+            history: None,
         }
     }
 }

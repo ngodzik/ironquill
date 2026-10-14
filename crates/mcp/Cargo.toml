@@ -1,0 +1,16 @@
+[package]
+name    = "universe-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A client of the Model Context Protocol: the tools of the servers the settings declare, offered to models."
+
+[dependencies]
+universe-core.workspace = true
+serde_json.workspace    = true
+reqwest.workspace       = true
+tokio = { workspace = true, features = ["process", "io-util", "sync", "time", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util"] }

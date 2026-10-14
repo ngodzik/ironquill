@@ -12,6 +12,7 @@ use crate::error::AgentError;
 use crate::event::{Event, Purpose};
 
 mod compact;
+mod investigate;
 
 pub use compact::{Compaction, Subject};
 
@@ -147,7 +148,7 @@ the code, and you review it after. Change no file and run nothing that changes a
 read only, and universe stops the pair if a file changes.";
 
 /// The tools a planner reading through universe gets.
-const READ_TOOLS: [&str; 4] = ["search", "outline", "read_file", "list_dir"];
+const READ_TOOLS: [&str; 5] = ["search", "outline", "read_file", "list_dir", "view_image"];
 
 /// The most of a diff a review reads, in bytes.
 const REVIEW_DIFF_BYTES: usize = 40_000;
@@ -282,6 +283,8 @@ struct Ctx<'a, M, D, O> {
     allowed_hosts: Vec<String>,
     /// The programs the person allowed besides the known ones.
     allowed_programs: Vec<String>,
+    /// Whether the person was told this request that the context fills.
+    context_warned: bool,
     /// The settings of the last call to an agent, and its context's size:
     /// what its session is kept with.
     last_call: Option<Call>,
@@ -289,6 +292,9 @@ struct Ctx<'a, M, D, O> {
     /// The last request sent to a provider's model for the conversation:
     /// what a tick sends again to keep its cache warm.
     last_request: Option<ChatRequest>,
+    /// The conversation as an investigator may look at it again, during
+    /// `/debug`.
+    history: Option<investigate::History>,
 }
 
 enum Attempt {
@@ -452,9 +458,11 @@ impl Session {
             allowed_secrets: config.allowed_secrets.clone(),
             allowed_hosts: config.allowed_hosts.clone(),
             allowed_programs: config.allowed_programs.clone(),
+            context_warned: false,
             last_call: None,
             last_context: None,
             last_request: None,
+            history: None,
         };
         // A request keeps its own session warm; the other one is ticked
         // meanwhile, and the ticks count with the request.
@@ -555,7 +563,14 @@ impl Session {
         let Some(first) = ctx.config.tiers.first().cloned() else {
             return Ok(());
         };
-        if ctx.config.pair.is_some() || first.delegate().is_some() || self.last_used == 0 {
+        // Only for the models the person listed, typically the expensive
+        // ones, and only with someone to ask.
+        if ctx.config.pair.is_some()
+            || first.delegate().is_some()
+            || self.last_used == 0
+            || !ctx.config.summarize_when_cold.contains(&first)
+            || ctx.config.approver.is_none()
+        {
             return Ok(());
         }
         let idle = now_secs().saturating_sub(self.last_used);
@@ -646,7 +661,7 @@ impl Session {
     }
 
     /// Asks the person what to do with a conversation whose cache expired;
-    /// without anybody to ask, it starts again from its summary.
+    /// without anybody to ask, it goes on as it is.
     async fn ask_cold_start<M, D, O>(
         ctx: &Ctx<'_, M, D, O>,
         model: &ModelId,
@@ -654,7 +669,7 @@ impl Session {
         tokens: Option<u64>,
     ) -> Answer {
         let Some(approver) = &ctx.config.approver else {
-            return Answer::Yes;
+            return Answer::No;
         };
         approver
             .ask(Approval {
@@ -733,14 +748,20 @@ impl Session {
         // picked, and is told what was said without it meanwhile.
         let agent = first.delegate().map(|(agent, _)| agent);
         if let Some(agent) = agent {
-            // A cold session starts afresh and is told the conversation,
-            // unless the person would rather go on with it as it is.
+            // A cold session goes on as it is, unless the model is one the
+            // person listed to start afresh, told the conversation, and
+            // they say so.
             let mut thread = self.warm(agent).map(|t| (t.session.clone(), t.seen));
             if thread.is_none()
                 && let Some(cold) = self.agents.get(&agent).cloned()
             {
                 let idle = now_secs().saturating_sub(cold.used);
-                match Self::ask_cold_start(ctx, first, idle, cold.context).await {
+                let answer = if ctx.config.summarize_when_cold.contains(first) {
+                    Self::ask_cold_start(ctx, first, idle, cold.context).await
+                } else {
+                    Answer::No
+                };
+                match answer {
                     Answer::Stop => return Err(AgentError::NotSent),
                     Answer::No => thread = Some((cold.session, cold.seen)),
                     Answer::Yes | Answer::Always => {}
@@ -1542,9 +1563,11 @@ pub async fn run<M: ChatModel, D: Delegate>(
         allowed_secrets: config.allowed_secrets.clone(),
         allowed_hosts: config.allowed_hosts.clone(),
         allowed_programs: config.allowed_programs.clone(),
+        context_warned: false,
         last_call: None,
         last_context: None,
         last_request: None,
+        history: None,
     };
     let mut failure: Option<CheckFailure> = None;
     let mut previous: Option<&ModelId> = None;
@@ -1955,10 +1978,6 @@ async fn run_agent<M, D: Delegate, O: FnMut(Event) + Send>(
     }
     Ok(reply)
 }
-
-/// Tool results a compaction keeps at most: the latest ones are what the
-/// model is working on. It keeps fewer when that is not enough.
-const KEEP_RESULTS: usize = 4;
 
 /// Output tokens counted for a call before it is made: a reply that edits
 /// code is rarely longer.
@@ -3134,10 +3153,25 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
     if leads && let Some(spec) = delegate_spec(&ctx.config.team, model_id) {
         tools.push(spec);
     }
+    // An investigator may look at the conversation again.
+    if ctx.history.is_some() {
+        tools.extend(investigate::History::specs());
+    }
+    // Tools served by others: a reader gets only those that only read.
+    if let Some(external) = &ctx.config.external {
+        tools.extend(
+            external
+                .specs()
+                .into_iter()
+                .filter(|t| role != Role::Reader || external.reads_only(&t.name) == Some(true)),
+        );
+    }
     let window = ctx.model.context_window(model_id).await;
     let identity = identity(model_id, leads, ctx.config);
     let pricing = ctx.model.pricing(model_id).await;
-    let compact_at = window.map_or(ctx.config.compact_at, |w| ctx.config.compact_at.min(w / 2));
+    let warn_at = window
+        .filter(|_| ctx.config.context_warning < 100)
+        .map(|w| w * u64::from(ctx.config.context_warning) / 100);
     let mut left = ctx.config.max_turns;
     // Whether its last reply was empty: it is asked once to go on.
     let mut silent = false;
@@ -3151,47 +3185,48 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
             }
         }
         left -= 1;
-        let before = crate::context::approx_tokens(messages);
-        if before > compact_at {
-            // Down to half the threshold, so that the next calls only add
-            // to it: each compaction makes the provider's cache start over.
-            let mut compacted = messages.clone();
-            let mut dropped = 0;
-            for keep in (1..=KEEP_RESULTS).rev() {
-                dropped += crate::context::compact(&mut compacted, keep);
-                if crate::context::approx_tokens(&compacted) <= compact_at / 2 {
-                    break;
-                }
-            }
-            // Only when it is worth it: a fifth less at least. A conversation
-            // long with words rather than tool results gains little, and
-            // would lose its cache on every call.
-            let after = crate::context::approx_tokens(&compacted);
-            if dropped > 0 && after * 5 <= before * 4 {
-                *messages = compacted;
-                (ctx.observe)(Event::Compacted {
-                    dropped,
-                    before: TokenCount(before),
-                    after: TokenCount(after),
-                });
-            }
+        // Nothing is dropped by itself: past a share of the context, the
+        // person is told once that `/compact` would help.
+        let used = crate::context::approx_tokens(messages);
+        if let (Some(warn_at), Some(window)) = (warn_at, window)
+            && used >= warn_at
+            && !ctx.context_warned
+        {
+            ctx.context_warned = true;
+            (ctx.observe)(Event::ContextFilling {
+                used: TokenCount(used),
+                window: TokenCount(window),
+            });
         }
         let mut sent = messages.clone();
         if let Some(Message::System(prompt)) = sent.first_mut() {
             prompt.push_str(&identity);
         }
-        let request = ChatRequest {
+        let mut request = ChatRequest {
             model: model_id.clone(),
             messages: sent,
             tools: tools.clone(),
             effort: ctx.effort,
         };
         within_budget(ctx, pricing, &request)?;
-        let response = ctx
-            .model
-            .complete(&request)
-            .await
-            .map_err(|e| AgentError::Model(Box::new(e)))?;
+        // Providers do not publish how large an image may be: one refused
+        // as too large is halved, every image with it, and the request sent
+        // again, without asking the model again.
+        let mut halved = 0;
+        let response = loop {
+            match ctx.model.complete(&request).await {
+                Ok(response) => break response,
+                Err(e)
+                    if halved < IMAGE_HALVINGS
+                        && image_too_large(&e.to_string())
+                        && halve_images(&mut request.messages) =>
+                {
+                    halve_images(messages);
+                    halved += 1;
+                }
+                Err(e) => return Err(AgentError::Model(Box::new(e))),
+            }
+        };
         if ctx.purpose == Purpose::Chat {
             ctx.last_request = Some(request);
         }
@@ -3243,12 +3278,31 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         if response.tool_calls.is_empty() {
             return Ok(true);
         }
+        let mut pictures = Vec::new();
         for call in &response.tool_calls {
             if leads && call.name == DELEGATE_TOOL {
                 let report = Box::pin(hand_over(ctx, model_id, &call.arguments)).await?;
                 messages.push(Message::Tool {
                     call_id: call.id.clone(),
                     content: report,
+                });
+                continue;
+            }
+            if let Some(answer) = ctx.history.as_mut().and_then(|h| h.answer(call)) {
+                messages.push(Message::Tool {
+                    call_id: call.id.clone(),
+                    content: answer,
+                });
+                continue;
+            }
+            if let Some(external) = ctx.config.external.clone()
+                && let Some(reads_only) = external.reads_only(&call.name)
+            {
+                let content =
+                    external_call(ctx, model_id, external.as_ref(), call, reads_only).await;
+                messages.push(Message::Tool {
+                    call_id: call.id.clone(),
+                    content,
                 });
                 continue;
             }
@@ -3261,6 +3315,11 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 continue;
             }
             let mut result = ctx.toolbox.call(call);
+            if let Ok(output) = &mut result
+                && let Some(picture) = output.picture.take()
+            {
+                pictures.push(picture);
+            }
             // Outside the workspace: the person may add a folder for the
             // rest of the conversation, and the call is made again.
             if let Err(universe_tools::ToolError::OutsideWorkspace { path, .. }) = &result
@@ -3293,7 +3352,109 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 content: result.map_or_else(|e| format!("error: {e}"), |o| o.for_model),
             });
         }
+        // A tool result cannot carry an image in the OpenAI format: each
+        // goes as a message of its own, after the turn's results.
+        messages.extend(pictures.into_iter().map(|p| Message::Image {
+            data: p.base64(),
+            mime: p.mime,
+        }));
     }
+}
+
+/// Calls a tool served by another: at once when it only reads, else once the
+/// person said yes. What it returns is redacted of the environment's
+/// secrets, as a command's output is.
+async fn external_call<M: ChatModel, D, O: FnMut(Event) + Send>(
+    ctx: &mut Ctx<'_, M, D, O>,
+    model: &ModelId,
+    external: &dyn universe_core::ExternalTools,
+    call: &universe_core::ToolCall,
+    reads_only: bool,
+) -> String {
+    let line = format!("{} {}", call.name, call.arguments);
+    if !reads_only {
+        let answer = match &ctx.config.approver {
+            Some(approver) => {
+                approver
+                    .ask(Approval {
+                        model: model.clone(),
+                        question: Question::ExternalTool {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    })
+                    .await
+            }
+            None => Answer::No,
+        };
+        if !answer.yes() {
+            audit(ctx, model, &line, "held, refused", None);
+            return "refused: this tool may change something, and the person did not allow it. \
+                    Do not reach the same result another way: say what you wanted to do."
+                .to_owned();
+        }
+    }
+    let outcome = external.call(&call.name, &call.arguments).await;
+    let decision = if reads_only {
+        "ran, it only reads"
+    } else {
+        "ran, approved by the person"
+    };
+    let (status, text) = match outcome {
+        Ok(text) => ("done", text),
+        Err(why) => ("failed", format!("error: {why}")),
+    };
+    audit(ctx, model, &line, decision, Some(status));
+    let (text, _) = universe_tools::redact_secrets(&text);
+    (ctx.observe)(Event::Tool {
+        name: call.name.clone(),
+        path: None,
+        outcome: if status == "done" {
+            Ok(universe_tools::ToolSummary::Ran {
+                label: call.name.clone(),
+                lines: text.lines().count(),
+            })
+        } else {
+            Err(text.clone())
+        },
+    });
+    text
+}
+
+/// How many times images are halved for a provider that refuses them.
+const IMAGE_HALVINGS: u32 = 3;
+
+/// Whether a provider's error says an image is too large, as each words it.
+fn image_too_large(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("image")
+        && [
+            "too large",
+            "too big",
+            "exceed",
+            "maximum",
+            "max size",
+            "size limit",
+            "dimension",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
+}
+
+/// Halves every image of `messages`; whether any was.
+fn halve_images(messages: &mut [Message]) -> bool {
+    let mut any = false;
+    for message in messages {
+        if let Message::Image { mime, data } = message
+            && let Some(smaller) =
+                universe_tools::Picture::from_base64(mime, data).and_then(|p| p.halved())
+        {
+            *data = smaller.base64();
+            *mime = smaller.mime;
+            any = true;
+        }
+    }
+    any
 }
 
 /// For a model whose reply was empty.
@@ -3433,6 +3594,7 @@ fn flattened(messages: &[Message]) -> String {
                 let start: String = content.chars().take(RESULT_CHARS).collect();
                 out.push_str(&format!("(result) {start}\n\n"));
             }
+            Message::Image { mime, .. } => out.push_str(&format!("(an image, {mime})\n\n")),
         }
     }
     latest(&out, SUMMARY_INPUT_BYTES)
@@ -3824,7 +3986,7 @@ fn catch_up_all(messages: &[Message]) -> String {
                     out.push_str(&format!("Assistant: {text}\n\n"));
                 }
             }
-            Message::System(_) | Message::Tool { .. } => {}
+            Message::System(_) | Message::Tool { .. } | Message::Image { .. } => {}
         }
     }
     out
@@ -3884,6 +4046,7 @@ mod tests {
         answers: Mutex<VecDeque<ChatResponse>>,
         seen: Mutex<Vec<ChatRequest>>,
         pricing: Option<Pricing>,
+        window: Option<u64>,
     }
 
     impl Scripted {
@@ -3892,6 +4055,14 @@ mod tests {
                 answers: Mutex::new(answers.into()),
                 seen: Mutex::new(Vec::new()),
                 pricing: None,
+                window: None,
+            }
+        }
+
+        fn windowed(self, tokens: u64) -> Self {
+            Self {
+                window: Some(tokens),
+                ..self
             }
         }
 
@@ -3918,6 +4089,10 @@ mod tests {
 
         async fn pricing(&self, _: &ModelId) -> Option<Pricing> {
             self.pricing
+        }
+
+        async fn context_window(&self, _: &ModelId) -> Option<u64> {
+            self.window
         }
     }
 
@@ -4051,60 +4226,6 @@ mod tests {
         assert!(approves("OK"));
         assert!(approves(" `ok`.\n"));
         assert!(!approves("OK, but README.md is missing the route."));
-    }
-
-    #[tokio::test]
-    async fn a_long_conversation_is_compacted_once_past_the_threshold() {
-        let (dir, mut toolbox) = setup();
-        for name in ["a", "b", "c", "d", "e", "f"] {
-            std::fs::write(dir.path().join(format!("{name}.txt")), "word ".repeat(500)).unwrap();
-        }
-        let mut answers: Vec<ChatResponse> = ["a", "b", "c", "d", "e", "f"]
-            .iter()
-            .map(|n| calls("read_file", json!({"path": format!("{n}.txt")})))
-            .collect();
-        answers.push(says("Read them all."));
-        let model = Scripted::new(answers);
-        let config = AgentConfig::builder()
-            .tier(ModelId::new("cheap").unwrap())
-            .compact_at(2_500)
-            .build()
-            .unwrap();
-        let mut session = Session::new();
-        let mut events = Vec::new();
-        session
-            .send(
-                &model,
-                &NoDelegate,
-                &mut toolbox,
-                &config,
-                "read all",
-                "",
-                |e| {
-                    events.push(e);
-                },
-            )
-            .await
-            .unwrap();
-
-        let compactions: Vec<&Event> = events
-            .iter()
-            .filter(|e| matches!(e, Event::Compacted { .. }))
-            .collect();
-        assert_eq!(compactions.len(), 1, "once, all at once: {compactions:?}");
-        let seen = model.seen.lock().unwrap();
-        let last = &seen.last().unwrap().messages;
-        assert!(crate::context::tests::valid(last));
-        let dropped = last
-            .iter()
-            .filter(|m| matches!(m, Message::Tool { content, .. } if content.starts_with("[Earlier result")))
-            .count();
-        assert!(dropped >= 1);
-        // The latest results are kept whole.
-        assert!(matches!(
-            &last[last.len() - 1],
-            Message::Tool { content, .. } if content.starts_with("word")
-        ));
     }
 
     #[tokio::test]
@@ -4560,7 +4681,9 @@ mod tests {
             .tier(ModelId::new("claude-code/opus").unwrap())
             .member(Member::new(ModelId::new("cheap").unwrap(), ""))
             .build()
-            .unwrap();
+            .unwrap()
+            .with_summarize_when_cold(vec![ModelId::new("claude-code/opus").unwrap()])
+            .with_approver(Approver::new(|_| async { Answer::Yes }));
         let long = format!("make done.txt {}", "with care ".repeat(3_000));
         let mut session = Session::new();
         let first = session
@@ -4750,6 +4873,285 @@ mod tests {
         assert_eq!(model.seen.lock().unwrap().len(), 2);
     }
 
+    /// Refuses any image whose base64 is longer than it accepts, as a
+    /// provider whose limit nobody published does.
+    struct ImageLimit {
+        most: usize,
+        seen: Mutex<Vec<ChatRequest>>,
+        answers: Mutex<VecDeque<ChatResponse>>,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("400: image exceeds the maximum size")]
+    struct TooLarge;
+
+    impl ChatModel for ImageLimit {
+        type Error = TooLarge;
+
+        async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, TooLarge> {
+            self.seen.lock().unwrap().push(request.clone());
+            let too_large = request
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Image { data, .. } if data.len() > self.most));
+            if too_large {
+                return Err(TooLarge);
+            }
+            Ok(self.answers.lock().unwrap().pop_front().unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_image_refused_as_too_large_is_halved_and_sent_again() {
+        let (dir, mut toolbox) = setup();
+        let image = image::RgbImage::from_fn(400, 300, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x * y) % 256) as u8])
+        });
+        image.save(dir.path().join("shot.png")).unwrap();
+        let full = universe_tools::Picture::from_bytes(
+            std::fs::read(dir.path().join("shot.png")).unwrap(),
+        )
+        .unwrap()
+        .base64()
+        .len();
+        let model = ImageLimit {
+            most: full / 3,
+            seen: Mutex::new(Vec::new()),
+            answers: Mutex::new(VecDeque::from([
+                calls("view_image", json!({"path": "shot.png"})),
+                says("A gradient."),
+            ])),
+        };
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "look",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let seen = model.seen.lock().unwrap();
+        // Refused, then sent again smaller: the image follows the result.
+        let last = &seen.last().unwrap().messages;
+        let at = last
+            .iter()
+            .position(|m| matches!(m, Message::Image { .. }))
+            .unwrap();
+        assert!(
+            matches!(&last[at - 1], Message::Tool { content, .. } if content.contains("400×300"))
+        );
+        let Message::Image { data, .. } = &last[at] else {
+            unreachable!()
+        };
+        assert!(data.len() <= full / 3);
+        assert!(seen.len() >= 3 && seen.len() <= 2 + 3);
+    }
+
+    /// Two tools served by another: one reads, one writes.
+    #[derive(Debug, Default)]
+    struct Tracker {
+        called: Mutex<Vec<String>>,
+    }
+
+    impl universe_core::ExternalTools for Tracker {
+        fn specs(&self) -> Vec<ToolSpec> {
+            ["tracker__get_issue", "tracker__close_issue"]
+                .map(|name| ToolSpec {
+                    name: name.into(),
+                    description: String::new(),
+                    parameters: json!({"type": "object"}),
+                })
+                .to_vec()
+        }
+
+        fn reads_only(&self, name: &str) -> Option<bool> {
+            match name {
+                "tracker__get_issue" => Some(true),
+                "tracker__close_issue" => Some(false),
+                _ => None,
+            }
+        }
+
+        fn call<'a>(&'a self, name: &'a str, _: &'a str) -> universe_core::ExternalCall<'a> {
+            self.called.lock().unwrap().push(name.to_owned());
+            Box::pin(async move { Ok(format!("{name} done")) })
+        }
+
+        fn status(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_external_tool_that_reads_runs_and_one_that_writes_asks() {
+        let (_dir, mut toolbox) = setup();
+        let tracker = Arc::new(Tracker::default());
+        let model = Scripted::new(vec![
+            calls("tracker__get_issue", json!({"id": "ENG-1"})),
+            calls("tracker__close_issue", json!({"id": "ENG-1"})),
+            says("Read it; closing was refused."),
+        ]);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap()
+            .with_external_tools(Some(
+                Arc::clone(&tracker) as Arc<dyn universe_core::ExternalTools>
+            ))
+            .with_approver({
+                let asked = Arc::clone(&asked);
+                Approver::new(move |approval: Approval| {
+                    asked.lock().unwrap().push(approval);
+                    async { Answer::No }
+                })
+            });
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "close it",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(*tracker.called.lock().unwrap(), ["tracker__get_issue"]);
+        assert!(matches!(
+            &asked.lock().unwrap()[0].question,
+            Question::ExternalTool { name, .. } if name == "tracker__close_issue"
+        ));
+        let seen = model.seen.lock().unwrap();
+        assert!(
+            seen[0]
+                .tools
+                .iter()
+                .any(|t| t.name == "tracker__close_issue")
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_investigates_in_a_fresh_context_and_only_its_report_comes_back() {
+        let (_dir, mut toolbox) = setup();
+        let model = Scripted::new(vec![
+            says("The parser drops the last line."),
+            // The brief, as one more turn of the conversation.
+            says("The person reports that the parser drops the last line of a file."),
+            // The investigator looks at the first exchange, then reports.
+            calls("read_exchange", json!({"number": 1})),
+            says("src/parser.rs:12 stops one line early: `..len - 1`."),
+        ]);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        let mut session = Session::new();
+        let secret_detail = "only in the first exchange";
+        session
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                &format!("why is the last line lost? {secret_detail}"),
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let before = session.messages.len();
+        let mut events = Vec::new();
+        session
+            .investigate(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                &ModelId::new("cheap").unwrap(),
+                "where is the bug?",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+        let seen = model.seen.lock().unwrap();
+        // The brief was asked with the conversation's own prefix and tools.
+        assert!(seen[1].messages.len() > 2 && !seen[1].tools.is_empty());
+        // The investigator starts from the brief and the list, not the
+        // conversation; it read the first exchange again when it asked.
+        let start = &seen[2].messages;
+        assert_eq!(start.len(), 2);
+        assert!(
+            matches!(&start[1], Message::User(t) if t.contains("1. User: why is the last line lost"))
+        );
+        assert!(seen[2].tools.iter().any(|t| t.name == "read_exchange"));
+        assert!(matches!(
+            seen[3].messages.last(),
+            Some(Message::Tool { content, .. }) if content.contains(secret_detail)
+        ));
+        // Only the question and the report join the conversation.
+        assert_eq!(session.messages.len(), before + 2);
+        assert!(matches!(
+            session.messages.last(),
+            Some(Message::Assistant { content: Some(t), .. })
+                if t.contains("src/parser.rs:12") && t.contains("1 look at the conversation")
+        ));
+        assert!(events.iter().any(|e| matches!(e, Event::Delegating { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_conversation_filling_the_context_says_so_once_and_drops_nothing() {
+        let (dir, mut toolbox) = setup();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(format!("{name}.txt")), "word ".repeat(500)).unwrap();
+        }
+        let mut answers: Vec<ChatResponse> = ["a", "b", "c"]
+            .iter()
+            .map(|n| calls("read_file", json!({"path": format!("{n}.txt")})))
+            .collect();
+        answers.push(says("Read them all."));
+        let model = Scripted::new(answers).windowed(1_000);
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        let mut events = Vec::new();
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "read all",
+                "",
+                |e| events.push(e),
+            )
+            .await
+            .unwrap();
+        let warnings = events
+            .iter()
+            .filter(|e| matches!(e, Event::ContextFilling { .. }))
+            .count();
+        assert_eq!(warnings, 1);
+        // Every result is sent whole, the oldest included.
+        let seen = model.seen.lock().unwrap();
+        let last = &seen.last().unwrap().messages;
+        let whole = last
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { content, .. } if content.starts_with("word")))
+            .count();
+        assert_eq!(whole, 3);
+    }
+
     #[tokio::test]
     async fn a_file_outside_the_workspace_adds_a_folder_once_the_person_says_yes() {
         let (_dir, mut toolbox) = setup();
@@ -4924,7 +5326,9 @@ mod tests {
         let config = AgentConfig::builder()
             .tier(ModelId::new("cheap").unwrap())
             .build()
-            .unwrap();
+            .unwrap()
+            .with_summarize_when_cold(vec![ModelId::new("cheap").unwrap()])
+            .with_approver(Approver::new(|_| async { Answer::Yes }));
         let mut session = Session::new();
         let long = "the parser ".repeat(3_000);
         for i in 1..=3 {
@@ -5875,6 +6279,7 @@ mod tests {
             .tier(ModelId::new("claude-code/opus").unwrap())
             .build()
             .unwrap()
+            .with_summarize_when_cold(vec![ModelId::new("claude-code/opus").unwrap()])
             .with_approver(Approver::new(move |approval: Approval| {
                 assert!(matches!(approval.question, Question::ColdStart { .. }));
                 async move { answer }

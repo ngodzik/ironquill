@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use universe_core::{Effort, ModelId, Usd};
+use universe_core::{Effort, ExternalTools, ModelId, Usd};
 use universe_tools::Check;
 
 use crate::error::AgentError;
@@ -17,7 +17,7 @@ pub struct AgentConfig {
     pub(crate) checks: Vec<Check>,
     pub(crate) team: Vec<Member>,
     pub(crate) budget: Option<Usd>,
-    pub(crate) compact_at: u64,
+    pub(crate) context_warning: u8,
     pub(crate) effort: Option<Effort>,
     pub(crate) pair: Option<Pair>,
     pub(crate) detect_checks: bool,
@@ -28,6 +28,8 @@ pub struct AgentConfig {
     pub(crate) strict_commands: bool,
     pub(crate) allowed_hosts: Vec<String>,
     pub(crate) allowed_programs: Vec<String>,
+    pub(crate) summarize_when_cold: Vec<ModelId>,
+    pub(crate) external: Option<Arc<dyn ExternalTools>>,
     pub(crate) audit_log: Option<std::path::PathBuf>,
 }
 
@@ -77,6 +79,14 @@ pub enum Question {
     KeepWarm {
         /// How long the conversation has waited.
         minutes: u64,
+    },
+    /// Whether a tool served by another, one that may change something,
+    /// may run.
+    ExternalTool {
+        /// Its name, `<server>__<tool>`.
+        name: String,
+        /// Its arguments, as JSON.
+        arguments: String,
     },
     /// A file tool reached outside the workspace: whether to add a folder
     /// for the rest of the conversation.
@@ -219,7 +229,7 @@ impl AgentConfig {
             checks: Vec::new(),
             team: Vec::new(),
             budget: None,
-            compact_at: COMPACT_AT,
+            context_warning: CONTEXT_WARNING,
             effort: Some(Effort::High),
             pair: None,
             detect_checks: false,
@@ -269,6 +279,22 @@ impl AgentConfig {
         self
     }
 
+    /// Tools served by others, MCP servers' for one: offered to models
+    /// besides universe's own. Those that only read run at once; any other
+    /// waits for the person, as a held command does.
+    pub fn with_external_tools(mut self, tools: Option<Arc<dyn ExternalTools>>) -> Self {
+        self.external = tools;
+        self
+    }
+
+    /// The models whose conversation may be started again from its summary
+    /// when their cache expired after a pause, the person asked first:
+    /// typically the expensive ones. Others go on as they are.
+    pub fn with_summarize_when_cold(mut self, models: Vec<ModelId>) -> Self {
+        self.summarize_when_cold = models;
+        self
+    }
+
     /// The project's own programs, which strict mode knows as if it had a
     /// rule for them.
     pub fn with_allowed_programs(mut self, programs: Vec<String>) -> Self {
@@ -283,9 +309,9 @@ impl AgentConfig {
     }
 }
 
-/// Tokens of conversation past which old tool results are dropped, unless
-/// half the model's context is less.
-pub const COMPACT_AT: u64 = 40_000;
+/// The share of a model's context, in percent, past which the person is
+/// told that `/compact` would help.
+pub const CONTEXT_WARNING: u8 = 80;
 
 /// Collects an [`AgentConfig`] and validates it at [`build`](Self::build).
 #[derive(Debug, Clone)]
@@ -296,7 +322,7 @@ pub struct AgentConfigBuilder {
     checks: Vec<Check>,
     team: Vec<Member>,
     budget: Option<Usd>,
-    compact_at: u64,
+    context_warning: u8,
     effort: Option<Effort>,
     pair: Option<Pair>,
     detect_checks: bool,
@@ -347,12 +373,13 @@ impl AgentConfigBuilder {
         self
     }
 
-    /// How long the conversation may grow, in tokens, before the results of
-    /// old tool calls are dropped, all at once: the conversation is then
-    /// resent shorter, and its new start is cached again. Defaults to
-    /// [`COMPACT_AT`], or half the model's context when that is less.
-    pub fn compact_at(mut self, tokens: u64) -> Self {
-        self.compact_at = tokens;
+    /// The share of the model's context, in percent, past which the person
+    /// is told that `/compact` would help; 100 never tells. Nothing is
+    /// dropped by itself: a model that loses what it read reads it again,
+    /// which costs more turns, and with a cache resending is cheap. Defaults
+    /// to [`CONTEXT_WARNING`].
+    pub fn context_warning(mut self, percent: u8) -> Self {
+        self.context_warning = percent.min(100);
         self
     }
 
@@ -413,7 +440,9 @@ impl AgentConfigBuilder {
             checks: self.checks,
             team: self.team,
             budget: self.budget,
-            compact_at: self.compact_at,
+            context_warning: self.context_warning,
+            summarize_when_cold: Vec::new(),
+            external: None,
             effort: self.effort,
             pair: self.pair,
             detect_checks: self.detect_checks,

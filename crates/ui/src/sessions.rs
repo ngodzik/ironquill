@@ -53,6 +53,39 @@ pub struct Summary {
     pub requests: usize,
     /// What it cost.
     pub cost: Usd,
+    /// The project it belongs to.
+    #[serde(default)]
+    pub project: PathBuf,
+}
+
+/// universe's own folder, as the rest of it finds it: `UNIVERSE_HOME`, else
+/// `~/.universe`.
+fn base() -> Option<PathBuf> {
+    Some(match std::env::var_os("UNIVERSE_HOME") {
+        Some(home) => PathBuf::from(home),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".universe"),
+    })
+}
+
+/// The latest conversations of every project, most recent first, at most
+/// `limit`.
+#[must_use]
+pub fn latest_everywhere(limit: usize) -> Vec<Summary> {
+    let Some(sessions) = base().map(|b| b.join("sessions")) else {
+        return Vec::new();
+    };
+    let Ok(projects) = fs::read_dir(&sessions) else {
+        return Vec::new();
+    };
+    let mut all: Vec<Summary> = projects
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .flat_map(|e| Store::at(e.path()).list())
+        .filter(|s| !s.project.as_os_str().is_empty())
+        .collect();
+    all.sort_by_key(|s| std::cmp::Reverse(s.updated));
+    all.truncate(limit);
+    all
 }
 
 /// The conversations of one project.
@@ -65,11 +98,9 @@ impl Store {
     /// The store for `project`, or `None` when there is no home directory
     /// to put it in.
     pub fn for_project(project: &Path) -> Option<Self> {
-        let base = match std::env::var_os("UNIVERSE_HOME") {
-            Some(home) => PathBuf::from(home),
-            None => PathBuf::from(std::env::var_os("HOME")?).join(".universe"),
-        };
-        Some(Self::at(base.join("sessions").join(project_key(project))))
+        Some(Self::at(
+            base()?.join("sessions").join(project_key(project)),
+        ))
     }
 
     pub(crate) fn at(dir: PathBuf) -> Self {

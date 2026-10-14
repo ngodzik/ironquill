@@ -14,6 +14,11 @@ use crate::error::LlmError;
 /// How many more times a request whose connection failed is tried.
 const CONNECT_RETRIES: u32 = 2;
 
+/// How long a completion may take, from sending it to its last byte: a
+/// provider that holds a request without answering would keep the agent
+/// waiting for ever.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// A provider that speaks the OpenAI compatible chat completions protocol.
 ///
 /// `base_url` is the prefix both `/chat/completions` and `/models` hang off,
@@ -181,6 +186,7 @@ impl ChatModel for OpenAiCompatible {
                 .post(&url)
                 .bearer_auth(key)
                 .json(&payload)
+                .timeout(REQUEST_TIMEOUT)
                 .send()
                 .await
             {
@@ -304,6 +310,13 @@ fn parse_known(body: &str) -> HashMap<String, Known> {
 }
 
 pub(crate) fn transport(url: &str, source: reqwest::Error) -> LlmError {
+    if source.is_timeout() {
+        return LlmError::TimedOut {
+            url: url.to_owned(),
+            minutes: REQUEST_TIMEOUT.as_secs() / 60,
+            source,
+        };
+    }
     LlmError::Transport {
         url: url.to_owned(),
         source,
@@ -397,6 +410,13 @@ fn wire_message(message: &Message) -> Value {
         Message::Tool { call_id, content } => {
             json!({"role": "tool", "tool_call_id": call_id, "content": content})
         }
+        Message::Image { mime, data } => json!({
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": format!("data:{mime};base64,{data}")},
+            }],
+        }),
     }
 }
 
@@ -571,6 +591,42 @@ fn parse_pricing(url: &str, body: &str, model: &ModelId) -> Result<Pricing, LlmE
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_image_goes_as_a_user_message_with_a_data_url() {
+        let message = Message::Image {
+            mime: "image/png".into(),
+            data: "iVBORw0K".into(),
+        };
+        assert_eq!(
+            wire_message(&message),
+            json!({
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0K"}}]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_held_without_answer_says_it_may_have_been_billed() {
+        // A server that accepts and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _held: Vec<_> = listener.incoming().take(1).collect();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let url = format!("http://{address}/chat/completions");
+        let failure = reqwest::Client::new()
+            .post(&url)
+            .timeout(std::time::Duration::from_millis(100))
+            .send()
+            .await
+            .unwrap_err();
+        let error = transport(&url, failure);
+        assert!(matches!(error, LlmError::TimedOut { minutes: 10, .. }));
+        assert!(error.to_string().contains("may have been billed"));
+    }
+
     use super::*;
 
     const URL: &str = "https://example.test/v1/chat/completions";

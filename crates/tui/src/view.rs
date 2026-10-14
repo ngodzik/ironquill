@@ -71,6 +71,18 @@ pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
         render_compact(frame, app);
     }
     if let Some(selected) = app.chats_open() {
+        let now = sessions::now();
+        let elsewhere = app.elsewhere().iter().map(|saved| {
+            let project = saved
+                .project
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            format!(
+                "  {project} › {} · {}",
+                saved.name,
+                sessions::ago(saved.updated, now)
+            )
+        });
         let rows = app
             .chat_rows()
             .into_iter()
@@ -87,10 +99,11 @@ pub(crate) fn render(frame: &mut Frame, app: &App, pictures: &dyn Pictures) {
                     plural(chat.requests, "request", "requests")
                 )
             })
+            .chain(elsewhere)
             .collect();
         render_list(
             frame,
-            " Conversations ",
+            " Conversations, then the latest of every project ",
             rows,
             selected,
             " ↑↓: move · Enter: show · n: new · x: close one not shown · Esc: close ",
@@ -206,6 +219,18 @@ fn render_approval(frame: &mut Frame, app: &App) {
                 " No request for {minutes} minutes. Each read of the warm sessions costs a \
                  little; letting them cool, the next request writes them to the cache again."
             ))],
+        ),
+        Question::ExternalTool { name, arguments } => (
+            Color::Red,
+            " Run this tool? ",
+            " y: run it · n: refuse ".to_owned(),
+            vec![
+                Line::raw(format!(
+                    " {} wants {name}, a tool that may change something, with:",
+                    approval.model
+                )),
+                Line::styled(format!(" {arguments}"), fg(Color::Red)),
+            ],
         ),
         Question::AddFolder { path, folder } => (
             Color::Yellow,
@@ -516,7 +541,11 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(Clear, area);
     let block = pane_block(" Model ".into(), true).title_bottom(
-        Line::styled(" Enter: choose · Space: team · Esc: close ", fg(DIM)).centered(),
+        Line::styled(
+            " Enter: choose · Space: team · Ctrl-F: fresh work ◆ · Esc: close ",
+            fg(DIM),
+        )
+        .centered(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -559,7 +588,8 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
             " "
         };
         let team = if row.in_team { "✓" } else { " " };
-        let name = format!("{mark} {team} {}", app.model_label(&row.model));
+        let fresh = if row.fresh { "◆" } else { " " };
+        let name = format!("{mark} {team}{fresh} {}", app.model_label(&row.model));
         let gap = room.saturating_sub(name.chars().count() + row.note.chars().count() + 1);
         let mut style = Style::new();
         if !row.offered {

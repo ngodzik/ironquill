@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 
 use universe_core::CacheTtl;
 
+use std::collections::BTreeMap;
+
+use universe_core::McpServer;
+
 use crate::backdrop::{Motion, Pattern};
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +66,11 @@ pub struct Defaults {
     /// The member of the team that plans in a pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner: Option<String>,
+    /// The model for work that starts with little context: `/debug`'s
+    /// investigations, reading a ticket, checking progress. Unsaid, the
+    /// conversation's model does it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_model: Option<String>,
     /// The usage pane's window, such as `6h`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_window: Option<String>,
@@ -129,6 +138,19 @@ pub struct Defaults {
     /// the start, the first chosen. Set in the file only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<String>,
+    /// The share of the model's context, in percent, past which `/compact`
+    /// is suggested; 80 when unsaid, 100 never. Set in the file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_warning: Option<u8>,
+    /// The models whose conversation may start again from its summary when
+    /// their cache expired after a pause, the person asked first: typically
+    /// the expensive ones. Set in the file only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summarize_when_cold: Vec<String>,
+    /// MCP servers, `[mcp.<name>]`, each a `url` (with `headers`) or a
+    /// `command` (with `env`). Set in the file only: it may hold tokens.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServer>,
 }
 
 impl Defaults {
@@ -195,6 +217,12 @@ impl Defaults {
         let text = toml::to_string_pretty(self).map_err(io::Error::other)?;
         let tmp = path.with_extension("toml.tmp");
         fs::write(&tmp, text)?;
+        // Its servers' headers may hold tokens: readable by its owner only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        }
         fs::rename(tmp, path)
     }
 }
@@ -215,6 +243,7 @@ mod tests {
             budget: Some(0.25),
             effort: Some("max".into()),
             planner: Some("b/strong".into()),
+            fresh_model: Some("a/cheap".into()),
             usage_window: Some("6h".into()),
             allowed_secrets: vec!["API_TOKEN".into()],
             lenient_commands: true,
@@ -232,9 +261,25 @@ mod tests {
             background: Some(Pattern::Rain),
             background_motion: Some(Motion::Slow),
             workspaces: vec!["~/code/shop".into()],
+            context_warning: Some(90),
+            summarize_when_cold: vec!["b/strong".into()],
+            mcp: BTreeMap::from([(
+                "tracker".into(),
+                McpServer {
+                    url: Some("https://mcp.example.com/mcp".into()),
+                    headers: BTreeMap::from([("Authorization".into(), "Bearer t".into())]),
+                    ..McpServer::default()
+                },
+            )]),
         };
         defaults.save(&path).unwrap();
         assert_eq!(Defaults::load(&path), Ok(defaults));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "its tokens are its owner's");
+        }
     }
 
     #[test]
