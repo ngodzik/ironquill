@@ -6,11 +6,11 @@ use bevy_egui::egui::{
     TextFormat, Ui, text::LayoutJob,
 };
 use universe_tools::{DiffLine, ToolSummary};
+use universe_ui::markdown::{self as md, Block, Marker};
 use universe_ui::{App, Effect, Entry, step_title};
 
 use crate::theme::{
-    ACCENT, BODY_SIZE, CODE, CYAN, DIM, EDGE, GREEN, LINK, MAGENTA, RAISED, RED, SELECTED, TEXT,
-    YELLOW,
+    ACCENT, BODY_SIZE, CODE, CYAN, DIM, EDGE, GREEN, LINK, MAGENTA, RED, TEXT, YELLOW,
 };
 
 /// How many lines of a failed check's output show.
@@ -30,7 +30,7 @@ pub(crate) fn show(ui: &mut Ui, app: &App, effects: &mut Vec<Effect>) {
             .inner_margin(Margin::symmetric(10, 6))
             .corner_radius(CornerRadius::same(8))
             .fill(if is_selected {
-                SELECTED
+                ui.visuals().selection.bg_fill
             } else {
                 Color32::TRANSPARENT
             });
@@ -257,7 +257,7 @@ fn welcome(ui: &mut Ui, app: &App) {
 /// What the person wrote, set apart on a card.
 fn user(ui: &mut Ui, text: &str) {
     Frame::new()
-        .fill(RAISED)
+        .fill(ui.visuals().faint_bg_color)
         .stroke(Stroke::new(1.0, EDGE))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(12, 8))
@@ -407,7 +407,7 @@ fn tool(ui: &mut Ui, name: &str, path: Option<&str>, outcome: &Result<ToolSummar
 /// A file's change, its added and removed lines on tinted rows.
 fn diff_block(ui: &mut Ui, diff: &[DiffLine]) {
     Frame::new()
-        .fill(RAISED)
+        .fill(ui.visuals().faint_bg_color)
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(8, 6))
         .show(ui, |ui| {
@@ -433,47 +433,144 @@ fn diff_block(ui: &mut Ui, diff: &[DiffLine]) {
         });
 }
 
-/// A reply's Markdown, as much of it as reads better drawn: headings, bold,
-/// inline code, quotes, and fenced blocks with a copy button.
+/// A reply's Markdown, as `universe_ui::markdown` reads it: headings by
+/// level, lists nested, numbered or ticked, quotes behind a bar with a copy
+/// button, rules, tables, and fenced blocks with a copy button.
 fn markdown(ui: &mut Ui, text: &str, effects: &mut Vec<Effect>) {
-    let mut lines = text.lines().peekable();
-    let mut paragraph: Vec<&str> = Vec::new();
-    while let Some(line) = lines.next() {
-        if let Some(info) = line.trim_start().strip_prefix("```") {
-            flush(ui, &mut paragraph);
-            let mut code = Vec::new();
-            for inner in lines.by_ref() {
-                if inner.trim_start().starts_with("```") {
-                    break;
+    blocks(ui, &md::parse(text), effects);
+}
+
+fn blocks(ui: &mut Ui, list: &[Block], effects: &mut Vec<Effect>) {
+    for block in list {
+        match block {
+            Block::Blank => ui.add_space(4.0),
+            Block::Heading { level, spans } => {
+                ui.add_space(4.0);
+                let size = match level {
+                    1 => BODY_SIZE + 6.0,
+                    2 => BODY_SIZE + 3.5,
+                    3 => BODY_SIZE + 1.5,
+                    _ => BODY_SIZE,
+                };
+                let mut job = LayoutJob::default();
+                runs(
+                    &mut job,
+                    spans,
+                    size,
+                    Color32::WHITE,
+                    ui.visuals().faint_bg_color,
+                );
+                job.wrap.max_width = ui.available_width();
+                ui.label(job);
+            }
+            Block::Paragraph(lines) => {
+                let mut job = LayoutJob::default();
+                for (i, line) in lines.iter().enumerate() {
+                    if i > 0 {
+                        job.append("\n", 0.0, plain());
+                    }
+                    runs(&mut job, line, BODY_SIZE, TEXT, ui.visuals().faint_bg_color);
                 }
-                code.push(inner);
+                job.wrap.max_width = ui.available_width();
+                ui.label(job);
             }
-            code_block(ui, info.trim(), &code.join("\n"), effects);
-        } else if line.trim_start().starts_with('>') {
-            flush(ui, &mut paragraph);
-            let mut quoted = vec![line];
-            while let Some(next) = lines.next_if(|l| l.trim_start().starts_with('>')) {
-                quoted.push(next);
+            Block::Item {
+                depth,
+                marker,
+                spans,
+            } => {
+                let mark = match marker {
+                    Marker::Bullet => ["•", "◦", "▪"][depth % 3].to_owned(),
+                    Marker::Number(n) => format!("{n}."),
+                    Marker::Task(true) => "☑".to_owned(),
+                    Marker::Task(false) => "☐".to_owned(),
+                };
+                let colour = if matches!(marker, Marker::Task(true)) {
+                    DIM
+                } else {
+                    TEXT
+                };
+                ui.horizontal_top(|ui| {
+                    ui.add_space(4.0 + 16.0 * *depth as f32);
+                    ui.label(RichText::new(mark).size(BODY_SIZE).color(DIM));
+                    let mut job = LayoutJob::default();
+                    runs(
+                        &mut job,
+                        spans,
+                        BODY_SIZE,
+                        colour,
+                        ui.visuals().faint_bg_color,
+                    );
+                    job.wrap.max_width = ui.available_width();
+                    ui.label(job);
+                });
             }
-            quote(ui, &unquoted(&quoted), effects);
-        } else if let Some(heading) = heading(line) {
-            flush(ui, &mut paragraph);
-            ui.add_space(4.0);
-            ui.label(RichText::new(heading).size(BODY_SIZE + 3.0).strong());
-        } else if line.trim().is_empty() {
-            flush(ui, &mut paragraph);
-            ui.add_space(4.0);
-        } else {
-            paragraph.push(line);
+            Block::Rule => {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+            }
+            Block::Quote { text, blocks } => quote(ui, text, blocks, effects),
+            Block::Code { language, text } => code_block(ui, language, text, effects),
+            Block::Image { alt, path } => {
+                ui.label(RichText::new(format!("![{alt}]({path})")).color(DIM));
+            }
+            Block::Table {
+                header,
+                aligns,
+                rows,
+            } => table(ui, header, aligns, rows),
         }
     }
-    flush(ui, &mut paragraph);
+}
+
+/// A table on a card, its header bold, its columns aligned as written.
+fn table(ui: &mut Ui, header: &[Vec<md::Span>], aligns: &[md::Align], rows: &[Vec<Vec<md::Span>>]) {
+    Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(Stroke::new(1.0, EDGE))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            egui::Grid::new(ui.next_auto_id())
+                .striped(true)
+                .spacing(egui::vec2(18.0, 4.0))
+                .show(ui, |ui| {
+                    let cells = |ui: &mut Ui, row: &[Vec<md::Span>], colour: Color32| {
+                        for (c, cell) in row.iter().enumerate() {
+                            let mut job = LayoutJob::default();
+                            runs(
+                                &mut job,
+                                cell,
+                                BODY_SIZE - 0.5,
+                                colour,
+                                ui.visuals().faint_bg_color,
+                            );
+                            let align = match aligns.get(c).copied().unwrap_or_default() {
+                                md::Align::Left => Align::Min,
+                                md::Align::Center => Align::Center,
+                                md::Align::Right => Align::Max,
+                            };
+                            // A cell keeps to one line: the grid gives each
+                            // column the room its widest cell needs.
+                            ui.with_layout(Layout::top_down(align), |ui| {
+                                ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend))
+                            });
+                        }
+                        ui.end_row();
+                    };
+                    cells(ui, header, Color32::WHITE);
+                    for row in rows {
+                        cells(ui, row, TEXT);
+                    }
+                });
+        });
 }
 
 /// A quote set apart by a bar on its left, its markers gone and its
 /// text drawn as Markdown again, with a button that copies it as written
 /// without them: a quoted draft is often what is wanted.
-fn quote(ui: &mut Ui, text: &str, effects: &mut Vec<Effect>) {
+fn quote(ui: &mut Ui, text: &str, inner: &[Block], effects: &mut Vec<Effect>) {
     let shown = Frame::new()
         .inner_margin(Margin {
             left: 12,
@@ -488,7 +585,7 @@ fn quote(ui: &mut Ui, text: &str, effects: &mut Vec<Effect>) {
                     effects.push(Effect::Copy(text.to_owned()));
                 }
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                    markdown(ui, text, effects);
+                    blocks(ui, inner, effects);
                 });
             });
         });
@@ -500,41 +597,6 @@ fn quote(ui: &mut Ui, text: &str, effects: &mut Vec<Effect>) {
     );
 }
 
-/// Quoted lines without their first `>` and the space after it.
-fn unquoted(lines: &[&str]) -> String {
-    lines
-        .iter()
-        .map(|line| {
-            let line = line.trim_start();
-            let line = line.strip_prefix('>').unwrap_or(line);
-            line.strip_prefix(' ').unwrap_or(line)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn heading(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start_matches('#');
-    (trimmed.len() < line.len() && trimmed.starts_with(' ')).then(|| trimmed.trim())
-}
-
-/// Draws the lines gathered as one block of text, line breaks kept.
-fn flush(ui: &mut Ui, paragraph: &mut Vec<&str>) {
-    if paragraph.is_empty() {
-        return;
-    }
-    let mut job = LayoutJob::default();
-    for (i, line) in paragraph.iter().enumerate() {
-        if i > 0 {
-            job.append("\n", 0.0, plain());
-        }
-        inline(&mut job, line);
-    }
-    job.wrap.max_width = ui.available_width();
-    ui.label(job);
-    paragraph.clear();
-}
-
 fn plain() -> TextFormat {
     TextFormat {
         font_id: FontId::proportional(BODY_SIZE),
@@ -543,50 +605,29 @@ fn plain() -> TextFormat {
     }
 }
 
-/// `**bold**` and `` `code` `` within a line; a marker left open shows as
-/// written.
-fn inline(job: &mut LayoutJob, line: &str) {
-    let mut rest = line;
-    while !rest.is_empty() {
-        let code = rest.find('`');
-        let bold = rest.find("**");
-        match (code, bold) {
-            (Some(c), b) if b.is_none_or(|b| c < b) => {
-                if let Some(end) = rest[c + 1..].find('`') {
-                    job.append(&rest[..c], 0.0, plain());
-                    job.append(
-                        &rest[c + 1..c + 1 + end],
-                        0.0,
-                        TextFormat {
-                            font_id: FontId::monospace(BODY_SIZE - 0.5),
-                            color: LINK,
-                            background: RAISED,
-                            ..TextFormat::default()
-                        },
-                    );
-                    rest = &rest[c + 2 + end..];
-                    continue;
-                }
-            }
-            (_, Some(b)) => {
-                if let Some(end) = rest[b + 2..].find("**") {
-                    job.append(&rest[..b], 0.0, plain());
-                    job.append(
-                        &rest[b + 2..b + 2 + end],
-                        0.0,
-                        TextFormat {
-                            color: Color32::WHITE,
-                            ..plain()
-                        },
-                    );
-                    rest = &rest[b + 4 + end..];
-                    continue;
-                }
-            }
-            _ => {}
+/// The runs of the shared reader, appended to `job` at `size`.
+/// Inline code sits on `background`, the window's raised colour, as
+/// see-through as the window.
+fn runs(job: &mut LayoutJob, spans: &[md::Span], size: f32, colour: Color32, background: Color32) {
+    for span in spans {
+        let mut format = TextFormat {
+            font_id: FontId::proportional(size),
+            color: if span.bold { Color32::WHITE } else { colour },
+            italics: span.italic,
+            ..TextFormat::default()
+        };
+        if span.strike {
+            format.strikethrough = Stroke::new(1.0, colour);
         }
-        job.append(rest, 0.0, plain());
-        break;
+        if span.code {
+            format.font_id = FontId::monospace(size - 0.5);
+            format.color = LINK;
+            format.background = background;
+        } else if span.link.is_some() {
+            format.color = CYAN;
+            format.underline = Stroke::new(1.0, CYAN);
+        }
+        job.append(&span.text, 0.0, format);
     }
 }
 
@@ -594,7 +635,7 @@ fn inline(job: &mut LayoutJob, line: &str) {
 /// beside; a diff tinted line by line.
 fn code_block(ui: &mut Ui, language: &str, code: &str, effects: &mut Vec<Effect>) {
     Frame::new()
-        .fill(RAISED)
+        .fill(ui.visuals().faint_bg_color)
         .stroke(Stroke::new(1.0, EDGE))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(10, 8))
@@ -606,6 +647,14 @@ fn code_block(ui: &mut Ui, language: &str, code: &str, effects: &mut Vec<Effect>
                 }
                 ui.label(RichText::new(language).small().color(DIM));
             });
+            // A diagram drawn takes the place of its code.
+            if language.split_whitespace().next() == Some("mermaid") {
+                let diagrams: Option<crate::diagrams::Diagrams> =
+                    ui.data(|d| d.get_temp(egui::Id::new("diagrams")));
+                if diagrams.is_some_and(|d| d.show(ui, code)) {
+                    return;
+                }
+            }
             let diff = language.split_whitespace().next() == Some("diff");
             for line in code.lines() {
                 let colour = match line.chars().next() {
@@ -625,7 +674,13 @@ mod tests {
 
     fn pieces(line: &str) -> Vec<String> {
         let mut job = LayoutJob::default();
-        inline(&mut job, line);
+        runs(
+            &mut job,
+            &md::inline(line),
+            BODY_SIZE,
+            TEXT,
+            crate::theme::RAISED,
+        );
         job.sections
             .iter()
             .map(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].to_owned())
@@ -645,20 +700,5 @@ mod tests {
     fn an_unclosed_marker_stays_as_written() {
         assert_eq!(pieces("a `b"), ["a `b"]);
         assert_eq!(pieces("2 ** 3"), ["2 ** 3"]);
-    }
-
-    #[test]
-    fn quotes_lose_one_marker_each() {
-        assert_eq!(
-            unquoted(&["> Dear team,", ">", "> > earlier", ">no space"]),
-            "Dear team,\n\n> earlier\nno space"
-        );
-    }
-
-    #[test]
-    fn headings_need_hashes_and_a_space() {
-        assert_eq!(heading("## Plan"), Some("Plan"));
-        assert_eq!(heading("#hashtag"), None);
-        assert_eq!(heading("plain"), None);
     }
 }

@@ -1,9 +1,11 @@
-//! Just enough Markdown for model replies: fenced code blocks, inline code,
-//! bold, headings and lists. Anything else is shown as written, which for
-//! Markdown is readable anyway.
+//! Replies' Markdown in the terminal, as `universe_ui::markdown` reads it:
+//! headings by level, lists nested, numbered or ticked, quotes behind a bar,
+//! rules, fenced code with a copy mark, tables boxed and aligned with wide
+//! columns wrapped, and pictures where the terminal draws them.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use universe_ui::markdown::{self, Align, Block, Marker};
 
 use crate::pictures::{Picture, Pictures};
 
@@ -12,6 +14,8 @@ const CODE_BLOCK: Color = Color::Rgb(229, 192, 123);
 /// The colour of code blocks, which references inside are not looked for.
 pub(crate) const CODE_BLOCK_COLOR: Color = CODE_BLOCK;
 const INLINE_CODE: Color = Color::Rgb(130, 170, 255);
+const LINK: Color = Color::Rgb(86, 182, 194);
+const FRAME: Color = Color::DarkGray;
 
 /// The mark drawn over a code block: a click copies the block as written.
 pub(crate) const COPY_MARK: &str = "⧉ copy";
@@ -31,161 +35,255 @@ pub(crate) fn render(
     base: Style,
     pictures: &dyn Pictures,
 ) -> Vec<Line<'static>> {
-    let width = width.max(1);
     let mut out = Vec::new();
-    let mut in_code = false;
-    // Inside a ```diff block: its lines in the colours of a diff.
-    let mut in_diff = false;
-    let lines: Vec<&str> = text.lines().collect();
-    let mut at = 0;
-
-    while at < lines.len() {
-        let raw = lines[at];
-        at += 1;
-        let trimmed = raw.trim_start();
-        if let Some(language) = trimmed.strip_prefix("```") {
-            // An opening fence becomes the copy mark, a closing one nothing.
-            in_code = !in_code;
-            in_diff = in_code && language.trim().starts_with("diff");
-            if in_code {
-                let mut spans = vec![Span::styled(COPY_MARK, base.fg(Color::DarkGray))];
-                if !language.trim().is_empty() {
-                    spans.push(Span::styled(
-                        format!(" · {}", language.trim()),
-                        base.fg(Color::DarkGray),
-                    ));
-                }
-                out.push(Line::from(spans));
-                // A diagram drawn takes the place of its code.
-                if language.trim() == "mermaid"
-                    && let Some(end) = lines[at..]
-                        .iter()
-                        .position(|l| l.trim_start().starts_with("```"))
-                {
-                    let source = lines[at..at + end].join("\n");
-                    if let Some(drawn) = pictures.lines(Picture::Mermaid(&source), width) {
-                        out.extend(drawn);
-                        at += end + 1;
-                        in_code = false;
-                    }
-                }
-            }
-            continue;
-        }
-        if in_code {
-            let style = if in_diff {
-                match raw.chars().next() {
-                    Some('+') => base.fg(Color::Rgb(110, 180, 120)),
-                    Some('-') => base.fg(Color::Rgb(200, 110, 110)),
-                    Some('@') => base.fg(Color::Cyan),
-                    _ => base.fg(CODE_BLOCK),
-                }
-            } else {
-                base.fg(CODE_BLOCK)
-            };
-            let chars: Vec<char> = raw.chars().collect();
-            if chars.is_empty() {
-                out.push(Line::default());
-            }
-            for chunk in chars.chunks(width) {
-                out.push(Line::from(Span::styled(
-                    chunk.iter().collect::<String>(),
-                    style,
-                )));
-            }
-            continue;
-        }
-        if trimmed.is_empty() {
-            out.push(Line::default());
-            continue;
-        }
-
-        if let Some(path) = image(trimmed)
-            && let Some(drawn) = pictures.lines(Picture::File(path), width)
-        {
-            out.extend(drawn);
-            continue;
-        }
-
-        let indent = raw.len() - trimmed.len();
-        if let Some(heading) = heading(trimmed) {
-            let bold = base.add_modifier(Modifier::BOLD);
-            fill(&mut out, &inline(heading, bold), width, "", "");
-        } else if let Some(item) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
-            let lead = format!("{}• ", " ".repeat(indent));
-            let rest = " ".repeat(lead.chars().count());
-            fill(&mut out, &inline(item, base), width, &lead, &rest);
-        } else {
-            fill(&mut out, &inline(raw, base), width, "", "");
-        }
-    }
+    blocks(
+        &markdown::parse(text),
+        width.max(1),
+        base,
+        pictures,
+        &mut out,
+    );
     out
 }
 
-/// The path of a line that is only a local image, `![what](path)`.
-fn image(line: &str) -> Option<&str> {
-    let rest = line.trim_end().strip_prefix("![")?;
-    let (_, rest) = rest.split_once("](")?;
-    let path = rest.strip_suffix(')')?;
-    let local = !path.is_empty() && !path.contains("://") && !path.contains(char::is_whitespace);
-    local.then_some(path)
-}
-
-/// The text of a `#` heading line, without its hashes.
-fn heading(line: &str) -> Option<&str> {
-    let hashes = line.chars().take_while(|c| *c == '#').count();
-    if (1..=6).contains(&hashes) {
-        line[hashes..].strip_prefix(' ')
-    } else {
-        None
+fn blocks(
+    list: &[Block],
+    width: usize,
+    base: Style,
+    pictures: &dyn Pictures,
+    out: &mut Vec<Line<'static>>,
+) {
+    for block in list {
+        match block {
+            Block::Blank => out.push(Line::default()),
+            Block::Heading { level, spans } => {
+                let style = match level {
+                    1 => base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    2 => base.add_modifier(Modifier::BOLD),
+                    _ => base.add_modifier(Modifier::BOLD).fg(Color::Gray),
+                };
+                fill(out, &pieces(spans, style), width, "", "");
+            }
+            Block::Paragraph(lines) => {
+                for line in lines {
+                    fill(out, &pieces(line, base), width, "", "");
+                }
+            }
+            Block::Item {
+                depth,
+                marker,
+                spans,
+            } => {
+                let mark = match marker {
+                    Marker::Bullet => ["•", "◦", "▪"][depth % 3].to_owned(),
+                    Marker::Number(n) => format!("{n}."),
+                    Marker::Task(true) => "☑".to_owned(),
+                    Marker::Task(false) => "☐".to_owned(),
+                };
+                let lead = format!("{}{mark} ", "  ".repeat(*depth));
+                let rest = " ".repeat(lead.chars().count());
+                let style = if matches!(marker, Marker::Task(true)) {
+                    base.fg(Color::DarkGray)
+                } else {
+                    base
+                };
+                fill(out, &pieces(spans, style), width, &lead, &rest);
+            }
+            Block::Rule => out.push(Line::styled("─".repeat(width.min(60)), base.fg(FRAME))),
+            Block::Quote { blocks: inner, .. } => {
+                let mut quoted = Vec::new();
+                blocks(
+                    inner,
+                    width.saturating_sub(2).max(1),
+                    base.fg(Color::Gray),
+                    pictures,
+                    &mut quoted,
+                );
+                for mut line in quoted {
+                    line.spans.insert(0, Span::styled("│ ", base.fg(FRAME)));
+                    out.push(line);
+                }
+            }
+            Block::Code { language, text } => code(language, text, width, base, pictures, out),
+            // Only a local file is drawn: nothing is fetched from the web.
+            Block::Image { alt, path } => match (!path.contains("://"))
+                .then(|| pictures.lines(Picture::File(path), width))
+                .flatten()
+            {
+                Some(drawn) => out.extend(drawn),
+                None => fill(out, &[(format!("![{alt}]({path})"), base)], width, "", ""),
+            },
+            Block::Table {
+                header,
+                aligns,
+                rows,
+            } => table(header, aligns, rows, width, base, out),
+        }
     }
 }
 
-/// Splits one line into styled pieces at `code` and **bold** markers. A marker
-/// without its closing twin is kept as written.
-fn inline(line: &str, base: Style) -> Vec<Piece> {
-    let mut pieces = Vec::new();
-    let mut plain = String::new();
-    let mut bold = false;
-    let mut rest = line;
-
-    let style_of = |bold: bool| {
-        if bold {
-            base.add_modifier(Modifier::BOLD)
+/// A fenced block: its copy mark, then its lines; a diff coloured by sign,
+/// a diagram drawn in its place where the terminal can.
+fn code(
+    language: &str,
+    text: &str,
+    width: usize,
+    base: Style,
+    pictures: &dyn Pictures,
+    out: &mut Vec<Line<'static>>,
+) {
+    let mut spans = vec![Span::styled(COPY_MARK, base.fg(Color::DarkGray))];
+    if !language.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {language}"),
+            base.fg(Color::DarkGray),
+        ));
+    }
+    out.push(Line::from(spans));
+    if language == "mermaid"
+        && let Some(drawn) = pictures.lines(Picture::Mermaid(text), width)
+    {
+        out.extend(drawn);
+        return;
+    }
+    let diff = language.starts_with("diff");
+    for raw in text.lines() {
+        let style = if diff {
+            match raw.chars().next() {
+                Some('+') => base.fg(Color::Rgb(110, 180, 120)),
+                Some('-') => base.fg(Color::Rgb(200, 110, 110)),
+                Some('@') => base.fg(Color::Cyan),
+                _ => base.fg(CODE_BLOCK),
+            }
         } else {
-            base
+            base.fg(CODE_BLOCK)
+        };
+        let chars: Vec<char> = raw.chars().collect();
+        if chars.is_empty() {
+            out.push(Line::default());
+        }
+        for chunk in chars.chunks(width) {
+            out.push(Line::from(Span::styled(
+                chunk.iter().collect::<String>(),
+                style,
+            )));
+        }
+    }
+}
+
+/// A table in a box, its columns aligned; when wider than `width`, the
+/// widest columns narrow and their cells wrap.
+fn table(
+    header: &[Vec<markdown::Span>],
+    aligns: &[Align],
+    rows: &[Vec<Vec<markdown::Span>>],
+    width: usize,
+    base: Style,
+    out: &mut Vec<Line<'static>>,
+) {
+    let columns = header.len();
+    if columns == 0 {
+        return;
+    }
+    let text = |cell: &[markdown::Span]| markdown::plain(cell);
+    let mut widths: Vec<usize> = (0..columns)
+        .map(|c| {
+            std::iter::once(&header[c])
+                .chain(rows.iter().map(|r| &r[c]))
+                .map(|cell| text(cell).chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(1)
+        })
+        .collect();
+    // Borders and padding: `│ a │ b │`.
+    let room = width.saturating_sub(3 * columns + 1).max(columns);
+    while widths.iter().sum::<usize>() > room {
+        let (widest, _) = widths
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, w)| **w)
+            .unwrap_or((0, &0));
+        if widths[widest] <= 3 {
+            break;
+        }
+        widths[widest] -= 1;
+    }
+    let frame = base.fg(FRAME);
+    let border = |left: &str, middle: &str, right: &str| {
+        let parts: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+        Line::styled(format!("{left}{}{right}", parts.join(middle)), frame)
+    };
+    out.push(border("┌", "┬", "┐"));
+    let row = |out: &mut Vec<Line<'static>>, cells: &[Vec<markdown::Span>], style: Style| {
+        let wrapped: Vec<Vec<Vec<Piece>>> = cells
+            .iter()
+            .zip(&widths)
+            .map(|(cell, w)| {
+                let mut lines = Vec::new();
+                fill(&mut lines, &pieces(cell, style), *w, "", "");
+                lines
+                    .into_iter()
+                    .map(|l| {
+                        l.spans
+                            .into_iter()
+                            .map(|s| (s.content.into_owned(), s.style))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        for line in 0..height {
+            let mut spans = vec![Span::styled("│", frame)];
+            for (c, cell) in wrapped.iter().enumerate() {
+                let parts = cell.get(line).cloned().unwrap_or_default();
+                let used: usize = parts.iter().map(|(t, _)| t.chars().count()).sum();
+                let gap = widths[c].saturating_sub(used);
+                let (left, right) = match aligns.get(c).copied().unwrap_or_default() {
+                    Align::Left => (0, gap),
+                    Align::Right => (gap, 0),
+                    Align::Center => (gap / 2, gap - gap / 2),
+                };
+                spans.push(Span::raw(format!(" {}", " ".repeat(left))));
+                spans.extend(parts.into_iter().map(|(t, s)| Span::styled(t, s)));
+                spans.push(Span::raw(format!("{} ", " ".repeat(right))));
+                spans.push(Span::styled("│", frame));
+            }
+            out.push(Line::from(spans));
         }
     };
+    row(out, header, base.add_modifier(Modifier::BOLD));
+    out.push(border("├", "┼", "┤"));
+    for cells in rows {
+        row(out, cells, base);
+    }
+    out.push(border("└", "┴", "┘"));
+}
 
-    while let Some(c) = rest.chars().next() {
-        if c == '`'
-            && let Some(end) = rest[1..].find('`')
-        {
-            if !plain.is_empty() {
-                pieces.push((std::mem::take(&mut plain), style_of(bold)));
+/// The runs of the shared reader as styled pieces.
+fn pieces(spans: &[markdown::Span], base: Style) -> Vec<Piece> {
+    spans
+        .iter()
+        .map(|span| {
+            let mut style = base;
+            if span.bold {
+                style = style.add_modifier(Modifier::BOLD);
             }
-            pieces.push((rest[1..=end].to_owned(), style_of(bold).fg(INLINE_CODE)));
-            rest = &rest[end + 2..];
-            continue;
-        }
-        if rest.starts_with("**") && (bold || rest[2..].contains("**")) {
-            if !plain.is_empty() {
-                pieces.push((std::mem::take(&mut plain), style_of(bold)));
+            if span.italic {
+                style = style.add_modifier(Modifier::ITALIC);
             }
-            bold = !bold;
-            rest = &rest[2..];
-            continue;
-        }
-        plain.push(c);
-        rest = &rest[c.len_utf8()..];
-    }
-    if !plain.is_empty() {
-        pieces.push((plain, style_of(bold)));
-    }
-    pieces
+            if span.strike {
+                style = style.add_modifier(Modifier::CROSSED_OUT);
+            }
+            if span.code {
+                style = style.fg(INLINE_CODE);
+            } else if span.link.is_some() {
+                style = style.fg(LINK).add_modifier(Modifier::UNDERLINED);
+            }
+            (span.text.clone(), style)
+        })
+        .collect()
 }
 
 /// Lays `pieces` out in lines of at most `width` characters, breaking at
@@ -331,6 +429,44 @@ mod tests {
             )),
             ["![plan](a.png)", "⧉ copy · mermaid", "graph"]
         );
+    }
+
+    #[test]
+    fn lists_quotes_rules_and_tables_are_drawn() {
+        let out = render(
+            "1. first\n- [x] done\n  - nested\n---\n> quoted",
+            40,
+            Style::new(),
+        );
+        assert_eq!(
+            text(&out),
+            [
+                "1. first",
+                "☑ done",
+                "  ◦ nested",
+                &"─".repeat(40),
+                "│ quoted"
+            ]
+        );
+        let table = render("| a | bb |\n|---|---:|\n| x | 1 |", 40, Style::new());
+        assert_eq!(
+            text(&table),
+            [
+                "┌───┬────┐",
+                "│ a │ bb │",
+                "├───┼────┤",
+                "│ x │  1 │",
+                "└───┴────┘"
+            ]
+        );
+        // Too wide: the widest column narrows and its cells wrap.
+        let wide = render(
+            "| k | value |\n|---|---|\n| a | one two three four |",
+            16,
+            Style::new(),
+        );
+        assert!(wide.iter().all(|l| l.width() <= 16), "{:?}", text(&wide));
+        assert!(wide.len() > 5);
     }
 
     #[test]

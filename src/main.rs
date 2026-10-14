@@ -462,6 +462,7 @@ async fn interface(
         allow_sleep: defaults.keep_awake == Some(false),
         see_through: defaults.see_through,
         opacity: defaults.opacity,
+        text_size: defaults.text_size,
         chat_width: defaults.chat_width,
         images: defaults.images.unwrap_or_default(),
         mermaid: defaults.mermaid.clone(),

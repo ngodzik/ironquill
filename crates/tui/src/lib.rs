@@ -32,7 +32,7 @@ use universe_core::{ChatModel, Delegate};
 use universe_tools::Workspace;
 
 use universe_ui::workspaces::Relaunch;
-use universe_ui::{App, Defaults, Host, Settings, Start, Waiting, input};
+use universe_ui::{App, Host, Settings, Start, Waiting, input};
 
 pub use error::TuiError;
 
@@ -90,9 +90,11 @@ where
     // Whether the terminal draws images is found once, from what it says
     // of itself.
     let terminal_kind = graphics::detect(settings.images, |name| std::env::var(name).ok());
-    let renderer =
-        pictures::Renderer::find(settings.mermaid.as_deref(), pictures::Renderer::installed);
-    let cache = Defaults::path().map(|p| p.with_file_name("cache").join("diagrams"));
+    let renderer = universe_ui::diagrams::Renderer::find(
+        settings.mermaid.as_deref(),
+        universe_ui::diagrams::Renderer::installed,
+    );
+    let cache = universe_ui::diagrams::cache();
     let mut screen = terminal_kind.map(graphics::Screen::new);
     let gallery = RefCell::new(pictures::Gallery::new(workspace.root().to_owned()));
     gallery

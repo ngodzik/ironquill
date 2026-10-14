@@ -52,7 +52,8 @@ pub(crate) fn rgb(c: Rgb) -> Color32 {
 pub(crate) const BODY_SIZE: f32 = 14.5;
 
 /// Fonts the system may have, tried after egui's own for the characters
-/// those lack: the spinner's braille, arrows, ✗, ⎿.
+/// those lack: the spinner's braille, arrows, ✗, ⎿, and ☐ ☑ ◦ ▪ ✕ ↻ ▸ ▾,
+/// which DejaVu Sans and Noto Sans have on Linux.
 const FALLBACK_FONTS: [(&str, &str); 5] = [
     (
         "dejavu-sans",
@@ -96,6 +97,20 @@ fn fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// Makes every surface egui fills, windows and menus included, as opaque
+/// as the window: Ctrl-M fades them all together.
+pub(crate) fn follow(ctx: &egui::Context, opacity: f32) {
+    let mut visuals = ctx.global_style().visuals.clone();
+    visuals.panel_fill = see(PANEL, opacity);
+    visuals.window_fill = see(RAISED, opacity);
+    visuals.extreme_bg_color = see(BACKGROUND, opacity);
+    visuals.faint_bg_color = see(RAISED, opacity);
+    visuals.selection.bg_fill = see(SELECTED, opacity);
+    visuals.widgets.inactive.weak_bg_fill = see(RAISED, opacity);
+    visuals.widgets.inactive.bg_fill = see(RAISED, opacity);
+    ctx.set_visuals(visuals);
 }
 
 /// Sets the window's look once, before the first frame.

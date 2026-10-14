@@ -16,6 +16,9 @@ pub(crate) enum Pressed {
     /// in most applications. The terminal pastes by itself; a window must
     /// ask.
     Paste,
+    /// The text a step larger (1), smaller (-1) or as at first (0): Cmd +,
+    /// Cmd − and Cmd 0 on macOS, Ctrl elsewhere.
+    TextSize(i32),
 }
 
 /// The modifiers held, as the window knows them.
@@ -64,6 +67,19 @@ pub(crate) fn translate(key: &Key, held: Held) -> Option<Pressed> {
             let c = text.chars().next()?;
             if (held.control || held.command) && c.eq_ignore_ascii_case(&'v') {
                 return Some(Pressed::Paste);
+            }
+            let zooms = if cfg!(target_os = "macos") {
+                held.command
+            } else {
+                held.control
+            };
+            if zooms {
+                match c {
+                    '=' | '+' => return Some(Pressed::TextSize(1)),
+                    '-' | '_' => return Some(Pressed::TextSize(-1)),
+                    '0' => return Some(Pressed::TextSize(0)),
+                    _ => {}
+                }
             }
             // Cmd with a letter is the system's (Cmd-C copies, through
             // egui), never the letter typed; so is the copy off macOS.

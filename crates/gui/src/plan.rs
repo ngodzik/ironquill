@@ -1140,7 +1140,7 @@ fn trail(ui: &mut Ui, at: Pos2, level: &str, project: &str) -> Option<String> {
 
 /// The two views of the codebase, top right, to pick with the mouse.
 pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
-    let area = Rect::from_min_size(rect.right_top() + vec2(-504.0, 20.0), vec2(480.0, 30.0));
+    let area = Rect::from_min_size(rect.right_top() + vec2(-604.0, 20.0), vec2(580.0, 30.0));
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(area)
@@ -1165,6 +1165,16 @@ pub(crate) fn switch(ui: &mut Ui, rect: Rect, app: &mut App) {
                 if ui.add(egui::Button::selectable(on, text)).clicked() && !on {
                     app.show_map(Some(view));
                 }
+            }
+            // First from the left: back to the conversation, which the views
+            // leave the whole window.
+            let back = RichText::new("✕ Chat").size(14.0).color(TEXT);
+            if ui
+                .add(egui::Button::new(back))
+                .on_hover_text("Back to the conversation")
+                .clicked()
+            {
+                app.show_map(None);
             }
         },
     );
