@@ -516,7 +516,11 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(Clear, area);
     let block = pane_block(" Model ".into(), true).title_bottom(
-        Line::styled(" Enter: choose · Space: team · Esc: close ", fg(DIM)).centered(),
+        Line::styled(
+            " Enter: choose · Space: team · Ctrl-F: fresh work ◆ · Esc: close ",
+            fg(DIM),
+        )
+        .centered(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -559,7 +563,8 @@ fn render_model_picker(frame: &mut Frame, app: &App) {
             " "
         };
         let team = if row.in_team { "✓" } else { " " };
-        let name = format!("{mark} {team} {}", app.model_label(&row.model));
+        let fresh = if row.fresh { "◆" } else { " " };
+        let name = format!("{mark} {team}{fresh} {}", app.model_label(&row.model));
         let gap = room.saturating_sub(name.chars().count() + row.note.chars().count() + 1);
         let mut style = Style::new();
         if !row.offered {

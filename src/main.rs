@@ -435,6 +435,11 @@ async fn interface(
             choices.effort.or_kept(kept).unwrap_or_default()
         },
         planner: defaults.planner.as_deref().map(ModelId::new).transpose()?,
+        fresh_model: defaults
+            .fresh_model
+            .as_deref()
+            .map(ModelId::new)
+            .transpose()?,
         usage_window: defaults
             .usage_window
             .as_deref()

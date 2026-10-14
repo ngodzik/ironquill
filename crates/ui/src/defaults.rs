@@ -62,6 +62,11 @@ pub struct Defaults {
     /// The member of the team that plans in a pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner: Option<String>,
+    /// The model for work that starts with little context: `/debug`'s
+    /// investigations, reading a ticket, checking progress. Unsaid, the
+    /// conversation's model does it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_model: Option<String>,
     /// The usage pane's window, such as `6h`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_window: Option<String>,
@@ -224,6 +229,7 @@ mod tests {
             budget: Some(0.25),
             effort: Some("max".into()),
             planner: Some("b/strong".into()),
+            fresh_model: Some("a/cheap".into()),
             usage_window: Some("6h".into()),
             allowed_secrets: vec!["API_TOKEN".into()],
             lenient_commands: true,

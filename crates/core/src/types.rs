@@ -329,6 +329,14 @@ pub enum Message {
         /// What the tool returned, or why it failed.
         content: String,
     },
+    /// An image a tool showed, sent after the turn's results: a tool result
+    /// cannot carry one in the OpenAI format.
+    Image {
+        /// Its media type, such as `image/png`.
+        mime: String,
+        /// The image, in base64.
+        data: String,
+    },
 }
 
 impl Message {

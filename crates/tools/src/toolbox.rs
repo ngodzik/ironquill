@@ -52,6 +52,8 @@ pub struct ToolOutput {
     pub for_model: String,
     /// What the person is shown.
     pub summary: ToolSummary,
+    /// An image for the model to see, sent after the turn's results.
+    pub picture: Option<crate::picture::Picture>,
 }
 
 /// The tools a model may call, bound to one workspace.
@@ -151,6 +153,18 @@ impl Toolbox {
                 }),
             },
             ToolSpec {
+                name: "view_image".into(),
+                description: "Look at an image of the project: a PNG, JPEG, GIF or WebP file \
+                    of 20 MB at most, such as a screenshot or a diagram. You see it after this \
+                    turn's results."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": path},
+                    "required": ["path"],
+                }),
+            },
+            ToolSpec {
                 name: "outline".into(),
                 description: "The map of a file or directory: its functions, classes, methods \
                     and types with their line numbers, without their code. Knows Rust, Python, \
@@ -226,7 +240,10 @@ impl Toolbox {
 
     /// Whether the tool named `name` changes nothing.
     pub fn reads_only(name: &str) -> bool {
-        matches!(name, "search" | "outline" | "read_file" | "list_dir")
+        matches!(
+            name,
+            "search" | "outline" | "read_file" | "list_dir" | "view_image"
+        )
     }
 
     /// Runs one call and returns what to tell the model.
@@ -237,6 +254,26 @@ impl Toolbox {
     /// failed edit is information for the next turn, not a reason to stop.
     pub fn call(&mut self, call: &ToolCall) -> Result<ToolOutput, ToolError> {
         match call.name.as_str() {
+            "view_image" => {
+                let args: PathArgs = parse(call)?;
+                let path = self.workspace.resolve(&args.path)?;
+                let shown = self.workspace.shown(&path);
+                let picture = crate::picture::read(&path, &shown)?;
+                let size = picture
+                    .size()
+                    .map_or_else(String::new, |(w, h)| format!(", {w}×{h}"));
+                Ok(ToolOutput {
+                    for_model: format!(
+                        "{} ({}{size}) is attached after this turn's results.",
+                        args.path, picture.mime
+                    ),
+                    summary: ToolSummary::Read {
+                        path: args.path,
+                        lines: 0,
+                    },
+                    picture: Some(picture),
+                })
+            }
             "read_file" => {
                 let args: ReadArgs = parse(call)?;
                 let text = self.workspace.read(&args.path)?;
@@ -250,6 +287,7 @@ impl Toolbox {
                         ));
                     }
                     return Ok(ToolOutput {
+                        picture: None,
                         summary: ToolSummary::Read {
                             lines: total,
                             path: args.path,
@@ -267,6 +305,7 @@ impl Toolbox {
                 }
                 let lines: Vec<&str> = text.lines().skip(start - 1).take(end + 1 - start).collect();
                 Ok(ToolOutput {
+                    picture: None,
                     summary: ToolSummary::Ran {
                         label: format!("Read({} {start}-{end})", args.path),
                         lines: lines.len(),
@@ -285,6 +324,7 @@ impl Toolbox {
                     args.glob.as_deref(),
                 )?;
                 Ok(ToolOutput {
+                    picture: None,
                     summary: ToolSummary::Ran {
                         label: format!("Search({})", args.pattern),
                         lines: matches,
@@ -305,6 +345,7 @@ impl Toolbox {
                     crate::outline::outline_dir(self.workspace.root(), &path)
                 };
                 Ok(ToolOutput {
+                    picture: None,
                     summary: ToolSummary::Ran {
                         label: format!("Outline({})", args.path),
                         lines: text.lines().count(),
@@ -316,6 +357,7 @@ impl Toolbox {
                 let args: PathArgs = parse(call)?;
                 let listing = self.list(&args.path)?;
                 Ok(ToolOutput {
+                    picture: None,
                     summary: ToolSummary::Listed {
                         entries: listing.lines().count(),
                         path: args.path,
@@ -361,6 +403,7 @@ impl Toolbox {
         }
         self.edits += 1;
         ToolOutput {
+            picture: None,
             for_model: for_model.into(),
             summary: ToolSummary::Changed {
                 path,

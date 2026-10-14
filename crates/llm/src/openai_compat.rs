@@ -410,6 +410,13 @@ fn wire_message(message: &Message) -> Value {
         Message::Tool { call_id, content } => {
             json!({"role": "tool", "tool_call_id": call_id, "content": content})
         }
+        Message::Image { mime, data } => json!({
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": format!("data:{mime};base64,{data}")},
+            }],
+        }),
     }
 }
 
@@ -584,6 +591,21 @@ fn parse_pricing(url: &str, body: &str, model: &ModelId) -> Result<Pricing, LlmE
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_image_goes_as_a_user_message_with_a_data_url() {
+        let message = Message::Image {
+            mime: "image/png".into(),
+            data: "iVBORw0K".into(),
+        };
+        assert_eq!(
+            wire_message(&message),
+            json!({
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0K"}}]
+            })
+        );
+    }
+
     #[tokio::test]
     async fn a_request_held_without_answer_says_it_may_have_been_billed() {
         // A server that accepts and never answers.

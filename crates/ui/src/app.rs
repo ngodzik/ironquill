@@ -125,6 +125,9 @@ pub struct Settings {
     /// The member of the team that plans in a pair; `None` picks
     /// the best scored, or the dearest.
     pub planner: Option<ModelId>,
+    /// The model for work that starts with little context; `None`, the
+    /// conversation's own. Never an agent.
+    pub fresh_model: Option<ModelId>,
     /// Without checks set, find the project's own when checking: its test
     /// runner, and tests a model has just written.
     pub detect_checks: bool,
@@ -241,6 +244,8 @@ pub struct ModelRow {
     /// Among the models offered every time, not only found by the search.
     pub offered: bool,
     pub in_team: bool,
+    /// The model for work that starts with little context (◆).
+    pub fresh: bool,
 }
 
 /// Something only the event loop can do, asked for by the state.
@@ -3497,6 +3502,7 @@ impl App {
             note: self.note(model),
             offered,
             in_team: self.settings.team.contains(model),
+            fresh: self.settings.fresh_model.as_ref() == Some(model),
         };
         let mut rows: Vec<ModelRow> = self
             .settings
@@ -4013,6 +4019,15 @@ impl App {
         Some(None)
     }
 
+    /// The model for work that starts with little context: the one marked
+    /// ◆, else the conversation's.
+    pub fn fresh_model(&self) -> Option<ModelId> {
+        self.settings
+            .fresh_model
+            .clone()
+            .or_else(|| self.current_model().cloned())
+    }
+
     /// The usage samples, and the pane's window while it shows.
     pub fn usage_pane(&self) -> Option<(&UsageLog, u64)> {
         self.usage_open
@@ -4135,6 +4150,26 @@ impl App {
             KeyCode::Char(' ') => {
                 if let Some(row) = rows.get(selected) {
                     self.toggle_team(row.model.clone());
+                }
+            }
+            // Ctrl-F: the model for work that starts with little context,
+            // or none again.
+            KeyCode::Char('f') if ctrl => {
+                if let Some(row) = rows.get(selected) {
+                    let model = row.model.clone();
+                    if model.delegate().is_some() {
+                        self.error(format!(
+                            "{model} is an agent: it cannot answer the single questions fresh work asks"
+                        ));
+                    } else if self.settings.fresh_model.as_ref() == Some(&model) {
+                        self.settings.fresh_model = None;
+                        self.info("Fresh work is done by the conversation's model again");
+                    } else {
+                        self.info(format!(
+                            "◆ {model} does the work that starts with little context: /debug, tickets"
+                        ));
+                        self.settings.fresh_model = Some(model);
+                    }
                 }
             }
             // Delete takes a model off the list, and off the team: it is no
@@ -4261,6 +4296,7 @@ impl App {
             budget: self.settings.budget.map(|b| b.0),
             effort: Some(self.settings.effort.to_string()),
             planner: self.settings.planner.as_ref().map(ToString::to_string),
+            fresh_model: self.settings.fresh_model.as_ref().map(ToString::to_string),
             usage_window: Some(crate::usage::window_name(self.usage_window)),
             allowed_secrets: self.settings.allowed_secrets.clone(),
             lenient_commands: !self.settings.strict_commands,
@@ -5331,6 +5367,27 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_f_marks_the_model_for_fresh_work_but_never_an_agent() {
+        let mut app = ready();
+        app.settings.models = vec![
+            ModelId::new("cheap").unwrap(),
+            ModelId::new("claude-code/opus").unwrap(),
+        ];
+        assert_eq!(app.fresh_model(), Some(ModelId::new("cheap").unwrap()));
+        app.open_model_picker();
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_f);
+        assert_eq!(app.defaults().fresh_model.as_deref(), Some("cheap"));
+        assert!(app.model_rows()[0].fresh);
+        press(&mut app, KeyCode::Down);
+        app.on_key(ctrl_f);
+        assert_eq!(app.defaults().fresh_model.as_deref(), Some("cheap"));
+        press(&mut app, KeyCode::Up);
+        app.on_key(ctrl_f);
+        assert_eq!(app.defaults().fresh_model, None);
+    }
+
+    #[test]
     fn pair_mode_has_opus_plan_and_sonnet_code() {
         let mut app = ready();
         app.settings.pair_mode = true;
@@ -6254,6 +6311,7 @@ mod tests {
                 budget: Some(0.25),
                 effort: Some("high".into()),
                 planner: None,
+                fresh_model: None,
                 usage_window: Some("1h".into()),
                 allowed_secrets: vec![],
                 lenient_commands: true,

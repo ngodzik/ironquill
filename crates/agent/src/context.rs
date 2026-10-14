@@ -48,7 +48,9 @@ pub(crate) fn to_text(messages: &[Message]) -> String {
                     block(&mut out, &title, result.unwrap_or(""));
                 }
             }
-            Message::Tool { .. } => {}
+            // An image cannot be edited as text: an edited context leaves
+            // it out.
+            Message::Tool { .. } | Message::Image { .. } => {}
         }
     }
     out
@@ -203,6 +205,9 @@ pub(crate) fn sanitize(messages: Vec<Message>) -> Vec<Message> {
     out
 }
 
+/// What an image weighs in characters, about: 1,500 tokens.
+const IMAGE_CHARS: usize = 6_000;
+
 /// A rough size in tokens, four characters each, enough to see what an edit
 /// saves.
 pub(crate) fn approx_tokens(messages: &[Message]) -> u64 {
@@ -221,6 +226,8 @@ pub(crate) fn approx_tokens(messages: &[Message]) -> u64 {
                         .sum::<usize>()
             }
             Message::Tool { content, .. } => content.len(),
+            // What providers bill an image of a usual size, about.
+            Message::Image { .. } => IMAGE_CHARS,
         })
         .sum();
     (chars / 4) as u64

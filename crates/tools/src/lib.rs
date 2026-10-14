@@ -20,6 +20,7 @@ mod git;
 mod gitview;
 mod lsp;
 mod outline;
+mod picture;
 mod rules;
 mod search;
 mod snapshot;
@@ -42,6 +43,7 @@ pub use gitview::{
 };
 pub use lsp::{Location, LspError, Servers};
 pub use outline::project_map;
+pub use picture::Picture;
 pub use rules::project_instructions;
 pub use snapshot::Snapshot;
 pub use toolbox::{ToolOutput, ToolSummary, Toolbox};

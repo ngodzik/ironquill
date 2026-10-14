@@ -147,7 +147,7 @@ the code, and you review it after. Change no file and run nothing that changes a
 read only, and universe stops the pair if a file changes.";
 
 /// The tools a planner reading through universe gets.
-const READ_TOOLS: [&str; 4] = ["search", "outline", "read_file", "list_dir"];
+const READ_TOOLS: [&str; 5] = ["search", "outline", "read_file", "list_dir", "view_image"];
 
 /// The most of a diff a review reads, in bytes.
 const REVIEW_DIFF_BYTES: usize = 40_000;
@@ -3183,18 +3183,31 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         if let Some(Message::System(prompt)) = sent.first_mut() {
             prompt.push_str(&identity);
         }
-        let request = ChatRequest {
+        let mut request = ChatRequest {
             model: model_id.clone(),
             messages: sent,
             tools: tools.clone(),
             effort: ctx.effort,
         };
         within_budget(ctx, pricing, &request)?;
-        let response = ctx
-            .model
-            .complete(&request)
-            .await
-            .map_err(|e| AgentError::Model(Box::new(e)))?;
+        // Providers do not publish how large an image may be: one refused
+        // as too large is halved, every image with it, and the request sent
+        // again, without asking the model again.
+        let mut halved = 0;
+        let response = loop {
+            match ctx.model.complete(&request).await {
+                Ok(response) => break response,
+                Err(e)
+                    if halved < IMAGE_HALVINGS
+                        && image_too_large(&e.to_string())
+                        && halve_images(&mut request.messages) =>
+                {
+                    halve_images(messages);
+                    halved += 1;
+                }
+                Err(e) => return Err(AgentError::Model(Box::new(e))),
+            }
+        };
         if ctx.purpose == Purpose::Chat {
             ctx.last_request = Some(request);
         }
@@ -3246,6 +3259,7 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
         if response.tool_calls.is_empty() {
             return Ok(true);
         }
+        let mut pictures = Vec::new();
         for call in &response.tool_calls {
             if leads && call.name == DELEGATE_TOOL {
                 let report = Box::pin(hand_over(ctx, model_id, &call.arguments)).await?;
@@ -3264,6 +3278,11 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 continue;
             }
             let mut result = ctx.toolbox.call(call);
+            if let Ok(output) = &mut result
+                && let Some(picture) = output.picture.take()
+            {
+                pictures.push(picture);
+            }
             // Outside the workspace: the person may add a folder for the
             // rest of the conversation, and the call is made again.
             if let Err(universe_tools::ToolError::OutsideWorkspace { path, .. }) = &result
@@ -3296,7 +3315,49 @@ async fn converse<M: ChatModel, D: Delegate, O: FnMut(Event) + Send>(
                 content: result.map_or_else(|e| format!("error: {e}"), |o| o.for_model),
             });
         }
+        // A tool result cannot carry an image in the OpenAI format: each
+        // goes as a message of its own, after the turn's results.
+        messages.extend(pictures.into_iter().map(|p| Message::Image {
+            data: p.base64(),
+            mime: p.mime,
+        }));
     }
+}
+
+/// How many times images are halved for a provider that refuses them.
+const IMAGE_HALVINGS: u32 = 3;
+
+/// Whether a provider's error says an image is too large, as each words it.
+fn image_too_large(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("image")
+        && [
+            "too large",
+            "too big",
+            "exceed",
+            "maximum",
+            "max size",
+            "size limit",
+            "dimension",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
+}
+
+/// Halves every image of `messages`; whether any was.
+fn halve_images(messages: &mut [Message]) -> bool {
+    let mut any = false;
+    for message in messages {
+        if let Message::Image { mime, data } = message
+            && let Some(smaller) =
+                universe_tools::Picture::from_base64(mime, data).and_then(|p| p.halved())
+        {
+            *data = smaller.base64();
+            *mime = smaller.mime;
+            any = true;
+        }
+    }
+    any
 }
 
 /// For a model whose reply was empty.
@@ -3436,6 +3497,7 @@ fn flattened(messages: &[Message]) -> String {
                 let start: String = content.chars().take(RESULT_CHARS).collect();
                 out.push_str(&format!("(result) {start}\n\n"));
             }
+            Message::Image { mime, .. } => out.push_str(&format!("(an image, {mime})\n\n")),
         }
     }
     latest(&out, SUMMARY_INPUT_BYTES)
@@ -3827,7 +3889,7 @@ fn catch_up_all(messages: &[Message]) -> String {
                     out.push_str(&format!("Assistant: {text}\n\n"));
                 }
             }
-            Message::System(_) | Message::Tool { .. } => {}
+            Message::System(_) | Message::Tool { .. } | Message::Image { .. } => {}
         }
     }
     out
@@ -4712,6 +4774,88 @@ mod tests {
         assert_eq!(checks_run(&events), 0);
         assert!(dir.path().join("notes.txt").exists());
         assert_eq!(model.seen.lock().unwrap().len(), 2);
+    }
+
+    /// Refuses any image whose base64 is longer than it accepts, as a
+    /// provider whose limit nobody published does.
+    struct ImageLimit {
+        most: usize,
+        seen: Mutex<Vec<ChatRequest>>,
+        answers: Mutex<VecDeque<ChatResponse>>,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("400: image exceeds the maximum size")]
+    struct TooLarge;
+
+    impl ChatModel for ImageLimit {
+        type Error = TooLarge;
+
+        async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, TooLarge> {
+            self.seen.lock().unwrap().push(request.clone());
+            let too_large = request
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Image { data, .. } if data.len() > self.most));
+            if too_large {
+                return Err(TooLarge);
+            }
+            Ok(self.answers.lock().unwrap().pop_front().unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_image_refused_as_too_large_is_halved_and_sent_again() {
+        let (dir, mut toolbox) = setup();
+        let image = image::RgbImage::from_fn(400, 300, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x * y) % 256) as u8])
+        });
+        image.save(dir.path().join("shot.png")).unwrap();
+        let full = universe_tools::Picture::from_bytes(
+            std::fs::read(dir.path().join("shot.png")).unwrap(),
+        )
+        .unwrap()
+        .base64()
+        .len();
+        let model = ImageLimit {
+            most: full / 3,
+            seen: Mutex::new(Vec::new()),
+            answers: Mutex::new(VecDeque::from([
+                calls("view_image", json!({"path": "shot.png"})),
+                says("A gradient."),
+            ])),
+        };
+        let config = AgentConfig::builder()
+            .tier(ModelId::new("cheap").unwrap())
+            .build()
+            .unwrap();
+        Session::new()
+            .send(
+                &model,
+                &NoDelegate,
+                &mut toolbox,
+                &config,
+                "look",
+                "",
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let seen = model.seen.lock().unwrap();
+        // Refused, then sent again smaller: the image follows the result.
+        let last = &seen.last().unwrap().messages;
+        let at = last
+            .iter()
+            .position(|m| matches!(m, Message::Image { .. }))
+            .unwrap();
+        assert!(
+            matches!(&last[at - 1], Message::Tool { content, .. } if content.contains("400×300"))
+        );
+        let Message::Image { data, .. } = &last[at] else {
+            unreachable!()
+        };
+        assert!(data.len() <= full / 3);
+        assert!(seen.len() >= 3 && seen.len() <= 2 + 3);
     }
 
     #[tokio::test]
