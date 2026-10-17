@@ -75,7 +75,7 @@ syntect    = { version = "5.3.0", default-features = false, features = ["default
 # Images a model is shown: read to know their size, halved when a provider
 # refuses them as too large. The version Bevy already brings.
 image      = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-base64     = "0.22.1"
+base64     = "0.23.1"
 
 [package]
 name    = "universe"
