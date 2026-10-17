@@ -69,7 +69,7 @@ bevy       = { version = "0.19.1", default-features = false, features = [
     "bevy_post_process", "bevy_camera", "bevy_mesh", "bevy_image", "bevy_shader", "bevy_material",
     "bevy_pbr", "bevy_light", "bevy_gizmos", "bevy_gizmos_render",
 ] }
-bevy_egui  = { version = "0.42.0", default-features = false, features = ["render", "default_fonts"] }
+bevy_egui  = { version = "0.43.1", default-features = false, features = ["render", "default_fonts"] }
 egui_plot  = "0.37.0"
 syntect    = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 # Images a model is shown: read to know their size, halved when a provider
